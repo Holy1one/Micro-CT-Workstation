@@ -1,24 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
-import { DevPreviewAdapter } from "./devAdapter";
-import type { EngineAdapter, EngineCommand, EngineSnapshot } from "./types";
-
-class TauriEngineAdapter implements EngineAdapter {
-  readonly kind = "tauri" as const;
-
-  getSnapshot(): Promise<EngineSnapshot> {
-    return invoke<EngineSnapshot>("engine_snapshot");
-  }
-
-  dispatch(command: EngineCommand): Promise<EngineSnapshot> {
-    return invoke<EngineSnapshot>("engine_command", { command });
-  }
-}
-
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
-}
+import type { EngineAdapter } from "./types";
+import { WorkstationAdapter } from "./workstationAdapter";
 
 export function createEngineAdapter(): EngineAdapter {
-  return isTauriRuntime() ? new TauriEngineAdapter() : new DevPreviewAdapter();
+  // The RTS9060 link layer (scan workflow + device transports, ported from the
+  // proven Python host in kernal/software) is the single device/task owner for
+  // every runtime — browser dev server and the Tauri desktop shell alike.
+  // The Rust ct-engine sidecar remains in place as the future bridge point for
+  // physical serial / camera SDKs; its protocol and code are untouched.
+  return new WorkstationAdapter();
 }
-

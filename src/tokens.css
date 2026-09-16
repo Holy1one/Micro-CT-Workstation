@@ -1,0 +1,373 @@
+/* ============================================================
+   Micro-CT Workstation · Industrial Console
+   设计令牌 —— 由设计稿直接导出，可直接替换现有样式变量
+
+   来源：Ardot 设计文件「Micro-CT Workstation · 界面优化」
+        https://ardot.tencent.com/file/726485156717388
+
+   ★ 设计要点
+     1) 视觉体系：Apple 系统风 —— 画布 #F5F5F7 / 纯白卡片 / 发丝分隔线 /
+        单一 Action Blue 强调色 / 大圆角（18-20）/ 无装饰性渐变。
+     2) 中央视口 =「真实感 3D 场景图（主题×角度四选一）+ 状态浮窗」：
+        · 3D-scene-light.png / 3D-scene-dark.png = 转台 0°（Ready）
+        · 3D-scene-light-144.png / 3D-scene-dark-144.png = 转台 144°（Scanning/Paused/Fault）
+        构图：相机（左）→ 转台待测物（中）→ X 射线源（右），直线光路；
+        只有待测物是卡通形象（默认宇航员手办，可替换），设备一律真实感渲染。
+     3) 控制坞：磨砂玻璃底座（白色半透明 + backdrop-filter 磨砂 + 1px 高光描边 + 外投影），
+        内含 4 颗 54×54 圆键，默认只显图标、hover 才展开文字标签。
+     4) 底部控制台（日志）、状态栏、射线/时间开关、系统预检进度条的令牌。
+
+   主题：双主题
+     · 默认（:root）      = Light 浅色 · 简洁白
+     · [data-theme=dark]  = Dark  深色 · 夜间模式
+   运行状态由 [data-state] 驱动：ready / scanning / paused / fault
+   切换主题只反转 <html data-theme>；切换状态只改 <html data-state>。
+   ============================================================ */
+
+/* ------------------------------------------------------------
+   默认主题 · Light
+   ------------------------------------------------------------ */
+:root,
+[data-theme="light"] {
+  /* ---- 底色 / 机箱层级 ---- */
+  --appBg:        #F5F5F7;   /* 应用最底画布 */
+  --chassis:      #FFFFFF;   /* 菜单栏 / 状态栏 */
+  --panel:        #FFFFFF;   /* 卡片面板 */
+  --panelHeader:  #FAFAFC;   /* 卡片内嵌标题条 / 视口工具条 / 统计小块底 */
+  --well:         #F5F5F7;   /* 凹陷区：输入框、进度槽、预检条底槽 */
+  --line:         #F0F0F0;   /* 卡片内发丝分隔线（1px） */
+  --lineStrong:   #E0E0E0;   /* 区块之间分隔线（菜单栏/控制台/状态栏上下） */
+  --lineField:    #D2D2D7;   /* 输入框描边 */
+
+  /* ---- 文字层级 ---- */
+  --textPrimary:   #1D1D1F;  /* 标题、读数、值 */
+  --textSecondary: #6E6E73;  /* 说明、字段名、次级信息 */
+  --textMuted:     #8E8E93;  /* 最弱提示、日志时间戳、脚注 */
+  --textDisabled:  #AEAEB2;  /* 置灰控件文字 */
+
+  /* ---- 语义色（颜色即语义，不要换色表达同一动作） ---- */
+  --accent:        #0066CC;  /* 唯一强调色：选中态、链接、PASS 标签 */
+  --accentText:    #1A7F37;  /* 日志 INFO/OK 级别文字（绿） */
+  --ok:            #34C759;  /* 就绪点、预检通过、进度条绿色段 */
+  --warn:          #FFB340;  /* 预检告警（黄）、暂停按钮 */
+  --warnText:      #B26A00;  /* 日志 WARN 级别文字（琥珀） */
+  --danger:        #FF3B30;  /* 急停按钮（红） */
+  --dangerSolid:   #C71A1C;  /* Xray Disable / Timer On / 故障条等实心红 */
+  --dangerText:    #B3261E;  /* 日志 ERR 级别文字（红） */
+  --violet:        #8B5CF6;  /* 读取上一次扫描进度（紫） */
+  --btnHome:       #3B82F6;  /* 设备回零（深蓝，取自按钮 SVG） */
+  --btnResume:     #0A84FF;  /* 从暂停开始 / 继续（浅蓝，取自按钮 SVG） */
+  --beamGlow:      #F5A623;  /* X 射线束暖色（视口内唯一暖色高亮） */
+  --optics:        #1F7A8C;  /* 光路/光学路径描边 */
+
+  /* ---- 极浅语义底（芯片、徽章、状态条底） ---- */
+  --okSoft:     #EBF7EF;
+  --warnSoft:   #FEF2E4;
+  --dangerSoft: #FCE6E5;
+  --accentSoft: #EEF4FF;
+  --neutralSoft:#E8E8ED;     /* 灰色按钮：Xray Enable / Timer Off / Retry */
+
+  /* ---- 中央 Live Scene 视口（跟随主题） ---- */
+  --sceneBg:     #FAFAFC;    /* 视口底（浅色 = 浅色取景器） */
+  --sceneLine:   #E0E0E0;    /* 视口描边 */
+  --rayReady:    0.12;       /* 射线层透明度：就绪（微弱预览） */
+  --rayScanning: 0.85;       /* 射线层透明度：出束中 */
+  --rayPaused:   0.14;       /* 射线层透明度：暂停（基本无束） */
+  --rayFault:    0;          /* 射线层透明度：故障（强制归零） */
+
+  /* ---- 磨砂玻璃控制坞 ---- */
+  --dockBg:        rgba(255, 255, 255, 0.62);
+  --dockBorder:    rgba(255, 255, 255, 0.90);
+  --dockShadow:    rgba(16, 16, 23, 0.14);
+  --dockKeyBg:     rgba(255, 255, 255, 0.92);  /* 键帽底 */
+  --dockKeyBgHover:rgba(255, 255, 255, 1);
+  --dockLabelBg:   rgba(255, 255, 255, 0.94);  /* hover 展开的文字标签底 */
+
+  /* ---- 底部控制台（日志） ---- */
+  --consoleBg:     #FFFFFF;
+  --consoleTabBg:  #FAFAFC;
+  --consoleTabActive: #E8E8ED;
+  --consoleRail:   #FAFAFC;
+  --consoleThumb:  #C7C7CC;
+
+  /* ---- 系统预检进度条（三态） ---- */
+  --preflightTrack: #EAEAEA;
+  --preflightPass:  #34C759;
+  --preflightWarn:  #FFB340;
+  --preflightFail:  #C71A1C;
+
+  /* ---- 圆角 / 间距 ---- */
+  --radiusCard:    18px;   /* 卡片 */
+  --radiusPanel:   16px;   /* 规范板 / 大面板 */
+  --radiusDock:    37px;   /* 控制坞（高 74 → 全圆角胶囊） */
+  --radiusKey:     27px;   /* 坞内键帽（54 直径） */
+  --radiusChip:    11px;   /* 芯片 / 徽章 / 统计小块 */
+  --radiusControl: 12px;   /* 按钮 / 开关 */
+  --radiusSmall:   8px;    /* 标签页 / 小控件 */
+  --space1: 4px;  --space2: 8px;  --space3: 12px;
+  --space4: 16px; --space6: 24px; --space8: 32px;
+
+  /* ---- 字体 ---- */
+  --fontUi:   "Inter", "Geist", "Noto Sans SC", system-ui, sans-serif;
+  --fontMono: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+  --fontCjk:  "Noto Sans SC", "Source Han Sans SC", sans-serif;
+
+  /* ---- 顶栏主题切换段控 ---- */
+  --segTrack:    #E8E8ED;
+  --segActiveBg: var(--accent);
+  --segActiveFg: #FFFFFF;
+  --segIdleFg:   var(--textSecondary);
+}
+
+/* ------------------------------------------------------------
+   夜间模式 · Dark
+   2026-09-16 更新：与设计稿新增的 4 张 Dark 画布逐一对色
+   （画布 #12161D / 机箱条 #1A2029 / 卡片 #1E2530 / 日志体 #141922）
+   ------------------------------------------------------------ */
+[data-theme="dark"] {
+  --appBg:        #12161D;
+  --chassis:      #1A2029;   /* 菜单栏 / 输出控制台 / 状态栏 */
+  --panel:        #1E2530;
+  --panelHeader:  #212834;
+  --well:         #141922;
+  --line:         #2A313C;
+  --lineStrong:   #2A313C;
+  --lineField:    #39424D;
+
+  --textPrimary:   #E8ECF2;
+  --textSecondary: #9AA4B2;
+  --textMuted:     #7E8898;
+  --textDisabled:  #5F6873;
+
+  --accent:      #5AA9F5;   /* 暗底上提亮的 Action Blue（对比度达标） */
+  --accentText:  #4ADE80;
+  --ok:          #4ADE80;
+  --warn:        #F5B940;
+  --warnText:    #F5B940;
+  --danger:      #FF6B61;
+  --dangerSolid: #D7261F;
+  --dangerText:  #FF8A80;
+  --violet:      #BF5AF2;
+  --btnHome:     #409CFF;
+  --btnResume:   #64D2FF;
+  --beamGlow:    #FFB340;
+  --optics:      #4FB3C7;
+
+  --okSoft:     #12291D;
+  --warnSoft:   #2C2410;
+  --dangerSoft: #331A18;
+  --accentSoft: #16304F;
+  --neutralSoft:#2A323E;
+
+  --sceneBg:     #12161D;   /* 暗态场景图为自带深底渲染，见 3D-scene-dark*.png */
+  --sceneLine:   #2A313C;
+  --rayReady:    0.10;
+  --rayScanning: 0.80;
+  --rayPaused:   0.12;
+  --rayFault:    0;
+
+  /* 深底玻璃：低透明度白 + 白色描边（与画布 Control Dock · Frosted 一致） */
+  --dockBg:        rgba(255, 255, 255, 0.10);
+  --dockBorder:    rgba(255, 255, 255, 0.18);
+  --dockShadow:    rgba(0, 0, 0, 0.55);
+  --dockKeyBg:     rgba(255, 255, 255, 0.13);
+  --dockKeyBgHover:rgba(255, 255, 255, 0.22);
+  --dockLabelBg:   rgba(30, 37, 48, 0.94);
+  --dockHighlight: rgba(255, 255, 255, 0.25);
+
+  --consoleBg:        #141922;
+  --consoleTabBg:     #1A2029;
+  --consoleTabActive: #2A323E;
+  --consoleRail:      #212834;
+  --consoleThumb:     #3D4654;
+
+  --preflightTrack: #39424D;  /* 暗底上已提亮（原 #EAEAEA 在深底上几乎不可见） */
+  --preflightPass:  #4ADE80;
+  --preflightWarn:  #F5B940;
+  --preflightFail:  #D7261F;
+
+  --segTrack: #2A323E;
+  --segActiveBg: #0066CC;     /* 段控选中态沿用 Action Blue + 白字（画布口径） */
+}
+
+/* ============================================================
+   顶栏主题切换段控（Light | Dark）
+   规格：底槽高 24 / 圆角 12 / 内边距 2 / 段间距 2
+        段高 20 / 圆角 10 / 左右内边距 9 / 文字 10.5px
+        选中段：SemiBold + 强调色底 + 白字；未选中：Regular + 透明底
+   ============================================================ */
+.theme-toggle { display: inline-flex; gap: 2px; padding: 2px;
+  background: var(--segTrack); border-radius: 12px; }
+.theme-toggle__seg { height: 20px; padding: 0 9px; display: inline-flex;
+  align-items: center; border-radius: 10px; font-size: 10.5px; font-weight: 400;
+  color: var(--segIdleFg); background: transparent; border: 0; cursor: pointer; }
+.theme-toggle__seg[aria-pressed="true"] { background: var(--segActiveBg);
+  color: var(--segActiveFg); font-weight: 600; }
+
+/* ============================================================
+   中央 Live Scene 视口（真实感 3D 场景图 + 卡通待测物 + DOM 覆盖层）
+   结构：
+     .live-scene             视口容器（clipsContent，底 --sceneBg）
+       .scene-render         <img src="3D-scene-{light|dark}[-144].png">
+                             宽 100% 等比（1536×972）、垂直居中，上下留面板底色
+       .scene-object         待测物独立层（可选，默认已合成进场景图）：
+                             透明底 PNG 叠在转台顶面，换形象只换这一层
+       .status-float         右上角半透明状态浮窗 ×3（磨砂，基础设备状态）
+   场景图按主题 × 转台角度切换：Ready=0°，Scanning/Paused/Fault=144°。
+   三维结构与光路口径（源→物→板→镜头四点共线直线）见 重构交接说明.md 5.6。
+   ============================================================ */
+.live-scene {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--sceneBg);
+}
+.scene-render { position: absolute; left: 0; right: 0; top: 50%;
+  transform: translateY(-50%); width: 100%; aspect-ratio: 1536 / 972;
+  object-fit: contain; pointer-events: none; }
+.scene-object { position: absolute; pointer-events: none; }
+.status-float { position: absolute; right: 12px; display: inline-flex;
+  align-items: center; gap: 6px; padding: 5px 10px; border-radius: 10px;
+  font-family: var(--fontMono); font-size: 9.5px;
+  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18); }
+/* 浅色主题：白玻璃 + 深色文字（场景底为浅灰影棚） */
+.status-float { color: #172025;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(23, 32, 37, 0.14); }
+/* 暗色主题：深玻璃 + 浅色文字 */
+[data-theme="dark"] .status-float { color: #E8ECF2;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3); }
+.status-float__dot { width: 6px; height: 6px; border-radius: 3px; }
+/* 分层 / 实时 3D 方案保留：射线层与呼吸动画走 --ray* / --beamGlow 令牌 */
+.scene-ray { position: absolute; opacity: 0; pointer-events: none;
+  mix-blend-mode: screen; transition: opacity 180ms ease-out; }
+
+[data-state="ready"]    .scene-ray { opacity: var(--rayReady); }
+[data-state="scanning"] .scene-ray { opacity: var(--rayScanning); }
+[data-state="paused"]   .scene-ray { opacity: var(--rayPaused); }
+[data-state="fault"]    .scene-ray { opacity: var(--rayFault); }
+
+/* 出束中：射线轻微呼吸，其余状态静止 */
+[data-state="scanning"] .scene-ray { animation: rayBreath 2.4s ease-in-out infinite; }
+@keyframes rayBreath { 0%,100% { filter: brightness(1); }
+                       50%     { filter: brightness(1.18); } }
+
+/* 视口内读数：复用主题文字色，不要另起一套 */
+.scene-readout { color: var(--textPrimary); font-variant-numeric: tabular-nums; }
+.scene-label   { color: var(--textSecondary); }
+.scene-safety  { color: var(--textSecondary); letter-spacing: .04em; }
+[data-state="scanning"] .scene-safety { color: var(--dangerText); }
+[data-state="fault"]    .scene-safety { color: var(--dangerText); font-weight: 600; }
+
+/* ============================================================
+   磨砂玻璃控制坞（按钮说明要求：底座采用苹果的磨砂玻璃效果）
+   · 默认只显示 4 颗圆键（54×54，全圆角）
+   · 鼠标靠近（hover / focus-within）才展开文字标签
+   · 玻璃配方跟随主题，两套值都在主题令牌里
+   ============================================================ */
+.control-dock {
+  display: inline-flex; gap: 8px; padding: 10px;
+  background: var(--dockBg);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  backdrop-filter: blur(20px) saturate(140%);
+  border: 1px solid var(--dockBorder);
+  border-radius: var(--radiusDock);
+  box-shadow: 0 6px 20px var(--dockShadow), inset 0 1px 1px var(--dockHighlight, rgba(255,255,255,.85));
+}
+.dock-key { position: relative; width: 54px; height: 54px; border-radius: var(--radiusKey);
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--dockKeyBg); border: 0; cursor: pointer;
+  transition: background 140ms ease-out, transform 140ms ease-out; }
+.control-dock:hover .dock-key { background: var(--dockKeyBgHover); }
+.dock-key:active { transform: scale(0.94); }
+.dock-key[disabled], .dock-key[aria-disabled="true"] { opacity: 0.35; cursor: not-allowed; }
+
+/* 展开的文字标签：默认隐藏，hover 才出现（在坞的下方居中展开） */
+.dock-key__label { position: absolute; top: calc(100% + 8px); left: 50%;
+  transform: translateX(-50%) translateY(-4px);
+  padding: 4px 8px; border-radius: 8px; white-space: nowrap;
+  font-size: 10.5px; color: var(--textPrimary); background: var(--dockLabelBg);
+  box-shadow: 0 4px 12px var(--dockShadow);
+  opacity: 0; pointer-events: none; transition: opacity 140ms ease-out, transform 140ms ease-out; }
+.control-dock:hover .dock-key__label,
+.dock-key:focus-visible .dock-key__label { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* 第二槽位按状态循环：开始（绿）→ 暂停（黄）→ 继续（浅蓝）
+   色值取自用户提供的按钮 SVG，直接内联在 <svg> 里，不要用滤镜改色 */
+[data-state="scanning"] .dock-key--play  .dock-icon--play   { display: none; }
+[data-state="scanning"] .dock-key--play  .dock-icon--pause  { display: block; }
+[data-state="paused"]   .dock-key--play  .dock-icon--play   { display: none; }
+[data-state="paused"]   .dock-key--play  .dock-icon--resume { display: block; }
+[data-state="paused"]   .dock-key--play  { background: var(--accentSoft); }
+[data-state="fault"]    .dock-key--play  { opacity: 0.45; pointer-events: none; }
+[data-state="fault"]    .dock-key--estop { background: var(--dangerSoft);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 26%, transparent); }
+
+/* 扫描中：回零与读取置灰（暂停时回零可用） */
+[data-state="scanning"] .dock-key--home,
+[data-state="scanning"] .dock-key--restore { opacity: 0.35; pointer-events: none; }
+[data-state="paused"]   .dock-key--restore { opacity: 0.45; pointer-events: none; }
+[data-state="fault"]    .dock-key--home { opacity: 0.35; pointer-events: none; }
+[data-state="fault"]    .dock-key--restore { opacity: 1; }
+
+/* ============================================================
+   射线 / 时间开关（按钮说明「射线开启关闭切换效果」「按时间开关」）
+   灰 = 关闭态；红 = 已使能（射线可出束 / 定时器生效）
+   ============================================================ */
+.switch-btn { height: 48px; border-radius: var(--radiusControl); border: 0;
+  font-size: 12.5px; cursor: pointer; transition: background 140ms ease-out; }
+.switch-btn--idle { background: var(--neutralSoft); color: var(--textPrimary); }
+.switch-btn--on   { background: var(--dangerSolid); color: #fff; font-weight: 600; }
+.switch-field { height: 40px; padding: 0 10px; border-radius: 10px;
+  background: var(--well); display: inline-flex; align-items: center;
+  justify-content: space-between; gap: 8px; }
+.switch-field__key { font-size: 8.5px; color: var(--textSecondary); }
+.switch-field__val { font-family: var(--fontMono); font-size: 14px; color: var(--textPrimary); }
+
+/* ============================================================
+   系统预检进度条（按钮说明：逐渐填充→绿；出问题→黄；确认故障→整条红）
+   ============================================================ */
+.preflight { height: 6px; border-radius: 3px; background: var(--preflightTrack); overflow: hidden; }
+.preflight__fill { height: 100%; border-radius: 3px; transition: width 320ms ease-out; }
+.preflight--pass .preflight__fill { width: 100%; background: var(--preflightPass); }
+.preflight--warn .preflight__fill { width: 62%;  background: var(--preflightWarn); }
+.preflight--fail .preflight__fill { width: 100%; background: var(--preflightFail); }
+.preflight__pill { display: inline-block; width: 34px; height: 14px; border-radius: 7px; }
+.preflight__pill--pending { background: var(--well); border: 1px solid var(--consoleThumb); }
+.preflight__pill--done    { background: var(--preflightPass); }
+
+/* ============================================================
+   底部控制台（日志 / 图像预览）
+   前 4 个标签是日志，最后一个是本轮已拍图像；聚合日志汇总全部设备与串口
+   ============================================================ */
+.console { background: var(--consoleBg); border-top: 1px solid var(--lineStrong); }
+.console__tabs { background: var(--consoleTabBg); border-right: 1px solid var(--lineStrong);
+  padding: 8px; display: flex; flex-direction: column; gap: 2px; }
+.console__tab { height: 30px; padding: 0 10px; border-radius: var(--radiusSmall);
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 10.5px; color: var(--textMuted); background: transparent; border: 0; cursor: pointer; }
+.console__tab[aria-selected="true"] { background: var(--consoleTabActive);
+  color: var(--textPrimary); font-weight: 600; }
+.log-line { display: flex; gap: 10px; font-size: 11.5px; line-height: 1.45; }
+.log-line__time { flex: 0 0 110px; font-family: var(--fontMono); color: var(--textMuted); }
+.log-line__tag  { flex: 0 0 106px; font-family: var(--fontMono); font-weight: 600; }
+.log-line__msg  { flex: 1 1 auto; color: var(--textPrimary); }
+.log-line--info .log-line__tag { color: var(--accentText); }
+.log-line--pass .log-line__tag { color: var(--accent); }
+.log-line--warn .log-line__tag { color: var(--warnText); }
+.log-line--err  .log-line__tag { color: var(--dangerText); }
+
+/* 状态栏 */
+.statusbar { height: 30px; padding: 0 14px; background: var(--chassis);
+  border-top: 1px solid var(--lineStrong);
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 10px; color: var(--textSecondary); }
+.statusbar__state { color: var(--textPrimary); font-weight: 600; }
+.statusbar__dot { width: 6px; height: 6px; border-radius: 3px; background: var(--ok); }
+[data-state="scanning"] .statusbar__dot { background: var(--warn); }
+[data-state="paused"]   .statusbar__dot { background: var(--accent); }
+[data-state="fault"]    .statusbar__dot { background: var(--danger); }
+.statusbar__link { font-family: var(--fontMono); }

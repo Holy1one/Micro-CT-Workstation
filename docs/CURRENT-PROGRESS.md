@@ -1,3 +1,39 @@
+# 当前进度（2026-09-16，第二轮）
+
+## v0.2.0-alpha：控制台重构 + RTS9060 设备链路迁移
+
+- 展示层按 `前端/重构交接说明.md` 全部重做：`src/App.tsx` 与 `src/styles.css` 重写，
+  `src/tokens.css`（拷贝自 `前端/tokens.css`）为唯一色源；页面栅格 32/1/1fr/1/220/1/30，
+  三栏 352/1fr/376（<1440px 时 320/340）；浅色默认 + 暗色夜间模式（data-theme，localStorage 记忆，
+  切换不重挂载、不重置扫描状态）；运行态 READY/SCANNING/PAUSED/FAULT 挂在 `<html data-state>`。
+- 中央 Live Scene：主题×转台角度四选一渲染图（`public/assets/3D-scene-{light|dark}[-144].png`），
+  右上三个磨砂状态浮窗（X-RAY/CAMERA/SAMPLE）+ LIVE RENDER 指示 + 左下角度读数 + 安全条 +
+  底部磨砂玻璃控制坞（4 颗 54×54 圆键，默认只显图标、hover 展开文字标签，图标用设计方 SVG）。
+- 设备链路层新增 `src/engine/rts9060/`（移植自 kernal/software/host 已验证实现）：
+  行协议编解码（命令名不变）、NanoTransport 接口 + 固件语义执行器（96000 脉冲/圈、
+  ACK→READY_TO_CAPTURE 握手、STOP→POSITION_UNKNOWN）、Moxtek 12W 控制器模型（fail-closed 锁存）、
+  D7100 拍摄模型（host-only、逐帧校验）、扫描工作流（预检 8 项→回零→逐视角 MOVE_ABS→出束→
+  拍照→CAPTURE_DONE→提交；暂停在提交边界生效并保留脉冲计数；急停并行断束+STOP 并锁存 FAULT；
+  恢复路径=释放急停→回零→重预检；每视角落盘检查点供 Restore 续扫）。
+- `src/engine/workstationAdapter.ts` 把工作流桥接到不变的 `EngineAdapter` 契约；
+  `src-tauri/` 与 `crates/ct-engine` 零改动，串口命令名零改动（验收 #14）。
+- 数值口径：kV/µA 一律 1 位小数（30.2 kV / 101.0 µA）；角度 2 位小数、四处同值
+  （读数/ANGLE/POS/日志），5 视角 → 72.00°/view，序列 0/72/144/216/288；相机 D7100、射线源 USB。
+
+## 验证结果（第二轮）
+
+- `npm run typecheck`：通过。
+- `npm run build`：通过（vite 36 模块）。
+- `npm run test:sites`：4/4 通过。
+- 交互链路实机截图验收（agent-browser，1600×1000）：浅色 READY/SCANNING/PAUSED/FAULT 四态、
+  暗色四态、Image Preview（5 帧深色瓦片 + 元数据）、Turntable 子日志独立计数、
+  急停→释放→回零→重预检→READY 恢复路径、Restore 恢复 3/5 @144.00° 后 Start 变浅蓝 Resume——全部通过。
+- 1600×1000 下 document 与全部面板 `scrollWidth/scrollHeight` 零溢出；
+  1280×720（125% 等效）页面栅格固定、侧栏转为栏内滚动（控制台惯例）。
+- 浏览器控制台无报错。
+- 日志规则：最新在最上、110px 等宽时间戳、PASS 蓝/INFO·OK 绿/WARN 琥珀/ERR 红/ACTION 蓝；
+  扫描关键节点（MOVE_ABS、出束窗口、拍照保存、CAPTURE_DONE、暂停/继续/回零/急停/预检）全部落日志。
+
 # 当前进度（2026-09-16）
 
 ## 已完成

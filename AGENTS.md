@@ -12,11 +12,10 @@ The desktop UI is a fixed, no-page-scroll 16:9 industrial workstation. Keep devi
 
 Durable workstation UI rules:
 
-- Keep the native Windows title bar; do not draw a second application title/header below it. The content begins with the compact `File / Edit / Tools / Help` menu row.
-- The visible application language is English only, including phases, device details, errors and log messages.
-- The center scene must not crowd out the side columns. At 1600 × 900 the side columns are approximately 24% each; use readable 11–13 px workstation text rather than miniature dashboard typography.
-- Each device row has its own connection indicator and refresh control. Do not replace these with one undifferentiated global status row.
-- The fixed bottom rail has five selectors: aggregated, X-ray, turntable and camera logs, then Image Preview. Image Preview is hidden until its selector is active and replaces the log content; it is never a permanent right-bottom panel.
-- Logs use terminal-like consecutive lines but retain the light industrial palette. Timestamps include the full local date and time to seconds.
-- The right-bottom panel contains operation progress, process state and the current scan configuration summary—not Image Preview.
+- The console follows `前端/重构交接说明.md` + `前端/tokens.css` (design baseline 1600×1000): page grid `32/1/1fr/1/220/1/30`, columns `352/1fr/376`, Apple-style light theme by default with a dark night mode on `<html data-theme>`, run state on `<html data-state>` (ready/scanning/paused/fault). All colors come from tokens.css variables — never hardcode hex in components.
+- Keep the native Windows title bar; the content begins with the compact `File / Edit / Tools / Help` menu row; no brand mark in the menu bar (theme segmented control + DEVELOPER PREVIEW + ENGINE ONLINE on the right).
+- The visible application language is English only, including phases, device details, errors and log messages. Camera is always D7100; the X-ray source link is always USB; kV/µA render with one decimal, angles with two.
+- The device/task owner is the RTS9060 link layer in `src/engine/rts9060/` (ported from `kernal/software/host`), bridged by `src/engine/workstationAdapter.ts` to the unchanged `EngineAdapter` contract. Serial command names are contractual: HEARTBEAT/PING/STATUS/SET_MICROSTEPS/REARM/HOME/MOVE_ABS/MOVE_REL/CAPTURE_DONE/STOP/GET_HALL. Mechanics: 96000 pulses/rev; N views per rev → 360/N degrees and 96000/N pulses per view. `src-tauri/` and `crates/ct-engine` stay untouched.
+- Safety semantics are highest priority: outside SCANNING the scene safety bar, status bar safety text and the Xray switch must all show the closed state at the same time; FAULT forces all three into the red latched state simultaneously. E-STOP release requires re-home + re-inspection before Start.
+- Logs: newest first, 110px monospaced timestamp column, level colors PASS blue / INFO·OK green / WARN amber / ERR red / ACTION blue; every scan milestone (MOVE_ABS, exposure window, capture, CAPTURE_DONE, pause/resume/home/E-stop, pre-inspection) must land in the log.
 - Passing layout QA requires both page and every main panel to satisfy `scrollWidth <= clientWidth` and `scrollHeight <= clientHeight` at 1600 × 900 and the 125% equivalent 1280 × 720 viewport. Hiding overflow is not evidence that content fits.

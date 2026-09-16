@@ -1,10 +1,19 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#071521" />
+    <meta name="theme-color" content="#F5F5F7" />
     <title>Micro-CT Workstation</title>
+    <script>
+      // Apply the persisted theme before first paint to avoid a theme flash.
+      try {
+        var saved = window.localStorage.getItem("micro-ct-workstation.theme");
+        document.documentElement.dataset.theme = saved === "dark" ? "dark" : "light";
+      } catch (err) {
+        document.documentElement.dataset.theme = "light";
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -73,6 +73,7 @@ export interface EngineSnapshot {
   logs: LogEntry[];
   lastError: string | null;
   updatedAt: string;
+  workstation?: WorkstationView;
 }
 
 export type EngineCommand =
@@ -85,10 +86,119 @@ export type EngineCommand =
   | { type: "resume" }
   | { type: "restore_previous" }
   | { type: "stop" }
-  | { type: "set_parameters"; parameters: ScanParameters };
+  | { type: "set_parameters"; parameters: ScanParameters }
+  | { type: "estop_release" }
+  | { type: "retry_device"; device: DeviceId }
+  | { type: "xray_toggle" }
+  | { type: "timer_toggle" }
+  | { type: "usb_auto_shut_down_toggle" }
+  | { type: "send_voltage"; kv: number }
+  | { type: "send_current"; ua: number }
+  | {
+      type: "update_scan_setup";
+      setup: { savePath: string; taskId: string; projectionCount: number; exposureMs: number; maxXraySec: number };
+    };
 
 export interface EngineAdapter {
   readonly kind: "developer_preview" | "tauri";
   getSnapshot(): Promise<EngineSnapshot>;
   dispatch(command: EngineCommand): Promise<EngineSnapshot>;
+}
+
+/* ------------------------------------------------------------------ *
+ * Workstation console view-model (RTS9060 link layer).                 *
+ * Emitted by the workstation adapter as `EngineSnapshot.workstation`;  *
+ * the console renders exclusively from this block when present.        *
+ * ------------------------------------------------------------------ */
+
+export type ConsoleDataState = "ready" | "scanning" | "paused" | "fault";
+export type ConsoleTone = "ok" | "warn" | "accent" | "danger" | "muted";
+
+export interface ConsoleDeviceView {
+  id: DeviceId;
+  name: string;
+  word: string;
+  tone: ConsoleTone;
+  spec: string;
+}
+
+export interface ConsoleFloatView {
+  key: "X-RAY" | "CAMERA" | "SAMPLE";
+  text: string;
+  tone: ConsoleTone;
+}
+
+export interface ConsoleLogLine {
+  id: string;
+  timestamp: string;
+  level: "PASS" | "INFO" | "OK" | "WARN" | "ERR" | "ACTION";
+  source: "system" | "xray" | "nano" | "camera" | "preflight" | "operator";
+  message: string;
+}
+
+export interface ConsoleFrame {
+  index: number;
+  angleDeg: number;
+  exposureMs: number;
+  fileName: string;
+}
+
+export interface WorkstationView {
+  dataState: ConsoleDataState;
+  phaseWord: string;
+  phaseTone: "accent" | "warn" | "danger";
+  devices: ConsoleDeviceView[];
+  onlineSummary: string;
+  preflight: {
+    word: string;
+    percent: number;
+    tone: "pass" | "warn" | "fail" | "running";
+    subline: string;
+  };
+  floats: ConsoleFloatView[];
+  safetyBar: { text: string; tone: "muted" | "danger" | "dangerBold" };
+  scene: { angleDeg: number; rotated: boolean };
+  xray: {
+    setKv: number;
+    setUa: number;
+    monKv: number;
+    monUa: number;
+    powerW: number;
+    tempC: number;
+    beamOn: boolean;
+    latched: boolean;
+    onSec: number;
+    offSec: number;
+    timerOn: boolean;
+    usbAutoShutDown: boolean;
+  };
+  progress: {
+    captured: number;
+    total: number;
+    percent: number;
+    angleDeg: number;
+    etaText: string;
+    barTone: "accent" | "warn" | "danger";
+    barLabel: string;
+  };
+  summary: { savePath: string; acquisition: string; output: string };
+  statusbar: { left: string; right: string; dotTone: ConsoleTone };
+  dock: {
+    home: boolean;
+    play: boolean;
+    restore: boolean;
+    estop: boolean;
+    playMode: "start" | "pause" | "resume" | "disabled";
+  };
+  scanSetup: {
+    savePath: string;
+    taskId: string;
+    projectionCount: number;
+    angleStepDeg: number;
+    exposureMs: number;
+    maxXraySec: number;
+  };
+  consoleLogs: ConsoleLogLine[];
+  frames: ConsoleFrame[];
+  checkpointAvailable: boolean;
 }

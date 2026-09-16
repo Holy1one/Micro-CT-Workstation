@@ -1,256 +1,689 @@
-import {
-  Aperture, ArrowClockwise, Camera, Check, CircleNotch, ClockCountdown, Crosshair,
-  FloppyDisk, FolderOpen, HouseLine, Image, LockKey, Pause, Play, PlugsConnected,
-  Power, Radioactive, ShieldCheck, Stop, Warning,
-} from "@phosphor-icons/react";
 import { useEffect, useMemo, useState } from "react";
 import { useEngine } from "./engine/useEngine";
-import type { DeviceId, DeviceState, EngineCommand, EngineSnapshot, LogEntry, ScanParameters } from "./engine/types";
+import type {
+  ConsoleLogLine,
+  DeviceId,
+  EngineCommand,
+  EngineSnapshot,
+  WorkstationView,
+} from "./engine/types";
 
-type LogFilter = "聚合" | LogEntry["source"];
-type BottomView = LogFilter | "影像";
+type Theme = "light" | "dark";
+type BottomTab = "aggregate" | "xray" | "nano" | "camera" | "images";
 
-const deviceIcons: Record<DeviceId, typeof Aperture> = { xray: Radioactive, turntable: Aperture, camera: Camera };
-const deviceNames: Record<DeviceId, string> = { xray: "X-Ray Source", turntable: "Turntable / Nano", camera: "Camera / Nikon" };
-const stateLabels: Record<DeviceState, string> = {
-  offline: "OFFLINE", connected: "CONNECTED", ready: "READY", busy: "RUNNING", locked: "LOCKED", fault: "FAULT",
-};
-const logLevelLabels: Record<LogEntry["level"], string> = { info: "INFO", success: "PASS", warning: "WARN", error: "STOP" };
-const phaseLabels: Record<EngineSnapshot["phase"], string> = {
-  idle: "Idle", ready_for_home: "Ready for Home", ready: "Ready", running: "Running",
-  paused: "Paused", stopped: "Stopped", completed: "Completed", fault: "Fault",
-};
-const sourceLabels: Record<LogEntry["source"], string> = { 系统: "SYSTEM", 转台: "TURNTABLE", 相机: "CAMERA", 射线: "X-RAY" };
+const THEME_KEY = "micro-ct-workstation.theme";
 
-function formatTime(timestamp: string) {
-  try {
-    const date = new Date(timestamp);
-    const part = (value: number) => String(value).padStart(2, "0");
-    return `${date.getFullYear()}-${part(date.getMonth() + 1)}-${part(date.getDate())} ${part(date.getHours())}:${part(date.getMinutes())}:${part(date.getSeconds())}`;
-  } catch {
-    return "---- -- -- --:--:--";
-  }
+function useTheme(): [Theme, (theme: Theme) => void] {
+  const [theme, setTheme] = useState<Theme>(() => {
+    try {
+      return window.localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light";
+    } catch {
+      return "light";
+    }
+  });
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      window.localStorage.setItem(THEME_KEY, theme);
+    } catch {
+      /* storage unavailable */
+    }
+  }, [theme]);
+  return [theme, setTheme];
 }
 
-function deviceDetail(device: EngineSnapshot["devices"][number]) {
-  if (device.id === "xray") return "Hardware output interlocked";
-  if (device.state === "offline") return "Waiting for connection";
-  if (device.state === "busy") return device.id === "turntable" ? "Motion in progress" : "Awaiting capture";
-  if (device.state === "ready") return device.id === "camera" ? "Online · host storage" : "Online · ready";
-  return "Developer preview · no hardware";
+function logTime(timestamp: string): string {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "--:--:--.---";
+  const p = (value: number, size = 2) => String(value).padStart(size, "0");
+  return `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}.${p(date.getMilliseconds(), 3)}`;
 }
 
-function DeviceStatusRow({ device, busy, onRefresh }: {
-  device: EngineSnapshot["devices"][number];
-  busy: boolean;
-  onRefresh: (deviceId: DeviceId) => void;
-}) {
-  const Icon = deviceIcons[device.id];
+function formatHms(totalSeconds: number): string {
+  const s = Math.max(0, Math.min(359999, Math.round(totalSeconds)));
+  const p = (value: number) => String(value).padStart(2, "0");
+  return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
+}
+
+function parseHms(text: string): number | null {
+  const match = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec(text.trim());
+  if (!match) return null;
+  return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+}
+
+const toneClass = (tone: string) => `tone-${tone}`;
+
+/* ------------------------------------------------------------------ */
+/* Menu bar                                                            */
+/* ------------------------------------------------------------------ */
+
+function MenuBar({ theme, onTheme }: { theme: Theme; onTheme: (theme: Theme) => void }) {
   return (
-    <div className="device-status-row">
-      <span className="device-symbol" aria-hidden="true"><Icon size={19} weight="duotone" /></span>
-      <span className="device-status-copy"><strong>{deviceNames[device.id]}</strong><small>{deviceDetail(device)}</small></span>
-      <span className={`device-state state-${device.state}`}><i aria-hidden="true" />{stateLabels[device.state]}</span>
-      <button className="device-refresh" title={`Refresh ${deviceNames[device.id]} connection`} aria-label={`Refresh ${deviceNames[device.id]} connection`} onClick={() => onRefresh(device.id)} disabled={busy}>
-        <ArrowClockwise size={16} weight="bold" /><span>Refresh</span>
+    <header className="menu-bar">
+      <nav className="sys-menu" aria-label="Application menu">
+        {["File", "Edit", "Tools", "Help"].map((item) => (
+          <button key={item} type="button">
+            {item}
+          </button>
+        ))}
+      </nav>
+      <span className="menu-spacer" />
+      <div className="theme-toggle" role="group" aria-label="Theme">
+        {(["light", "dark"] as const).map((value) => (
+          <button
+            key={value}
+            type="button"
+            className="theme-toggle__seg"
+            aria-pressed={theme === value}
+            onClick={() => onTheme(value)}
+          >
+            {value === "light" ? "Light" : "Dark"}
+          </button>
+        ))}
+      </div>
+      <span className="badge badge--dev">DEVELOPER PREVIEW</span>
+      <span className="badge badge--engine">
+        <i aria-hidden="true" />
+        ENGINE ONLINE
+      </span>
+    </header>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Left column                                                         */
+/* ------------------------------------------------------------------ */
+
+function DevicePanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void }) {
+  return (
+    <section className="panel">
+      <div className="panel__header">
+        <h2>Device Connection Status</h2>
+        <span className="chip chip--ok">{ws.onlineSummary}</span>
+      </div>
+      <div className="device-list">
+        {ws.devices.map((device) => (
+          <div className="device-row" key={device.id}>
+            <div className="device-row__top">
+              <strong>{device.name}</strong>
+              <span className={`device-row__word ${toneClass(device.tone)}`}>{device.word}</span>
+              <button
+                type="button"
+                className="retry-link"
+                onClick={() => void dispatch({ type: "retry_device", device: device.id as DeviceId })}
+              >
+                Retry
+              </button>
+            </div>
+            <div className="device-row__spec">{device.spec}</div>
+          </div>
+        ))}
+      </div>
+      <div className="preflight-block">
+        <div className="preflight-block__top">
+          <span>One-click System Pre-inspection</span>
+          <strong className={ws.preflight.tone === "pass" ? "tone-ok" : ws.preflight.tone === "fail" ? "tone-danger" : "tone-warn"}>
+            {ws.preflight.word}
+          </strong>
+        </div>
+        <div className={`preflight preflight--${ws.preflight.tone === "running" ? "pass" : ws.preflight.tone}`} role="progressbar" aria-valuenow={ws.preflight.percent} aria-valuemin={0} aria-valuemax={100}>
+          <span className="preflight__fill" style={{ width: `${ws.preflight.percent}%` }} />
+        </div>
+        <div className="preflight-block__sub">{ws.preflight.subline}</div>
+      </div>
+    </section>
+  );
+}
+
+function ScanParamsPanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void }) {
+  const setup = ws.scanSetup;
+  const locked = ws.dataState === "scanning" || ws.dataState === "paused";
+  const [savePath, setSavePath] = useState(setup.savePath);
+  const [taskId, setTaskId] = useState(setup.taskId);
+  const [views, setViews] = useState(String(setup.projectionCount));
+  const [exposure, setExposure] = useState(String(setup.exposureMs));
+  const [maxXray, setMaxXray] = useState(formatHms(setup.maxXraySec));
+
+  useEffect(() => {
+    setSavePath(setup.savePath);
+    setTaskId(setup.taskId);
+    setViews(String(setup.projectionCount));
+    setExposure(String(setup.exposureMs));
+    setMaxXray(formatHms(setup.maxXraySec));
+    // Sync from the workflow only while idle; never clobber an edit mid-scan.
+  }, [setup.savePath, setup.taskId, setup.projectionCount, setup.exposureMs, setup.maxXraySec, locked]);
+
+  const commit = (patch: Partial<WorkstationView["scanSetup"]>) => {
+    dispatch({
+      type: "update_scan_setup",
+      setup: {
+        savePath,
+        taskId,
+        projectionCount: setup.projectionCount,
+        exposureMs: setup.exposureMs,
+        maxXraySec: setup.maxXraySec,
+        ...patch,
+      },
+    });
+  };
+
+  return (
+    <section className="panel">
+      <div className="panel__header">
+        <h2>Scan Parameters</h2>
+        <span className="chip chip--accent">{setup.projectionCount} PROJECTIONS</span>
+      </div>
+      <div className="param-stack">
+        <label className="param-field">
+          <span>Save Path</span>
+          <input
+            value={savePath}
+            disabled={locked}
+            onChange={(event) => setSavePath(event.target.value)}
+            onBlur={() => savePath.trim() && commit({ savePath })}
+          />
+        </label>
+        <label className="param-field">
+          <span>Task ID</span>
+          <div className="param-field__row">
+            <input
+              value={taskId}
+              disabled={locked}
+              onChange={(event) => setTaskId(event.target.value)}
+              onBlur={() => taskId.trim() && commit({ taskId })}
+            />
+            <button type="button" className="browse-link" disabled={locked}>
+              Browse…
+            </button>
+          </div>
+        </label>
+        <div className="param-line">
+          <span>Total Projection Count</span>
+          <div className="param-line__value">
+            <input
+              className="param-line__input"
+              value={views}
+              disabled={locked}
+              inputMode="numeric"
+              onChange={(event) => setViews(event.target.value.replace(/[^0-9]/g, ""))}
+              onBlur={() => {
+                const count = Math.max(1, Math.min(360, Number(views) || setup.projectionCount));
+                setViews(String(count));
+                commit({ projectionCount: count });
+              }}
+            />
+            <small>views · {setup.angleStepDeg.toFixed(2)}° / view</small>
+          </div>
+        </div>
+        <div className="param-line">
+          <span>Single Shot Exposure</span>
+          <div className="param-line__value">
+            <input
+              className="param-line__input"
+              value={exposure}
+              disabled={locked}
+              inputMode="numeric"
+              onChange={(event) => setExposure(event.target.value.replace(/[^0-9]/g, ""))}
+              onBlur={() => {
+                const ms = Math.max(1, Math.min(10000, Number(exposure) || setup.exposureMs));
+                setExposure(String(ms));
+                commit({ exposureMs: ms });
+              }}
+            />
+            <small>ms</small>
+          </div>
+        </div>
+        <div className="param-line">
+          <span>Max X-ray Duration</span>
+          <div className="param-line__value">
+            <input
+              className="param-line__input param-line__input--wide"
+              value={maxXray}
+              disabled={locked}
+              onChange={(event) => setMaxXray(event.target.value)}
+              onBlur={() => {
+                const seconds = parseHms(maxXray);
+                if (seconds !== null && seconds > 0) {
+                  commit({ maxXraySec: seconds });
+                  setMaxXray(formatHms(seconds));
+                } else {
+                  setMaxXray(formatHms(setup.maxXraySec));
+                }
+              }}
+            />
+            <small>hh:mm:ss</small>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Center: live scene                                                  */
+/* ------------------------------------------------------------------ */
+
+function DockIcon({ src, alt }: { src: string; alt: string }) {
+  return <img className="dock-icon" src={src} alt={alt} draggable={false} />;
+}
+
+function ControlDock({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void }) {
+  const dock = ws.dock;
+  const play =
+    dock.playMode === "pause"
+      ? { src: "/assets/dock-pause.svg", label: "Pause", command: { type: "pause" } as EngineCommand }
+      : dock.playMode === "resume"
+        ? { src: "/assets/dock-resume.svg", label: "Resume", command: { type: "resume" } as EngineCommand }
+        : { src: "/assets/dock-play.svg", label: "Start", command: { type: "start_scan" } as EngineCommand };
+
+  return (
+    <div className="control-dock" aria-label="Scan controls">
+      <button
+        type="button"
+        className="dock-key dock-key--home"
+        aria-label="Home"
+        disabled={!dock.home}
+        onClick={() => void dispatch({ type: "home" })}
+      >
+        <DockIcon src="/assets/dock-home.svg" alt="" />
+        <span className="dock-key__label">Home</span>
+      </button>
+      <button
+        type="button"
+        className="dock-key dock-key--play"
+        aria-label={play.label}
+        disabled={!dock.play}
+        onClick={() => void dispatch(play.command)}
+      >
+        <DockIcon src={play.src} alt="" />
+        <span className="dock-key__label">{play.label}</span>
+      </button>
+      <button
+        type="button"
+        className="dock-key dock-key--restore"
+        aria-label="Restore"
+        disabled={!dock.restore}
+        onClick={() => void dispatch({ type: "restore_previous" })}
+      >
+        <DockIcon src="/assets/dock-restore.svg" alt="" />
+        <span className="dock-key__label">Restore</span>
+      </button>
+      <button
+        type="button"
+        className="dock-key dock-key--estop"
+        aria-label={ws.dataState === "fault" ? "Release E-Stop" : "E-Stop"}
+        disabled={!dock.estop}
+        onClick={() => void dispatch(ws.dataState === "fault" ? { type: "estop_release" } : { type: "stop" })}
+      >
+        <DockIcon src="/assets/dock-estop.svg" alt="" />
+        <span className="dock-key__label">{ws.dataState === "fault" ? "Release" : "E-Stop"}</span>
       </button>
     </div>
   );
 }
 
-function LabeledNumber({ label, value, unit }: { label: string; value: string | number; unit?: string }) {
-  return <div className="labeled-number"><span>{label}</span><div><strong>{value}</strong>{unit ? <small>{unit}</small> : null}</div></div>;
+function LiveScene({ ws, theme, dispatch }: { ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void }) {
+  const [viewPreset, setViewPreset] = useState<"iso" | "top">("iso");
+  const sceneSrc = `/assets/3D-scene-${theme}${ws.scene.rotated ? "-144" : ""}.png`;
+  return (
+    <section className="panel live-panel">
+      <div className="scene-toolbar">
+        <span className="chip chip--accent">3D RENDER</span>
+        <h2>Live Scene</h2>
+        <span className="menu-spacer" />
+        {(["iso", "top"] as const).map((preset) => (
+          <button
+            key={preset}
+            type="button"
+            className={`scene-view-btn ${viewPreset === preset ? "active" : ""}`}
+            aria-pressed={viewPreset === preset}
+            onClick={() => setViewPreset(preset)}
+          >
+            {preset.toUpperCase()}
+          </button>
+        ))}
+      </div>
+      <div className="live-scene">
+        <img className="scene-render" src={sceneSrc} alt="Micro-CT workspace: camera, turntable with sample, X-ray source" draggable={false} />
+        <span className="live-indicator">
+          <i aria-hidden="true" />
+          LIVE RENDER
+        </span>
+        <div className="status-floats">
+          {ws.floats.map((float) => (
+            <span className="status-float" key={float.key}>
+              <i className={`status-float__dot ${toneClass(float.tone)}`} aria-hidden="true" />
+              {float.key}
+              <b>{float.text}</b>
+            </span>
+          ))}
+        </div>
+        <div className="scene-readout-block">
+          <span className="scene-label">TURNTABLE ANGLE</span>
+          <strong className="scene-readout">{ws.scene.angleDeg.toFixed(2)}°</strong>
+          <span className={`scene-safety ${ws.safetyBar.tone !== "muted" ? "scene-safety--danger" : ""} ${ws.safetyBar.tone === "dangerBold" ? "scene-safety--bold" : ""}`}>
+            {ws.safetyBar.text}
+          </span>
+        </div>
+        <ControlDock ws={ws} dispatch={dispatch} />
+      </div>
+    </section>
+  );
 }
 
-function ControlDock({ snapshot, busy, dispatch }: {
-  snapshot: EngineSnapshot;
-  busy: boolean;
-  dispatch: (command: EngineCommand) => Promise<void>;
-}) {
-  const running = snapshot.phase === "running";
-  const paused = snapshot.phase === "paused";
-  const active = running || paused;
-  const ready = snapshot.preflightPassed && snapshot.homed;
-  const primary = paused
-    ? { label: "Resume", icon: Play, command: { type: "resume" } as EngineCommand, className: "resume" }
-    : running
-      ? { label: "Pause", icon: Pause, command: { type: "pause" } as EngineCommand, className: "pause" }
-      : { label: "Start", icon: Play, command: { type: "start_scan" } as EngineCommand, className: "start" };
-  const PrimaryIcon = primary.icon;
+/* ------------------------------------------------------------------ */
+/* Right column                                                        */
+/* ------------------------------------------------------------------ */
+
+function XrayPanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void }) {
+  const [kvDraft, setKvDraft] = useState(ws.xray.setKv.toFixed(1));
+  const [uaDraft, setUaDraft] = useState(ws.xray.setUa.toFixed(1));
+  useEffect(() => {
+    setKvDraft(ws.xray.setKv.toFixed(1));
+    setUaDraft(ws.xray.setUa.toFixed(1));
+  }, [ws.xray.setKv, ws.xray.setUa]);
 
   return (
-    <div className="control-dock" aria-label="Scan quick controls">
-      <button className="dock-button home" title="Reset / Home" aria-label="Reset / Home" onClick={() => void dispatch({ type: "home" })} disabled={busy || snapshot.connectionState !== "connected" || active || !snapshot.preflightPassed}>
-        <HouseLine size={23} weight="duotone" /><span>Home</span>
+    <section className="panel">
+      <div className="panel__header">
+        <h2>12 Watt Controller</h2>
+        <span className="chip chip--muted">USB LINK</span>
+      </div>
+      <div className="xray-channels">
+        <div className="xray-channel">
+          <span className="xray-channel__label">SET kV</span>
+          <div className="xray-channel__row">
+            <input
+              className="xray-channel__well"
+              value={kvDraft}
+              inputMode="decimal"
+              onChange={(event) => setKvDraft(event.target.value)}
+              onBlur={() => setKvDraft((Number(kvDraft) || ws.xray.setKv).toFixed(1))}
+            />
+            <div className="xray-channel__side">
+              <small>MON {ws.xray.monKv.toFixed(1)} kV</small>
+              <button type="button" className="send-btn" onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) || ws.xray.setKv })}>
+                SEND V
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className="xray-channel">
+          <span className="xray-channel__label">SET µA</span>
+          <div className="xray-channel__row">
+            <input
+              className="xray-channel__well"
+              value={uaDraft}
+              inputMode="decimal"
+              onChange={(event) => setUaDraft(event.target.value)}
+              onBlur={() => setUaDraft((Number(uaDraft) || ws.xray.setUa).toFixed(1))}
+            />
+            <div className="xray-channel__side">
+              <small>MON {ws.xray.monUa.toFixed(1)} µA</small>
+              <button type="button" className="send-btn" onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) || ws.xray.setUa })}>
+                SEND I
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="xray-meters">
+        <div className="xray-meter">
+          <span>POWER</span>
+          <div className="xray-meter__well">{ws.xray.powerW.toFixed(1)} W</div>
+        </div>
+        <div className="xray-meter">
+          <span>TEMP</span>
+          <div className="xray-meter__well">{ws.xray.tempC.toFixed(1)} °C</div>
+        </div>
+      </div>
+      <button
+        type="button"
+        className={`switch-btn switch-btn--block ${ws.xray.beamOn ? "switch-btn--on" : "switch-btn--idle"}`}
+        disabled={ws.dataState === "fault"}
+        onClick={() => void dispatch({ type: "xray_toggle" })}
+      >
+        {ws.xray.beamOn ? "Xray Disable" : "Xray Enable"}
       </button>
-      <div className="dock-actions">
-        <button className={`dock-button ${primary.className}`} title={primary.label} aria-label={primary.label} onClick={() => void dispatch(primary.command)} disabled={busy || (!active && !ready)}>
-          <PrimaryIcon size={23} weight="fill" /><span>{primary.label}</span>
-        </button>
-        <button className="dock-button restore" title="Load previous scan progress" aria-label="Load previous scan progress" onClick={() => void dispatch({ type: "restore_previous" })} disabled={busy || snapshot.connectionState !== "connected" || active}>
-          <ArrowClockwise size={23} weight="bold" /><span>Restore</span>
-        </button>
-        <button className="dock-button emergency" title="Emergency stop all equipment" aria-label="Emergency stop all equipment" onClick={() => void dispatch({ type: "stop" })} disabled={busy || snapshot.connectionState !== "connected"}>
-          <Stop size={23} weight="fill" /><span>E-Stop</span>
+      <div className="panel__divider" />
+      <div className="timer-row">
+        <div className="timer-field">
+          <span>On Sec</span>
+          <div className="timer-field__well">{ws.xray.onSec}</div>
+        </div>
+        <div className="timer-field">
+          <span>Off Sec</span>
+          <div className="timer-field__well">{ws.xray.offSec}</div>
+        </div>
+        <button
+          type="button"
+          className={`switch-btn switch-btn--chip ${ws.xray.timerOn ? "switch-btn--on" : "switch-btn--idle"}`}
+          disabled={ws.dataState === "scanning"}
+          onClick={() => void dispatch({ type: "timer_toggle" })}
+        >
+          {ws.xray.timerOn ? "Timer On" : "Timer Off"}
         </button>
       </div>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={ws.xray.usbAutoShutDown}
+          onChange={() => void dispatch({ type: "usb_auto_shut_down_toggle" })}
+        />
+        <i aria-hidden="true" />
+        USB Auto Shut Down
+      </label>
+      <p className="panel__footnote">Output fail-closed · interlock checked before every exposure</p>
+    </section>
+  );
+}
+
+function OperationPanel({ ws }: { ws: WorkstationView }) {
+  return (
+    <section className="panel">
+      <div className="panel__header">
+        <h2>Operation Status</h2>
+        <span className={`chip chip--${ws.phaseTone}`}>{ws.phaseWord}</span>
+      </div>
+      <div className="op-stats">
+        <div className="op-stat">
+          <span>CAPTURED</span>
+          <strong>
+            {ws.progress.captured} / {ws.progress.total}
+          </strong>
+        </div>
+        <div className="op-stat">
+          <span>ANGLE</span>
+          <strong>{ws.progress.angleDeg.toFixed(2)}°</strong>
+        </div>
+        <div className="op-stat">
+          <span>ETA</span>
+          <strong>{ws.progress.etaText}</strong>
+        </div>
+      </div>
+      <div className="op-progress">
+        <div className="op-progress__head">
+          <span>VIEW PROGRESS</span>
+          <small>{ws.progress.barLabel}</small>
+        </div>
+        <div className={`op-progress__bar op-progress__bar--${ws.progress.barTone}`} role="progressbar" aria-valuenow={ws.progress.percent} aria-valuemin={0} aria-valuemax={100}>
+          <span style={{ width: `${ws.progress.percent}%` }} />
+        </div>
+      </div>
+      <div className="op-summary">
+        <span className="op-summary__title">PROCESS SUMMARY</span>
+        <div>
+          <span>Save Path</span>
+          <strong>{ws.summary.savePath}</strong>
+        </div>
+        <div>
+          <span>Acquisition</span>
+          <strong>{ws.summary.acquisition}</strong>
+        </div>
+        <div>
+          <span>Output</span>
+          <strong>{ws.summary.output}</strong>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Bottom console                                                      */
+/* ------------------------------------------------------------------ */
+
+const bottomTabs: Array<{ id: BottomTab; label: string }> = [
+  { id: "aggregate", label: "Log Aggregation" },
+  { id: "xray", label: "X-ray Log" },
+  { id: "nano", label: "Turntable Log" },
+  { id: "camera", label: "Camera Log" },
+  { id: "images", label: "Image Preview" },
+];
+
+const logLevelClass: Record<ConsoleLogLine["level"], string> = {
+  PASS: "log-line--pass",
+  INFO: "log-line--info",
+  OK: "log-line--info",
+  WARN: "log-line--warn",
+  ERR: "log-line--err",
+  ACTION: "log-line--pass",
+};
+
+function LogLines({ logs }: { logs: ConsoleLogLine[] }) {
+  if (!logs.length) return <div className="log-empty">No records in this channel.</div>;
+  return (
+    <div className="log-lines">
+      {logs.map((entry) => (
+        <div className={`log-line ${logLevelClass[entry.level]}`} key={entry.id}>
+          <time className="log-line__time">[{logTime(entry.timestamp)}]</time>
+          <span className="log-line__tag">
+            {entry.level} · {entry.source}
+          </span>
+          <span className="log-line__msg">{entry.message}</span>
+        </div>
+      ))}
     </div>
   );
 }
 
-export function App() {
-  const { snapshot, busy, error, refresh, dispatch } = useEngine();
-  const [draft, setDraft] = useState<ScanParameters | null>(null);
-  const [bottomView, setBottomView] = useState<BottomView>("聚合");
-  const [timerEnabled, setTimerEnabled] = useState(false);
-  const [timerSeconds, setTimerSeconds] = useState(300);
-  const [maxXraySeconds, setMaxXraySeconds] = useState(120);
-  const [setKv, setSetKv] = useState(30);
-  const [setUa, setSetUa] = useState(100);
-  const [refreshingDevice, setRefreshingDevice] = useState<DeviceId | null>(null);
-
-  useEffect(() => { if (snapshot && !draft) setDraft(snapshot.parameters); }, [snapshot, draft]);
-  const logs = useMemo(() => {
-    if (!snapshot || bottomView === "影像") return [];
-    const filtered = bottomView === "聚合" ? snapshot.logs : snapshot.logs.filter((entry) => entry.source === bottomView);
-    return filtered.slice(0, 7);
-  }, [snapshot, bottomView]);
-
-  if (!snapshot || !draft) {
-    return <main className="loading-screen"><CircleNotch size={28} className="spin" /><strong>Initializing CT Engine</strong><span>All physical outputs remain disabled</span></main>;
-  }
-
-  const active = snapshot.phase === "running" || snapshot.phase === "paused";
-  const connected = snapshot.connectionState === "connected";
-  const dirty = JSON.stringify(draft) !== JSON.stringify(snapshot.parameters);
-  const preflightPercent = snapshot.preflightPassed ? 100 : connected ? 38 : 0;
-  const xrayLocked = !snapshot.safety.xrayAvailable;
-  const phaseLabel = phaseLabels[snapshot.phase];
-  const updateProjectionCount = (value: number) => {
-    const projectionCount = Math.max(4, Math.min(3600, Math.round(value || 4)));
-    setDraft((current) => current && { ...current, projectionCount, angleStepDeg: Number((360 / projectionCount).toFixed(4)) });
-  };
-  const refreshDevice = (deviceId: DeviceId) => {
-    setRefreshingDevice(deviceId);
-    void refresh().finally(() => window.setTimeout(() => setRefreshingDevice(null), 180));
-  };
+function BottomConsole({ ws }: { ws: WorkstationView }) {
+  const [tab, setTab] = useState<BottomTab>("aggregate");
+  const logs = ws.consoleLogs;
+  const filtered = useMemo(() => {
+    if (tab === "aggregate" || tab === "images") return logs;
+    return logs.filter((entry) => entry.source === tab);
+  }, [logs, tab]);
+  const counts = useMemo(
+    () => ({
+      aggregate: logs.length,
+      xray: logs.filter((entry) => entry.source === "xray").length,
+      nano: logs.filter((entry) => entry.source === "nano").length,
+      camera: logs.filter((entry) => entry.source === "camera").length,
+      images: ws.frames.length,
+    }),
+    [logs, ws.frames.length],
+  );
+  const header =
+    tab === "images"
+      ? `CAPTURED IMAGES · ${ws.scanSetup.taskId} · ${ws.progress.captured} / ${ws.progress.total} VIEWS · ${ws.scanSetup.angleStepDeg.toFixed(2)}° STEP · ${ws.scanSetup.exposureMs} ms`
+      : tab === "aggregate"
+        ? "AGGREGATED STREAM · 5 SOURCES · FOLLOW TAIL"
+        : `${tab === "xray" ? "X-RAY" : tab === "nano" ? "TURNTABLE" : "CAMERA"} STREAM · FOLLOW TAIL`;
 
   return (
-    <main className="industrial-app">
-      <header className="window-header">
-        <nav className="menu-line" aria-label="Application menu"><button>File</button><button>Edit</button><button>Tools</button><button>Help</button><span className="menu-spacer" /><span className="preview-label"><LockKey size={13} />DEVELOPER PREVIEW · NO REAL HARDWARE</span><span className={`runtime-dot ${connected ? "online" : "offline"}`}><i />{connected ? "ENGINE ONLINE" : "ENGINE STANDBY"}</span></nav>
-      </header>
-
-      {error ? <div className="error-toast" role="alert"><Warning size={18} weight="fill" /><span>{error}</span></div> : null}
-
-      <section className="main-console">
-        <aside className="left-console">
-          <section className="industrial-panel device-connection-panel">
-            <div className="industrial-panel-title">
-              <div><PlugsConnected size={18} weight="duotone" /><h2>Device Connection Status</h2></div>
-              <button className={`preview-link-button ${connected ? "disconnect" : "connect"}`} onClick={() => void dispatch(connected ? { type: "disconnect" } : { type: "connect", adapter: "developer_preview" })} disabled={busy || active}>{connected ? "Disconnect Preview" : "Connect Preview"}</button>
-            </div>
-            <div className="device-status-list">
-              {(["xray", "turntable", "camera"] as DeviceId[]).map((id) => {
-                const device = snapshot.devices.find((item) => item.id === id);
-                return device ? <DeviceStatusRow key={id} device={device} busy={busy || refreshingDevice === id} onRefresh={refreshDevice} /> : null;
-              })}
-            </div>
-            <div className="preflight-block">
-              <div className="preflight-copy"><span>One-click System Pre-inspection</span><strong>{snapshot.preflightPassed ? "PASSED" : connected ? "READY" : "WAITING"}</strong></div>
-              <div className={`inspection-meter ${snapshot.preflightPassed ? "passed" : connected ? "ready" : "waiting"}`} role="progressbar" aria-valuenow={preflightPercent} aria-valuemin={0} aria-valuemax={100}><span style={{ width: `${preflightPercent}%` }} /></div>
-              <button className="preflight-button" onClick={() => void dispatch({ type: "preflight" })} disabled={busy || !connected || active}><ShieldCheck size={17} weight="duotone" />Run System Check</button>
-            </div>
-          </section>
-
-          <section className="industrial-panel parameter-panel-v2">
-            <div className="industrial-panel-title"><div><FloppyDisk size={18} weight="duotone" /><h2>Scan Parameters</h2></div><span className={dirty ? "parameter-state dirty" : "parameter-state"}>{dirty ? "UNSAVED" : "SYNCED"}</span></div>
-            <fieldset disabled={busy || active}>
-              <label><span>Save Path</span><div className="field-with-icon"><input value={draft.savePath} onChange={(event) => setDraft({ ...draft, savePath: event.target.value })} /><FolderOpen size={16} /></div></label>
-              <label><span>Task ID</span><input value={draft.taskId} onChange={(event) => setDraft({ ...draft, taskId: event.target.value })} /></label>
-              <div className="parameter-row">
-                <label><span>Total Projections</span><input type="number" min="4" max="3600" value={draft.projectionCount} onChange={(event) => updateProjectionCount(Number(event.target.value))} /></label>
-                <label><span>Angle Step</span><div className="field-with-unit"><input readOnly value={draft.angleStepDeg} /><small>°</small></div></label>
-              </div>
-              <div className="parameter-row">
-                <label><span>Single Shot Exposure</span><div className="field-with-unit"><input type="number" min="1" max="10000" value={draft.exposureMs} onChange={(event) => setDraft({ ...draft, exposureMs: Number(event.target.value) })} /><small>ms</small></div></label>
-                <label><span>Max X-ray Duration</span><div className="field-with-unit"><input type="number" min="1" max="3600" value={maxXraySeconds} onChange={(event) => setMaxXraySeconds(Number(event.target.value))} /><small>s</small></div></label>
-              </div>
-            </fieldset>
-            <button className="apply-button" disabled={busy || active || !dirty} onClick={() => void dispatch({ type: "set_parameters", parameters: draft })}><FloppyDisk size={16} />Apply Parameters</button>
-          </section>
-        </aside>
-
-        <section className="scene-console">
-          <div className="scene-toolbar"><div><span>LIVE WORKSPACE</span><strong>{phaseLabel}</strong></div><div className="scene-toolbar-actions"><button title="Reset view"><Crosshair size={17} /></button><button title="Camera view"><Camera size={17} /></button></div></div>
-          <div className="equipment-scene">
-            <img src="/assets/micro-ct-equipment-scene-v2.png" alt="Micro-CT camera, turntable and X-ray source workspace" />
-            <span className="scene-tag tag-camera"><Camera size={15} />Camera</span>
-            <span className="scene-tag tag-turntable"><Aperture size={15} />Turntable · {snapshot.progress.angleDeg.toFixed(2)}°</span>
-            <span className="scene-tag tag-xray"><Radioactive size={15} />X-Ray · Locked</span>
-            <span className={`phase-indicator phase-${snapshot.phase}`}><i />{phaseLabel}</span>
-            <ControlDock snapshot={snapshot} busy={busy} dispatch={dispatch} />
-          </div>
-        </section>
-
-        <aside className="right-console">
-          <section className="industrial-panel xray-controller">
-            <div className="industrial-panel-title"><div><Radioactive size={19} weight="duotone" /><h2>12 Watt Controller</h2></div><span className="controller-lock"><LockKey size={13} />LOCKED</span></div>
-            <div className="xray-control-grid">
-              <label className="xray-setting"><span>Set Voltage</span><div><input type="range" min="20" max="70" value={setKv} onChange={(event) => setSetKv(Number(event.target.value))} disabled={xrayLocked} /><strong>{setKv}<small>kV</small></strong></div></label>
-              <label className="xray-setting"><span>Set Current</span><div><input type="range" min="10" max="200" value={setUa} onChange={(event) => setSetUa(Number(event.target.value))} disabled={xrayLocked} /><strong>{setUa}<small>μA</small></strong></div></label>
-            </div>
-            <div className="xray-readbacks"><LabeledNumber label="Monitor Voltage" value="--" unit="kV" /><LabeledNumber label="Monitor Current" value="--" unit="μA" /><LabeledNumber label="Power" value="--" unit="W" /><LabeledNumber label="Temp" value="--" unit="°C" /></div>
-            <button className="xray-enable" disabled={xrayLocked}><Power size={18} weight="fill" />X-ray Enable</button>
-            <div className="timer-control"><div><ClockCountdown size={18} /><span>Exposure Timer</span></div><label className="timer-seconds"><span>Auto stop</span><input type="number" min="1" value={timerSeconds} onChange={(event) => setTimerSeconds(Number(event.target.value))} disabled={!timerEnabled} /><small>s</small></label><button className={`toggle ${timerEnabled ? "on" : "off"}`} role="switch" aria-checked={timerEnabled} onClick={() => setTimerEnabled((value) => !value)}><i /><span>{timerEnabled ? "ON" : "OFF"}</span></button></div>
-            <p className="xray-safety-copy"><ShieldCheck size={15} />V1 hardware output is fail-closed; Windows device integration is not enabled.</p>
-          </section>
-
-          <section className="industrial-panel operation-status">
-            <div className="industrial-panel-title"><div><Aperture size={18} weight="duotone" /><h2>Operation Status</h2></div><span className={`operation-badge phase-${snapshot.phase}`}>{phaseLabel}</span></div>
-            <div className="progress-header"><span>Acquisition Progress</span><strong>{snapshot.progress.current} / {snapshot.progress.total}<b>{snapshot.progress.percent}%</b></strong></div>
-            <div className="scan-progress"><span style={{ width: `${snapshot.progress.percent}%` }} /></div>
-            <div className="operation-numbers"><LabeledNumber label="Current Angle" value={snapshot.progress.angleDeg.toFixed(2)} unit="°" /><LabeledNumber label="ETA" value={snapshot.progress.etaSeconds ?? "--"} unit={snapshot.progress.etaSeconds === null ? undefined : "s"} /><LabeledNumber label="Real Images" value={snapshot.imageCount} /></div>
-            <div className="process-summary">
-              <div className={connected ? "done" : "current"}><i>{connected ? <Check size={12} /> : "1"}</i><span>Device link</span></div>
-              <div className={snapshot.preflightPassed ? "done" : connected ? "current" : "pending"}><i>{snapshot.preflightPassed ? <Check size={12} /> : "2"}</i><span>Pre-inspection</span></div>
-              <div className={snapshot.homed ? "done" : snapshot.preflightPassed ? "current" : "pending"}><i>{snapshot.homed ? <Check size={12} /> : "3"}</i><span>Turntable home</span></div>
-              <div className={active || snapshot.phase === "completed" ? "current" : "pending"}><i>4</i><span>Acquisition</span></div>
-            </div>
-            <div className="scan-summary" aria-label="Current scan configuration summary">
-              <div><span>Task</span><strong>{snapshot.parameters.taskId}</strong></div>
-              <div><span>Scan setup</span><strong>{snapshot.parameters.projectionCount} × {snapshot.parameters.angleStepDeg}° · {snapshot.parameters.exposureMs} ms</strong></div>
-              <div><span>Safety</span><strong>{snapshot.safety.xrayEnabled ? "X-RAY ACTIVE" : "X-ray locked · motion preview only"}</strong></div>
-            </div>
-          </section>
-        </aside>
-      </section>
-
-      <section className="bottom-console">
-        <div className="log-tab-rail" role="tablist" aria-label="Logs and image preview">
-          <div className="rail-title"><strong>OUTPUT</strong><span>LOGS / CURRENT ROUND</span></div>
-          {(["聚合", "射线", "转台", "相机", "影像"] as const).map((view) => {
-            const count = view === "影像" ? snapshot.imageCount : view === "聚合" ? snapshot.logs.length : snapshot.logs.filter((entry) => entry.source === view).length;
-            const label = view === "聚合" ? "Log Aggregation" : view === "射线" ? "X-ray Log" : view === "转台" ? "Turntable Log" : view === "相机" ? "Camera Log" : "Image Preview";
-            return <button key={view} role="tab" aria-selected={bottomView === view} className={bottomView === view ? "active" : ""} onClick={() => setBottomView(view)}>{label}<span>{count}</span></button>;
-          })}
-        </div>
-        {bottomView === "影像" ? (
-          <div className="image-preview-pane" role="tabpanel" key="image-preview">
-            <div className="bottom-pane-head"><div><Image size={18} /><strong>IMAGE PREVIEW · CURRENT ROUND</strong></div><span>{snapshot.imageCount} real images · preview never fabricates captures</span></div>
-            <div className="image-slot-row">{Array.from({ length: 5 }, (_, index) => <div className="image-slot" key={index}><Image size={25} weight="duotone" /><span>{snapshot.imageCount > index ? `Frame ${String(index + 1).padStart(3, "0")}` : "Awaiting capture"}</span></div>)}</div>
+    <section className="console">
+      <div className="console__tabs" role="tablist" aria-label="Logs and image preview">
+        {bottomTabs.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            aria-selected={tab === item.id}
+            className="console__tab"
+            onClick={() => setTab(item.id)}
+          >
+            {item.label}
+            <span>{counts[item.id]}</span>
+          </button>
+        ))}
+      </div>
+      <div className="console__body" role="tabpanel">
+        <div className="console__head">{header}</div>
+        {tab === "images" ? (
+          <div className="image-strip">
+            {Array.from({ length: ws.progress.total }, (_, index) => {
+              const frame = ws.frames.find((item) => item.index === index + 1);
+              return (
+                <div className={`image-tile ${frame ? "image-tile--captured" : ""}`} key={index}>
+                  <strong>VIEW {String(index + 1).padStart(2, "0")}</strong>
+                  <span>{frame ? `${frame.angleDeg.toFixed(2)}° · ${frame.exposureMs} ms · 16-bit` : "queued"}</span>
+                </div>
+              );
+            })}
           </div>
         ) : (
-          <div className="terminal-log" role="tabpanel" aria-label="Runtime log" key="terminal-log">
-            <div className="bottom-pane-head"><div><strong>{bottomView === "聚合" ? "AGGREGATED DEVICE LOG" : `${sourceLabels[bottomView]} LOG`}</strong></div><span>Newest entries first · {logs.length} visible</span></div>
-            <div className="terminal-lines">
-              {logs.length ? logs.map((entry) => <div className={`terminal-line level-${entry.level}`} key={entry.id}><time>[{formatTime(entry.timestamp)}]</time><i>[{logLevelLabels[entry.level]}]</i><span>[{sourceLabels[entry.source]}]</span><p>{entry.message}</p></div>) : <div className="terminal-empty">No records in this channel.</div>}
-            </div>
-          </div>
+          <LogLines logs={filtered} />
         )}
-      </section>
+      </div>
+    </section>
+  );
+}
 
-      <footer className="status-line"><span><i className={connected ? "online" : "offline"} />{snapshot.adapterLabel}</span><span>Protocol JSONL v1</span><span>Last update {formatTime(snapshot.updatedAt)}</span><span className="status-spacer" /><span>{snapshot.safety.xrayEnabled ? "X-RAY ACTIVE" : "X-RAY SAFE / DISABLED"}</span></footer>
+/* ------------------------------------------------------------------ */
+/* App                                                                 */
+/* ------------------------------------------------------------------ */
+
+export function App() {
+  const { snapshot, error, dispatch } = useEngine();
+  const [theme, setTheme] = useTheme();
+  const ws: WorkstationView | undefined = snapshot?.workstation;
+
+  useEffect(() => {
+    if (ws) document.documentElement.dataset.state = ws.dataState;
+  }, [ws]);
+
+  if (!snapshot || !ws) {
+    return (
+      <main className="boot-screen">
+        <strong>Micro-CT Workstation</strong>
+        <span>Linking RTS9060 device chain…</span>
+      </main>
+    );
+  }
+
+  return (
+    <main className="console-app">
+      <MenuBar theme={theme} onTheme={setTheme} />
+      <div className="app-divider" />
+      {error ? (
+        <div className="error-toast" role="alert">
+          {error}
+        </div>
+      ) : null}
+      <section className="main-console">
+        <aside className="col">
+          <DevicePanel ws={ws} dispatch={dispatch} />
+          <ScanParamsPanel ws={ws} dispatch={dispatch} />
+        </aside>
+        <LiveScene ws={ws} theme={theme} dispatch={dispatch} />
+        <aside className="col">
+          <XrayPanel ws={ws} dispatch={dispatch} />
+          <OperationPanel ws={ws} />
+        </aside>
+      </section>
+      <div className="app-divider" />
+      <BottomConsole ws={ws} />
+      <div className="app-divider" />
+      <footer className="status-bar">
+        <span className="status-bar__left">
+          <i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} aria-hidden="true" />
+          <strong>{ws.statusbar.left}</strong>
+        </span>
+        <span className="status-bar__right">{ws.statusbar.right}</span>
+      </footer>
     </main>
   );
 }
+
+export type { EngineSnapshot };
