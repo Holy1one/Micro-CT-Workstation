@@ -1,0 +1,1 @@
+{"main-capability":{"identifier":"main-capability","description":"Local application window; commands do not expose filesystem, shell, or hardware access.","local":true,"windows":["main"],"permissions":["core:default"]}}
