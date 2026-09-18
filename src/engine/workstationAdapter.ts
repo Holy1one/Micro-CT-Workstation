@@ -71,6 +71,10 @@ export class WorkstationAdapter implements EngineAdapter {
     return this.buildSnapshot();
   }
 
+  close(): void {
+    this.workflow.close();
+  }
+
   async dispatch(command: EngineCommand): Promise<EngineSnapshot> {
     const wf = this.workflow;
     switch (command.type) {
@@ -142,9 +146,9 @@ export class WorkstationAdapter implements EngineAdapter {
     const dataStateToPhase = phaseToEngine[wf.phase];
     return {
       mode: "developer_preview",
-      modeLabel: "RTS9060 device link",
+      modeLabel: "DEVELOPER PREVIEW · NO REAL HARDWARE",
       connectionState: "connected",
-      adapterLabel: `RTS9060 Link · ${LINK_LABEL}`,
+      adapterLabel: `Browser Preview · ${LINK_LABEL}`,
       phase: dataStateToPhase,
       phaseLabel: ws.phaseWord,
       preflightPassed: wf.preflightPassed,
@@ -200,6 +204,12 @@ export class WorkstationAdapter implements EngineAdapter {
     const percent = total > 0 ? Math.round((captured / total) * 100) : 0;
     const angle = wf.angleDeg;
     const step = wf.angleStepDeg;
+    const configured =
+      wf.params.taskId.trim().length > 0 &&
+      wf.params.savePath.trim().length > 0 &&
+      wf.params.projectionCount > 0 &&
+      wf.params.exposureMs > 0 &&
+      wf.params.maxXraySec > 0;
 
     const dataState: ConsoleDataState =
       phase === "scanning" ? "scanning" : phase === "paused" ? "paused" : phase === "fault" ? "fault" : "ready";
@@ -223,17 +233,17 @@ export class WorkstationAdapter implements EngineAdapter {
 
     const xraySpec =
       phase === "fault"
-        ? "12 W · USB · TUBE OFF · FAULT LATCHED"
+        ? "12 W · PREVIEW · OUTPUT LATCHED"
         : rb.beamOn
-          ? `12 W · USB · TUBE ON · ${fixed1(rb.setUa)} µA`
+          ? `12 W · PREVIEW BEAM · ${fixed1(rb.setUa)} µA SET`
           : phase === "paused"
-            ? `12 W · USB · TUBE OFF · ${fixed1(rb.setUa)} µA`
-            : "12 W · USB · TUBE OFF · INTLK OK";
+            ? `12 W · PREVIEW PAUSED · ${fixed1(rb.setUa)} µA SET`
+            : "12 W · PREVIEW ONLY · NO REAL HARDWARE";
 
     const devices: ConsoleDeviceView[] = [
       { id: "xray", name: "X-Ray Source", word: xrayWord, tone: xrayTone, spec: xraySpec },
       { id: "turntable", name: "Turntable-Nano", word: tableWord, tone: tableTone, spec: `POS ${fixed2(angle)}° · 60:1 · 8 µSTEP` },
-      { id: "camera", name: "Camera", word: cameraWord, tone: cameraTone, spec: "D7100 · PTP · PC-ONLY · SAVE OK" },
+      { id: "camera", name: "Camera", word: cameraWord, tone: cameraTone, spec: "D7100 · DEVELOPER PREVIEW · PREVIEW DATA · NO DEVICE I/O" },
     ];
 
     const floats: ConsoleFloatView[] = [
@@ -301,13 +311,18 @@ export class WorkstationAdapter implements EngineAdapter {
           : phase === "ready" || phase === "completed"
             ? wf.preflightPassed && wf.homed
             : false,
-      restore: phase === "ready" || phase === "fault" || phase === "stopped" || phase === "completed",
+      restore:
+        (phase === "ready" || phase === "completed") &&
+        wf.preflightPassed &&
+        wf.homed &&
+        wf.checkpointAvailable,
       estop: phase !== "booting",
       playMode: phase === "scanning" ? "pause" : phase === "paused" ? "resume" : phase === "fault" ? "disabled" : "start",
     };
 
-    const statusLeft =
-      phase === "scanning"
+    const statusLeft = !configured
+      ? "SETUP REQUIRED  enter Task ID, Save Path, projections, exposure, and maximum X-ray time"
+      : phase === "scanning"
         ? `SCANNING  view ${Math.min(captured + 1, total)} / ${total} · ${fixed2(step)}°/view · ${captured} / ${total} captured · ${fixed2(angle)}° · exposing · ETA ${wf.etaText}`
         : phase === "paused"
           ? `PAUSED  view ${Math.min(captured + 1, total)} / ${total} · held at ${fixed2(angle)}° · pulse counter kept · resume to continue`
@@ -324,7 +339,7 @@ export class WorkstationAdapter implements EngineAdapter {
       phaseWord,
       phaseTone,
       devices,
-      onlineSummary: "3 / 3 ONLINE",
+      onlineSummary: "PREVIEW · 0 REAL DEVICES",
       preflight,
       floats,
       safetyBar,
@@ -345,13 +360,15 @@ export class WorkstationAdapter implements EngineAdapter {
       },
       progress: { captured, total, percent, angleDeg: angle, etaText: wf.etaText, barTone, barLabel },
       summary: {
-        savePath: `D:\\CT\\${wf.params.taskId}`,
-        acquisition: `${total} views · ${fixed2(step)}° · ${wf.params.exposureMs} ms`,
+        savePath: wf.params.savePath,
+        acquisition: configured
+          ? `${total} views · ${fixed2(step)}° · ${wf.params.exposureMs} ms`
+          : "Scan setup not configured",
         output: `${fixed1(rb.setKv)} kV · ${fixed1(rb.setUa)} µA · ${fixed1(rb.powerW)} W`,
       },
       statusbar: {
-        left: statusLeft,
-        right: `${LINK_LABEL} · fw ${FIRMWARE_VERSION} · ${fixed1(rb.powerW)} W · ${fixed1(rb.tempC)} °C`,
+        left: `DEVELOPER PREVIEW · ${statusLeft}`,
+        right: `NO REAL HARDWARE · ${LINK_LABEL} · fw ${FIRMWARE_VERSION} · ${fixed1(rb.powerW)} W SET`,
         dotTone: phase === "scanning" ? "warn" : phase === "paused" ? "accent" : phase === "fault" ? "danger" : "ok",
       },
       dock,

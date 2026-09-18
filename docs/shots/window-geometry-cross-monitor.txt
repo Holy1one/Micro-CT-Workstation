@@ -1,0 +1,41 @@
+﻿HWND=15013974
+---- restored-primary ----
+  isZoomed=False showCmd=1
+  outer=[78,41,1374,1080]
+  dwmVisible=[85,41,1367,1073]
+  client=[86,72,1366,1072] size=1280x1000
+  monitor rcMonitor=[0,0,1920,1080] rcWork=[0,0,1920,1032] primary=True dpiX=96
+  dom inner=1280x1000 dpr=1 zoom=0.8
+  dom canvas=1280x800 x=0 y=100
+  expected zoom=0.8 gutterX=0.0 gutterY=100.0
+  foregroundMatch=True crop=E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App\docs\shots\window-geometry-cross-restored-primary-window-crop-bitblt.png
+---- moved-secondary ----
+  isZoomed=False showCmd=1
+  outer=[2400,120,3696,1159]
+  dwmVisible=[2528,150,4132,1441]
+  client=[2407,150,3688,1151] size=1281x1001
+  monitor rcMonitor=[1920,0,3456,864] rcWork=[1920,0,3456,816] primary=False dpiX=96
+  dom inner=1282x1002 dpr=1.25 zoom=0.80125
+  dom canvas=1282x801.25 x=0.20 y=100.58
+  expected zoom=0.800625 gutterX=0.0 gutterY=100.19
+  foregroundMatch=True crop=E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App\docs\shots\window-geometry-cross-moved-secondary-window-crop-bitblt.png
+---- maximized-secondary ----
+  isZoomed=True showCmd=3
+  outer=[1913,-7,3463,823]
+  dwmVisible=[1920,0,3840,1020]
+  client=[1920,23,3456,815] size=1536x792
+  monitor rcMonitor=[1920,0,3456,864] rcWork=[1920,0,3456,816] primary=False dpiX=96
+  dom inner=1536x794 dpr=1.25 zoom=0.794
+  dom canvas=1270.40x794 x=132.80 y=0
+  expected zoom=0.792 gutterX=134.40 gutterY=0.0
+  foregroundMatch=True crop=E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App\docs\shots\window-geometry-cross-maximized-secondary-window-crop-bitblt.png
+---- back-primary-maximized ----
+  isZoomed=True showCmd=3
+  outer=[-8,-8,1928,1040]
+  dwmVisible=[0,0,1920,1032]
+  client=[0,23,1920,1032] size=1920x1009
+  monitor rcMonitor=[0,0,1920,1080] rcWork=[0,0,1920,1032] primary=True dpiX=96
+  dom inner=1920x1009 dpr=1 zoom=1.009
+  dom canvas=1614.39x1008.98 x=152.80 y=0
+  expected zoom=1.009 gutterX=152.80 gutterY=0
+  foregroundMatch=True crop=E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App\docs\shots\window-geometry-cross-back-primary-window-crop-bitblt.png

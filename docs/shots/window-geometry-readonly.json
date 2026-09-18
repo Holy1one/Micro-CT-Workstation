@@ -1,0 +1,148 @@
+{
+  "timestamp": "2026-09-18T13:42:27+0800",
+  "hwnd": 6166718,
+  "note": "read-only: no SetWindowPos/ShowWindow/restore/SetForegroundWindow",
+  "stateBefore": {
+    "isZoomed": true,
+    "styleHex": "0x15cf0000",
+    "WS_MAXIMIZE": true,
+    "showCmd": 3,
+    "rcNormalPosition": [
+      104,
+      69,
+      1848,
+      1080
+    ],
+    "outer": [
+      -8,
+      -8,
+      1928,
+      1040
+    ],
+    "outerSize": [
+      1936,
+      1048
+    ]
+  },
+  "full": {
+    "label": "readonly-clean",
+    "timestamp": "2026-09-18T13:42:29+0800",
+    "hwnd": 6166718,
+    "isZoomed": true,
+    "showCmd": 3,
+    "rcNormalPosition": [
+      104,
+      69,
+      1848,
+      1080
+    ],
+    "osOuterRect": [
+      -8,
+      -8,
+      1928,
+      1040
+    ],
+    "osOuterSize": [
+      1936,
+      1048
+    ],
+    "dwmVisibleFrame": [
+      0,
+      0,
+      1920,
+      1032
+    ],
+    "clientScreenRect": [
+      0,
+      23,
+      1920,
+      1032
+    ],
+    "clientSize": [
+      1920,
+      1009
+    ],
+    "dpiForWindow": 96,
+    "monitor": {
+      "rcMonitor": [
+        0,
+        0,
+        1920,
+        1080
+      ],
+      "rcWork": [
+        0,
+        0,
+        1920,
+        1032
+      ],
+      "primary": true,
+      "dpiX": 96,
+      "scalePercent": 100
+    },
+    "dom": {
+      "error": "<urlopen error timed out>"
+    },
+    "expectedCanvas": {
+      "mode": "fill",
+      "designHeight": 1009.0,
+      "zoom": 1.0,
+      "scaledWidth": 1920.0,
+      "scaledHeight": 1009.0,
+      "gutterX": 0.0,
+      "gutterY": 0.0
+    },
+    "monitorCount": 2,
+    "virtualScreen": [
+      0,
+      0,
+      3456,
+      1080
+    ],
+    "foregroundHwnd": 6166718,
+    "evidence": {
+      "api": "PrintWindow(hwnd, PW_RENDERFULLCONTENT)",
+      "printWindowUsed": true,
+      "foregroundSteal": false,
+      "foregroundMatchesTarget": true,
+      "windowPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-readonly-clean-window-printwindow.png",
+      "windowPngSize": [
+        1920,
+        1009
+      ],
+      "renderStats": {
+        "uniqueColors": 3031,
+        "meanLuma": 239.56,
+        "midRowEdges": 16,
+        "verdict": "rendered"
+      }
+    }
+  },
+  "stateAfter": {
+    "isZoomed": true,
+    "styleHex": "0x15cf0000",
+    "WS_MAXIMIZE": true,
+    "showCmd": 3,
+    "rcNormalPosition": [
+      104,
+      69,
+      1848,
+      1080
+    ],
+    "outer": [
+      -8,
+      -8,
+      1928,
+      1040
+    ],
+    "outerSize": [
+      1936,
+      1048
+    ]
+  },
+  "focus": {
+    "foregroundHwnd": 6166718,
+    "targetIsForeground": true,
+    "note": "capture uses PrintWindow; focus is left untouched"
+  }
+}

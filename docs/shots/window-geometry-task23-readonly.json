@@ -1,0 +1,177 @@
+{
+  "timestamp": "2026-09-18T12:00:15+0800",
+  "hwnd": 15013974,
+  "note": "read-only: no SetWindowPos/ShowWindow/restore",
+  "beforeForeground": {
+    "isZoomed": true,
+    "styleHex": "0x15cf0000",
+    "WS_MAXIMIZE": true,
+    "showCmd": 3,
+    "rcNormalPosition": [
+      78,
+      41,
+      1694,
+      1080
+    ],
+    "outer": [
+      -8,
+      -8,
+      1928,
+      1040
+    ],
+    "outerSize": [
+      1936,
+      1048
+    ]
+  },
+  "afterForeground": {
+    "isZoomed": true,
+    "styleHex": "0x15cf0000",
+    "WS_MAXIMIZE": true,
+    "showCmd": 3,
+    "rcNormalPosition": [
+      78,
+      41,
+      1694,
+      1080
+    ],
+    "outer": [
+      -8,
+      -8,
+      1928,
+      1040
+    ],
+    "outerSize": [
+      1936,
+      1048
+    ]
+  },
+  "full": {
+    "label": "readonly-clean",
+    "timestamp": "2026-09-18T12:00:16+0800",
+    "hwnd": 15013974,
+    "isZoomed": true,
+    "showCmd": 3,
+    "rcNormalPosition": [
+      78,
+      41,
+      1694,
+      1080
+    ],
+    "osOuterRect": [
+      -8,
+      -8,
+      1928,
+      1040
+    ],
+    "osOuterSize": [
+      1936,
+      1048
+    ],
+    "dwmVisibleFrame": [
+      0,
+      0,
+      1920,
+      1032
+    ],
+    "clientScreenRect": [
+      0,
+      23,
+      1920,
+      1032
+    ],
+    "clientSize": [
+      1920,
+      1009
+    ],
+    "dpiForWindow": 96,
+    "monitor": {
+      "rcMonitor": [
+        0,
+        0,
+        1920,
+        1080
+      ],
+      "rcWork": [
+        0,
+        0,
+        1920,
+        1032
+      ],
+      "primary": true,
+      "dpiX": 96,
+      "scalePercent": 100
+    },
+    "dom": {
+      "sampleId": "1789704016320",
+      "timestamp": "2026-09-18T04:00:16.320Z",
+      "innerWidth": 1920,
+      "innerHeight": 1009,
+      "devicePixelRatio": 1,
+      "visualViewport": {
+        "width": 1920,
+        "height": 1009,
+        "scale": 1
+      },
+      "documentScroll": {
+        "scrollWidth": 1920,
+        "scrollHeight": 1009,
+        "clientWidth": 1920,
+        "clientHeight": 1009
+      },
+      "viewportShell": {
+        "x": 0,
+        "y": 0,
+        "width": 1920,
+        "height": 1009,
+        "top": 0,
+        "left": 0,
+        "right": 1920,
+        "bottom": 1009
+      },
+      "designCanvas": {
+        "x": 152.796875,
+        "y": 0,
+        "width": 1614.390625,
+        "height": 1008.984375,
+        "top": 0,
+        "left": 152.796875,
+        "right": 1767.1875,
+        "bottom": 1008.984375
+      },
+      "designCanvasZoom": "1.009"
+    },
+    "expectedCanvas": {
+      "zoom": 1.009,
+      "scaledWidth": 1614.3999999999999,
+      "scaledHeight": 1008.9999999999999,
+      "gutterX": 152.80000000000007,
+      "gutterY": 5.684341886080802e-14
+    },
+    "monitorCount": 2,
+    "virtualScreen": [
+      0,
+      0,
+      3456,
+      1080
+    ],
+    "foregroundHwnd": 15013974,
+    "evidence": {
+      "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
+      "printWindowUsed": false,
+      "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-readonly-clean-virtual-desktop-bitblt.png",
+      "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-readonly-clean-window-crop-bitblt.png",
+      "windowCropSize": [
+        1920,
+        1032
+      ],
+      "cropBox": [
+        0,
+        0,
+        1920,
+        1032
+      ],
+      "foregroundMatchesTarget": true
+    }
+  }
+}

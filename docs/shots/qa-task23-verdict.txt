@@ -1,0 +1,66 @@
+QA verification of window-layer task #23 (maximize fix)
+Generated: 2026-09-18 (Asia/Shanghai)  |  Business source NOT modified
+
+Build provenance (critical)
+  src-tauri/tauri.conf.json last modified  : 11:49:26  ("maximized": true REMOVED, line 13)
+  src-tauri/src/main.rs    last modified  : 11:49:37  (configure_window: apply_dynamic_min_size
+                                                       then window.maximize())
+  target/debug/ct-workstation.exe mtime    : 11:57:24  -> NEWER than both sources
+  cargo build exit code                    : 0 (no-op; binary already up to date)
+  => The binary under test DOES include the #23 changes. It is not the stale 11:47:55 one.
+
+Startup (read-only; no SetWindowPos / ShowWindow / restore before the first read)
+  isZoomed               = TRUE
+  showCmd (placement)    = 3 (SW_SHOWMAXIMIZED)
+  style WS_MAXIMIZE bit  = SET (styleHex 0x15CF0000)
+  osOuterRect            = [-8,-8,1928,1040]  (1936x1048 = rcWork + 2x8px invisible border)
+  DWM visible frame      = [0,0,1920,1032]     == primary rcWork EXACTLY
+  client (screen)        = [0,23,1920,1032]    1920x1009
+  rcNormalPosition       = [78,41,1694,1080]    -> restored bounds 1600x1000 (now recorded)
+  DOM inner / dpr / zoom = 1920x1009 / 1.0 / 1.009 ; canvas 1614.39x1008.98 ;
+                           gutterX 152.80 (symmetric), gutterY 0.00
+  => OS_MAXIMIZED = PASS (IsZoomed TRUE, showCmd 3, frame贴合 rcWork)
+
+Restore / min-size / re-maximize
+  restored   : isZoomed=false, outer [78,41,1694,1080], client 1600x1000,
+               DOM zoom 1.000, canvas 1600x1000, gutters 0/0
+  shrink drag: right border dragged far left -> client clamped at exactly 1280x1000
+               (outer 1296x1039); DOM zoom 0.800, canvas 1280x800, gutterY 100 symmetric
+  re-max     : isZoomed=true, outer [-8,-8,1928,1040], frame [0,0,1920,1032] == rcWork
+  => MIN-SIZE CLAMP = PASS (1280x800 enforced) ; restore/re-max = PASS
+
+Cross-monitor / DPI (secondary monitor is 125%)
+  moved to secondary : monitor switches to rcWork [1920,0,3456,816]; DOM dpr 1.0 -> 1.25;
+                       DOM inner 1282x1002, zoom 0.80125 == min(1282/1600,1002/1000),
+                       canvas 1282x801.25, gutterY 100.19 symmetric
+  maximized on it    : isZoomed=true, ok; DOM inner 1536x794, zoom 0.794,
+                       canvas 1270.40x794, gutterX 132.80 symmetric, gutterY 0
+  back on primary    : outer [-8,-8,1928,1040], frame [0,0,1920,1032] == rcWork;
+                       DOM dpr 1.0, zoom 1.009, canvas 1614.39x1008.98, gutterX 152.80
+  => CROSS-MONITOR / DPI RE-CALCULATION = PASS (160 ms debounce respected: 1.8 s waits)
+  Note: the QA probe process is DPI-unaware, so raw Win32 rects on the 125% monitor are
+  virtualized; this is why "expected zoom" computed from Win32 (0.792) differs by 0.002
+  from the DOM zoom (0.794). The DOM numbers are internally exact.
+
+VISUAL
+  All captures: GetDC(NULL) + CreateCompatibleDC + CreateCompatibleBitmap +
+  BitBlt(SRCCOPY) + GetDIBits. PrintWindow never used.
+  foregroundMatchesTarget = true in 5 of 6 captures (2 captures lost foreground to
+  WorkBuddy). Crops show the app filling [0,0,1920,1032] when maximized and correctly
+  scaled at 1280x800 minimum.
+  => VISUAL = PASS (evidence-based; optional human re-check)
+
+Residual limitations
+  - No 150% monitor on this machine; system scaling was not modified.
+  - Cross-monitor tested by programmatic move, not a physical drag across the bezel.
+  - Native directory dialog remains UNVERIFIED (task 16).
+
+Artifacts (docs/shots/)
+  qa-task23-verdict.txt, window-geometry-task23-readonly.json,
+  window-geometry-restore-minmax.json/.txt (+ guard-*-window-crop-bitblt.png),
+  window-geometry-cross-monitor.json/.txt (+ cross-*-window-crop-bitblt.png),
+  qa-task23-build.log (cargo exit 0 + exe mtime), qa-lock-release.txt, qa-lock-check.txt,
+  window-geometry-ready-task23.txt (PAGE_LOAD Finished, ENGINE_READY_MS=477)
+
+FINAL: OS_MAXIMIZED PASS | MIN-SIZE CLAMP PASS | CANVAS_CONTAIN PASS |
+       CROSS-MONITOR/DPI PASS | VISUAL PASS

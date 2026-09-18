@@ -1,0 +1,324 @@
+{
+  "logFile": "C:\\Users\\Anbao\\AppData\\Local\\Temp\\microct-qa-session.log",
+  "refusedFile": "C:\\Users\\Anbao\\AppData\\Local\\Temp\\microct-qa-session.exe",
+  "checks": {
+    "dialogOpened": true,
+    "cancelClicked": true,
+    "dialogClosedAfterCancel": true,
+    "cancelWroteNothing": true,
+    "targetTypedIntoDialog": true,
+    "okClicked": true,
+    "dialogClosedAfterOk": true,
+    "fileWritten": true,
+    "logHasSessionHeader": true,
+    "logMatchesField": true,
+    "exeTargetTyped": true,
+    "exeOkClicked": true,
+    "exeTargetRefused": true
+  },
+  "pid": 64436,
+  "mainWindow": {
+    "hwnd": 16584290,
+    "title": "Micro-CT Workstation",
+    "class": "Tauri Window"
+  },
+  "pageUrl": "http://tauri.localhost/",
+  "savePathField": "E:\\Main\\Pictures\\Camera Roll",
+  "dialog": {
+    "hwnd": 2428766,
+    "title": "Export session log",
+    "class": "#32770",
+    "children": [
+      {
+        "hwnd": 2492764,
+        "class": "DUIViewWndClassName",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 9832234,
+        "class": "DirectUIHWND",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 6228820,
+        "class": "FloatNotifySink",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 18483932,
+        "class": "ComboBox",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 9963426,
+        "class": "Edit",
+        "text": "",
+        "id": 1001
+      },
+      {
+        "hwnd": 23466388,
+        "class": "CtrlNotifySink",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 7932070,
+        "class": "NamespaceTreeControl",
+        "text": "命名空间树状控制项",
+        "id": 0
+      },
+      {
+        "hwnd": 1972348,
+        "class": "Static",
+        "text": "命名空间树状控制项",
+        "id": 0
+      },
+      {
+        "hwnd": 1577502,
+        "class": "SysTreeView32",
+        "text": "导航窗格",
+        "id": 100
+      },
+      {
+        "hwnd": 40112882,
+        "class": "CtrlNotifySink",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 2102390,
+        "class": "SHELLDLL_DefView",
+        "text": "ShellView",
+        "id": 1121
+      },
+      {
+        "hwnd": 40569010,
+        "class": "DirectUIHWND",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 3870616,
+        "class": "CtrlNotifySink",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 4197566,
+        "class": "ScrollBar",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 29168926,
+        "class": "CtrlNotifySink",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 3345524,
+        "class": "ScrollBar",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 10882548,
+        "class": "FloatNotifySink",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 1578094,
+        "class": "Button",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 1577752,
+        "class": "FloatNotifySink",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 4720198,
+        "class": "ComboBox",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 3869804,
+        "class": "ToolbarWindow32",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 5771070,
+        "class": "Button",
+        "text": "保存(&S)",
+        "id": 1
+      },
+      {
+        "hwnd": 3085088,
+        "class": "Button",
+        "text": "取消",
+        "id": 2
+      },
+      {
+        "hwnd": 2035914,
+        "class": "ScrollBar",
+        "text": "",
+        "id": -1
+      },
+      {
+        "hwnd": 52235796,
+        "class": "Static",
+        "text": "",
+        "id": 1092
+      },
+      {
+        "hwnd": 11668988,
+        "class": "Static",
+        "text": "",
+        "id": 1091
+      },
+      {
+        "hwnd": 9702980,
+        "class": "Static",
+        "text": "",
+        "id": 1093
+      },
+      {
+        "hwnd": 15927446,
+        "class": "ListBox",
+        "text": "",
+        "id": 1120
+      },
+      {
+        "hwnd": 52103800,
+        "class": "Static",
+        "text": "",
+        "id": 1095
+      },
+      {
+        "hwnd": 1774134,
+        "class": "Button",
+        "text": "帮助(&H)",
+        "id": 1038
+      },
+      {
+        "hwnd": 1447190,
+        "class": "WorkerW",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 11080886,
+        "class": "ReBarWindow32",
+        "text": "",
+        "id": 40965
+      },
+      {
+        "hwnd": 51384232,
+        "class": "TravelBand",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 10618614,
+        "class": "ToolbarWindow32",
+        "text": "导航按钮",
+        "id": 0
+      },
+      {
+        "hwnd": 2364536,
+        "class": "UpBand",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 5505672,
+        "class": "ToolbarWindow32",
+        "text": "上区段",
+        "id": 0
+      },
+      {
+        "hwnd": 14751804,
+        "class": "Address Band Root",
+        "text": "",
+        "id": 41477
+      },
+      {
+        "hwnd": 2495144,
+        "class": "msctls_progress32",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 8132772,
+        "class": "Breadcrumb Parent",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 5835304,
+        "class": "ToolbarWindow32",
+        "text": "地址: E:\\Main\\Pictures\\Camera Roll",
+        "id": 1001
+      },
+      {
+        "hwnd": 1775754,
+        "class": "ToolbarWindow32",
+        "text": "地址区段",
+        "id": 0
+      },
+      {
+        "hwnd": 10487008,
+        "class": "SeparatorBand",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 15340002,
+        "class": "UniversalSearchBand",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 8587522,
+        "class": "Search Box",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 18158006,
+        "class": "SearchEditBoxWrapperClass",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 7279136,
+        "class": "DirectUIHWND",
+        "text": "",
+        "id": 0
+      },
+      {
+        "hwnd": 4854016,
+        "class": "SeparatorBand",
+        "text": "",
+        "id": 0
+      }
+    ]
+  },
+  "logBytes": 607,
+  "logHead": [
+    "Micro-CT Workstation session log",
+    "exported    : 2026-09-18T07:13:52.771Z",
+    "engine      : ct-engine sidecar (JSONL stdio IPC)"
+  ],
+  "whitelistNote": "the dialog filter appends .log, so this probe only proves the app never writes an .exe file; the rejection itself is covered by cargo test",
+  "verdict": true
+}

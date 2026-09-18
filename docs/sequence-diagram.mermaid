@@ -1,0 +1,94 @@
+sequenceDiagram
+    autonumber
+    participant OS as Windows / Monitor
+    participant A as React App / ScanParamsPanel
+    participant P as DesktopPathService
+    participant D as Tauri Dialog Plugin
+    participant T as Tauri Desktop Gateway
+    participant C as EngineClient
+    participant E as ct-engine sidecar
+
+    rect rgb(245,248,252)
+      Note over OS,T: Window initialization and cross-monitor policy
+      OS->>T: create main window
+      T->>T: apply_dynamic_min_size(current monitor work area, DPI)
+      T->>T: maximize main window
+      T->>T: bootstrap_engine on background thread
+      T->>C: spawn ct-engine
+      C->>E: snapshot JSONL v1
+      E-->>C: full EngineSnapshot
+      OS->>T: Moved or ScaleFactorChanged
+      T->>T: schedule_dynamic_min_size (160 ms debounce)
+      T->>T: recompute minimum on main thread
+    end
+
+    rect rgb(250,246,240)
+      Note over A,T: Resolve configured Windows image directory
+      A->>P: resolveDefaultImageDirectory()
+      P->>T: invoke(resolve_default_image_directory)
+      T->>T: SHGetKnownFolderPath(Pictures)
+      T->>T: SHGetKnownFolderPath(Camera Roll)
+      alt Camera Roll is below configured Pictures
+        T-->>P: Camera Roll absolute path
+      else Camera Roll missing or outside Pictures anchor
+        T-->>P: Pictures absolute path
+      end
+      P-->>A: existing path
+      A->>T: engine_command(update_scan_setup{savePath})
+      T->>C: request(update_scan_setup, partial payload)
+      C->>E: JSONL Request v1
+      E->>E: deserialize Option fields and atomically apply patch
+      E-->>C: Response(full snapshot)
+      C-->>A: WorkstationView.scanSetup
+    end
+
+    rect rgb(242,250,245)
+      Note over A,E: Operator fills required blank drafts
+      A->>A: validate Task ID / projection / exposure / duration
+      A->>T: engine_command(update_scan_setup{changedField})
+      T->>C: request(partial patch)
+      C->>E: JSONL Request v1
+      E->>E: range-check patch; invalidate preflight/home
+      E-->>A: full snapshot or ENGINE:INVALID_PARAMETERS
+    end
+
+    rect rgb(248,244,252)
+      Note over A,D: Native directory selection
+      A->>P: chooseImageDirectory(currentPath)
+      P->>D: open(directory=true, multiple=false)
+      alt directory selected
+        D-->>P: absolute path
+        P-->>A: path
+        A->>T: update_scan_setup{savePath:path}
+        T->>C: request
+        C->>E: atomically apply partial patch
+        E-->>A: full snapshot
+      else cancelled
+        D-->>A: null; no command
+      end
+    end
+
+    rect rgb(252,245,245)
+      Note over A,E: Preflight and recovery safety gates
+      A->>T: engine_command(preflight)
+      T->>C: request
+      C->>E: JSONL Request v1
+      E->>E: validate complete setup + connection + latch
+      alt setup incomplete
+        E-->>A: ENGINE:INVALID_PARAMETERS
+      else valid
+        E-->>A: ReadyForHome snapshot
+      end
+      A->>T: home then start_scan
+      T->>C: ordered requests
+      C->>E: require preflight + home + safe latch
+      E-->>A: running snapshot
+      A->>T: stop
+      T->>C: request
+      C->>E: beam off; latch fault; invalidate preflight/home
+      E-->>A: fault snapshot
+      A->>T: estop_release -> preflight -> home
+      T->>C: ordered recovery requests
+      C->>E: unlock only after full recovery sequence
+      E-->>A: safe snapshot
+    end

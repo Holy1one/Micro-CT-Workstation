@@ -2,7 +2,7 @@
 use ct_engine::{timestamp, Request, Response, PROTOCOL_VERSION};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
@@ -28,16 +28,32 @@ impl EngineClient {
             .parent()
             .ok_or("Missing executable directory")?
             .join(filename);
+        if !path.is_file() {
+            return Err(format!(
+                "ct-engine sidecar is missing next to the workstation executable: {}",
+                path.display()
+            )
+            .into());
+        }
+        Self::spawn_at(&path, cfg!(debug_assertions))
+    }
+
+    fn spawn_at(path: &Path, preview: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let mut command = Command::new(path);
-        // Release builds deliberately never enable development simulation.
-        if cfg!(debug_assertions) {
+        if preview {
             command.arg("--preview");
         }
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()?;
+            .spawn()
+            .map_err(|error| {
+                format!(
+                    "failed to launch ct-engine sidecar at {}: {error}",
+                    path.display()
+                )
+            })?;
         let stdin = child.stdin.take().ok_or("Missing engine stdin")?;
         let stdout = child.stdout.take().ok_or("Missing engine stdout")?;
         let (sender, responses) = mpsc::channel();
@@ -116,5 +132,21 @@ impl Drop for EngineClient {
         let _ = self.request("stop", serde_json::json!({}));
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_sidecar_reports_the_exact_path() {
+        let missing = std::env::temp_dir().join("micro-ct-missing-sidecar.exe");
+        let error = EngineClient::spawn_at(&missing, true)
+            .err()
+            .expect("missing sidecar must fail")
+            .to_string();
+        assert!(error.contains("failed to launch ct-engine sidecar at"));
+        assert!(error.contains(&missing.display().to_string()));
     }
 }

@@ -39,11 +39,23 @@
   --lineStrong:   #E0E0E0;   /* 区块之间分隔线（菜单栏/控制台/状态栏上下） */
   --lineField:    #D2D2D7;   /* 输入框描边 */
 
+  /* ---- 最大化窗口的机箱留白（8:5 画布之外的区域 = 机箱框，不是空白） ---- */
+  --viewportGutter:      #E9EAEE;  /* 留白底：比画布深一档，读起来是机箱 */
+  --viewportGutterEdge:  #DCDEE3;  /* 留白两侧边缘渐隐 */
+  --canvasBorder:        #D6D8DD;  /* 画布外框 */
+  --canvasInset:         rgba(255, 255, 255, 0.90);
+  --canvasShadow:        rgba(16, 18, 28, 0.16);
+
   /* ---- 文字层级 ---- */
   --textPrimary:   #1D1D1F;  /* 标题、读数、值 */
   --textSecondary: #6E6E73;  /* 说明、字段名、次级信息 */
   --textMuted:     #8E8E93;  /* 最弱提示、日志时间戳、脚注 */
   --textDisabled:  #AEAEB2;  /* 置灰控件文字 */
+  --onAccent:      #FFFFFF;
+  --glassText:     #172025;
+  --glassBg:       rgba(255, 255, 255, 0.72);
+  --glassBorder:   rgba(23, 32, 37, 0.14);
+  --glassShadow:   rgba(0, 0, 0, 0.18);
 
   /* ---- 语义色（颜色即语义，不要换色表达同一动作） ---- */
   --accent:        #0066CC;  /* 唯一强调色：选中态、链接、PASS 标签 */
@@ -70,9 +82,15 @@
   /* ---- 中央 Live Scene 视口（跟随主题） ---- */
   --sceneBg:     #FAFAFC;    /* 视口底（浅色 = 浅色取景器） */
   --sceneLine:   #E0E0E0;    /* 视口描边 */
-  --rayReady:    0.12;       /* 射线层透明度：就绪（微弱预览） */
-  --rayScanning: 0.85;       /* 射线层透明度：出束中 */
-  --rayPaused:   0.14;       /* 射线层透明度：暂停（基本无束） */
+  /* 3D 舞台：桌面（布纹）与球壁（纸纹）的固有色，以及它们唯一能变白的手段
+     ——自发光强度。靠着色的光照到不了白：球壁法线朝内拿到的是半球光的地色，
+     方向光又被 three 除以 π，所以必须靠 emissive 提亮。 */
+  --stageTable:  #E8E6E2;    /* 桌面圆盘（比球壁暗一档，地平线才有交代） */
+  --stageWall:   #F4F4F6;    /* 上半球球壁 */
+  --stageGlow:   0.55;       /* 桌面/球壁的 emissiveIntensity */
+  --rayReady:    0.05;       /* 射线层透明度：就绪（微弱预览） */
+  --rayScanning: 0.2;        /* 射线层透明度：出束中（四层叠加 + 加色混合） */
+  --rayPaused:   0.06;       /* 射线层透明度：暂停（基本无束） */
   --rayFault:    0;          /* 射线层透明度：故障（强制归零） */
 
   /* ---- 磨砂玻璃控制坞 ---- */
@@ -98,6 +116,7 @@
 
   /* ---- 圆角 / 间距 ---- */
   --radiusCard:    18px;   /* 卡片 */
+  --radiusCardCompact: 12px;
   --radiusPanel:   16px;   /* 规范板 / 大面板 */
   --radiusDock:    37px;   /* 控制坞（高 74 → 全圆角胶囊） */
   --radiusKey:     27px;   /* 坞内键帽（54 直径） */
@@ -108,9 +127,9 @@
   --space4: 16px; --space6: 24px; --space8: 32px;
 
   /* ---- 字体 ---- */
-  --fontUi:   "Inter", "Geist", "Noto Sans SC", system-ui, sans-serif;
-  --fontMono: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
-  --fontCjk:  "Noto Sans SC", "Source Han Sans SC", sans-serif;
+  --fontUi:   "IBM Plex Sans", "Source Sans 3", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  --fontMono: "IBM Plex Mono", "JetBrains Mono", Consolas, monospace;
+  --fontCjk:  "Microsoft YaHei UI", "Segoe UI", sans-serif;
 
   /* ---- 顶栏主题切换段控 ---- */
   --segTrack:    #E8E8ED;
@@ -134,10 +153,22 @@
   --lineStrong:   #2A313C;
   --lineField:    #39424D;
 
+  /* ---- 最大化窗口的机箱留白（暗色：比画布更深的机身） ---- */
+  --viewportGutter:      #0B0E13;
+  --viewportGutterEdge:  #060910;
+  --canvasBorder:        #2A313C;
+  --canvasInset:         rgba(255, 255, 255, 0.06);
+  --canvasShadow:        rgba(0, 0, 0, 0.55);
+
   --textPrimary:   #E8ECF2;
   --textSecondary: #9AA4B2;
   --textMuted:     #7E8898;
   --textDisabled:  #5F6873;
+  --onAccent:      #FFFFFF;
+  --glassText:     #E8ECF2;
+  --glassBg:       rgba(255, 255, 255, 0.12);
+  --glassBorder:   rgba(255, 255, 255, 0.22);
+  --glassShadow:   rgba(0, 0, 0, 0.30);
 
   --accent:      #5AA9F5;   /* 暗底上提亮的 Action Blue（对比度达标） */
   --accentText:  #4ADE80;
@@ -161,9 +192,12 @@
 
   --sceneBg:     #12161D;   /* 暗态场景图为自带深底渲染，见 3D-scene-dark*.png */
   --sceneLine:   #2A313C;
-  --rayReady:    0.10;
-  --rayScanning: 0.80;
-  --rayPaused:   0.12;
+  --stageTable:  #4F525A;   /* 桌面圆盘（暗态沿用同一套结构：比球壁亮一档） */
+  --stageWall:   #3E424A;   /* 上半球球壁 */
+  --stageGlow:   0.18;      /* 暗态自发光压低，否则桌面会脱离夜景 */
+  --rayReady:    0.06;
+  --rayScanning: 0.38;
+  --rayPaused:   0.07;
   --rayFault:    0;
 
   /* 深底玻璃：低透明度白 + 白色描边（与画布 Control Dock · Frosted 一致） */
@@ -204,6 +238,15 @@
 .theme-toggle__seg[aria-pressed="true"] { background: var(--segActiveBg);
   color: var(--segActiveFg); font-weight: 600; }
 
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* ============================================================
    中央 Live Scene 视口（真实感 3D 场景图 + 卡通待测物 + DOM 覆盖层）
    结构：
@@ -229,17 +272,9 @@
 .status-float { position: absolute; right: 12px; display: inline-flex;
   align-items: center; gap: 6px; padding: 5px 10px; border-radius: 10px;
   font-family: var(--fontMono); font-size: 9.5px;
+  color: var(--glassText); background: var(--glassBg); border: 1px solid var(--glassBorder);
   -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18); }
-/* 浅色主题：白玻璃 + 深色文字（场景底为浅灰影棚） */
-.status-float { color: #172025;
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid rgba(23, 32, 37, 0.14); }
-/* 暗色主题：深玻璃 + 浅色文字 */
-[data-theme="dark"] .status-float { color: #E8ECF2;
-  background: rgba(255, 255, 255, 0.12);
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3); }
+  box-shadow: 0 4px 12px var(--glassShadow); }
 .status-float__dot { width: 6px; height: 6px; border-radius: 3px; }
 /* 分层 / 实时 3D 方案保留：射线层与呼吸动画走 --ray* / --beamGlow 令牌 */
 .scene-ray { position: absolute; opacity: 0; pointer-events: none;

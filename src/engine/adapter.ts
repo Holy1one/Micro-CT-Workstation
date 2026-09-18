@@ -1,11 +1,15 @@
+import { TauriEngineAdapter } from "./tauriAdapter";
 import type { EngineAdapter } from "./types";
 import { WorkstationAdapter } from "./workstationAdapter";
 
+function isTauriRuntime(): boolean {
+  const runtimeWindow = window as Window & {
+    __TAURI_INTERNALS__?: unknown;
+    __TAURI__?: unknown;
+  };
+  return Boolean(runtimeWindow.__TAURI_INTERNALS__ ?? runtimeWindow.__TAURI__);
+}
+
 export function createEngineAdapter(): EngineAdapter {
-  // The RTS9060 link layer (scan workflow + device transports, ported from the
-  // proven Python host in kernal/software) is the single device/task owner for
-  // every runtime — browser dev server and the Tauri desktop shell alike.
-  // The Rust ct-engine sidecar remains in place as the future bridge point for
-  // physical serial / camera SDKs; its protocol and code are untouched.
-  return new WorkstationAdapter();
+  return isTauriRuntime() ? new TauriEngineAdapter() : new WorkstationAdapter();
 }

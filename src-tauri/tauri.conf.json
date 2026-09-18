@@ -4,13 +4,13 @@
   "version": "0.1.0",
   "identifier": "edu.lzu.microct.workstation",
   "build": {
-    "beforeDevCommand": "npm run dev -- --port 4173 --strictPort",
+    "beforeDevCommand": "npm run engine:build && npm run dev -- --port 4173 --strictPort",
     "devUrl": "http://127.0.0.1:4173",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run engine:build && npm run build",
     "frontendDist": "../dist/client"
   },
   "app": {
-    "windows": [{"title": "Micro-CT Workstation", "width": 1600, "height": 900, "minWidth": 1280, "minHeight": 720}],
+    "windows": [{"title": "Micro-CT Workstation", "width": 1728, "height": 972, "fullscreen": false, "decorations": true, "resizable": true, "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu-sandbox"}],
     "security": {"csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"}
   },
   "bundle": {

@@ -1,5 +1,24 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Folder } from "@phosphor-icons/react";
+import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
 import { useEngine } from "./engine/useEngine";
+import {
+  chooseImageDirectory,
+  exportSessionLog,
+  resolveDefaultImageDirectory,
+  revealDirectory,
+} from "./platform/desktopPaths";
+import {
+  DEFAULT_SCAN_SETUP,
+  MENU_GROUPS,
+  type MenuActionId,
+  type MenuAvailability,
+  type TopMenu,
+} from "./menuActions";
+import { LiveSceneCanvas } from "./scene/LiveSceneCanvas";
+import { StaticSceneFallback } from "./scene/StaticSceneFallback";
+import { useSceneFallback } from "./scene/useSceneFallback";
+import type { ViewPreset } from "./scene/types";
 import type {
   ConsoleLogLine,
   DeviceId,
@@ -39,12 +58,6 @@ function logTime(timestamp: string): string {
   return `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}.${p(date.getMilliseconds(), 3)}`;
 }
 
-function formatHms(totalSeconds: number): string {
-  const s = Math.max(0, Math.min(359999, Math.round(totalSeconds)));
-  const p = (value: number) => String(value).padStart(2, "0");
-  return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
-}
-
 function parseHms(text: string): number | null {
   const match = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec(text.trim());
   if (!match) return null;
@@ -54,18 +67,116 @@ function parseHms(text: string): number | null {
 const toneClass = (tone: string) => `tone-${tone}`;
 
 /* ------------------------------------------------------------------ */
-/* Menu bar                                                            */
+/* Menu bar + floating drop-down submenu                               */
 /* ------------------------------------------------------------------ */
 
-function MenuBar({ theme, onTheme }: { theme: Theme; onTheme: (theme: Theme) => void }) {
+/** Seconds -> hh:mm:ss, the format the Max X-ray field accepts. */
+function formatHms(total: number): string {
+  const p = (value: number): string => String(value).padStart(2, "0");
+  return `${p(Math.floor(total / 3600))}:${p(Math.floor((total % 3600) / 60))}:${p(total % 60)}`;
+}
+
+/** Plain-text session log for `File → Export Session Log…`. */
+function sessionLogText(ws: WorkstationView, adapterKind: "developer_preview" | "tauri"): string {
+  const header = [
+    "Micro-CT Workstation session log",
+    `exported    : ${new Date().toISOString()}`,
+    `engine      : ${adapterKind === "tauri" ? "ct-engine sidecar (JSONL stdio IPC)" : "browser developer preview"}`,
+    `task        : ${ws.scanSetup.taskId || "(not configured)"}`,
+    `save path   : ${ws.scanSetup.savePath || "(not configured)"}`,
+    `acquisition : ${ws.summary.acquisition}`,
+    `output      : ${ws.summary.output}`,
+    `progress    : ${ws.progress.captured} / ${ws.progress.total} views · ${ws.progress.percent}%`,
+    `phase       : ${ws.phaseWord}`,
+    "",
+  ].join("\n");
+  const lines = ws.consoleLogs
+    .map((entry) => `[${entry.timestamp}] ${entry.level} · ${entry.source} · ${entry.message}`)
+    .join("\n");
+  return `${header}${lines}\n`;
+}
+
+function MenuBar({
+  theme,
+  onTheme,
+  snapshot,
+  adapterKind,
+  availability,
+  onAction,
+}: {
+  theme: Theme;
+  onTheme: (theme: Theme) => void;
+  snapshot: EngineSnapshot;
+  adapterKind: "developer_preview" | "tauri";
+  availability: MenuAvailability;
+  onAction: (id: MenuActionId) => void;
+}) {
+  const [openMenu, setOpenMenu] = useState<TopMenu | null>(null);
+  const barRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!openMenu) return;
+    const onPointerDown = (event: MouseEvent): void => {
+      if (!barRef.current?.contains(event.target as Node)) setOpenMenu(null);
+    };
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setOpenMenu(null);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [openMenu]);
+
   return (
-    <header className="menu-bar">
+    <header className="menu-bar" ref={barRef}>
       <nav className="sys-menu" aria-label="Application menu">
-        {["File", "Edit", "Tools", "Help"].map((item) => (
-          <button key={item} type="button">
-            {item}
-          </button>
-        ))}
+        {MENU_GROUPS.map((group) => {
+          const open = openMenu === group.label;
+          return (
+            <span className="menu-group" key={group.label}>
+              <button
+                type="button"
+                className={`sys-menu__item ${open ? "is-open" : ""}`}
+                aria-haspopup="menu"
+                aria-expanded={open}
+                onClick={() => setOpenMenu(open ? null : group.label)}
+                onMouseEnter={() => {
+                  if (openMenu) setOpenMenu(group.label);
+                }}
+              >
+                {group.label}
+              </button>
+              {open ? (
+                <div className="menu-dropdown" role="menu" aria-label={`${group.label} menu`}>
+                  {group.entries.map((entry) => {
+                    const state = availability[entry.id];
+                    return (
+                      <button
+                        key={entry.id}
+                        type="button"
+                        role="menuitem"
+                        className="menu-dropdown__item"
+                        disabled={!state.available}
+                        aria-disabled={!state.available}
+                        title={state.reason ?? entry.label}
+                        onClick={() => {
+                          setOpenMenu(null);
+                          onAction(entry.id);
+                        }}
+                      >
+                        {entry.label}
+                        {state.reason ? <small className="menu-dropdown__note">{state.reason}</small> : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </span>
+          );
+        })}
       </nav>
       <span className="menu-spacer" />
       <div className="theme-toggle" role="group" aria-label="Theme">
@@ -81,10 +192,12 @@ function MenuBar({ theme, onTheme }: { theme: Theme; onTheme: (theme: Theme) => 
           </button>
         ))}
       </div>
-      <span className="badge badge--dev">DEVELOPER PREVIEW</span>
-      <span className="badge badge--engine">
+      <span className={`badge ${snapshot.mode === "developer_preview" ? "badge--dev" : "badge--locked"}`}>
+        {snapshot.mode === "developer_preview" ? "DEVELOPER PREVIEW · NO REAL HARDWARE" : "PRODUCTION LOCKED"}
+      </span>
+      <span className={`badge badge--engine badge--${snapshot.connectionState}`}>
         <i aria-hidden="true" />
-        ENGINE ONLINE
+        {adapterKind === "tauri" ? "TAURI / CT-ENGINE" : "BROWSER PREVIEW"} · {snapshot.connectionState.toUpperCase()}
       </span>
     </header>
   );
@@ -94,34 +207,77 @@ function MenuBar({ theme, onTheme }: { theme: Theme; onTheme: (theme: Theme) => 
 /* Left column                                                         */
 /* ------------------------------------------------------------------ */
 
-function DevicePanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void }) {
+function DevicePanel({
+  ws,
+  busy,
+  dispatch,
+}: {
+  ws: WorkstationView;
+  busy: boolean;
+  dispatch: (c: EngineCommand) => Promise<void>;
+}) {
+  const [pendingDevice, setPendingDevice] = useState<DeviceId | null>(null);
+  const setup = ws.scanSetup;
+  const setupComplete =
+    setup.taskId.trim().length > 0 &&
+    setup.savePath.trim().length > 0 &&
+    Number.isInteger(setup.projectionCount) &&
+    setup.projectionCount >= 1 &&
+    setup.projectionCount <= 360 &&
+    Number.isInteger(setup.exposureMs) &&
+    setup.exposureMs >= 1 &&
+    setup.exposureMs <= 10000 &&
+    Number.isInteger(setup.maxXraySec) &&
+    setup.maxXraySec >= 1 &&
+    setup.maxXraySec <= 359999;
+  const runRetry = async (device: DeviceId): Promise<void> => {
+    setPendingDevice(device);
+    try {
+      await dispatch({ type: "retry_device", device });
+    } finally {
+      setPendingDevice(null);
+    }
+  };
+
   return (
-    <section className="panel">
+    <section className="panel device-panel">
       <div className="panel__header">
         <h2>Device Connection Status</h2>
-        <span className="chip chip--ok">{ws.onlineSummary}</span>
       </div>
       <div className="device-list">
-        {ws.devices.map((device) => (
-          <div className="device-row" key={device.id}>
-            <div className="device-row__top">
-              <strong>{device.name}</strong>
-              <span className={`device-row__word ${toneClass(device.tone)}`}>{device.word}</span>
-              <button
-                type="button"
-                className="retry-link"
-                onClick={() => void dispatch({ type: "retry_device", device: device.id as DeviceId })}
-              >
-                Retry
-              </button>
+        {ws.devices.map((device) => {
+          const retrying = pendingDevice === device.id;
+          return (
+            <div className="device-row" key={device.id}>
+              <div className="device-row__top">
+                <strong>{device.name}</strong>
+                <span className={`device-row__word ${toneClass(device.tone)}`}>{device.word}</span>
+                <button
+                  type="button"
+                  className="retry-btn"
+                  disabled={busy || pendingDevice !== null}
+                  aria-busy={retrying}
+                  onClick={() => void runRetry(device.id as DeviceId)}
+                >
+                  {retrying ? "Retrying…" : "Retry"}
+                </button>
+              </div>
+              <div className="device-row__spec">{device.spec}</div>
             </div>
-            <div className="device-row__spec">{device.spec}</div>
-          </div>
-        ))}
+          );
+        })}
       </div>
       <div className="preflight-block">
         <div className="preflight-block__top">
-          <span>One-click System Pre-inspection</span>
+          <button
+            type="button"
+            className="preflight-btn"
+            disabled={!setupComplete || busy || ws.dataState === "scanning" || ws.dataState === "paused"}
+            aria-busy={ws.preflight.tone === "running"}
+            onClick={() => void dispatch({ type: "preflight" })}
+          >
+            {ws.preflight.tone === "running" ? "Inspecting…" : "Run Preflight"}
+          </button>
           <strong className={ws.preflight.tone === "pass" ? "tone-ok" : ws.preflight.tone === "fail" ? "tone-danger" : "tone-warn"}>
             {ws.preflight.word}
           </strong>
@@ -131,128 +287,165 @@ function DevicePanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engi
         </div>
         <div className="preflight-block__sub">{ws.preflight.subline}</div>
       </div>
+      <div className="device-online-summary">
+        <span>LINK SUMMARY</span>
+        <strong>{ws.onlineSummary}</strong>
+      </div>
     </section>
   );
 }
 
-function ScanParamsPanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void }) {
+function ScanParamsPanel({
+  ws,
+  busy,
+  desktopRuntime,
+  dispatch,
+  syncRevision,
+}: {
+  ws: WorkstationView;
+  busy: boolean;
+  desktopRuntime: boolean;
+  dispatch: (c: EngineCommand) => Promise<void>;
+  /** Bumped when a menu command changed the setup, so drafts refill from the engine. */
+  syncRevision: number;
+}) {
   const setup = ws.scanSetup;
-  const locked = ws.dataState === "scanning" || ws.dataState === "paused";
-  const [savePath, setSavePath] = useState(setup.savePath);
-  const [taskId, setTaskId] = useState(setup.taskId);
-  const [views, setViews] = useState(String(setup.projectionCount));
-  const [exposure, setExposure] = useState(String(setup.exposureMs));
-  const [maxXray, setMaxXray] = useState(formatHms(setup.maxXraySec));
+  const locked = busy || ws.dataState === "scanning" || ws.dataState === "paused";
+  const defaultPathRequested = useRef(false);
+  const taskIdRef = useRef<HTMLInputElement | null>(null);
+  const [savePath, setSavePath] = useState("");
+  const [taskId, setTaskId] = useState("");
+  const [views, setViews] = useState("");
+  const [exposure, setExposure] = useState("");
+  const [maxXray, setMaxXray] = useState("");
+  const [pathError, setPathError] = useState<string | null>(null);
 
   useEffect(() => {
-    setSavePath(setup.savePath);
-    setTaskId(setup.taskId);
-    setViews(String(setup.projectionCount));
-    setExposure(String(setup.exposureMs));
-    setMaxXray(formatHms(setup.maxXraySec));
-    // Sync from the workflow only while idle; never clobber an edit mid-scan.
-  }, [setup.savePath, setup.taskId, setup.projectionCount, setup.exposureMs, setup.maxXraySec, locked]);
+    if (!desktopRuntime || defaultPathRequested.current || savePath.trim()) return;
+    defaultPathRequested.current = true;
+    void resolveDefaultImageDirectory()
+      .then((path) => {
+        setSavePath(path);
+        setPathError(null);
+        return dispatch({ type: "update_scan_setup", setup: { savePath: path } });
+      })
+      .catch((reason: unknown) => {
+        setSavePath("");
+        setPathError(reason instanceof Error ? reason.message : String(reason));
+      });
+  }, [desktopRuntime, dispatch, savePath]);
 
-  const commit = (patch: Partial<WorkstationView["scanSetup"]>) => {
-    dispatch({
-      type: "update_scan_setup",
-      setup: {
-        savePath,
-        taskId,
-        projectionCount: setup.projectionCount,
-        exposureMs: setup.exposureMs,
-        maxXraySec: setup.maxXraySec,
-        ...patch,
-      },
-    });
+  const commitText = (field: "savePath" | "taskId", value: string): void => {
+    const trimmed = value.trim();
+    if (trimmed) void dispatch({ type: "update_scan_setup", setup: { [field]: trimmed } });
   };
 
+  const commitInteger = (field: "projectionCount" | "exposureMs", value: string, min: number, max: number): void => {
+    if (!/^\d+$/.test(value)) return;
+    const parsed = Number(value);
+    if (Number.isInteger(parsed) && parsed >= min && parsed <= max) {
+      void dispatch({ type: "update_scan_setup", setup: { [field]: parsed } });
+    }
+  };
+
+  const commitDuration = (): void => {
+    const seconds = parseHms(maxXray);
+    if (seconds !== null && seconds >= 1 && seconds <= 359999) {
+      void dispatch({ type: "update_scan_setup", setup: { maxXraySec: seconds } });
+    }
+  };
+
+  const chooseDirectory = async (): Promise<void> => {
+    try {
+      const selected = await chooseImageDirectory(savePath);
+      if (!selected) return;
+      setSavePath(selected);
+      setPathError(null);
+      await dispatch({ type: "update_scan_setup", setup: { savePath: selected } });
+    } catch (reason: unknown) {
+      setPathError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const viewsInvalid = views !== "" && (!/^\d+$/.test(views) || Number(views) < 1 || Number(views) > 360);
+  const exposureInvalid = exposure !== "" && (!/^\d+$/.test(exposure) || Number(exposure) < 1 || Number(exposure) > 10000);
+  const durationSeconds = parseHms(maxXray);
+  const durationInvalid = maxXray !== "" && (durationSeconds === null || durationSeconds < 1 || durationSeconds > 359999);
+
+  // New Scan Task / Reset Parameters go through the engine, so the drafts are
+  // refilled from the engine snapshot once the next poll lands.
+  useEffect(() => {
+    if (syncRevision === 0) return;
+    setTaskId(setup.taskId);
+    setSavePath(setup.savePath);
+    setViews(setup.projectionCount > 0 ? String(setup.projectionCount) : "");
+    setExposure(setup.exposureMs > 0 ? String(setup.exposureMs) : "");
+    setMaxXray(setup.maxXraySec > 0 ? formatHms(setup.maxXraySec) : "");
+    taskIdRef.current?.focus();
+  }, [syncRevision]);
+
   return (
-    <section className="panel">
+    <section className="panel scan-panel">
       <div className="panel__header">
         <h2>Scan Parameters</h2>
-        <span className="chip chip--accent">{setup.projectionCount} PROJECTIONS</span>
+        <span className="chip chip--accent">
+          {setup.projectionCount > 0 ? `${setup.projectionCount} PROJECTIONS` : "NOT CONFIGURED"}
+        </span>
       </div>
       <div className="param-stack">
-        <label className="param-field">
-          <span>Save Path</span>
+        <label className="param-field param-field--full">
+          <span>Task ID</span>
           <input
-            value={savePath}
+            ref={taskIdRef}
+            value={taskId}
             disabled={locked}
-            onChange={(event) => setSavePath(event.target.value)}
-            onBlur={() => savePath.trim() && commit({ savePath })}
+            onChange={(event) => setTaskId(event.target.value)}
+            onBlur={() => commitText("taskId", taskId)}
           />
         </label>
-        <label className="param-field">
-          <span>Task ID</span>
-          <div className="param-field__row">
+        <label className="param-field param-field--full">
+          <span>Save Path</span>
+          <div className={`path-control ${pathError ? "is-invalid" : ""}`}>
             <input
-              value={taskId}
+              value={savePath}
               disabled={locked}
-              onChange={(event) => setTaskId(event.target.value)}
-              onBlur={() => taskId.trim() && commit({ taskId })}
+              aria-invalid={Boolean(pathError)}
+              placeholder={desktopRuntime ? "Windows image directory unavailable" : "Unavailable in developer preview"}
+              onChange={(event) => {
+                setSavePath(event.target.value);
+                setPathError(null);
+              }}
+              onBlur={() => commitText("savePath", savePath)}
             />
-            <button type="button" className="browse-link" disabled={locked}>
-              Browse…
+            <button
+              type="button"
+              className="folder-btn"
+              disabled={locked || !desktopRuntime}
+              title={desktopRuntime ? "Select image directory" : "Native directory selection is unavailable in developer preview"}
+              aria-label="Select image directory"
+              onClick={() => void chooseDirectory()}
+            >
+              <Folder size={18} weight="duotone" aria-hidden="true" />
             </button>
           </div>
+          {pathError ? <small className="field-error">{pathError}</small> : null}
         </label>
-        <div className="param-line">
-          <span>Total Projection Count</span>
-          <div className="param-line__value">
-            <input
-              className="param-line__input"
-              value={views}
-              disabled={locked}
-              inputMode="numeric"
-              onChange={(event) => setViews(event.target.value.replace(/[^0-9]/g, ""))}
-              onBlur={() => {
-                const count = Math.max(1, Math.min(360, Number(views) || setup.projectionCount));
-                setViews(String(count));
-                commit({ projectionCount: count });
-              }}
-            />
-            <small>views · {setup.angleStepDeg.toFixed(2)}° / view</small>
-          </div>
-        </div>
-        <div className="param-line">
-          <span>Single Shot Exposure</span>
-          <div className="param-line__value">
-            <input
-              className="param-line__input"
-              value={exposure}
-              disabled={locked}
-              inputMode="numeric"
-              onChange={(event) => setExposure(event.target.value.replace(/[^0-9]/g, ""))}
-              onBlur={() => {
-                const ms = Math.max(1, Math.min(10000, Number(exposure) || setup.exposureMs));
-                setExposure(String(ms));
-                commit({ exposureMs: ms });
-              }}
-            />
-            <small>ms</small>
-          </div>
-        </div>
-        <div className="param-line">
-          <span>Max X-ray Duration</span>
-          <div className="param-line__value">
-            <input
-              className="param-line__input param-line__input--wide"
-              value={maxXray}
-              disabled={locked}
-              onChange={(event) => setMaxXray(event.target.value)}
-              onBlur={() => {
-                const seconds = parseHms(maxXray);
-                if (seconds !== null && seconds > 0) {
-                  commit({ maxXraySec: seconds });
-                  setMaxXray(formatHms(seconds));
-                } else {
-                  setMaxXray(formatHms(setup.maxXraySec));
-                }
-              }}
-            />
+        <div className="scan-input-grid">
+          <label className={`numeric-field ${viewsInvalid ? "is-invalid" : ""}`}>
+            <span>Total Projections</span>
+            <input value={views} disabled={locked} inputMode="numeric" aria-invalid={viewsInvalid} onChange={(event) => setViews(event.target.value)} onBlur={() => commitInteger("projectionCount", views, 1, 360)} />
+            <small>1–360 views</small>
+          </label>
+          <label className={`numeric-field ${exposureInvalid ? "is-invalid" : ""}`}>
+            <span>Exposure</span>
+            <input value={exposure} disabled={locked} inputMode="numeric" aria-invalid={exposureInvalid} onChange={(event) => setExposure(event.target.value)} onBlur={() => commitInteger("exposureMs", exposure, 1, 10000)} />
+            <small>1–10000 ms</small>
+          </label>
+          <label className={`numeric-field ${durationInvalid ? "is-invalid" : ""}`}>
+            <span>Max X-ray</span>
+            <input value={maxXray} disabled={locked} aria-invalid={durationInvalid} placeholder="hh:mm:ss" onChange={(event) => setMaxXray(event.target.value)} onBlur={commitDuration} />
             <small>hh:mm:ss</small>
-          </div>
+          </label>
         </div>
       </div>
     </section>
@@ -323,15 +516,22 @@ function ControlDock({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engi
 }
 
 function LiveScene({ ws, theme, dispatch }: { ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void }) {
-  const [viewPreset, setViewPreset] = useState<"iso" | "top">("iso");
-  const sceneSrc = `/assets/3D-scene-${theme}${ws.scene.rotated ? "-144" : ""}.png`;
+  const [viewPreset, setViewPreset] = useState<ViewPreset>("iso");
+  const fallback = useSceneFallback();
+  const sceneView = {
+    dataState: ws.dataState,
+    angleDeg: ws.scene.angleDeg,
+    theme,
+    beamOn: ws.xray.beamOn,
+    xrayLatched: ws.xray.latched,
+  } as const;
   return (
     <section className="panel live-panel">
       <div className="scene-toolbar">
         <span className="chip chip--accent">3D RENDER</span>
         <h2>Live Scene</h2>
         <span className="menu-spacer" />
-        {(["iso", "top"] as const).map((preset) => (
+        {(["iso", "front", "top"] as const).map((preset) => (
           <button
             key={preset}
             type="button"
@@ -344,7 +544,11 @@ function LiveScene({ ws, theme, dispatch }: { ws: WorkstationView; theme: Theme;
         ))}
       </div>
       <div className="live-scene">
-        <img className="scene-render" src={sceneSrc} alt="Micro-CT workspace: camera, turntable with sample, X-ray source" draggable={false} />
+        {fallback.reason ? (
+          <StaticSceneFallback view={sceneView} reason={fallback.reason} />
+        ) : (
+          <LiveSceneCanvas view={sceneView} preset={viewPreset} onContextLost={fallback.setContextLost} />
+        )}
         <span className="live-indicator">
           <i aria-hidden="true" />
           LIVE RENDER
@@ -375,7 +579,7 @@ function LiveScene({ ws, theme, dispatch }: { ws: WorkstationView; theme: Theme;
 /* Right column                                                        */
 /* ------------------------------------------------------------------ */
 
-function XrayPanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void }) {
+function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean; dispatch: (c: EngineCommand) => Promise<void> }) {
   const [kvDraft, setKvDraft] = useState(ws.xray.setKv.toFixed(1));
   const [uaDraft, setUaDraft] = useState(ws.xray.setUa.toFixed(1));
   useEffect(() => {
@@ -391,39 +595,41 @@ function XrayPanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engine
       </div>
       <div className="xray-channels">
         <div className="xray-channel">
-          <span className="xray-channel__label">SET kV</span>
+          <span className="xray-channel__label">VOLTAGE</span>
           <div className="xray-channel__row">
-            <input
-              className="xray-channel__well"
-              value={kvDraft}
-              inputMode="decimal"
-              onChange={(event) => setKvDraft(event.target.value)}
-              onBlur={() => setKvDraft((Number(kvDraft) || ws.xray.setKv).toFixed(1))}
-            />
-            <div className="xray-channel__side">
-              <small>MON {ws.xray.monKv.toFixed(1)} kV</small>
-              <button type="button" className="send-btn" onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) || ws.xray.setKv })}>
-                SEND V
-              </button>
+            <div className="xray-channel__control">
+              <span className="xray-channel__key">SET</span>
+              <input
+                className="xray-channel__well"
+                value={kvDraft}
+                disabled={busy}
+                inputMode="decimal"
+                onChange={(event) => setKvDraft(event.target.value)}
+              />
+              <span className="xray-channel__monitor">MON {ws.xray.monKv.toFixed(1)} kV</span>
             </div>
+            <button type="button" className="send-btn" disabled={busy || !Number.isFinite(Number(kvDraft))} onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) })}>
+              SEND V
+            </button>
           </div>
         </div>
         <div className="xray-channel">
-          <span className="xray-channel__label">SET µA</span>
+          <span className="xray-channel__label">CURRENT</span>
           <div className="xray-channel__row">
-            <input
-              className="xray-channel__well"
-              value={uaDraft}
-              inputMode="decimal"
-              onChange={(event) => setUaDraft(event.target.value)}
-              onBlur={() => setUaDraft((Number(uaDraft) || ws.xray.setUa).toFixed(1))}
-            />
-            <div className="xray-channel__side">
-              <small>MON {ws.xray.monUa.toFixed(1)} µA</small>
-              <button type="button" className="send-btn" onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) || ws.xray.setUa })}>
-                SEND I
-              </button>
+            <div className="xray-channel__control">
+              <span className="xray-channel__key">SET</span>
+              <input
+                className="xray-channel__well"
+                value={uaDraft}
+                disabled={busy}
+                inputMode="decimal"
+                onChange={(event) => setUaDraft(event.target.value)}
+              />
+              <span className="xray-channel__monitor">MON {ws.xray.monUa.toFixed(1)} µA</span>
             </div>
+            <button type="button" className="send-btn" disabled={busy || !Number.isFinite(Number(uaDraft))} onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) })}>
+              SEND I
+            </button>
           </div>
         </div>
       </div>
@@ -440,7 +646,7 @@ function XrayPanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engine
       <button
         type="button"
         className={`switch-btn switch-btn--block ${ws.xray.beamOn ? "switch-btn--on" : "switch-btn--idle"}`}
-        disabled={ws.dataState === "fault"}
+        disabled={busy || ws.dataState === "fault"}
         onClick={() => void dispatch({ type: "xray_toggle" })}
       >
         {ws.xray.beamOn ? "Xray Disable" : "Xray Enable"}
@@ -458,7 +664,7 @@ function XrayPanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engine
         <button
           type="button"
           className={`switch-btn switch-btn--chip ${ws.xray.timerOn ? "switch-btn--on" : "switch-btn--idle"}`}
-          disabled={ws.dataState === "scanning"}
+          disabled={busy || ws.dataState === "scanning"}
           onClick={() => void dispatch({ type: "timer_toggle" })}
         >
           {ws.xray.timerOn ? "Timer On" : "Timer Off"}
@@ -480,7 +686,7 @@ function XrayPanel({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engine
 
 function OperationPanel({ ws }: { ws: WorkstationView }) {
   return (
-    <section className="panel">
+    <section className="panel operation-panel">
       <div className="panel__header">
         <h2>Operation Status</h2>
         <span className={`chip chip--${ws.phaseTone}`}>{ws.phaseWord}</span>
@@ -631,57 +837,458 @@ function BottomConsole({ ws }: { ws: WorkstationView }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Menu dialogs (overlay on the fixed design canvas, layout unchanged) */
+/* ------------------------------------------------------------------ */
+
+type DialogKind = "guide" | "safety" | "about" | "preferences" | "diagnostics";
+
+const DIALOG_TITLES: Record<DialogKind, string> = {
+  guide: "User Guide",
+  safety: "Safety Notes",
+  about: "About Micro-CT Workstation",
+  preferences: "Preferences",
+  diagnostics: "Device Diagnostics",
+};
+
+const APP_VERSION = "0.1.0";
+
+function InfoDialog({
+  kind,
+  ws,
+  snapshot,
+  adapterKind,
+  theme,
+  onTheme,
+  onClose,
+}: {
+  kind: DialogKind;
+  ws: WorkstationView;
+  snapshot: EngineSnapshot;
+  adapterKind: "developer_preview" | "tauri";
+  theme: Theme;
+  onTheme: (theme: Theme) => void;
+  onClose: () => void;
+}) {
+  let body: ReactNode = null;
+  if (kind === "guide") {
+    body = (
+      <ol className="modal-list">
+        <li>
+          <strong>Configure the scan.</strong> Task ID, Save Path, Total Projections, Exposure and Max X-ray
+          (hh:mm:ss) must all be filled: preflight stays blocked until every field is set.
+        </li>
+        <li>
+          <strong>Run preflight</strong> (Tools → Run Preflight). Eight checks run over the link; the engine
+          rejects exposure until they pass.
+        </li>
+        <li>
+          <strong>Home all axes</strong> (Tools → Home All Axes, or the dock). HOME is required before any
+          exposure and is invalidated whenever a parameter changes.
+        </li>
+        <li>
+          <strong>Start the scan.</strong> Pause holds the pulse counter, Resume continues, E-STOP latches the
+          output off.
+        </li>
+        <li>
+          <strong>After E-STOP</strong> repeat HOME and preflight: the latch is released by the engine, never by
+          the operator alone.
+        </li>
+      </ol>
+    );
+  } else if (kind === "safety") {
+    body = (
+      <ul className="modal-list">
+        <li>
+          <strong>E-STOP is fail-closed.</strong> It latches the X-ray output off and invalidates preflight and
+          HOME in the engine.
+        </li>
+        <li>
+          <strong>Preflight before HOME, HOME before exposure.</strong> The engine rejects HOME without
+          preflight and rejects exposure without HOME.
+        </li>
+        <li>
+          <strong>Any parameter change invalidates the safety chain.</strong> Editing Task ID, Save Path,
+          projections, exposure or Max X-ray resets preflight and HOME.
+        </li>
+        <li>
+          <strong>This build drives no hardware.</strong> {snapshot.modeLabel}. Interlocks, beam and turntable
+          motion are simulated; never treat a passing preflight as a verified interlock.
+        </li>
+      </ul>
+    );
+  } else if (kind === "about") {
+    body = (
+      <dl className="modal-facts">
+        <div>
+          <dt>Application</dt>
+          <dd>Micro-CT Workstation</dd>
+        </div>
+        <div>
+          <dt>Version</dt>
+          <dd>{APP_VERSION}</dd>
+        </div>
+        <div>
+          <dt>Engine</dt>
+          <dd>{snapshot.modeLabel}</dd>
+        </div>
+        <div>
+          <dt>Control chain</dt>
+          <dd>
+            {adapterKind === "tauri"
+              ? "React → Tauri invoke → Rust EngineClient → ct-engine (JSONL stdio IPC)"
+              : "Browser developer preview (no ct-engine sidecar)"}
+          </dd>
+        </div>
+        <div>
+          <dt>Connection</dt>
+          <dd>{snapshot.connectionState.toUpperCase()}</dd>
+        </div>
+        <div>
+          <dt>Devices</dt>
+          <dd>{ws.onlineSummary}</dd>
+        </div>
+      </dl>
+    );
+  } else if (kind === "preferences") {
+    body = (
+      <div className="modal-stack">
+        <div className="modal-row">
+          <span>Interface theme</span>
+          <div className="theme-toggle" role="group" aria-label="Theme">
+            {(["light", "dark"] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                className="theme-toggle__seg"
+                aria-pressed={theme === value}
+                onClick={() => onTheme(value)}
+              >
+                {value === "light" ? "Light" : "Dark"}
+              </button>
+            ))}
+          </div>
+        </div>
+        <dl className="modal-facts">
+          <div>
+            <dt>Engine bridge</dt>
+            <dd>{adapterKind === "tauri" ? "TAURI / CT-ENGINE" : "BROWSER PREVIEW"}</dd>
+          </div>
+          <div>
+            <dt>Canvas</dt>
+            <dd>Fixed 1920 × 1080 design canvas, scaled as one unit</dd>
+          </div>
+          <div>
+            <dt>Safety model</dt>
+            <dd>Engine-owned · fail-closed E-STOP · preflight then HOME</dd>
+          </div>
+        </dl>
+      </div>
+    );
+  } else {
+    body = (
+      <div className="modal-stack">
+        <p className="modal-note">
+          Reconnect requested for every device; the engine reports the result in the log stream below.
+        </p>
+        <dl className="modal-facts">
+          {ws.devices.map((device) => (
+            <div key={device.id}>
+              <dt>{device.name}</dt>
+              <dd>
+                <span className={`tone-${device.tone}`}>{device.word}</span> · {device.spec}
+              </dd>
+            </div>
+          ))}
+          <div>
+            <dt>Link summary</dt>
+            <dd>{ws.onlineSummary}</dd>
+          </div>
+        </dl>
+      </div>
+    );
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <section
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="menu-dialog-title"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="modal-card__head">
+          <h2 id="menu-dialog-title">{DIALOG_TITLES[kind]}</h2>
+          <button type="button" className="modal-card__close" onClick={onClose} aria-label="Close dialog">
+            ×
+          </button>
+        </header>
+        <div className="modal-card__body">{body}</div>
+      </section>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* App                                                                 */
 /* ------------------------------------------------------------------ */
 
 export function App() {
-  const { snapshot, error, dispatch } = useEngine();
+  const { adapterKind, snapshot, busy, error, dispatch } = useEngine();
   const [theme, setTheme] = useTheme();
+  const [dialog, setDialog] = useState<DialogKind | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [canvasLayout, setCanvasLayout] = useState<CanvasLayout>(() =>
+    computeCanvasLayout(window.innerWidth, window.innerHeight),
+  );
   const ws: WorkstationView | undefined = snapshot?.workstation;
+  const [setupSync, setSetupSync] = useState(0);
+  const setupPendingSync = useRef(false);
+  const setupSignature = ws
+    ? [ws.scanSetup.taskId, ws.scanSetup.savePath, ws.scanSetup.projectionCount,
+       ws.scanSetup.exposureMs, ws.scanSetup.maxXraySec].join("|")
+    : "";
+  const lastSetupSignature = useRef(setupSignature);
+
+  // Menu commands mutate the setup through the engine; refill the panel drafts
+  // only once the engine snapshot actually changed.
+  useEffect(() => {
+    if (setupSignature === lastSetupSignature.current) return;
+    lastSetupSignature.current = setupSignature;
+    if (!setupPendingSync.current) return;
+    setupPendingSync.current = false;
+    setSetupSync((value) => value + 1);
+  }, [setupSignature]);
+
+  useEffect(() => {
+    const updateCanvasLayout = (): void => {
+      setCanvasLayout(computeCanvasLayout(window.innerWidth, window.innerHeight));
+    };
+    updateCanvasLayout();
+    window.addEventListener("resize", updateCanvasLayout);
+    return () => window.removeEventListener("resize", updateCanvasLayout);
+  }, []);
 
   useEffect(() => {
     if (ws) document.documentElement.dataset.state = ws.dataState;
   }, [ws]);
 
-  if (!snapshot || !ws) {
+  const availability: MenuAvailability = useMemo(() => {
+    const ok = { available: true, reason: null };
+    const blocked = (reason: string) => ({ available: false, reason });
+    const setup = ws?.scanSetup;
+    const running = ws?.dataState === "scanning" || ws?.dataState === "paused";
+    const configured = Boolean(
+      setup &&
+        setup.taskId.trim() &&
+        setup.savePath.trim() &&
+        setup.projectionCount > 0 &&
+        setup.exposureMs > 0 &&
+        setup.maxXraySec > 0,
+    );
+    const desktop = adapterKind === "tauri";
+    const estopLatched = ws?.dataState === "fault";
+    return {
+      "file.newTask": running ? blocked("scan active") : ok,
+      "file.openImageFolder": desktop
+        ? running
+          ? blocked("scan active")
+          : ok
+        : blocked("desktop only"),
+      "file.openLastResult": setup?.savePath.trim() ? ok : blocked("no save path"),
+      "file.exportLog": desktop ? ok : blocked("desktop only"),
+      // The engine owns scan state; it has no undo history to walk back.
+      "edit.undo": blocked("engine has no undo stack"),
+      "edit.redo": blocked("engine has no undo stack"),
+      "edit.resetParameters": running ? blocked("scan active") : ok,
+      "edit.preferences": ok,
+      "tools.runPreflight": estopLatched
+        ? blocked("E-STOP latched")
+        : configured
+          ? ok
+          : blocked("setup incomplete"),
+      "tools.homeAllAxes": estopLatched
+        ? blocked("E-STOP latched")
+        : snapshot?.preflightPassed
+          ? ok
+          : blocked("preflight required"),
+      "tools.restorePrevious": ws?.checkpointAvailable
+        ? ok
+        : blocked("no checkpoint"),
+      "tools.deviceDiagnostics": ok,
+      "help.userGuide": ok,
+      "help.safetyNotes": ok,
+      "help.about": ok,
+    };
+  }, [adapterKind, snapshot?.preflightPassed, ws]);
+
+  const handleMenuAction = useCallback(
+    async (id: MenuActionId): Promise<void> => {
+      if (!ws) return;
+      setActionError(null);
+      try {
+        switch (id) {
+          case "file.newTask": {
+            const now = new Date();
+            const p = (value: number): string => String(value).padStart(2, "0");
+            const stamp =
+              `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}` +
+              `-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+            setupPendingSync.current = true;
+            // The engine invalidates preflight and HOME on every setup change.
+            await dispatch({ type: "update_scan_setup", setup: { taskId: `scan-${stamp}` } });
+            break;
+          }
+          case "file.openImageFolder": {
+            const selected = await chooseImageDirectory(ws.scanSetup.savePath);
+            if (!selected) break;
+            // Refill the Scan Parameters drafts from the engine so the Save Path
+            // field shows the folder the picker returned.
+            setupPendingSync.current = true;
+            await dispatch({ type: "update_scan_setup", setup: { savePath: selected } });
+            await revealDirectory(selected);
+            break;
+          }
+          case "file.openLastResult":
+            await revealDirectory(ws.scanSetup.savePath);
+            break;
+          case "file.exportLog": {
+            const name = `session-${ws.scanSetup.taskId.trim() || "log"}.log`;
+            await exportSessionLog(name, sessionLogText(ws, adapterKind));
+            break;
+          }
+          case "edit.resetParameters":
+            setupPendingSync.current = true;
+            await dispatch({ type: "update_scan_setup", setup: { ...DEFAULT_SCAN_SETUP } });
+            break;
+          case "edit.undo":
+          case "edit.redo":
+            // The engine owns scan state and exposes no undo history, so these
+            // entries stay permanently disabled (see `availability`).
+            break;
+          case "edit.preferences":
+            setDialog("preferences");
+            break;
+          case "tools.runPreflight":
+            await dispatch({ type: "preflight" });
+            break;
+          case "tools.homeAllAxes":
+            await dispatch({ type: "home" });
+            break;
+          case "tools.restorePrevious":
+            await dispatch({ type: "restore_previous" });
+            break;
+          case "tools.deviceDiagnostics":
+            for (const device of ["xray", "turntable", "camera"] as const) {
+              await dispatch({ type: "retry_device", device });
+            }
+            setDialog("diagnostics");
+            break;
+          case "help.userGuide":
+            setDialog("guide");
+            break;
+          case "help.safetyNotes":
+            setDialog("safety");
+            break;
+          case "help.about":
+            setDialog("about");
+            break;
+          default:
+            break;
+        }
+      } catch (reason: unknown) {
+        setActionError(reason instanceof Error ? reason.message : String(reason));
+      }
+    },
+    [adapterKind, dispatch, ws],
+  );
+
+  useEffect(() => {
+    if (!dialog) return;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setDialog(null);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [dialog]);
+
+  if (!snapshot) {
     return (
       <main className="boot-screen">
         <strong>Micro-CT Workstation</strong>
-        <span>Linking RTS9060 device chain…</span>
+        <span>{error ? `Engine unavailable · ${error}` : "Starting ct-engine control chain…"}</span>
+      </main>
+    );
+  }
+
+  if (!ws) {
+    return (
+      <main className="boot-screen boot-screen--error">
+        <strong>Engine protocol unavailable</strong>
+        <span>{error ?? "The engine returned no workstation view. Restart the desktop application."}</span>
       </main>
     );
   }
 
   return (
-    <main className="console-app">
-      <MenuBar theme={theme} onTheme={setTheme} />
-      <div className="app-divider" />
-      {error ? (
-        <div className="error-toast" role="alert">
-          {error}
-        </div>
-      ) : null}
-      <section className="main-console">
-        <aside className="col">
-          <DevicePanel ws={ws} dispatch={dispatch} />
-          <ScanParamsPanel ws={ws} dispatch={dispatch} />
-        </aside>
-        <LiveScene ws={ws} theme={theme} dispatch={dispatch} />
-        <aside className="col">
-          <XrayPanel ws={ws} dispatch={dispatch} />
-          <OperationPanel ws={ws} />
-        </aside>
-      </section>
-      <div className="app-divider" />
-      <BottomConsole ws={ws} />
-      <div className="app-divider" />
-      <footer className="status-bar">
-        <span className="status-bar__left">
-          <i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} aria-hidden="true" />
-          <strong>{ws.statusbar.left}</strong>
-        </span>
-        <span className="status-bar__right">{ws.statusbar.right}</span>
-      </footer>
+    <main className="viewport-shell">
+      <div
+        className="design-canvas"
+        style={{ zoom: canvasLayout.zoom, height: `${canvasLayout.designHeight}px` }}
+      >
+        <MenuBar
+          theme={theme}
+          onTheme={setTheme}
+          snapshot={snapshot}
+          adapterKind={adapterKind}
+          availability={availability}
+          onAction={(id) => void handleMenuAction(id)}
+        />
+        <div className="app-divider" />
+        {error || actionError ? (
+          <div className="error-toast" role="alert">
+            {actionError ?? error}
+          </div>
+        ) : null}
+        <section className="main-console">
+          <aside className="col">
+            <DevicePanel ws={ws} busy={busy} dispatch={dispatch} />
+            <ScanParamsPanel
+              ws={ws}
+              busy={busy}
+              desktopRuntime={adapterKind === "tauri"}
+              dispatch={dispatch}
+              syncRevision={setupSync}
+            />
+          </aside>
+          <LiveScene ws={ws} theme={theme} dispatch={dispatch} />
+          <aside className="col">
+            <XrayPanel ws={ws} busy={busy} dispatch={dispatch} />
+            <OperationPanel ws={ws} />
+          </aside>
+        </section>
+        <div className="app-divider" />
+        <BottomConsole ws={ws} />
+        <div className="app-divider" />
+        <footer className="status-bar">
+          <span className="status-bar__left">
+            <i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} aria-hidden="true" />
+            <strong>{ws.statusbar.left}</strong>
+          </span>
+          <span className="status-bar__right">{ws.statusbar.right}</span>
+        </footer>
+        {dialog ? (
+          <InfoDialog
+            kind={dialog}
+            ws={ws}
+            snapshot={snapshot}
+            adapterKind={adapterKind}
+            theme={theme}
+            onTheme={setTheme}
+            onClose={() => setDialog(null)}
+          />
+        ) : null}
+      </div>
     </main>
   );
 }

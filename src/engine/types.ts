@@ -76,6 +76,17 @@ export interface EngineSnapshot {
   workstation?: WorkstationView;
 }
 
+export interface ScanSetup {
+  savePath: string;
+  taskId: string;
+  projectionCount: number;
+  angleStepDeg: number;
+  exposureMs: number;
+  maxXraySec: number;
+}
+
+export type ScanSetupUpdate = Partial<Omit<ScanSetup, "angleStepDeg">>;
+
 export type EngineCommand =
   | { type: "connect"; adapter: "developer_preview" | "real_hardware" }
   | { type: "disconnect" }
@@ -94,15 +105,15 @@ export type EngineCommand =
   | { type: "usb_auto_shut_down_toggle" }
   | { type: "send_voltage"; kv: number }
   | { type: "send_current"; ua: number }
-  | {
-      type: "update_scan_setup";
-      setup: { savePath: string; taskId: string; projectionCount: number; exposureMs: number; maxXraySec: number };
-    };
+  | { type: "update_scan_setup"; setup: ScanSetupUpdate };
+
+export type AdapterKind = "developer_preview" | "tauri";
 
 export interface EngineAdapter {
-  readonly kind: "developer_preview" | "tauri";
+  readonly kind: AdapterKind;
   getSnapshot(): Promise<EngineSnapshot>;
   dispatch(command: EngineCommand): Promise<EngineSnapshot>;
+  close?(): void;
 }
 
 /* ------------------------------------------------------------------ *
@@ -190,14 +201,7 @@ export interface WorkstationView {
     estop: boolean;
     playMode: "start" | "pause" | "resume" | "disabled";
   };
-  scanSetup: {
-    savePath: string;
-    taskId: string;
-    projectionCount: number;
-    angleStepDeg: number;
-    exposureMs: number;
-    maxXraySec: number;
-  };
+  scanSetup: ScanSetup;
   consoleLogs: ConsoleLogLine[];
   frames: ConsoleFrame[];
   checkpointAvailable: boolean;

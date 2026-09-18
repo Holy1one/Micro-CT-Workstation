@@ -1,0 +1,100 @@
+Task 21 - real desktop window & visual verification (QA) - FINAL, re-verified after rebuild
+Generated: 2026-09-18 (Asia/Shanghai)  |  Business source NOT modified
+
+IMPORTANT correction to the first pass
+  The first pass ran target/debug/ct-workstation.exe built 2026-09-18T10:37:22,
+  which PREDATES the maximized-state guard in src-tauri/src/main.rs (last modified
+  11:45:28). Hence the earlier OS_MAXIMIZED=FAIL reflected a stale binary. After
+  `cargo build` (new exe 11:47:55) the same read-only sampling gives maximized=true.
+
+Environment (measured)
+  primary   : rcMonitor [0,0,1920,1080]  rcWork [0,0,1920,1032]  scale 100% (DOM dpr 1.0)
+  secondary : rcMonitor [1920,0,3456,864] rcWork [1920,0,3456,816] scale 125% (DOM dpr 1.25)
+              => a real 125% DPI monitor IS present and was exercised this round.
+  virtual desktop 3456x1080 ; monitor count 2
+  CAVEAT: the QA probe process is DPI-unaware, so raw Win32 rects taken while the
+  window is on the 125% monitor are virtualized (~x0.8). DOM/WebView2 numbers are
+  the authoritative web-layer measurement and are internally consistent.
+
+OS_MAXIMIZED = PASS
+  Fresh read-only launch, no window command issued before reading:
+    isZoomed = true ; GetWindowPlacement.showCmd = 3 (SW_SHOWMAXIMIZED) ;
+    style 0x15CF0000 -> WS_MAXIMIZE bit SET
+    osOuterRect        = [-8,-8,1928,1040]         (1936x1048 = rcWork + 2x8px border)
+    DWM visible frame  = [0,0,1920,1032]           == primary rcWork EXACTLY
+    client (screen)    = [0,23,1920,1032]          1920x1009
+    rcNormalPosition   = [26,26,1642,1065]         restore bounds = 1600x1000
+  Restore -> re-maximize verified:
+    restored  : isZoomed=false, outer [26,26,1642,1065], client 1600x1000, frame [33,26,1635,1058]
+    re-max    : isZoomed=true,  outer [-8,-8,1928,1040], frame [0,0,1920,1032] == rcWork
+  Maximize/restore now toggles normally.
+
+MIN-SIZE CLAMP = PASS
+  In the restored state the right border was physically drag-resized far left:
+    client width clamped at exactly 1280 (outer 1296 = 1280 + 16px border);
+    height stayed 1000 (above the 800 baseline).
+  => 1280x800 baseline (1600x1000 x 0.8) is enforced at runtime.
+
+CANVAS_CONTAIN = PASS (all states, DOM-authoritative)
+  maximized (primary, 96 DPI): inner 1920x1009, zoom 1.009, canvas 1614.39x1008.98,
+      gutterX 152.80 (symmetric), gutterY 0.00, no crop, no document scrollbar
+  restored  (primary, 96 DPI): inner 1600x1000, zoom 1.000, canvas 1600x1000,
+      gutterX 0.00, gutterY 0.00
+  min size  (primary, 96 DPI): inner 1280x1000, zoom 0.800, canvas 1280x800,
+      gutterX 0.00, gutterY 100.00 (symmetric)
+  moved to secondary (125%):   dpr 1.25, inner 1282x1002, zoom 0.80125 (= min(1282/1600,1002/1000)),
+      canvas 1282x801.25, gutterX 0.00, gutterY 100.19 (symmetric)
+  maximized secondary (125%):  dpr 1.25, inner 1536x794, zoom 0.794, canvas 1270.40x794,
+      gutterX 132.80 (symmetric), gutterY 0.00
+  back on primary:             dpr 1.0, inner 1920x1009, zoom 1.009, canvas 1614.39x1008.98,
+      gutterX 152.80, gutterY 0.00
+  In every state measured zoom == min(innerW/1600, innerH/1000), the canvas keeps the
+  1.6 aspect ratio within 0.02px, gutters are symmetric within 0.01px, at least one
+  axis is flush (the long-axis letterbox is the expected fixed-canvas behaviour), and
+  the canvas never leaves the viewport.
+
+CROSS-MONITOR / DPI RE-CALCULATION = PASS
+  Moving the restored window to the 125% secondary monitor and back:
+  - monitor reported changes to the secondary, DOM devicePixelRatio changes 1.0 -> 1.25,
+    zoom recomputed 0.800 -> 0.80125 -> 0.794 (maximized) -> 1.009 (back on primary).
+  - maximize on the secondary produced isZoomed=true and a consistent canvas fit.
+  - re-maximizing back on the primary restored frame == primary rcWork.
+  (160 ms debounce respected; samples taken 1.8 s after each move.)
+
+VISUAL = PASS (evidence-based)
+  All captures use the real GDI path: GetDC(NULL) + CreateCompatibleDC +
+  CreateCompatibleBitmap + BitBlt(SRCCOPY) + GetDIBits. PrintWindow was NEVER used.
+  foregroundMatchesTarget=true in all four window-state captures (maximized, restored,
+  min-size, re-maximized) and in 3 of 4 cross-monitor captures (the last one lost the
+  foreground to WorkBuddy). The maximized crop shows the full app UI filling
+  [0,0,1920,1032]; the min-size crop shows the correctly scaled UI with symmetric
+  100 px bands. Only artefact: an unrelated WorkBuddy toast overlapped the bottom-right
+  of one frame; it is not part of the app.
+  Human re-inspection is still welcome, but the automated real-BitBlt evidence is clean.
+
+Residual limitations (honest)
+  - The two monitors are 100% and 125%; 150% is not available on this machine and
+    system scaling was not modified.
+  - Cross-monitor Move/ScaleFactorChanged was exercised via a programmatic move to the
+    secondary monitor (work-area/DPI change observed), not via a physical drag across
+    the bezel.
+  - Native directory dialog remains UNVERIFIED from task 16.
+
+Artifacts (docs/shots/)
+  window-geometry-guard-maximized.json        (read-only maximized evidence)
+  window-geometry-readonly.json               (same content; current read-only sample)
+  window-geometry-restore-minmax.json/.txt    + guard-{maximized,restored,shrunk,remaximized}-window-crop-bitblt.png
+  window-geometry-cross-monitor.json/.txt     + cross-*-window-crop-bitblt.png
+  window-geometry-*-virtual-desktop-bitblt.png (full desktop, BitBlt)
+  qa-build-vs-source.txt  (main.rs 11:45:28 newer than the first-pass exe 10:37:22)
+  qa-task21-rebuild.txt   (new exe 11:47:55)
+  helper probes: qa_readonly_probe.py, qa_restore_minmax.py, qa_cross_monitor.py,
+                 qa_window_geometry_final.py, qa_summarize_*.ps1, qa-vite.config.mjs,
+                 qa-dom-geometry-plugin.mjs (QA-only; src/ untouched)
+
+FINAL VERDICT
+  OS_MAXIMIZED   : PASS
+  MIN-SIZE CLAMP : PASS (1280x800)
+  CANVAS_CONTAIN : PASS (96 DPI, 125% DPI, restored, maximized, min-size)
+  CROSS-MONITOR/DPI : PASS
+  VISUAL         : PASS (real BitBlt, no PrintWindow)

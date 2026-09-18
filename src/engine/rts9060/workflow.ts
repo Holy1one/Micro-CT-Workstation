@@ -139,11 +139,11 @@ export class ScanWorkflow {
 
   phase: WorkflowPhase = "booting";
   params: ScanParams = {
-    savePath: "D:\\CT\\2026-09-16\\demo-001",
-    taskId: "demo-001",
-    projectionCount: 5,
-    exposureMs: 120,
-    maxXraySec: 30,
+    savePath: "",
+    taskId: "",
+    projectionCount: 0,
+    exposureMs: 0,
+    maxXraySec: 0,
   };
   preflightPassed = false;
   preflightChecks = 0;
@@ -172,7 +172,7 @@ export class ScanWorkflow {
   }
 
   get angleStepDeg(): number {
-    return 360 / this.params.projectionCount;
+    return this.params.projectionCount > 0 ? 360 / this.params.projectionCount : 0;
   }
 
   get pulsesPerView(): number {
@@ -192,17 +192,27 @@ export class ScanWorkflow {
       await this.link.banner;
       await this.link.exec(cmd.status("{id}"), ["STATUS"]);
       await this.link.exec(cmd.setMicrosteps("{id}", 8), ["OK"]);
-      this.log("INFO", "system", `engine online · build ${FIRMWARE_VERSION}`);
+      this.log("INFO", "system", `DEVELOPER PREVIEW engine ready · NO REAL HARDWARE · NO DEVICE I/O · build ${FIRMWARE_VERSION}`);
       await delay(140);
-      this.log("INFO", "xray", `source link OK · ${this.source.readback().setKv.toFixed(1)} kV / ${this.source.readback().setUa.toFixed(1)} µA idle`);
+      this.log("INFO", "xray", `DEVELOPER PREVIEW X-ray · PREVIEW DATA ${this.source.readback().setKv.toFixed(1)} kV / ${this.source.readback().setUa.toFixed(1)} µA · NO DEVICE I/O`);
       this.camera.configure(this.params.savePath);
       await this.link.exec(cmd.rearm("{id}"), ["OK"]);
       await this.link.exec(cmd.home("{id}"), ["HOME_DONE"], 6000);
       this.homed = true;
       this.log("INFO", "nano", "turntable homed · Hall LOW at 0.00°");
       await delay(120);
-      this.log("INFO", "camera", `Nikon SDK 2.4 · ${this.params.projectionCount} views queued · ${this.params.exposureMs} ms`);
-      await this.runPreflight();
+      this.log("INFO", "camera", `DEVELOPER PREVIEW camera · PREVIEW DATA ${this.params.projectionCount} views · ${this.params.exposureMs} ms · NO DEVICE I/O`);
+      if (
+        this.params.taskId.trim() &&
+        this.params.savePath.trim() &&
+        this.params.projectionCount > 0 &&
+        this.params.exposureMs > 0 &&
+        this.params.maxXraySec > 0
+      ) {
+        await this.runPreflight();
+      } else {
+        this.log("WARN", "preflight", "Scan setup is incomplete · pre-inspection remains pending");
+      }
       if (this.phase === "booting") this.phase = "ready";
       this.emit();
     } catch (err) {
@@ -214,6 +224,8 @@ export class ScanWorkflow {
 
   async runPreflight(): Promise<void> {
     if (this.preflightRunning) return;
+    if (this.phase === "fault") throw new Error("Release E-STOP before pre-inspection");
+    this.validateCompleteParams(this.params);
     this.preflightRunning = true;
     this.preflightPassed = false;
     this.preflightChecks = 0;
@@ -226,7 +238,7 @@ export class ScanWorkflow {
     }
     this.preflightPassed = true;
     this.preflightRunning = false;
-    this.log("PASS", "preflight", `8/8 checks passed · USB link stable · ready to expose`);
+    this.log("PASS", "preflight", "8/8 DEVELOPER PREVIEW checks passed · NO REAL HARDWARE · NO DEVICE I/O");
     this.emit();
   }
 
@@ -264,7 +276,7 @@ export class ScanWorkflow {
 
   async startScan(): Promise<void> {
     if (this.scanRunning) return;
-    if (this.phase === "fault") throw new Error("FAULT latched · release E-STOP and re-home first");
+    if (this.phase === "fault" || this.estopRequested) throw new Error("FAULT latched · release E-STOP and re-home first");
     if (!this.preflightPassed) throw new Error("Run pre-inspection first");
     if (!this.homed) throw new Error("Home the turntable first");
     const resumeFrom = this.phase === "paused" ? this.captured : 0;
@@ -303,6 +315,12 @@ export class ScanWorkflow {
 
   async restore(): Promise<void> {
     this.ensureNotScanning("restore");
+    if (this.phase === "fault" || this.estopRequested) {
+      throw new Error("FAULT latched · release E-STOP and repeat pre-inspection and HOME first");
+    }
+    if (this.phase === "stopped" || !this.preflightPassed || !this.homed) {
+      throw new Error("Recovery required · repeat pre-inspection and HOME before restore");
+    }
     const checkpoint = this.readCheckpoint();
     if (!checkpoint) {
       this.log("WARN", "operator", "no previous scan progress on disk · nothing to restore");
@@ -318,16 +336,7 @@ export class ScanWorkflow {
       exposureMs: checkpoint.exposureMs,
     };
     this.camera.configure(this.params.savePath);
-    if (this.phase === "fault") {
-      this.source.rearm();
-      this.log("ACTION", "operator", "E-STOP released · safety latch cleared");
-    }
     if (!this.link.lastStatus?.rearmed) await this.link.exec(cmd.rearm("{id}"), ["OK"]);
-    if (!this.homed) {
-      await this.link.exec(cmd.home("{id}"), ["HOME_DONE"], 6000);
-      this.homed = true;
-      this.log("INFO", "nano", "turntable homed · Hall LOW at 0.00°");
-    }
     await this.link.exec(cmd.moveAbs("{id}", milliDeg(checkpoint.angleDeg)), ["READY_TO_CAPTURE"], 8000);
     await this.link.exec(cmd.captureDone("{id}"), ["IDLE"]);
     this.captured = checkpoint.view;
@@ -340,9 +349,6 @@ export class ScanWorkflow {
       path: `${this.params.savePath}/frame-${String(i + 1).padStart(4, "0")}.nef`,
       shaOk: true,
     }));
-    if (!this.preflightPassed) {
-      await this.runPreflight();
-    }
     this.phase = "paused";
     this.pauseRequested = true;
     this.log("INFO", "system", `progress restored · ${this.captured} / ${this.params.projectionCount} at ${this.angleDeg.toFixed(2)}° · press resume to continue`);
@@ -359,6 +365,7 @@ export class ScanWorkflow {
     } catch {
       /* link may already be torn down; latch stands regardless */
     }
+    this.preflightPassed = false;
     this.homed = false;
     this.log("ACTION", "operator", "E-STOP pressed · all outputs cut");
     this.log("ERR", "nano", "STOP · STOPPED POSITION_UNKNOWN · pulse counter invalidated");
@@ -396,7 +403,35 @@ export class ScanWorkflow {
 
   setParams(partial: Partial<ScanParams>): void {
     if (this.phase === "scanning" || this.phase === "paused") return;
-    this.params = { ...this.params, ...partial };
+    if (Object.keys(partial).length === 0) throw new Error("Scan setup patch is empty");
+
+    const next = { ...this.params, ...partial };
+    if ("savePath" in partial && !next.savePath.trim()) {
+      throw new Error("Save path must not be empty");
+    }
+    if ("taskId" in partial && !next.taskId.trim()) {
+      throw new Error("Task ID must not be empty");
+    }
+    if (
+      "projectionCount" in partial &&
+      (!Number.isInteger(next.projectionCount) || next.projectionCount < 1 || next.projectionCount > 360)
+    ) {
+      throw new Error("Projection count must be between 1 and 360");
+    }
+    if (
+      "exposureMs" in partial &&
+      (!Number.isInteger(next.exposureMs) || next.exposureMs < 1 || next.exposureMs > 10000)
+    ) {
+      throw new Error("Exposure must be between 1 and 10000 ms");
+    }
+    if (
+      "maxXraySec" in partial &&
+      (!Number.isInteger(next.maxXraySec) || next.maxXraySec < 1 || next.maxXraySec > 359999)
+    ) {
+      throw new Error("Maximum X-ray duration must be between 1 and 359999 seconds");
+    }
+
+    this.params = next;
     this.camera.configure(this.params.savePath);
     this.log("INFO", "system", `parameters updated · ${this.params.projectionCount} views · ${this.angleStepDeg.toFixed(2)}°/view · ${this.params.exposureMs} ms`);
     this.emit();
@@ -446,6 +481,24 @@ export class ScanWorkflow {
     this.emit();
   }
 
+  private validateCompleteParams(params: ScanParams, requireText = true): void {
+    if (requireText && !params.taskId.trim()) {
+      throw new Error("Enter a non-empty Task ID before pre-inspection");
+    }
+    if (requireText && !params.savePath.trim()) {
+      throw new Error("Select a non-empty Save Path before pre-inspection");
+    }
+    if (!Number.isInteger(params.projectionCount) || params.projectionCount < 1 || params.projectionCount > 360) {
+      throw new Error("Projection count must be between 1 and 360");
+    }
+    if (!Number.isInteger(params.exposureMs) || params.exposureMs < 1 || params.exposureMs > 10000) {
+      throw new Error("Exposure must be between 1 and 10000 ms");
+    }
+    if (!Number.isInteger(params.maxXraySec) || params.maxXraySec < 1 || params.maxXraySec > 359999) {
+      throw new Error("Maximum X-ray duration must be between 1 and 359999 seconds");
+    }
+  }
+
   // -------------------------------------------------------------- scan loop
 
   private async scanLoop(startView: number): Promise<void> {
@@ -464,7 +517,7 @@ export class ScanWorkflow {
           await this.link.exec(cmd.xrayWarning("{id}", true), ["OK"]).catch(() => undefined);
         }
         const rb = this.source.readback();
-        this.log("INFO", "xray", `exposure ${this.params.exposureMs} ms · ${rb.setKv.toFixed(1)} kV / ${rb.setUa.toFixed(1)} µA · dose OK`);
+        this.log("INFO", "xray", `DEVELOPER PREVIEW exposure · PREVIEW DATA ${this.params.exposureMs} ms · ${rb.setKv.toFixed(1)} kV / ${rb.setUa.toFixed(1)} µA · NO DEVICE I/O`);
         await delay(Math.max(this.params.exposureMs, 240));
         this.gate();
         const frame = await this.camera.capture(view, angle, this.params.exposureMs);

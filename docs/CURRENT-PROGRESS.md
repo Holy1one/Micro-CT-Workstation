@@ -133,3 +133,58 @@
 - 1600 × 900 / DPR 1.0 严格几何审计通过：document、主区、左右栏、中央场景、四个侧栏面板、底栏、日志导航和日志内容均无 `scrollWidth/clientWidth` 或 `scrollHeight/clientHeight` 溢出。
 - 1280 × 720 / DPR 1.25 严格几何审计通过：左侧设备与参数面板客户高度均为 250 px，参数区 `scrollHeight=clientHeight=250`，Apply Parameters 完整可见；其余所有主面板同样无滚动或隐藏截断。
 - 最终 Windows debug 中复验：逐设备刷新 ×3 → 连接 → 预检 → 回零 → 开始 → 暂停 → 继续 → STOP → 加载上次进度 → STOP。两次 STOP 后预检和回零均失效，Home/Start 禁用，X-ray 保持 `SAFE / DISABLED`，Image Preview 没有伪造图片。
+
+# 当前进度（2026-09-18，Windows 桌面菜单与原生对话框验收）
+
+## 下拉菜单接线
+
+- `File / Edit / Tools / Help` 共 15 项全部接真实功能，没有占位：`src/menuActions.ts` 定义，
+  `App.tsx` 的 `handleMenuAction` 分发；`Edit` 的 Undo/Redo 因引擎没有撤销栈而长期置灰并给出原因。
+- `Edit > Preferences` 为真实主题切换浮层；`Help` 三页内容（操作顺序 / 安全须知 / 关于）均实读引擎状态。
+
+## 原生对话框真实点击验收（CDP 驱动，全程不抢焦点）
+
+- 驱动方式：应用以 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port` 启动，
+  页面用 CDP 的 `Input.dispatchMouseEvent` 点真实坐标，原生对话框用 `BM_CLICK` 窗口消息操作；
+  窗口只在点击期间 `SW_SHOWNOACTIVATE`（显示但不激活），结束后立即最小化归还。
+- 目录选择器（`docs/shots/qa_directory_picker_verify.py`，证据 `directory-picker-verify.json`）：
+  真对话框为 `#32770` / `Select projection image directory` / 按钮 `选择文件夹·取消·帮助(&H)`；
+  取消后 Save Path 保持原值；在对话框内导航到另一个目录并确定后，输入框与摘要同步变为该目录，
+  Explorer 打开的也是该目录。
+- 保存对话框（`docs/shots/qa_save_dialog_verify.py`，证据 `save-dialog-verify.json`）：
+  真对话框 `#32770` / `Export session log`；取消不写盘；选择目标后写出 607 字节日志，
+  内容含 `Micro-CT Workstation session log` 与当前 Save Path；`.exe` 目标没有产生任何文件
+  （对话框过滤器会补 `.log`，真正的拒收逻辑由 `cargo test` 覆盖）。
+- 缺陷修复：`File > Open Image Folder` 原先只 `dispatch` + `revealDirectory`，没有 `setupPendingSync`，
+  导致选完目录后 Save Path 输入框仍显示旧路径；已修复并由
+  `tests/menu-wiring-contract.test.mjs` 的 “File > Open Image Folder refills the Save Path draft after picking” 防回归。
+
+## Headless 布局审计
+
+- 新增 `docs/shots/qa_layout_measure.py`：headless Edge + CDP，测量 1600×900 / 1920×1080 / 1280×720。
+  三档下 `document` 的 `scrollWidth×scrollHeight` 与 `clientWidth×clientHeight` 完全一致，
+  五个面板的纵横向溢出全部为 0，没有裁切；中央场景区底部余量 8–12 px（固定 16:9 画布缩放的自然结果），
+  无需修正。证据 `docs/shots/layout-measure.json`。
+
+## 菜单功能端到端验证（真实点击，CDP 驱动）
+
+- 新增 `docs/shots/qa_menu_functions_verify.py`，证据 `docs/shots/menu-functions-verify.json`（`verdict: true`）。
+  15 项菜单之外又逐个点击了有副作用的条目并读取 DOM 结果：
+  - `File > New Scan Task` → Task ID 变为 `scan-20260918-160834`（符合 `scan-\d{8}-\d{6}`）
+  - `Edit > Reset Parameters` → 三个字段回到 120 / 200 / `00:10:00`（= 600 s）
+  - `Edit > Undo/Redo` → 仍为 `disabled`，提示 `engine has no undo stack`
+  - `Edit > Preferences` → 标题 `Preferences`；点 Dark 后 `data-theme=dark`，点 Light 后回到 `light`
+  - `Tools > Run Preflight` → 新增日志 `8/8 preview checks passed · real interlocks unverified`
+  - `Tools > Home All Axes` → 新增日志 `Preview HOME complete · 0.00°`
+  - `Tools > Device Diagnostics` → 列出 X-Ray Source / Turntable-Nano / Camera（外加 Link summary）
+  - `Help` 三页 → 标题分别为 User Guide / Safety Notes / About Micro-CT Workstation，About 正文含 `ct-engine`
+- 判据采用**日志增量比对**（点击前后快照求差），避免用历史日志里恰好出现的 preflight/home 字样蒙对。
+- 截图证据已移除：同一窗口两次 `PrintWindow` 抓到的帧字节完全相同（MD5 一致），说明未激活状态下
+  抓的是合成缓存帧，不能作为视觉证据；本项以 DOM 断言为准。
+
+## 校验与新增资产
+
+- `tsc --noEmit` 通过；Node 契约测试 21/21 通过；`cargo test` 12/12 通过。
+- 新增：`docs/shots/qa_directory_picker_verify.py`、`qa_save_dialog_verify.py`、`qa_layout_measure.py`，
+  证据 `directory-picker-dialog.png`、`save-dialog-native.png` 与三个 JSON。
+- 验收产物均落在 `%TEMP%` 并在脚本结尾清理，不留在用户目录。

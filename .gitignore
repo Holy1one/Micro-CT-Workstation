@@ -5,3 +5,11 @@ release/
 .DS_Store
 src-tauri/binaries/
 *.log
+
+# Local QA / agent scratch output - never part of the shipped source.
+.ai-memory/
+.cleanup-backup/
+.qa-*.txt
+.verification-status.txt
+build-check-evidence.tmp
+qa-browser-snapshot.txt

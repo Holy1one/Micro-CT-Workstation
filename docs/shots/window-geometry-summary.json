@@ -1,0 +1,387 @@
+{
+  "hwnd": 19008006,
+  "primaryWorkArea": [
+    0,
+    0,
+    1920,
+    1032
+  ],
+  "samples": [
+    {
+      "label": "startup-observed",
+      "timestamp": "2026-09-18T13:26:10+0800",
+      "hwnd": 19008006,
+      "isZoomed": true,
+      "showCmd": 3,
+      "rcNormalPosition": [
+        176,
+        69,
+        1920,
+        1080
+      ],
+      "osOuterRect": [
+        40,
+        40,
+        1976,
+        1088
+      ],
+      "osOuterSize": [
+        1936,
+        1048
+      ],
+      "dwmVisibleFrame": [
+        48,
+        48,
+        1968,
+        1080
+      ],
+      "clientScreenRect": [
+        48,
+        71,
+        1968,
+        1080
+      ],
+      "clientSize": [
+        1920,
+        1009
+      ],
+      "dpiForWindow": 96,
+      "monitor": {
+        "rcMonitor": [
+          0,
+          0,
+          1920,
+          1080
+        ],
+        "rcWork": [
+          0,
+          0,
+          1920,
+          1032
+        ],
+        "primary": true,
+        "dpiX": 96,
+        "scalePercent": 100
+      },
+      "dom": {
+        "error": "<urlopen error timed out>"
+      },
+      "expectedCanvas": {
+        "mode": "fill",
+        "designHeight": 1009.0,
+        "zoom": 1.0,
+        "scaledWidth": 1920.0,
+        "scaledHeight": 1009.0,
+        "gutterX": 0.0,
+        "gutterY": 0.0
+      },
+      "monitorCount": 2,
+      "virtualScreen": [
+        0,
+        0,
+        3456,
+        1080
+      ],
+      "foregroundHwnd": 11862416,
+      "evidence": {
+        "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
+        "printWindowUsed": false,
+        "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-startup-observed-virtual-desktop-bitblt.png",
+        "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-startup-observed-window-crop-bitblt.png",
+        "windowCropSize": [
+          1920,
+          1032
+        ],
+        "cropBox": [
+          48,
+          48,
+          1968,
+          1080
+        ],
+        "foregroundMatchesTarget": false
+      }
+    },
+    {
+      "label": "requested-maximized",
+      "timestamp": "2026-09-18T13:26:17+0800",
+      "hwnd": 19008006,
+      "isZoomed": true,
+      "showCmd": 3,
+      "rcNormalPosition": [
+        176,
+        69,
+        1920,
+        1080
+      ],
+      "osOuterRect": [
+        40,
+        40,
+        1976,
+        1088
+      ],
+      "osOuterSize": [
+        1936,
+        1048
+      ],
+      "dwmVisibleFrame": [
+        48,
+        48,
+        1968,
+        1080
+      ],
+      "clientScreenRect": [
+        48,
+        71,
+        1968,
+        1080
+      ],
+      "clientSize": [
+        1920,
+        1009
+      ],
+      "dpiForWindow": 96,
+      "monitor": {
+        "rcMonitor": [
+          0,
+          0,
+          1920,
+          1080
+        ],
+        "rcWork": [
+          0,
+          0,
+          1920,
+          1032
+        ],
+        "primary": true,
+        "dpiX": 96,
+        "scalePercent": 100
+      },
+      "dom": {
+        "error": "<urlopen error timed out>"
+      },
+      "expectedCanvas": {
+        "mode": "fill",
+        "designHeight": 1009.0,
+        "zoom": 1.0,
+        "scaledWidth": 1920.0,
+        "scaledHeight": 1009.0,
+        "gutterX": 0.0,
+        "gutterY": 0.0
+      },
+      "monitorCount": 2,
+      "virtualScreen": [
+        0,
+        0,
+        3456,
+        1080
+      ],
+      "foregroundHwnd": 7213814,
+      "evidence": {
+        "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
+        "printWindowUsed": false,
+        "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-maximized-virtual-desktop-bitblt.png",
+        "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-maximized-window-crop-bitblt.png",
+        "windowCropSize": [
+          1920,
+          1032
+        ],
+        "cropBox": [
+          48,
+          48,
+          1968,
+          1080
+        ],
+        "foregroundMatchesTarget": false
+      }
+    },
+    {
+      "label": "requested-restored",
+      "timestamp": "2026-09-18T13:26:24+0800",
+      "hwnd": 19008006,
+      "isZoomed": false,
+      "showCmd": 1,
+      "rcNormalPosition": [
+        176,
+        69,
+        1920,
+        1080
+      ],
+      "osOuterRect": [
+        176,
+        69,
+        1920,
+        1080
+      ],
+      "osOuterSize": [
+        1744,
+        1011
+      ],
+      "dwmVisibleFrame": [
+        183,
+        69,
+        1913,
+        1073
+      ],
+      "clientScreenRect": [
+        184,
+        100,
+        1912,
+        1072
+      ],
+      "clientSize": [
+        1728,
+        972
+      ],
+      "dpiForWindow": 96,
+      "monitor": {
+        "rcMonitor": [
+          0,
+          0,
+          1920,
+          1080
+        ],
+        "rcWork": [
+          0,
+          0,
+          1920,
+          1032
+        ],
+        "primary": true,
+        "dpiX": 96,
+        "scalePercent": 100
+      },
+      "dom": {
+        "error": "<urlopen error timed out>"
+      },
+      "expectedCanvas": {
+        "mode": "fill",
+        "designHeight": 1080.0,
+        "zoom": 0.9,
+        "scaledWidth": 1728.0,
+        "scaledHeight": 972.0,
+        "gutterX": 0.0,
+        "gutterY": 0.0
+      },
+      "monitorCount": 2,
+      "virtualScreen": [
+        0,
+        0,
+        3456,
+        1080
+      ],
+      "foregroundHwnd": 25430288,
+      "evidence": {
+        "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
+        "printWindowUsed": false,
+        "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-restored-virtual-desktop-bitblt.png",
+        "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-restored-window-crop-bitblt.png",
+        "windowCropSize": [
+          1730,
+          1004
+        ],
+        "cropBox": [
+          183,
+          69,
+          1913,
+          1073
+        ],
+        "foregroundMatchesTarget": false
+      }
+    },
+    {
+      "label": "remaximized",
+      "timestamp": "2026-09-18T13:26:30+0800",
+      "hwnd": 19008006,
+      "isZoomed": true,
+      "showCmd": 3,
+      "rcNormalPosition": [
+        176,
+        69,
+        1920,
+        1080
+      ],
+      "osOuterRect": [
+        -8,
+        -8,
+        1928,
+        1040
+      ],
+      "osOuterSize": [
+        1936,
+        1048
+      ],
+      "dwmVisibleFrame": [
+        0,
+        0,
+        1920,
+        1032
+      ],
+      "clientScreenRect": [
+        0,
+        23,
+        1920,
+        1032
+      ],
+      "clientSize": [
+        1920,
+        1009
+      ],
+      "dpiForWindow": 96,
+      "monitor": {
+        "rcMonitor": [
+          0,
+          0,
+          1920,
+          1080
+        ],
+        "rcWork": [
+          0,
+          0,
+          1920,
+          1032
+        ],
+        "primary": true,
+        "dpiX": 96,
+        "scalePercent": 100
+      },
+      "dom": {
+        "error": "<urlopen error timed out>"
+      },
+      "expectedCanvas": {
+        "mode": "fill",
+        "designHeight": 1009.0,
+        "zoom": 1.0,
+        "scaledWidth": 1920.0,
+        "scaledHeight": 1009.0,
+        "gutterX": 0.0,
+        "gutterY": 0.0
+      },
+      "monitorCount": 2,
+      "virtualScreen": [
+        0,
+        0,
+        3456,
+        1080
+      ],
+      "foregroundHwnd": 25430288,
+      "evidence": {
+        "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
+        "printWindowUsed": false,
+        "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-remaximized-virtual-desktop-bitblt.png",
+        "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-remaximized-window-crop-bitblt.png",
+        "windowCropSize": [
+          1920,
+          1032
+        ],
+        "cropBox": [
+          0,
+          0,
+          1920,
+          1032
+        ],
+        "foregroundMatchesTarget": false
+      }
+    }
+  ]
+}

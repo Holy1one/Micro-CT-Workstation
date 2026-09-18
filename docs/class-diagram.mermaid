@@ -1,0 +1,171 @@
+classDiagram
+    direction LR
+
+    class App {
+      +Theme theme
+      +number canvasZoom
+      +EngineSnapshot snapshot
+      +dispatch(command: EngineCommand) Promise~void~
+      +render() ReactNode
+    }
+
+    class ScanParamsPanel {
+      +string savePathDraft
+      +string taskIdDraft
+      +string projectionCountDraft
+      +string exposureMsDraft
+      +string maxXrayDraft
+      +commitText(field, value) void
+      +commitInteger(field, value) void
+      +chooseDirectory() Promise~void~
+    }
+
+    class DesktopPathService {
+      +resolveDefaultImageDirectory() Promise~string~
+      +chooseImageDirectory(currentPath: string) Promise~string|null~
+      +isDesktopRuntime() boolean
+    }
+
+    class ScanSetup {
+      +string savePath
+      +string taskId
+      +number projectionCount
+      +number angleStepDeg
+      +number exposureMs
+      +number maxXraySec
+    }
+
+    class ScanSetupUpdate {
+      <<Partial DTO>>
+      +string? savePath
+      +string? taskId
+      +number? projectionCount
+      +number? exposureMs
+      +number? maxXraySec
+    }
+
+    class EngineAdapter {
+      <<interface>>
+      +AdapterKind kind
+      +getSnapshot() Promise~EngineSnapshot~
+      +dispatch(command: EngineCommand) Promise~EngineSnapshot~
+      +close() void
+    }
+
+    class TauriEngineAdapter {
+      +getSnapshot() Promise~EngineSnapshot~
+      +dispatch(command: EngineCommand) Promise~EngineSnapshot~
+    }
+
+    class WorkstationAdapter {
+      -ScanWorkflow workflow
+      +getSnapshot() Promise~EngineSnapshot~
+      +dispatch(command: EngineCommand) Promise~EngineSnapshot~
+      -buildSnapshot() EngineSnapshot
+    }
+
+    class TauriDesktopGateway {
+      <<Rust / Tauri>>
+      +resolve_default_image_directory() Result~String,String~
+      +engine_snapshot(state) Result~Value,String~
+      +engine_command(command,state) Result~Value,String~
+      +apply_dynamic_min_size(window) Result
+      +schedule_dynamic_min_size(window) void
+    }
+
+    class KnownFolderResolver {
+      +existing_known_folder(folderId) Result~PathBuf,String~
+      +is_descendant_path(path,parent) bool
+    }
+
+    class EngineState {
+      -Mutex~Option~EngineClient~~ client
+    }
+
+    class EngineClient {
+      -Child child
+      -ChildStdin stdin
+      -Receiver responses
+      -u64 sequence
+      +spawn() Result~EngineClient~
+      +request(command,payload) Result~Value,String~
+    }
+
+    class ScanSetupInput {
+      <<Rust DTO>>
+      +Option~String~ savePath
+      +Option~String~ taskId
+      +Option~u32~ projectionCount
+      +Option~u32~ exposureMs
+      +Option~u32~ maxXraySec
+      +apply(current,maxXray) Result
+    }
+
+    class Parameters {
+      +String taskId
+      +String savePath
+      +u32 projectionCount
+      +f64 angleStepDeg
+      +u32 exposureMs
+      +validate() Result
+    }
+
+    class Engine {
+      -bool preview
+      -bool connected
+      -Phase phase
+      -Parameters parameters
+      -u32 maxXraySec
+      -bool beamOn
+      -bool xrayLatched
+      +handle(request) Response
+      +snapshot() Value
+      -command(command,payload) Result
+      -invalidate(phase) void
+    }
+
+    class ScanWorkflow {
+      +WorkflowPhase phase
+      +ScanParams params
+      +runPreflight() Promise~void~
+      +home() Promise~void~
+      +startScan() Promise~void~
+      +restore() Promise~void~
+      +estop() Promise~void~
+      +estopRelease() Promise~void~
+      +setParams(partial) void
+    }
+
+    class EngineSnapshot {
+      +EngineMode mode
+      +EnginePhase phase
+      +WorkstationView workstation
+      +string updatedAt
+    }
+
+    class WorkstationView {
+      +ScanSetup scanSetup
+      +ConsoleDeviceView[] devices
+      +XrayView xray
+      +ProgressView progress
+      +SummaryView summary
+    }
+
+    App *-- ScanParamsPanel : renders
+    App --> EngineAdapter : useEngine
+    ScanParamsPanel --> DesktopPathService : native paths
+    ScanParamsPanel --> ScanSetupUpdate : emits patches
+    EngineAdapter <|.. TauriEngineAdapter
+    EngineAdapter <|.. WorkstationAdapter
+    WorkstationAdapter *-- ScanWorkflow : browser preview
+    DesktopPathService --> TauriDesktopGateway : invoke/dialog
+    TauriEngineAdapter --> TauriDesktopGateway : invoke
+    TauriDesktopGateway --> KnownFolderResolver : resolves Pictures/Camera Roll
+    TauriDesktopGateway *-- EngineState : manages
+    EngineState *-- EngineClient : owns sidecar
+    EngineClient --> Engine : JSONL stdio
+    Engine *-- Parameters
+    Engine --> ScanSetupInput : deserializes patch
+    ScanSetupInput --> Parameters : atomically updates
+    EngineSnapshot *-- WorkstationView
+    WorkstationView *-- ScanSetup

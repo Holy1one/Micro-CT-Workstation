@@ -1,0 +1,21 @@
+﻿{
+    "waitedSec":  0,
+    "ready":  true,
+    "app":  [
+                {
+                    "Id":  28256,
+                    "ProcessName":  "ct-workstation",
+                    "MainWindowTitle":  "Micro-CT Workstation"
+                }
+            ],
+    "diagnosticLines":  [
+                            "PAGE_LOAD label=main event=Started url=http://127.0.0.1:4173/",
+                            "ENGINE_READY_MS=606",
+                            "PAGE_LOAD label=main event=Finished url=http://127.0.0.1:4173/",
+                            "PAGE_LOAD label=main event=Started url=http://127.0.0.1:4173/",
+                            "PAGE_LOAD label=main event=Finished url=http://127.0.0.1:4173/",
+                            "PAGE_LOAD label=main event=Started url=http://127.0.0.1:4173/",
+                            "ENGINE_READY_MS=429",
+                            "PAGE_LOAD label=main event=Finished url=http://127.0.0.1:4173/"
+                        ]
+}

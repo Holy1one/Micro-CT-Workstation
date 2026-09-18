@@ -1,0 +1,253 @@
+{
+  "state": "restored",
+  "timestamp": "2026-09-18T11:33:22+0800",
+  "hwnd": 4721694,
+  "pid": 28256,
+  "isZoomed": false,
+  "windowPlacement": {
+    "showCmd": 1,
+    "rcNormalPosition": [
+      130,
+      33,
+      2066,
+      1089
+    ]
+  },
+  "osOuterRect": [
+    130,
+    41,
+    2066,
+    1089
+  ],
+  "dwmVisibleFrame": [
+    137,
+    41,
+    2059,
+    1082
+  ],
+  "clientScreenRect": [
+    138,
+    72,
+    2058,
+    1081
+  ],
+  "clientSize": [
+    1920,
+    1009
+  ],
+  "monitor": {
+    "handle": 131197,
+    "rcMonitor": [
+      0,
+      0,
+      1920,
+      1080
+    ],
+    "rcWork": [
+      0,
+      0,
+      1920,
+      1032
+    ],
+    "dpiX": 96,
+    "dpiY": 96,
+    "scalePercent": 100
+  },
+  "dpiForWindow": 96,
+  "systemMetrics": {
+    "monitorCount": 2,
+    "virtualScreen": [
+      0,
+      0,
+      3456,
+      1080
+    ]
+  },
+  "foregroundHwnd": 4721694,
+  "dom": {
+    "sampleId": "1789702401783",
+    "timestamp": "2026-09-18T03:33:21.783Z",
+    "innerWidth": 1920,
+    "innerHeight": 1009,
+    "devicePixelRatio": 1,
+    "visualViewport": {
+      "width": 1920,
+      "height": 1009,
+      "scale": 1
+    },
+    "documentScroll": {
+      "scrollWidth": 1920,
+      "scrollHeight": 1009,
+      "clientWidth": 1920,
+      "clientHeight": 1009
+    },
+    "viewportShell": {
+      "x": 0,
+      "y": 0,
+      "width": 1920,
+      "height": 1009,
+      "top": 0,
+      "left": 0,
+      "right": 1920,
+      "bottom": 1009
+    },
+    "designCanvas": {
+      "x": 152.796875,
+      "y": 0,
+      "width": 1614.390625,
+      "height": 1008.984375,
+      "top": 0,
+      "left": 152.796875,
+      "right": 1767.1875,
+      "bottom": 1008.984375
+    },
+    "designCanvasZoom": "1.009"
+  },
+  "expectedCanvas": {
+    "zoom": 1.009,
+    "scaledWidth": 1614.3999999999999,
+    "scaledHeight": 1008.9999999999999,
+    "gutterX": 152.80000000000007,
+    "gutterY": 5.684341886080802e-14
+  },
+  "evidence": {
+    "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
+    "printWindowUsed": false,
+    "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-restored-virtual-desktop-bitblt.png",
+    "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-restored-window-crop-bitblt.png",
+    "windowCropSize": [
+      1922,
+      1039
+    ],
+    "cropBox": [
+      137,
+      41,
+      2059,
+      1082
+    ],
+    "foregroundMatchesTarget": true,
+    "overlappingWindows": [
+      {
+        "hwnd": 65894,
+        "title": "",
+        "class": "Shell_TrayWnd",
+        "rect": [
+          0,
+          1032,
+          1920,
+          1080
+        ]
+      },
+      {
+        "hwnd": 25430288,
+        "title": "CT - CodeBuddy CN",
+        "class": "Chrome_WidgetWin_1",
+        "rect": [
+          -8,
+          -8,
+          1928,
+          1040
+        ]
+      },
+      {
+        "hwnd": 5769788,
+        "title": "WorkBuddy",
+        "class": "Chrome_WidgetWin_1",
+        "rect": [
+          1914,
+          -6,
+          3463,
+          823
+        ]
+      },
+      {
+        "hwnd": 5051662,
+        "title": "kernel_v2 | 嘉立创EDA(专业版) - V3.2.186",
+        "class": "Chrome_WidgetWin_1",
+        "rect": [
+          -8,
+          -8,
+          1928,
+          1040
+        ]
+      },
+      {
+        "hwnd": 15730230,
+        "title": "Microsoft OneDrive",
+        "class": "#32770",
+        "rect": [
+          769,
+          396,
+          1135,
+          573
+        ]
+      },
+      {
+        "hwnd": 197622,
+        "title": "",
+        "class": "Shell_SecondaryTrayWnd",
+        "rect": [
+          1920,
+          816,
+          3456,
+          864
+        ]
+      },
+      {
+        "hwnd": 1708782,
+        "title": "Molecular dynamics simulations of displacement cascades in LiAlO2 and LiAl5O8 ceramics | Scientific Reports - 豆包浏览器",
+        "class": "Chrome_WidgetWin_1",
+        "rect": [
+          -8,
+          -8,
+          1928,
+          1040
+        ]
+      },
+      {
+        "hwnd": 460268,
+        "title": "",
+        "class": "ApplicationFrameWindow",
+        "rect": [
+          0,
+          0,
+          1920,
+          1032
+        ]
+      },
+      {
+        "hwnd": 131140,
+        "title": "Windows 输入体验",
+        "class": "Windows.UI.Core.CoreWindow",
+        "rect": [
+          0,
+          0,
+          1920,
+          1080
+        ]
+      },
+      {
+        "hwnd": 66280,
+        "title": "NVIDIA GeForce Overlay",
+        "class": "CEF-OSC-WIDGET",
+        "rect": [
+          0,
+          0,
+          1919,
+          1080
+        ]
+      },
+      {
+        "hwnd": 131476,
+        "title": "Program Manager",
+        "class": "Progman",
+        "rect": [
+          0,
+          0,
+          3840,
+          1080
+        ]
+      }
+    ]
+  }
+}

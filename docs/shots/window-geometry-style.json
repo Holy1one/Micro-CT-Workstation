@@ -1,0 +1,79 @@
+{
+  "timestamp": "2026-09-18T11:41:30+0800",
+  "observed": {
+    "hwnd": 3871890,
+    "styleHex": "0x14cf0000",
+    "WS_MAXIMIZE": false,
+    "isZoomed": false,
+    "showCmd": 1,
+    "rcNormalPosition": [
+      0,
+      0,
+      1933,
+      1048
+    ],
+    "outer": [
+      0,
+      0,
+      1936,
+      1048
+    ]
+  },
+  "afterShowMaximize": {
+    "hwnd": 3871890,
+    "styleHex": "0x14cf0000",
+    "WS_MAXIMIZE": false,
+    "isZoomed": false,
+    "showCmd": 1,
+    "rcNormalPosition": [
+      0,
+      0,
+      1933,
+      1048
+    ],
+    "outer": [
+      0,
+      0,
+      1936,
+      1048
+    ]
+  },
+  "afterShowRestore": {
+    "hwnd": 3871890,
+    "styleHex": "0x14cf0000",
+    "WS_MAXIMIZE": false,
+    "isZoomed": false,
+    "showCmd": 1,
+    "rcNormalPosition": [
+      0,
+      0,
+      1933,
+      1048
+    ],
+    "outer": [
+      0,
+      0,
+      1936,
+      1048
+    ]
+  },
+  "afterShowMaximizeAgain": {
+    "hwnd": 3871890,
+    "styleHex": "0x14cf0000",
+    "WS_MAXIMIZE": false,
+    "isZoomed": false,
+    "showCmd": 1,
+    "rcNormalPosition": [
+      0,
+      0,
+      1933,
+      1048
+    ],
+    "outer": [
+      0,
+      0,
+      1936,
+      1048
+    ]
+  }
+}

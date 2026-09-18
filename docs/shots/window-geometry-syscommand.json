@@ -1,0 +1,65 @@
+{
+  "timestamp": "2026-09-18T11:35:39+0800",
+  "monitors": [
+    {
+      "handle": 197559,
+      "rcMonitor": [
+        1920,
+        0,
+        3456,
+        864
+      ],
+      "rcWork": [
+        1920,
+        0,
+        3456,
+        816
+      ],
+      "primary": false
+    },
+    {
+      "handle": 131197,
+      "rcMonitor": [
+        0,
+        0,
+        1920,
+        1080
+      ],
+      "rcWork": [
+        0,
+        0,
+        1920,
+        1032
+      ],
+      "primary": true
+    }
+  ],
+  "hwnd": 4721694,
+  "initial": {
+    "isZoomed": false,
+    "outer": [
+      1916,
+      6,
+      3466,
+      836
+    ]
+  },
+  "afterScMaximize": {
+    "isZoomed": false,
+    "outer": [
+      1916,
+      6,
+      3466,
+      836
+    ]
+  },
+  "afterScRestore": {
+    "isZoomed": false,
+    "outer": [
+      1916,
+      6,
+      3466,
+      836
+    ]
+  }
+}

@@ -1,0 +1,400 @@
+{
+  "timestamp": "2026-09-18T11:38:33+0800",
+  "hwnd": 4721694,
+  "steps": [
+    {
+      "step": "foreground",
+      "sample": {
+        "label": "foreground",
+        "timestamp": "2026-09-18T11:38:36+0800",
+        "hwnd": 4721694,
+        "isZoomed": false,
+        "showCmd": 1,
+        "rcNormalPosition": [
+          60,
+          48,
+          1996,
+          1108
+        ],
+        "osOuterRect": [
+          60,
+          60,
+          1996,
+          1108
+        ],
+        "osOuterSize": [
+          1936,
+          1048
+        ],
+        "dwmVisibleFrame": [
+          67,
+          60,
+          1989,
+          1101
+        ],
+        "clientScreenRect": [
+          68,
+          91,
+          1988,
+          1100
+        ],
+        "clientSize": [
+          1920,
+          1009
+        ],
+        "dpiForWindow": 96,
+        "monitor": {
+          "rcMonitor": [
+            0,
+            0,
+            1920,
+            1080
+          ],
+          "rcWork": [
+            0,
+            0,
+            1920,
+            1032
+          ],
+          "primary": true,
+          "dpiX": 96,
+          "scalePercent": 100
+        },
+        "dom": {
+          "sampleId": "1789702716225",
+          "timestamp": "2026-09-18T03:38:36.225Z",
+          "innerWidth": 1920,
+          "innerHeight": 1009,
+          "devicePixelRatio": 1,
+          "visualViewport": {
+            "width": 1920,
+            "height": 1009,
+            "scale": 1
+          },
+          "documentScroll": {
+            "scrollWidth": 1920,
+            "scrollHeight": 1009,
+            "clientWidth": 1920,
+            "clientHeight": 1009
+          },
+          "viewportShell": {
+            "x": 0,
+            "y": 0,
+            "width": 1920,
+            "height": 1009,
+            "top": 0,
+            "left": 0,
+            "right": 1920,
+            "bottom": 1009
+          },
+          "designCanvas": {
+            "x": 152.796875,
+            "y": 0,
+            "width": 1614.390625,
+            "height": 1008.984375,
+            "top": 0,
+            "left": 152.796875,
+            "right": 1767.1875,
+            "bottom": 1008.984375
+          },
+          "designCanvasZoom": "1.009"
+        },
+        "expectedCanvas": {
+          "zoom": 1.009,
+          "scaledWidth": 1614.3999999999999,
+          "scaledHeight": 1008.9999999999999,
+          "gutterX": 152.80000000000007,
+          "gutterY": 5.684341886080802e-14
+        },
+        "monitorCount": 2,
+        "virtualScreen": [
+          0,
+          0,
+          3456,
+          1080
+        ],
+        "foregroundHwnd": 26153560,
+        "evidence": {
+          "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
+          "printWindowUsed": false,
+          "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-foreground-virtual-desktop-bitblt.png",
+          "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-foreground-window-crop-bitblt.png",
+          "windowCropSize": [
+            1922,
+            1020
+          ],
+          "cropBox": [
+            67,
+            60,
+            1989,
+            1101
+          ],
+          "foregroundMatchesTarget": false
+        }
+      }
+    },
+    {
+      "step": "maximize",
+      "sample": {
+        "label": "maximize-attempt",
+        "timestamp": "2026-09-18T11:38:41+0800",
+        "hwnd": 4721694,
+        "isZoomed": false,
+        "showCmd": 1,
+        "rcNormalPosition": [
+          60,
+          48,
+          1996,
+          1108
+        ],
+        "osOuterRect": [
+          60,
+          60,
+          1996,
+          1108
+        ],
+        "osOuterSize": [
+          1936,
+          1048
+        ],
+        "dwmVisibleFrame": [
+          67,
+          60,
+          1989,
+          1101
+        ],
+        "clientScreenRect": [
+          68,
+          91,
+          1988,
+          1100
+        ],
+        "clientSize": [
+          1920,
+          1009
+        ],
+        "dpiForWindow": 96,
+        "monitor": {
+          "rcMonitor": [
+            0,
+            0,
+            1920,
+            1080
+          ],
+          "rcWork": [
+            0,
+            0,
+            1920,
+            1032
+          ],
+          "primary": true,
+          "dpiX": 96,
+          "scalePercent": 100
+        },
+        "dom": {
+          "sampleId": "1789702721654",
+          "timestamp": "2026-09-18T03:38:41.654Z",
+          "innerWidth": 1920,
+          "innerHeight": 1009,
+          "devicePixelRatio": 1,
+          "visualViewport": {
+            "width": 1920,
+            "height": 1009,
+            "scale": 1
+          },
+          "documentScroll": {
+            "scrollWidth": 1920,
+            "scrollHeight": 1009,
+            "clientWidth": 1920,
+            "clientHeight": 1009
+          },
+          "viewportShell": {
+            "x": 0,
+            "y": 0,
+            "width": 1920,
+            "height": 1009,
+            "top": 0,
+            "left": 0,
+            "right": 1920,
+            "bottom": 1009
+          },
+          "designCanvas": {
+            "x": 152.796875,
+            "y": 0,
+            "width": 1614.390625,
+            "height": 1008.984375,
+            "top": 0,
+            "left": 152.796875,
+            "right": 1767.1875,
+            "bottom": 1008.984375
+          },
+          "designCanvasZoom": "1.009"
+        },
+        "expectedCanvas": {
+          "zoom": 1.009,
+          "scaledWidth": 1614.3999999999999,
+          "scaledHeight": 1008.9999999999999,
+          "gutterX": 152.80000000000007,
+          "gutterY": 5.684341886080802e-14
+        },
+        "monitorCount": 2,
+        "virtualScreen": [
+          0,
+          0,
+          3456,
+          1080
+        ],
+        "foregroundHwnd": 26153560,
+        "evidence": {
+          "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
+          "printWindowUsed": false,
+          "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-maximize-attempt-virtual-desktop-bitblt.png",
+          "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-maximize-attempt-window-crop-bitblt.png",
+          "windowCropSize": [
+            1922,
+            1020
+          ],
+          "cropBox": [
+            67,
+            60,
+            1989,
+            1101
+          ],
+          "foregroundMatchesTarget": false
+        }
+      }
+    },
+    {
+      "step": "restore",
+      "sample": {
+        "label": "restore-attempt",
+        "timestamp": "2026-09-18T11:38:47+0800",
+        "hwnd": 4721694,
+        "isZoomed": false,
+        "showCmd": 1,
+        "rcNormalPosition": [
+          60,
+          48,
+          1996,
+          1108
+        ],
+        "osOuterRect": [
+          60,
+          60,
+          1996,
+          1108
+        ],
+        "osOuterSize": [
+          1936,
+          1048
+        ],
+        "dwmVisibleFrame": [
+          67,
+          60,
+          1989,
+          1101
+        ],
+        "clientScreenRect": [
+          68,
+          91,
+          1988,
+          1100
+        ],
+        "clientSize": [
+          1920,
+          1009
+        ],
+        "dpiForWindow": 96,
+        "monitor": {
+          "rcMonitor": [
+            0,
+            0,
+            1920,
+            1080
+          ],
+          "rcWork": [
+            0,
+            0,
+            1920,
+            1032
+          ],
+          "primary": true,
+          "dpiX": 96,
+          "scalePercent": 100
+        },
+        "dom": {
+          "sampleId": "1789702727417",
+          "timestamp": "2026-09-18T03:38:47.417Z",
+          "innerWidth": 1920,
+          "innerHeight": 1009,
+          "devicePixelRatio": 1,
+          "visualViewport": {
+            "width": 1920,
+            "height": 1009,
+            "scale": 1
+          },
+          "documentScroll": {
+            "scrollWidth": 1920,
+            "scrollHeight": 1009,
+            "clientWidth": 1920,
+            "clientHeight": 1009
+          },
+          "viewportShell": {
+            "x": 0,
+            "y": 0,
+            "width": 1920,
+            "height": 1009,
+            "top": 0,
+            "left": 0,
+            "right": 1920,
+            "bottom": 1009
+          },
+          "designCanvas": {
+            "x": 152.796875,
+            "y": 0,
+            "width": 1614.390625,
+            "height": 1008.984375,
+            "top": 0,
+            "left": 152.796875,
+            "right": 1767.1875,
+            "bottom": 1008.984375
+          },
+          "designCanvasZoom": "1.009"
+        },
+        "expectedCanvas": {
+          "zoom": 1.009,
+          "scaledWidth": 1614.3999999999999,
+          "scaledHeight": 1008.9999999999999,
+          "gutterX": 152.80000000000007,
+          "gutterY": 5.684341886080802e-14
+        },
+        "monitorCount": 2,
+        "virtualScreen": [
+          0,
+          0,
+          3456,
+          1080
+        ],
+        "foregroundHwnd": 26153560,
+        "evidence": {
+          "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
+          "printWindowUsed": false,
+          "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-restore-attempt-virtual-desktop-bitblt.png",
+          "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-restore-attempt-window-crop-bitblt.png",
+          "windowCropSize": [
+            1922,
+            1020
+          ],
+          "cropBox": [
+            67,
+            60,
+            1989,
+            1101
+          ],
+          "foregroundMatchesTarget": false
+        }
+      }
+    }
+  ],
+  "foregroundAfterForce": 4721694
+}

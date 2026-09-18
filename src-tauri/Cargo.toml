@@ -12,6 +12,10 @@ tauri = { version = "2", features = [] }
 serde.workspace = true
 serde_json.workspace = true
 ct-engine = { path = "../crates/ct-engine" }
+tauri-plugin-dialog = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

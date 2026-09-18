@@ -1,0 +1,20 @@
+﻿﻿python.exe : Traceback (most recent call last):
+所在位置 行:445 字符: 100
++ ... ocs\shots'; & "E:\Application\miniconda3\python.exe" "E:\Main\OneDriv ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last) 
+   ::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App
+\docs\shots\qa_focus_and_capture.py", line 24, in <module>
+    user32.GetCurrentThreadId.restype = wt.DWORD
+    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Application\miniconda3\Lib\ctypes\__init__.py", line 412, in __getat
+tr__
+    func = self.__getitem__(name)
+  File "E:\Application\miniconda3\Lib\ctypes\__init__.py", line 417, in __getit
+em__
+    func = self._FuncPtr((name_or_ordinal, self))
+AttributeError: function 'GetCurrentThreadId' not found
+

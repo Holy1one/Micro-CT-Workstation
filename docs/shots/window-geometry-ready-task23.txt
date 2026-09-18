@@ -1,0 +1,4 @@
+﻿READY=True WAIT=11.2s
+ENGINE_READY_MS=477
+PAGE_LOAD label=main event=Started url=http://127.0.0.1:4173/
+PAGE_LOAD label=main event=Finished url=http://127.0.0.1:4173/
