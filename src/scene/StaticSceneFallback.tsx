@@ -2,7 +2,6 @@ import type { SceneFallbackReason, SceneViewModel } from "./types";
 
 const REASON_LABELS: Record<SceneFallbackReason, string> = {
   "webgl-unavailable": "WebGL unavailable",
-  "reduced-motion": "Reduced motion",
   "context-lost": "Graphics context lost",
 };
 

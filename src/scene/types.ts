@@ -1,6 +1,6 @@
 export type SceneThemeName = "light" | "dark";
 export type ViewPreset = "iso" | "front" | "top";
-export type SceneFallbackReason = "webgl-unavailable" | "reduced-motion" | "context-lost";
+export type SceneFallbackReason = "webgl-unavailable" | "context-lost";
 
 export interface SceneViewModel {
   dataState: "ready" | "scanning" | "paused" | "fault";

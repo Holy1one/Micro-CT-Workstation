@@ -19,19 +19,15 @@ export function useSceneFallback(): {
   );
 
   useEffect(() => {
-    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const update = (): void => {
-      if (query.matches) {
-        setReason("reduced-motion");
-      } else if (!detectWebGlSupport()) {
-        setReason("webgl-unavailable");
-      } else {
-        setReason((current) => (current === "context-lost" ? current : null));
-      }
-    };
-    update();
-    query.addEventListener("change", update);
-    return () => query.removeEventListener("change", update);
+    // The live scene is the operator's only view of the bench, so it falls back
+    // to the static render only when WebGL is genuinely unusable. A
+    // "prefers-reduced-motion" setting asks for less animation, not for a
+    // different picture, so it must never swap the 3D view out.
+    if (!detectWebGlSupport()) {
+      setReason("webgl-unavailable");
+    } else {
+      setReason((current) => (current === "context-lost" ? current : null));
+    }
   }, []);
 
   return {
