@@ -13,8 +13,7 @@ import time
 
 import qa_window_geometry_final as final
 
-OUT = os.path.join(r"E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App",
-                   "docs", "shots")
+OUT = final.OUT
 REPORT = os.path.join(OUT, "window-geometry-readonly.json")
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

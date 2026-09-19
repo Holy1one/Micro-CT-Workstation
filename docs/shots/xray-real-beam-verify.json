@@ -1,0 +1,243 @@
+{
+  "startedAt": "2026-09-19T02:32:20.848Z",
+  "engine": "E:\\LZU_Master\\MicroCT\\Micro-CT-App\\target\\debug\\ct-engine.exe",
+  "setpoint": {
+    "kv": 20.0,
+    "ua": 50.0
+  },
+  "steps": [
+    {
+      "step": "P1: retry_device xray",
+      "pass": true
+    },
+    {
+      "step": "P1: beam enable REJECTED while USB Auto Shut Down armed (locked)",
+      "pass": true,
+      "errorCode": "SAFETY_LOCK_REQUIRED"
+    },
+    {
+      "step": "P1: release checkbox → device deadman RELEASED (0x74 0x00)",
+      "pass": true
+    },
+    {
+      "step": "P1: SEND V 20.0 kV",
+      "pass": true
+    },
+    {
+      "step": "P1: SEND I 50.0 µA",
+      "pass": true
+    },
+    {
+      "step": "P1: xray_toggle ON accepted",
+      "pass": true
+    },
+    {
+      "step": "P1: beam HELD 8s without re-enable",
+      "pass": true,
+      "samples": [
+        {
+          "on": true,
+          "kv": 20.07,
+          "ua": 50.0
+        },
+        {
+          "on": true,
+          "kv": 20.07,
+          "ua": 50.0
+        },
+        {
+          "on": true,
+          "kv": 20.13,
+          "ua": 49.1
+        },
+        {
+          "on": true,
+          "kv": 20.13,
+          "ua": 49.1
+        },
+        {
+          "on": true,
+          "kv": 20.11,
+          "ua": 50.0
+        },
+        {
+          "on": true,
+          "kv": 20.11,
+          "ua": 50.0
+        },
+        {
+          "on": true,
+          "kv": 20.02,
+          "ua": 49.3
+        },
+        {
+          "on": true,
+          "kv": 20.02,
+          "ua": 49.3
+        }
+      ]
+    },
+    {
+      "step": "P1: steady output matches setpoint (REAL beam)",
+      "pass": true,
+      "monKv": 20.024871826171875,
+      "monUa": 49.32403564453125
+    },
+    {
+      "step": "P1: xray_toggle OFF",
+      "pass": true
+    },
+    {
+      "step": "P1: beam OFF confirmed",
+      "pass": true
+    },
+    {
+      "step": "P1: re-arm checkbox → device deadman ARMED (0x74 0x01)",
+      "pass": true
+    },
+    {
+      "step": "P1: beam enable rejected again after re-arm",
+      "pass": true,
+      "errorCode": "SAFETY_LOCK_REQUIRED"
+    },
+    {
+      "step": "P2: release again",
+      "pass": true
+    },
+    {
+      "step": "P2: xray_toggle ON accepted",
+      "pass": true
+    },
+    {
+      "step": "P2: beam HELD 3s without re-enable",
+      "pass": true,
+      "samples": [
+        {
+          "on": true,
+          "kv": 20.03,
+          "ua": 49.8
+        },
+        {
+          "on": true,
+          "kv": 20.03,
+          "ua": 49.8
+        },
+        {
+          "on": true,
+          "kv": 20.0,
+          "ua": 47.7
+        }
+      ]
+    },
+    {
+      "step": "P2: steady output matches setpoint (REAL beam)",
+      "pass": true,
+      "monKv": 20.0042724609375,
+      "monUa": 47.72186279296875
+    },
+    {
+      "step": "P2: stdin EOF with beam ON → engine exited cleanly",
+      "pass": true,
+      "exitCode": 0
+    },
+    {
+      "step": "P2-reconnect: retry_device xray",
+      "pass": true
+    },
+    {
+      "step": "P2: beam was OFF after EOF termination (shutdown cleanup works)",
+      "pass": true
+    },
+    {
+      "step": "P2: second engine EOF",
+      "pass": true,
+      "exitCode": 0
+    },
+    {
+      "step": "P3: retry_device xray",
+      "pass": true
+    },
+    {
+      "step": "P3: beam OFF at start",
+      "pass": true
+    },
+    {
+      "step": "P3: release",
+      "pass": true
+    },
+    {
+      "step": "P3: SEND V 20.0 kV",
+      "pass": true
+    },
+    {
+      "step": "P3: SEND I 50.0 µA",
+      "pass": true
+    },
+    {
+      "step": "P3: xray_toggle ON accepted",
+      "pass": true
+    },
+    {
+      "step": "P3: beam HELD 3s without re-enable",
+      "pass": true,
+      "samples": [
+        {
+          "on": true,
+          "kv": 19.82,
+          "ua": 49.7
+        },
+        {
+          "on": true,
+          "kv": 19.82,
+          "ua": 49.7
+        },
+        {
+          "on": true,
+          "kv": 19.97,
+          "ua": 50.1
+        }
+      ]
+    },
+    {
+      "step": "P3: steady output matches setpoint (REAL beam)",
+      "pass": true,
+      "monKv": 19.9676513671875,
+      "monUa": 50.08697509765625
+    },
+    {
+      "step": "P3: taskkill /F with beam ON (released mode)",
+      "pass": true
+    },
+    {
+      "step": "P3-reconnect: retry_device xray",
+      "pass": true
+    },
+    {
+      "step": "P3: beam left ON by force-kill is DETECTED at connect (red state)",
+      "pass": true,
+      "monKv": 20.005416870117188,
+      "monUa": 49.800872802734375
+    },
+    {
+      "step": "P3: armed deadman auto-killed leftover beam",
+      "pass": false
+    },
+    {
+      "step": "P3: leftover beam manually disabled",
+      "pass": true
+    },
+    {
+      "step": "P3: beam confirmed OFF",
+      "pass": true
+    },
+    {
+      "step": "P3: final EOF shutdown",
+      "pass": true,
+      "exitCode": 0
+    }
+  ],
+  "initialBeamStateDetected": false,
+  "initialUsbAutoShutDown": true,
+  "finishedAt": "2026-09-19T02:32:51.387Z",
+  "verdict": true
+}

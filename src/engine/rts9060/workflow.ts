@@ -154,7 +154,8 @@ export class ScanWorkflow {
   frames: CapturedFrame[] = [];
   logs: ConsoleLogEntry[] = [];
   timerOn = false;
-  usbAutoShutDown = false;
+  usbAutoShutDown = true;
+  usbShutdownDelay = 5;
   checkpointAvailable = false;
 
   private pauseRequested = false;
@@ -478,6 +479,13 @@ export class ScanWorkflow {
   usbAutoShutDownToggle(): void {
     this.usbAutoShutDown = !this.usbAutoShutDown;
     this.log("INFO", "xray", this.usbAutoShutDown ? "USB auto shut down armed" : "USB auto shut down cleared");
+    this.emit();
+  }
+
+  setUsbShutdownDelay(delay: number): void {
+    if (!Number.isFinite(delay) || delay <= 0) return;
+    this.usbShutdownDelay = Math.round(delay);
+    this.log("INFO", "xray", `USB shutdown delay set to ${this.usbShutdownDelay}`);
     this.emit();
   }
 

@@ -1,7 +1,8 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { qaDomGeometryPlugin } from "./docs/shots/qa-dom-geometry-plugin.mjs";
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   build: {
     outDir: "dist/client",
   },
@@ -15,5 +16,5 @@ export default defineConfig({
       clientFiles: ["./src/main.tsx"],
     },
   },
-  plugins: [react()],
-});
+  plugins: [react(), ...(command === "serve" ? [qaDomGeometryPlugin()] : [])],
+}));

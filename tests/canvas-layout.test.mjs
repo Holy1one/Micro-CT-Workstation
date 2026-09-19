@@ -39,6 +39,14 @@ test("1K maximised client area leaves no side gutter", () => {
   assert.equal(layout.gutterY, 0);
 });
 
+test("reported 1011 x 695 client area remains flush on both axes", () => {
+  const layout = computeCanvasLayout(1011, 695);
+  assert.equal(layout.mode, "fill");
+  assert.ok(bothAxesFlush(layout, 1011, 695));
+  assert.equal(layout.gutterX, 0);
+  assert.equal(layout.gutterY, 0);
+});
+
 test("smallest allowed window is 0.9 of the design canvas and still fills", () => {
   const layout = computeCanvasLayout(1728, 972);
   assert.equal(layout.mode, "fill");

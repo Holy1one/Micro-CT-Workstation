@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-09-18T13:42:27+0800",
-  "hwnd": 6166718,
+  "timestamp": "2026-09-19T07:35:34+0800",
+  "hwnd": 590378,
   "note": "read-only: no SetWindowPos/ShowWindow/restore/SetForegroundWindow",
   "stateBefore": {
     "isZoomed": true,
@@ -8,112 +8,112 @@
     "WS_MAXIMIZE": true,
     "showCmd": 3,
     "rcNormalPosition": [
-      104,
-      69,
-      1848,
-      1080
+      0,
+      0,
+      1554,
+      882
     ],
     "outer": [
-      -8,
-      -8,
-      1928,
-      1040
+      -7,
+      -7,
+      1543,
+      823
     ],
     "outerSize": [
-      1936,
-      1048
+      1550,
+      830
     ]
   },
   "full": {
     "label": "readonly-clean",
-    "timestamp": "2026-09-18T13:42:29+0800",
-    "hwnd": 6166718,
+    "timestamp": "2026-09-19T07:35:34+0800",
+    "hwnd": 590378,
     "isZoomed": true,
     "showCmd": 3,
     "rcNormalPosition": [
-      104,
-      69,
-      1848,
-      1080
+      0,
+      0,
+      1554,
+      882
     ],
     "osOuterRect": [
-      -8,
-      -8,
-      1928,
-      1040
+      -7,
+      -7,
+      1543,
+      823
     ],
     "osOuterSize": [
-      1936,
-      1048
+      1550,
+      830
     ],
     "dwmVisibleFrame": [
       0,
       0,
       1920,
-      1032
+      1020
     ],
     "clientScreenRect": [
       0,
       23,
-      1920,
-      1032
+      1536,
+      815
     ],
     "clientSize": [
-      1920,
-      1009
+      1536,
+      792
     ],
-    "dpiForWindow": 96,
+    "dpiForWindow": 120,
     "monitor": {
       "rcMonitor": [
         0,
         0,
-        1920,
-        1080
+        1536,
+        864
       ],
       "rcWork": [
         0,
         0,
-        1920,
-        1032
+        1536,
+        816
       ],
       "primary": true,
       "dpiX": 96,
       "scalePercent": 100
     },
     "dom": {
-      "error": "<urlopen error timed out>"
+      "error": "Expecting value: line 1 column 1 (char 0)"
     },
     "expectedCanvas": {
       "mode": "fill",
-      "designHeight": 1009.0,
-      "zoom": 1.0,
-      "scaledWidth": 1920.0,
-      "scaledHeight": 1009.0,
+      "designHeight": 990.0,
+      "zoom": 0.8,
+      "scaledWidth": 1536.0,
+      "scaledHeight": 792.0,
       "gutterX": 0.0,
       "gutterY": 0.0
     },
-    "monitorCount": 2,
+    "monitorCount": 1,
     "virtualScreen": [
       0,
       0,
-      3456,
-      1080
+      1536,
+      864
     ],
-    "foregroundHwnd": 6166718,
+    "foregroundHwnd": 590378,
     "evidence": {
       "api": "PrintWindow(hwnd, PW_RENDERFULLCONTENT)",
       "printWindowUsed": true,
       "foregroundSteal": false,
       "foregroundMatchesTarget": true,
-      "windowPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-readonly-clean-window-printwindow.png",
+      "windowPng": "E:\\LZU_Master\\MicroCT\\Micro-CT-App\\docs\\shots\\window-geometry-readonly-clean-window-printwindow.png",
       "windowPngSize": [
-        1920,
-        1009
+        1536,
+        792
       ],
       "renderStats": {
-        "uniqueColors": 3031,
-        "meanLuma": 239.56,
-        "midRowEdges": 16,
+        "uniqueColors": 2837,
+        "meanLuma": 225.4,
+        "midRowEdges": 29,
         "verdict": "rendered"
       }
     }
@@ -124,24 +124,24 @@
     "WS_MAXIMIZE": true,
     "showCmd": 3,
     "rcNormalPosition": [
-      104,
-      69,
-      1848,
-      1080
+      0,
+      0,
+      1554,
+      882
     ],
     "outer": [
-      -8,
-      -8,
-      1928,
-      1040
+      -7,
+      -7,
+      1543,
+      823
     ],
     "outerSize": [
-      1936,
-      1048
+      1550,
+      830
     ]
   },
   "focus": {
-    "foregroundHwnd": 6166718,
+    "foregroundHwnd": 590378,
     "targetIsForeground": true,
     "note": "capture uses PrintWindow; focus is left untouched"
   }

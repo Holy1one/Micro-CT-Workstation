@@ -15,6 +15,9 @@ export function qaDomGeometryPlugin() {
     try {
       const canvas = document.querySelector(".design-canvas");
       const shell = document.querySelector(".viewport-shell");
+      const liveScene = document.querySelector(".live-scene");
+      const sceneRoot = document.querySelector(".scene-canvas");
+      const webglCanvas = document.querySelector(".scene-canvas canvas");
       const rect = (node) => {
         if (!node) return null;
         const r = node.getBoundingClientRect();
@@ -38,8 +41,11 @@ export function qaDomGeometryPlugin() {
         viewportShell: rect(shell),
         designCanvas: rect(canvas),
         designCanvasZoom: canvas ? getComputedStyle(canvas).zoom : null,
+        liveScene: rect(liveScene),
+        sceneRoot: rect(sceneRoot),
+        webglCanvas: rect(webglCanvas),
+        webglBuffer: webglCanvas ? { width: webglCanvas.width, height: webglCanvas.height } : null,
       };
-      document.title = "QA_GEOM|" + JSON.stringify(payload);
       fetch("/__qa_dom_geometry__", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }).catch(() => {});
     } catch (error) {
       /* no-op */

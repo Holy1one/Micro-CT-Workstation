@@ -26,6 +26,10 @@ fn main() -> io::Result<()> {
         writeln!(&mut stdout)?;
         stdout.flush()?;
     }
-    // stdin EOF ends this child; V1 has no physical outputs to release.
+    // stdin EOF means the desktop shell is gone (closed, crashed or killed).
+    // Shut down deterministically: stop any active scan and force the Moxtek
+    // OFF before this process exits, so a terminated UI can never leave the
+    // tube emitting.
+    engine.shutdown();
     Ok(())
 }

@@ -31,20 +31,26 @@ function oneDecimal(value: number): number {
 }
 
 export class XraySource12W {
-  private setKv = 30.2;
-  private setUa = 101.0;
+  private setKv = 60.0;
+  private setUa = 200.0;
   private beam = false;
   private latched = false;
   private interlock = true;
   private tempC = 31.4;
 
   setVoltage(kv: number): number {
-    this.setKv = oneDecimal(Math.min(KV_MAX, Math.max(KV_MIN, kv)));
+    if (!Number.isFinite(kv) || kv < KV_MIN || kv > KV_MAX || (kv * this.setUa) / 1000 > RATED_POWER_W) {
+      throw new Error("X-ray setpoint must remain within 4-70 kV and 12 W");
+    }
+    this.setKv = oneDecimal(kv);
     return this.setKv;
   }
 
   setCurrent(ua: number): number {
-    this.setUa = oneDecimal(Math.min(UA_MAX, Math.max(0, ua)));
+    if (!Number.isFinite(ua) || ua < 0 || ua > UA_MAX || (this.setKv * ua) / 1000 > RATED_POWER_W) {
+      throw new Error("X-ray setpoint must remain within 0-1000 uA and 12 W");
+    }
+    this.setUa = oneDecimal(ua);
     return this.setUa;
   }
 
@@ -85,7 +91,7 @@ export class XraySource12W {
       setUa: this.setUa,
       monKv,
       monUa,
-      powerW: RATED_POWER_W,
+      powerW: (monKv * monUa) / 1000,
       tempC: this.tempC,
       beamOn: this.beam,
       interlockOk: this.interlock,

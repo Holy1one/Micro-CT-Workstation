@@ -347,7 +347,8 @@ i.tone-danger { background: var(--danger); }
 .scene-view-btn.active { background: var(--neutralSoft); color: var(--textPrimary); }
 
 .live-scene { position: relative; flex: 1 1 auto; min-height: 0; isolation: isolate; }
-.scene-canvas { position: absolute !important; inset: 0; z-index: 1; touch-action: none; }
+.scene-canvas { position: absolute !important; inset: 0; width: 100% !important; height: 100% !important; z-index: 1; touch-action: none; }
+.scene-canvas > div, .scene-canvas canvas { width: 100% !important; height: 100% !important; display: block; }
 .scene-fallback { position: absolute; inset: 0; z-index: 1; }
 .scene-fallback__label {
   position: absolute;
@@ -508,6 +509,67 @@ i.tone-danger { background: var(--danger); }
 .check-row i::after { content: ""; font-size: 10px; color: #fff; line-height: 1; }
 .check-row input:checked + i { background: var(--accent); border-color: var(--accent); }
 .check-row input:checked + i::after { content: "✓"; }
+
+/* ---------- xray device safety block ---------- */
+
+.safety-block {
+  margin: 12px 14px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--neutralSoft);
+  padding-bottom: 10px;
+}
+.safety-block__head {
+  display: flex;
+  align-items: center;
+  padding: 9px 10px 0;
+}
+.safety-block__title {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--textMuted);
+}
+.safety-block__head .chip { margin-left: auto; }
+.check-row--inset { padding: 10px 10px 0; }
+.delay-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: end;
+  gap: 8px;
+  padding: 10px 10px 0;
+}
+.delay-row__field span {
+  display: block;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--textMuted);
+  margin-bottom: 4px;
+}
+.delay-row__field input {
+  width: 100%;
+  height: 30px;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--well);
+  color: var(--textPrimary);
+  font-family: var(--fontMono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 8px;
+  text-align: center;
+}
+.delay-row__field input:disabled { opacity: 0.55; }
+.delay-row .send-btn { height: 30px; }
+.delay-row__device {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--textSecondary);
+  white-space: nowrap;
+  padding-bottom: 8px;
+}
 
 /* ---------- operation status ---------- */
 

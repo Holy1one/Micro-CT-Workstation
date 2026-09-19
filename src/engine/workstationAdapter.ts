@@ -107,6 +107,8 @@ export class WorkstationAdapter implements EngineAdapter {
       case "retry_device":
         void wf.retryDevice(command.device);
         break;
+      case "camera_test_capture":
+        throw new Error("Real camera capture is available only in the desktop runtime");
       case "xray_toggle":
         void wf.xrayToggle();
         break;
@@ -115,6 +117,9 @@ export class WorkstationAdapter implements EngineAdapter {
         break;
       case "usb_auto_shut_down_toggle":
         wf.usbAutoShutDownToggle();
+        break;
+      case "set_usb_shutdown_delay":
+        wf.setUsbShutdownDelay(command.delay);
         break;
       case "send_voltage":
         wf.sendVoltage(command.kv);
@@ -318,6 +323,8 @@ export class WorkstationAdapter implements EngineAdapter {
         wf.checkpointAvailable,
       estop: phase !== "booting",
       playMode: phase === "scanning" ? "pause" : phase === "paused" ? "resume" : phase === "fault" ? "disabled" : "start",
+      homeReason: phase === "fault" ? "Release E-STOP, then run Preflight" : !wf.preflightPassed ? "Run Preflight first" : "",
+      playReason: phase === "fault" ? "Release E-STOP" : !wf.preflightPassed ? "Run Preflight first" : !wf.homed ? "Run HOME first" : "",
     };
 
     const statusLeft = !configured
@@ -357,6 +364,13 @@ export class WorkstationAdapter implements EngineAdapter {
         offSec: phase === "scanning" ? 6 : 20,
         timerOn: phase === "scanning" ? true : wf.timerOn,
         usbAutoShutDown: wf.usbAutoShutDown,
+        usbShutdownDelay: wf.usbShutdownDelay,
+        manualControlsEnabled: true,
+        timerControlsEnabled: true,
+        setpointControlsEnabled: true,
+        voltageConfirmed: true,
+        currentConfirmed: true,
+        setpointConfirmed: true,
       },
       progress: { captured, total, percent, angleDeg: angle, etaText: wf.etaText, barTone, barLabel },
       summary: {

@@ -188,3 +188,56 @@
 - 新增：`docs/shots/qa_directory_picker_verify.py`、`qa_save_dialog_verify.py`、`qa_layout_measure.py`，
   证据 `directory-picker-dialog.png`、`save-dialog-native.png` 与三个 JSON。
 - 验收产物均落在 `%TEMP%` 并在脚本结尾清理，不留在用户目录。
+
+# 当前进度（2026-09-19，X 射线真实控制与设备端死开关验收）
+
+## Moxtek 设备端机制（真机实测 + 官方软件反编译交叉验证）
+
+- 官方 `12WattControllerVer001`（.NET ClickOnce，桌面 `12W-Software`）反编译出三个此前未知的命令：
+  `0x74` = USB Auto Shut Down 开关（payload 1=armed / 0=released），`0x76` = 设延时（u16），
+  `0x77` = 读延时。官方监控定时器 500ms 才轮询一次。
+- 设备端死开关实测：armed 状态下最后一次 enable 后约 0.27 s 固件自动清除出束标志并受控降压；
+  只读轮询（GET_STATUS）喂不住，重发 enable（≤100ms）可以。因此官方软件也必须取消勾选才能持续出束。
+- 管子无故障：20/30/40/60 kV 四个功率点稳态输出与设定误差 <1.2%（`qa_xray_setpoint_sweep.py`）。
+- 早前"出束成功但秒掉"的根因即此死开关；此前所有未持握通信的出束均为爬升瞬态碰巧通过判定。
+
+## 本轮改动（crates/ct-engine + src-tauri）
+
+- `xray.rs`：连接时先读状态——检测到遗留束流则如实上报 `beam_on`（UI 红按钮），不静默强制关；
+  新增 `refresh_status`（非破坏性轮询）与 `set_usb_auto_shutdown(0x74)` / `read_usb_shutdown_timer(0x77)`；
+  `XrayHealth` 增加 `beam_on` / `usb_auto_shutdown` / `usb_shutdown_delay`。
+- `lib.rs`：生产模式 `xray_toggle` 实现真实手动开关束——关束永不锁定；开束要求
+  射线已连接 + 未 busy + 未锁存 + SEND V/I 已确认 + **USB Auto Shut Down 已释放**
+  （勾选态拒绝 `SAFETY_LOCK_REQUIRED`，即"勾选=锁定，释放=授权"）。
+  `usb_auto_shut_down_toggle` 现在真实下发 0x74 到设备；连接（retry_device/preflight）时把引擎
+  勾选状态同步到设备。`xray_connected` 不再要求 `beam_off_confirmed`（出束中也算已连接）；
+  `manualControlsEnabled` 只要求射线连接，脱离 preflight/HOME（X 射线可脱离 CT 单独控制）。
+  新增 `shutdown()`：stdin EOF 后确定性 stop scan + force OFF + 断开全部设备。
+- `main.rs`（ct-engine）：stdin EOF（窗口关闭/壳崩溃/被杀）后显式 `engine.shutdown()`。
+- `engine_client.rs`：Drop 改为 stop → 关闭 stdin（触发引擎 EOF 清理）→ 最多等 8 s → 卡住才 kill；
+  `xray_toggle` IPC 超时 20 s。
+- `nano.rs`：fail-fatal 会话模型改容错——命令级错误（ERR/安全拒绝/单次超时）只返回给调用方，
+  会话保持可恢复；心跳丢失与意外异步行记录后继续；仅传输层错误判 Lost。
+  这是"扫描转完一个角度不继续"的主要修复（此前一次串口抖动即永久断链）。
+
+## 真实硬件验收（`docs/shots/qa_xray_real_beam.py`，证据 `xray-real-beam-verify.json`，VERDICT true）
+
+- ARMED（勾选）手动开束被拒 `SAFETY_LOCK_REQUIRED`；释放后 20 kV / 50 µA（1 W）真实出束
+  **无重发 enable 持握 8 s**，回读 20.02–20.13 kV / 48.8–50.2 µA，与设定一致。
+- 手动关束确认；重新 ARMED 后开束再次被拒。
+- 释放态出束中 stdin EOF（模拟关窗）→ 引擎退出码 0 → 重连确认束流已关（软件清理链有效）。
+- 释放态出束中 `taskkill /F` → 束流物理保持 → 重连**检测到 beam_on（红按钮态，20.0 kV / 49.8 µA
+  实测仍在输出）**→ 手动 Xray Disable 关束确认。遗留束流检测链路真实有效。
+- 注意：armed 死开关只约束"armed 期间的出束"；对释放态下已存在的遗留束流无追溯力，
+  必须靠连接检测 + 手动关闭（已按此实现并验证）。
+
+## 校验
+
+- `cargo test --workspace`：ct-engine 32/32、ct-workstation 12/12 通过（含新增的
+  连接束流检测、0x74/0x77、命令容错恢复用例）。
+- `npm run typecheck` 通过；`npm run test:sites` 22/22 通过。
+
+## 未验收项
+
+- 完整真实扫描链（4 视角出束+拍照）依赖 digiCamControl/D7100，本机尚未安装相机控制端；
+  Nano 容错修复与 X 射线持握已分别单体验证，整链待相机就位后跑 `tmp/hw_runtime/run_rust_engine_4pt.py`。

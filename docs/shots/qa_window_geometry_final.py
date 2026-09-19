@@ -10,7 +10,7 @@ import time
 import urllib.request
 import zlib
 
-ROOT = r"E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App"
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 OUT = os.path.join(ROOT, "docs", "shots")
 DOM_URL = "http://127.0.0.1:4173/__qa_dom_geometry__"
 PRIMARY_WORK = (0, 0, 1920, 1032)

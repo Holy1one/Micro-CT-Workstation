@@ -173,6 +173,7 @@ export function LiveSceneCanvas({
   return (
     <Canvas
       className="scene-canvas"
+      resize={{ offsetSize: true }}
       frameloop="demand"
       dpr={[1, 1.75]}
       gl={{ alpha: true, antialias: false, powerPreference: "high-performance" }}

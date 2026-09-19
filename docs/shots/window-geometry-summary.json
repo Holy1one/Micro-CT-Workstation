@@ -1,5 +1,5 @@
 {
-  "hwnd": 19008006,
+  "hwnd": 5181340,
   "primaryWorkArea": [
     0,
     0,
@@ -9,378 +9,378 @@
   "samples": [
     {
       "label": "startup-observed",
-      "timestamp": "2026-09-18T13:26:10+0800",
-      "hwnd": 19008006,
+      "timestamp": "2026-09-18T20:06:37+0800",
+      "hwnd": 5181340,
       "isZoomed": true,
       "showCmd": 3,
       "rcNormalPosition": [
-        176,
-        69,
-        1920,
-        1080
+        0,
+        0,
+        1554,
+        882
       ],
       "osOuterRect": [
         40,
         40,
-        1976,
-        1088
+        1590,
+        870
       ],
       "osOuterSize": [
-        1936,
-        1048
+        1550,
+        830
       ],
       "dwmVisibleFrame": [
-        48,
-        48,
-        1968,
-        1080
+        59,
+        59,
+        1979,
+        1079
       ],
       "clientScreenRect": [
-        48,
-        71,
-        1968,
-        1080
+        47,
+        70,
+        1583,
+        862
       ],
       "clientSize": [
-        1920,
-        1009
+        1536,
+        792
       ],
-      "dpiForWindow": 96,
+      "dpiForWindow": 120,
       "monitor": {
         "rcMonitor": [
           0,
           0,
-          1920,
-          1080
+          1536,
+          864
         ],
         "rcWork": [
           0,
           0,
-          1920,
-          1032
+          1536,
+          816
         ],
         "primary": true,
         "dpiX": 96,
         "scalePercent": 100
       },
       "dom": {
-        "error": "<urlopen error timed out>"
+        "error": "Expecting value: line 1 column 1 (char 0)"
       },
       "expectedCanvas": {
         "mode": "fill",
-        "designHeight": 1009.0,
-        "zoom": 1.0,
-        "scaledWidth": 1920.0,
-        "scaledHeight": 1009.0,
+        "designHeight": 990.0,
+        "zoom": 0.8,
+        "scaledWidth": 1536.0,
+        "scaledHeight": 792.0,
         "gutterX": 0.0,
         "gutterY": 0.0
       },
-      "monitorCount": 2,
+      "monitorCount": 1,
       "virtualScreen": [
         0,
         0,
-        3456,
-        1080
+        1536,
+        864
       ],
-      "foregroundHwnd": 11862416,
+      "foregroundHwnd": 5181340,
       "evidence": {
-        "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
-        "printWindowUsed": false,
-        "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-startup-observed-virtual-desktop-bitblt.png",
-        "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-startup-observed-window-crop-bitblt.png",
-        "windowCropSize": [
-          1920,
-          1032
+        "api": "PrintWindow(hwnd, PW_RENDERFULLCONTENT)",
+        "printWindowUsed": true,
+        "foregroundSteal": false,
+        "foregroundMatchesTarget": true,
+        "windowPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-startup-observed-window-printwindow.png",
+        "windowPngSize": [
+          1536,
+          792
         ],
-        "cropBox": [
-          48,
-          48,
-          1968,
-          1080
-        ],
-        "foregroundMatchesTarget": false
+        "renderStats": {
+          "uniqueColors": 2272,
+          "meanLuma": 232.14,
+          "midRowEdges": 38,
+          "verdict": "rendered"
+        }
       }
     },
     {
       "label": "requested-maximized",
-      "timestamp": "2026-09-18T13:26:17+0800",
-      "hwnd": 19008006,
+      "timestamp": "2026-09-18T20:06:40+0800",
+      "hwnd": 5181340,
       "isZoomed": true,
       "showCmd": 3,
       "rcNormalPosition": [
-        176,
-        69,
-        1920,
-        1080
+        0,
+        0,
+        1554,
+        882
       ],
       "osOuterRect": [
         40,
         40,
-        1976,
-        1088
+        1590,
+        870
       ],
       "osOuterSize": [
-        1936,
-        1048
+        1550,
+        830
       ],
       "dwmVisibleFrame": [
-        48,
-        48,
-        1968,
-        1080
+        59,
+        59,
+        1979,
+        1079
       ],
       "clientScreenRect": [
-        48,
-        71,
-        1968,
-        1080
+        47,
+        70,
+        1583,
+        862
       ],
       "clientSize": [
-        1920,
-        1009
+        1536,
+        792
       ],
-      "dpiForWindow": 96,
+      "dpiForWindow": 120,
       "monitor": {
         "rcMonitor": [
           0,
           0,
-          1920,
-          1080
+          1536,
+          864
         ],
         "rcWork": [
           0,
           0,
-          1920,
-          1032
+          1536,
+          816
         ],
         "primary": true,
         "dpiX": 96,
         "scalePercent": 100
       },
       "dom": {
-        "error": "<urlopen error timed out>"
+        "error": "Expecting value: line 1 column 1 (char 0)"
       },
       "expectedCanvas": {
         "mode": "fill",
-        "designHeight": 1009.0,
-        "zoom": 1.0,
-        "scaledWidth": 1920.0,
-        "scaledHeight": 1009.0,
+        "designHeight": 990.0,
+        "zoom": 0.8,
+        "scaledWidth": 1536.0,
+        "scaledHeight": 792.0,
         "gutterX": 0.0,
         "gutterY": 0.0
       },
-      "monitorCount": 2,
+      "monitorCount": 1,
       "virtualScreen": [
         0,
         0,
-        3456,
-        1080
+        1536,
+        864
       ],
-      "foregroundHwnd": 7213814,
+      "foregroundHwnd": 5181340,
       "evidence": {
-        "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
-        "printWindowUsed": false,
-        "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-maximized-virtual-desktop-bitblt.png",
-        "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-maximized-window-crop-bitblt.png",
-        "windowCropSize": [
-          1920,
-          1032
+        "api": "PrintWindow(hwnd, PW_RENDERFULLCONTENT)",
+        "printWindowUsed": true,
+        "foregroundSteal": false,
+        "foregroundMatchesTarget": true,
+        "windowPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-maximized-window-printwindow.png",
+        "windowPngSize": [
+          1536,
+          792
         ],
-        "cropBox": [
-          48,
-          48,
-          1968,
-          1080
-        ],
-        "foregroundMatchesTarget": false
+        "renderStats": {
+          "uniqueColors": 2272,
+          "meanLuma": 232.14,
+          "midRowEdges": 38,
+          "verdict": "rendered"
+        }
       }
     },
     {
       "label": "requested-restored",
-      "timestamp": "2026-09-18T13:26:24+0800",
-      "hwnd": 19008006,
+      "timestamp": "2026-09-18T20:06:43+0800",
+      "hwnd": 5181340,
       "isZoomed": false,
       "showCmd": 1,
       "rcNormalPosition": [
-        176,
-        69,
-        1920,
-        1080
+        0,
+        0,
+        1554,
+        882
       ],
       "osOuterRect": [
-        176,
-        69,
-        1920,
-        1080
+        0,
+        0,
+        1554,
+        882
       ],
       "osOuterSize": [
-        1744,
-        1011
+        1554,
+        882
       ],
       "dwmVisibleFrame": [
-        183,
-        69,
-        1913,
-        1073
+        8,
+        0,
+        1934,
+        1094
       ],
       "clientScreenRect": [
-        184,
-        100,
-        1912,
-        1072
+        7,
+        30,
+        1546,
+        874
       ],
       "clientSize": [
-        1728,
-        972
+        1539,
+        844
       ],
-      "dpiForWindow": 96,
+      "dpiForWindow": 120,
       "monitor": {
         "rcMonitor": [
           0,
           0,
-          1920,
-          1080
+          1536,
+          864
         ],
         "rcWork": [
           0,
           0,
-          1920,
-          1032
+          1536,
+          816
         ],
         "primary": true,
         "dpiX": 96,
         "scalePercent": 100
       },
       "dom": {
-        "error": "<urlopen error timed out>"
+        "error": "Expecting value: line 1 column 1 (char 0)"
       },
       "expectedCanvas": {
         "mode": "fill",
-        "designHeight": 1080.0,
-        "zoom": 0.9,
-        "scaledWidth": 1728.0,
-        "scaledHeight": 972.0,
+        "designHeight": 1052.9434697855752,
+        "zoom": 0.8015625,
+        "scaledWidth": 1539.0,
+        "scaledHeight": 844.0000000000001,
         "gutterX": 0.0,
         "gutterY": 0.0
       },
-      "monitorCount": 2,
+      "monitorCount": 1,
       "virtualScreen": [
         0,
         0,
-        3456,
-        1080
+        1536,
+        864
       ],
-      "foregroundHwnd": 25430288,
+      "foregroundHwnd": 5181340,
       "evidence": {
-        "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
-        "printWindowUsed": false,
-        "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-restored-virtual-desktop-bitblt.png",
-        "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-restored-window-crop-bitblt.png",
-        "windowCropSize": [
-          1730,
-          1004
+        "api": "PrintWindow(hwnd, PW_RENDERFULLCONTENT)",
+        "printWindowUsed": true,
+        "foregroundSteal": false,
+        "foregroundMatchesTarget": true,
+        "windowPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-requested-restored-window-printwindow.png",
+        "windowPngSize": [
+          1539,
+          844
         ],
-        "cropBox": [
-          183,
-          69,
-          1913,
-          1073
-        ],
-        "foregroundMatchesTarget": false
+        "renderStats": {
+          "uniqueColors": 2492,
+          "meanLuma": 232.21,
+          "midRowEdges": 120,
+          "verdict": "rendered"
+        }
       }
     },
     {
       "label": "remaximized",
-      "timestamp": "2026-09-18T13:26:30+0800",
-      "hwnd": 19008006,
+      "timestamp": "2026-09-18T20:06:45+0800",
+      "hwnd": 5181340,
       "isZoomed": true,
       "showCmd": 3,
       "rcNormalPosition": [
-        176,
-        69,
-        1920,
-        1080
+        0,
+        0,
+        1554,
+        882
       ],
       "osOuterRect": [
-        -8,
-        -8,
-        1928,
-        1040
+        -7,
+        -7,
+        1543,
+        823
       ],
       "osOuterSize": [
-        1936,
-        1048
+        1550,
+        830
       ],
       "dwmVisibleFrame": [
         0,
         0,
         1920,
-        1032
+        1020
       ],
       "clientScreenRect": [
         0,
         23,
-        1920,
-        1032
+        1536,
+        815
       ],
       "clientSize": [
-        1920,
-        1009
+        1536,
+        792
       ],
-      "dpiForWindow": 96,
+      "dpiForWindow": 120,
       "monitor": {
         "rcMonitor": [
           0,
           0,
-          1920,
-          1080
+          1536,
+          864
         ],
         "rcWork": [
           0,
           0,
-          1920,
-          1032
+          1536,
+          816
         ],
         "primary": true,
         "dpiX": 96,
         "scalePercent": 100
       },
       "dom": {
-        "error": "<urlopen error timed out>"
+        "error": "Expecting value: line 1 column 1 (char 0)"
       },
       "expectedCanvas": {
         "mode": "fill",
-        "designHeight": 1009.0,
-        "zoom": 1.0,
-        "scaledWidth": 1920.0,
-        "scaledHeight": 1009.0,
+        "designHeight": 990.0,
+        "zoom": 0.8,
+        "scaledWidth": 1536.0,
+        "scaledHeight": 792.0,
         "gutterX": 0.0,
         "gutterY": 0.0
       },
-      "monitorCount": 2,
+      "monitorCount": 1,
       "virtualScreen": [
         0,
         0,
-        3456,
-        1080
+        1536,
+        864
       ],
-      "foregroundHwnd": 25430288,
+      "foregroundHwnd": 5181340,
       "evidence": {
-        "api": "GetDC(NULL)+CreateCompatibleDC+BitBlt(SRCCOPY)",
-        "printWindowUsed": false,
-        "virtualDesktopPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-remaximized-virtual-desktop-bitblt.png",
-        "windowCropPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-remaximized-window-crop-bitblt.png",
-        "windowCropSize": [
-          1920,
-          1032
+        "api": "PrintWindow(hwnd, PW_RENDERFULLCONTENT)",
+        "printWindowUsed": true,
+        "foregroundSteal": false,
+        "foregroundMatchesTarget": true,
+        "windowPng": "E:\\Main\\OneDrive\\LanZhouUniv\\Class\\mluti-energy imaging\\CT\\Micro-CT-App\\docs\\shots\\window-geometry-remaximized-window-printwindow.png",
+        "windowPngSize": [
+          1536,
+          792
         ],
-        "cropBox": [
-          0,
-          0,
-          1920,
-          1032
-        ],
-        "foregroundMatchesTarget": false
+        "renderStats": {
+          "uniqueColors": 2273,
+          "meanLuma": 232.14,
+          "midRowEdges": 38,
+          "verdict": "rendered"
+        }
       }
     }
   ]

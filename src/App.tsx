@@ -193,7 +193,7 @@ function MenuBar({
         ))}
       </div>
       <span className={`badge ${snapshot.mode === "developer_preview" ? "badge--dev" : "badge--locked"}`}>
-        {snapshot.mode === "developer_preview" ? "DEVELOPER PREVIEW · NO REAL HARDWARE" : "PRODUCTION LOCKED"}
+        {snapshot.modeLabel}
       </span>
       <span className={`badge badge--engine badge--${snapshot.connectionState}`}>
         <i aria-hidden="true" />
@@ -210,10 +210,14 @@ function MenuBar({
 function DevicePanel({
   ws,
   busy,
+  hardwareConnected,
+  desktopRuntime,
   dispatch,
 }: {
   ws: WorkstationView;
   busy: boolean;
+  hardwareConnected: boolean;
+  desktopRuntime: boolean;
   dispatch: (c: EngineCommand) => Promise<void>;
 }) {
   const [pendingDevice, setPendingDevice] = useState<DeviceId | null>(null);
@@ -233,7 +237,11 @@ function DevicePanel({
   const runRetry = async (device: DeviceId): Promise<void> => {
     setPendingDevice(device);
     try {
-      await dispatch({ type: "retry_device", device });
+      if (device === "turntable" && !hardwareConnected) {
+        await dispatch({ type: "connect", adapter: "real_hardware" });
+      } else {
+        await dispatch({ type: "retry_device", device });
+      }
     } finally {
       setPendingDevice(null);
     }
@@ -259,8 +267,19 @@ function DevicePanel({
                   aria-busy={retrying}
                   onClick={() => void runRetry(device.id as DeviceId)}
                 >
-                  {retrying ? "Retrying…" : "Retry"}
+                  {retrying ? "Connecting…" : (device.id === "turntable" && !hardwareConnected) || device.id === "camera" || device.id === "xray" ? "Connect" : "Retry"}
                 </button>
+                {device.id === "camera" && device.word === "ONLINE" && desktopRuntime ? (
+                  <button
+                    type="button"
+                    className="retry-btn"
+                    disabled={busy || pendingDevice !== null || !setup.savePath.trim() || !setup.taskId.trim()}
+                    title="Capture one dark test frame into Save Path / Task ID / frames"
+                    onClick={() => void dispatch({ type: "camera_test_capture" })}
+                  >
+                    Test capture
+                  </button>
+                ) : null}
               </div>
               <div className="device-row__spec">{device.spec}</div>
             </div>
@@ -475,6 +494,7 @@ function ControlDock({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engi
         type="button"
         className="dock-key dock-key--home"
         aria-label="Home"
+        title={dock.homeReason || "Home turntable"}
         disabled={!dock.home}
         onClick={() => void dispatch({ type: "home" })}
       >
@@ -485,6 +505,7 @@ function ControlDock({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engi
         type="button"
         className="dock-key dock-key--play"
         aria-label={play.label}
+        title={dock.playReason || play.label}
         disabled={!dock.play}
         onClick={() => void dispatch(play.command)}
       >
@@ -582,10 +603,21 @@ function LiveScene({ ws, theme, dispatch }: { ws: WorkstationView; theme: Theme;
 function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean; dispatch: (c: EngineCommand) => Promise<void> }) {
   const [kvDraft, setKvDraft] = useState(ws.xray.setKv.toFixed(1));
   const [uaDraft, setUaDraft] = useState(ws.xray.setUa.toFixed(1));
+  const [delayDraft, setDelayDraft] = useState(String(ws.xray.usbShutdownDelay ?? 5));
   useEffect(() => {
     setKvDraft(ws.xray.setKv.toFixed(1));
     setUaDraft(ws.xray.setUa.toFixed(1));
   }, [ws.xray.setKv, ws.xray.setUa]);
+  useEffect(() => {
+    if (ws.xray.usbShutdownDelay != null) {
+      setDelayDraft(String(ws.xray.usbShutdownDelay));
+    }
+  }, [ws.xray.usbShutdownDelay]);
+  const voltageDraftConfirmed =
+    ws.xray.voltageConfirmed && Number(kvDraft) === ws.xray.setKv;
+  const currentDraftConfirmed =
+    ws.xray.currentConfirmed && Number(uaDraft) === ws.xray.setUa;
+  const pairConfirmed = voltageDraftConfirmed && currentDraftConfirmed;
 
   return (
     <section className="panel">
@@ -602,14 +634,14 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
               <input
                 className="xray-channel__well"
                 value={kvDraft}
-                disabled={busy}
+                disabled={busy || !ws.xray.setpointControlsEnabled}
                 inputMode="decimal"
                 onChange={(event) => setKvDraft(event.target.value)}
               />
               <span className="xray-channel__monitor">MON {ws.xray.monKv.toFixed(1)} kV</span>
             </div>
-            <button type="button" className="send-btn" disabled={busy || !Number.isFinite(Number(kvDraft))} onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) })}>
-              SEND V
+            <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(kvDraft))} onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) })}>
+              {voltageDraftConfirmed ? "V SENT" : "SEND V"}
             </button>
           </div>
         </div>
@@ -621,14 +653,14 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
               <input
                 className="xray-channel__well"
                 value={uaDraft}
-                disabled={busy}
+                disabled={busy || !ws.xray.setpointControlsEnabled}
                 inputMode="decimal"
                 onChange={(event) => setUaDraft(event.target.value)}
               />
               <span className="xray-channel__monitor">MON {ws.xray.monUa.toFixed(1)} µA</span>
             </div>
-            <button type="button" className="send-btn" disabled={busy || !Number.isFinite(Number(uaDraft))} onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) })}>
-              SEND I
+            <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(uaDraft))} onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) })}>
+              {currentDraftConfirmed ? "I SENT" : "SEND I"}
             </button>
           </div>
         </div>
@@ -646,7 +678,7 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
       <button
         type="button"
         className={`switch-btn switch-btn--block ${ws.xray.beamOn ? "switch-btn--on" : "switch-btn--idle"}`}
-        disabled={busy || ws.dataState === "fault"}
+        disabled={busy || ws.dataState === "fault" || !ws.xray.manualControlsEnabled}
         onClick={() => void dispatch({ type: "xray_toggle" })}
       >
         {ws.xray.beamOn ? "Xray Disable" : "Xray Enable"}
@@ -664,22 +696,57 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
         <button
           type="button"
           className={`switch-btn switch-btn--chip ${ws.xray.timerOn ? "switch-btn--on" : "switch-btn--idle"}`}
-          disabled={busy || ws.dataState === "scanning"}
+          disabled={busy || ws.dataState === "scanning" || !ws.xray.timerControlsEnabled}
           onClick={() => void dispatch({ type: "timer_toggle" })}
         >
           {ws.xray.timerOn ? "Timer On" : "Timer Off"}
         </button>
       </div>
-      <label className="check-row">
-        <input
-          type="checkbox"
-          checked={ws.xray.usbAutoShutDown}
-          onChange={() => void dispatch({ type: "usb_auto_shut_down_toggle" })}
-        />
-        <i aria-hidden="true" />
-        USB Auto Shut Down
-      </label>
-      <p className="panel__footnote">Output fail-closed · interlock checked before every exposure</p>
+      <div className="safety-block">
+        <div className="safety-block__head">
+          <span className="safety-block__title">DEVICE SAFETY</span>
+          <span className={`chip chip--${ws.xray.usbAutoShutDown ? "ok" : "warn"}`}>
+            {ws.xray.usbAutoShutDown ? "ARMED · BEAM LOCKED" : "RELEASED · STANDALONE"}
+          </span>
+        </div>
+        <label className="check-row check-row--inset">
+          <input
+            type="checkbox"
+            checked={ws.xray.usbAutoShutDown}
+            disabled={busy || ws.dataState === "scanning"}
+            onChange={() => void dispatch({ type: "usb_auto_shut_down_toggle" })}
+          />
+          <i aria-hidden="true" />
+          USB Auto Shut Down
+        </label>
+        <div className="delay-row">
+          <div className="delay-row__field">
+            <span>Shut Down Delay</span>
+            <input
+              value={delayDraft}
+              inputMode="numeric"
+              disabled={busy || ws.dataState === "scanning" || !ws.xray.manualControlsEnabled}
+              onChange={(event) => setDelayDraft(event.target.value)}
+            />
+          </div>
+          <button
+            type="button"
+            className="send-btn"
+            disabled={busy || ws.dataState === "scanning" || !ws.xray.manualControlsEnabled || !/^\d+$/.test(delayDraft.trim()) || Number(delayDraft) <= 0 || Number(delayDraft) > 65535}
+            onClick={() => void dispatch({ type: "set_usb_shutdown_delay", delay: Number(delayDraft) })}
+          >
+            SET
+          </button>
+          <span className="delay-row__device">DEV {ws.xray.usbShutdownDelay ?? "—"}</span>
+        </div>
+      </div>
+      <p className="panel__footnote">
+        {ws.xray.usbAutoShutDown
+          ? "Deadman armed on device · beam enable locked · output dies if the host stops"
+          : pairConfirmed
+            ? "Released · setpoints confirmed · Xray Enable is live for standalone control"
+            : "Released · confirm both setpoints with SEND V and SEND I to unlock Xray Enable"}
+      </p>
     </section>
   );
 }
@@ -911,8 +978,8 @@ function InfoDialog({
           projections, exposure or Max X-ray resets preflight and HOME.
         </li>
         <li>
-          <strong>This build drives no hardware.</strong> {snapshot.modeLabel}. Interlocks, beam and turntable
-          motion are simulated; never treat a passing preflight as a verified interlock.
+          <strong>{snapshot.mode === "developer_preview" ? "This build drives no hardware." : "Stage 1 controls the Nano turntable only."}</strong>{" "}
+          {snapshot.modeLabel}. Camera and X-ray remain locked; never treat Nano preflight as a verified X-ray interlock.
         </li>
       </ul>
     );
@@ -1252,7 +1319,13 @@ export function App() {
         ) : null}
         <section className="main-console">
           <aside className="col">
-            <DevicePanel ws={ws} busy={busy} dispatch={dispatch} />
+            <DevicePanel
+              ws={ws}
+              busy={busy}
+              hardwareConnected={snapshot.connectionState === "connected"}
+              desktopRuntime={adapterKind === "tauri"}
+              dispatch={dispatch}
+            />
             <ScanParamsPanel
               ws={ws}
               busy={busy}

@@ -100,9 +100,11 @@ export type EngineCommand =
   | { type: "set_parameters"; parameters: ScanParameters }
   | { type: "estop_release" }
   | { type: "retry_device"; device: DeviceId }
+  | { type: "camera_test_capture" }
   | { type: "xray_toggle" }
   | { type: "timer_toggle" }
   | { type: "usb_auto_shut_down_toggle" }
+  | { type: "set_usb_shutdown_delay"; delay: number }
   | { type: "send_voltage"; kv: number }
   | { type: "send_current"; ua: number }
   | { type: "update_scan_setup"; setup: ScanSetupUpdate };
@@ -182,6 +184,13 @@ export interface WorkstationView {
     offSec: number;
     timerOn: boolean;
     usbAutoShutDown: boolean;
+    usbShutdownDelay: number | null;
+    manualControlsEnabled: boolean;
+    timerControlsEnabled: boolean;
+    setpointControlsEnabled: boolean;
+    voltageConfirmed: boolean;
+    currentConfirmed: boolean;
+    setpointConfirmed: boolean;
   };
   progress: {
     captured: number;
@@ -200,6 +209,8 @@ export interface WorkstationView {
     restore: boolean;
     estop: boolean;
     playMode: "start" | "pause" | "resume" | "disabled";
+    homeReason: string;
+    playReason: string;
   };
   scanSetup: ScanSetup;
   consoleLogs: ConsoleLogLine[];

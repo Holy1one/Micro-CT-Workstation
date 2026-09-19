@@ -1,10 +1,45 @@
+# Dependency, compiler, and packaging output
 node_modules/
 dist/
 target/
 release/
-.DS_Store
 src-tauri/binaries/
+
+# Logs and runtime crash output
 *.log
+*.stackdump
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor and IDE-local state
+.vs/
+.history/
+*.swp
+*.swo
+*~
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Language/tool caches
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.local
 
 # Local QA / agent scratch output - never part of the shipped source.
 .ai-memory/
@@ -13,3 +48,9 @@ src-tauri/binaries/
 .verification-status.txt
 build-check-evidence.tmp
 qa-browser-snapshot.txt
+qa-output/
+docs/shots/.tmp/
+
+# Generated window-level acceptance captures. Keep authored documentation
+# screenshots and checked-in baselines; ignore only this repeatable QA series.
+docs/shots/window-geometry-*-window-printwindow.png

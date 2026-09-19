@@ -5,6 +5,9 @@ import { join, resolve } from "node:path";
 const root = resolve(import.meta.dirname, "..");
 const release = process.argv.includes("--release");
 const profile = release ? "release" : "debug";
+const targetRoot = process.env.CARGO_TARGET_DIR
+  ? resolve(root, process.env.CARGO_TARGET_DIR)
+  : join(root, "target");
 
 execFileSync("cargo", ["build", "-p", "ct-engine", ...(release ? ["--release"] : [])], {
   cwd: root,
@@ -16,7 +19,7 @@ const triple = rustc.match(/^host:\s+(.+)$/m)?.[1]?.trim();
 if (!triple) throw new Error("Unable to determine the Rust host target triple");
 
 const executable = process.platform === "win32" ? "ct-engine.exe" : "ct-engine";
-const source = join(root, "target", profile, executable);
+const source = join(targetRoot, profile, executable);
 const destinationDirectory = join(root, "src-tauri", "binaries");
 const destination = join(destinationDirectory, `ct-engine-${triple}${process.platform === "win32" ? ".exe" : ""}`);
 mkdirSync(destinationDirectory, { recursive: true });

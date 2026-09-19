@@ -1,12 +1,24 @@
 //! Desktop scan-state owner and protocol-v1 command processor.
+pub mod adapters;
+mod scan;
+
+use adapters::camera::{CameraHealth, DigiCamControlAdapter};
+use adapters::nano::{NanoAdapter, NanoConnectionState};
+use adapters::xray::{
+    MoxtekAdapter, XrayHealth, MAX_CURRENT_UA, MAX_SETPOINT_POWER_W, MAX_VOLTAGE_KV,
+    MIN_VOLTAGE_KV,
+};
+use scan::{RealScanConfig, RealScanHandle};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::Path;
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_LOGS: usize = 100;
-const MAX_POWER_W: f64 = 12.0;
 
 pub fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -191,6 +203,20 @@ pub struct Engine {
     usb_auto_shut_down: bool,
     set_kv: f64,
     set_ua: f64,
+    set_kv_confirmed: bool,
+    set_ua_confirmed: bool,
+    nano: Option<Arc<NanoAdapter>>,
+    camera: Option<DigiCamControlAdapter>,
+    xray: Option<MoxtekAdapter>,
+    real_scan: Option<RealScanHandle>,
+    real_scan_revision: u64,
+    real_scan_message_count: usize,
+    scan_angle_deg: Option<f64>,
+    real_frames: Vec<Value>,
+    cached_camera_health: Option<CameraHealth>,
+    cached_xray_health: Option<XrayHealth>,
+    last_xray_poll: Instant,
+    last_error: Option<String>,
 }
 
 impl Engine {
@@ -211,9 +237,23 @@ impl Engine {
             beam_on: false,
             xray_latched: false,
             timer_on: false,
-            usb_auto_shut_down: false,
-            set_kv: 80.0,
-            set_ua: 100.0,
+            usb_auto_shut_down: true,
+            set_kv: 60.0,
+            set_ua: 200.0,
+            set_kv_confirmed: false,
+            set_ua_confirmed: false,
+            nano: None,
+            camera: None,
+            xray: None,
+            real_scan: None,
+            real_scan_revision: 0,
+            real_scan_message_count: 0,
+            scan_angle_deg: None,
+            real_frames: Vec::new(),
+            cached_camera_health: None,
+            cached_xray_health: None,
+            last_xray_poll: Instant::now() - Duration::from_secs(10),
+            last_error: None,
         };
         engine.log("INFO", "system", "ct-engine started; waiting for an explicit connection");
         engine.log("WARN", "xray", "NO REAL HARDWARE · output remains fail-closed");
@@ -221,7 +261,10 @@ impl Engine {
     }
 
     pub fn handle(&mut self, request: Request) -> Response {
+        self.sync_real_scan();
         self.tick();
+        self.sync_nano_health();
+        self.sync_xray_live_status();
         let error = if request.protocol_version != PROTOCOL_VERSION {
             Some("PROTOCOL_VERSION_MISMATCH")
         } else if request.request_id.is_empty()
@@ -267,6 +310,94 @@ impl Engine {
         matches!(self.phase, Phase::Running | Phase::Paused)
     }
 
+    fn sync_real_scan(&mut self) {
+        let Some(handle) = self.real_scan.as_mut() else {
+            return;
+        };
+        let progress = handle.progress();
+        let outcome = handle.try_finish();
+        if progress.revision != self.real_scan_revision {
+            self.real_scan_revision = progress.revision;
+            self.current = progress.captured;
+            self.scan_angle_deg = Some(progress.angle_deg);
+            self.beam_on = progress.beam_on;
+            self.phase = match progress.phase {
+                "paused" => Phase::Paused,
+                "completed" => Phase::Completed,
+                "fault" => Phase::Fault,
+                _ => Phase::Running,
+            };
+            self.real_frames = progress
+                .frames
+                .iter()
+                .map(|frame| serde_json::to_value(frame).unwrap_or_else(|_| json!({})))
+                .collect();
+            if let Some(health) = progress.xray_health {
+                self.cached_xray_health = Some(health);
+            }
+            let messages = progress
+                .messages
+                .iter()
+                .skip(self.real_scan_message_count)
+                .cloned()
+                .collect::<Vec<_>>();
+            self.real_scan_message_count = progress.messages.len();
+            for message in messages {
+                self.log(message.level, message.source, &message.message);
+            }
+            if let Some(error) = progress.error {
+                self.last_error = Some(error);
+            }
+        }
+        if let Some(outcome) = outcome {
+            let result = outcome.result;
+            self.cached_camera_health = Some(outcome.camera.health());
+            self.cached_xray_health = Some(outcome.xray.health());
+            self.camera = Some(outcome.camera);
+            self.xray = Some(outcome.xray);
+            let finished_handle = self.real_scan.take();
+            drop(finished_handle);
+            self.beam_on = false;
+            match result {
+                Ok(()) => {
+                    self.phase = Phase::Completed;
+                    self.last_error = None;
+                }
+                Err(error) => {
+                    self.last_error = Some(error);
+                    self.xray_latched = true;
+                    self.preflight = false;
+                    self.homed = false;
+                    self.phase = Phase::Fault;
+                }
+            }
+        }
+    }
+
+    fn stop_real_scan(&mut self) -> Result<(), &'static str> {
+        let Some(handle) = self.real_scan.as_ref() else {
+            return Ok(());
+        };
+        let nano_stop = handle.request_stop();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            self.sync_real_scan();
+            if self.real_scan.is_none() || !self.beam_on {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if self.beam_on {
+            self.last_error = Some("real scan STOP did not confirm X-ray OFF within 3 seconds".into());
+            return Err("XRAY_OFF_UNCONFIRMED");
+        }
+        if let Err(error) = nano_stop {
+            self.last_error = Some(error);
+            return Err("NANO_COMMUNICATION_FAILED");
+        }
+        Ok(())
+    }
+
     fn invalidate(&mut self, phase: Phase) {
         self.beam_on = false;
         self.preflight = false;
@@ -274,39 +405,238 @@ impl Engine {
         self.phase = phase;
     }
 
+    fn nano_error(&mut self, context: &str, error: impl std::fmt::Display) -> &'static str {
+        let message = format!("{context}: {error}");
+        self.last_error = Some(message.clone());
+        self.connected = false;
+        self.xray_latched = true;
+        self.invalidate(Phase::Fault);
+        self.log("ERR", "nano", &format!("{message} · STOP/OFF recovery required"));
+        "NANO_COMMUNICATION_FAILED"
+    }
+
+    fn force_xray_off(&mut self, context: &str) -> Result<(), &'static str> {
+        if let Some(xray) = self.xray.as_mut() {
+            if let Err(error) = xray.force_off() {
+                let message = format!("{context}: Moxtek OFF was not confirmed: {error}");
+                self.last_error = Some(message.clone());
+                self.xray_latched = true;
+                self.invalidate(Phase::Fault);
+                self.log("ERR", "xray", &message);
+                return Err("XRAY_OFF_UNCONFIRMED");
+            }
+        }
+        if let Some(nano) = self.nano.as_ref() {
+            if let Err(error) = nano.set_xray_warning(false) {
+                let message = format!("{context}: Nano XRAY_WARNING OFF was not confirmed: {error}");
+                self.last_error = Some(message.clone());
+                self.connected = false;
+                self.xray_latched = true;
+                self.invalidate(Phase::Fault);
+                self.log("ERR", "nano", &message);
+                return Err("NANO_COMMUNICATION_FAILED");
+            }
+        }
+        self.beam_on = false;
+        Ok(())
+    }
+
+    /// Polls the Moxtek for its live beam state (throttled, production only).
+    /// The hardware is the source of truth: an externally toggled beam is
+    /// reflected in `beam_on` so the switch shows red whenever output is live.
+    fn sync_xray_live_status(&mut self) {
+        if self.preview || self.real_scan.is_some() {
+            return;
+        }
+        if self.last_xray_poll.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        let Some(xray) = self.xray.as_mut() else {
+            return;
+        };
+        self.last_xray_poll = Instant::now();
+        match xray.refresh_status() {
+            Ok(health) => {
+                if health.beam_on != self.beam_on {
+                    self.log(
+                        "WARN",
+                        "xray",
+                        if health.beam_on {
+                            "Beam state changed externally · output is ON"
+                        } else {
+                            "Beam state changed externally · output is OFF"
+                        },
+                    );
+                }
+                self.beam_on = health.beam_on;
+                self.cached_xray_health = Some(health);
+            }
+            Err(error) => {
+                self.cached_xray_health = Some(xray.health());
+                self.log(
+                    "ERR",
+                    "xray",
+                    &format!("Moxtek status poll failed: {error} · X-ray controls unavailable"),
+                );
+            }
+        }
+    }
+
+    /// Deterministic shutdown used when the control channel closes (window
+    /// closed, shell crashed or killed): stop any scan, then force the Moxtek
+    /// OFF and release every device before the process exits.
+    pub fn shutdown(&mut self) {
+        let _ = self.stop_real_scan();
+        if self.real_scan.is_some() {
+            let deadline = Instant::now() + Duration::from_secs(65);
+            while self.real_scan.is_some() && Instant::now() < deadline {
+                self.sync_real_scan();
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let _ = self.force_xray_off("Engine shutdown");
+        if let Some(mut xray) = self.xray.take() {
+            let _ = xray.disconnect();
+        }
+        if let Some(nano) = self.nano.take() {
+            if let Ok(mut nano) = Arc::try_unwrap(nano) {
+                nano.disconnect();
+            }
+        }
+        if let Some(mut camera) = self.camera.take() {
+            camera.disconnect();
+        }
+        self.beam_on = false;
+        eprintln!("ct-engine shutdown complete · Moxtek OFF and warning OFF attempted");
+    }
+
+    fn sync_nano_health(&mut self) {
+        let Some(nano) = self.nano.as_ref() else {
+            return;
+        };
+        let health = nano.health();
+        if !matches!(health.state, NanoConnectionState::Connected) {
+            let detail = health
+                .last_error
+                .unwrap_or_else(|| format!("Nano state {:?}", health.state));
+            self.last_error = Some(detail.clone());
+            self.connected = false;
+            self.xray_latched = true;
+            self.invalidate(Phase::Fault);
+        }
+    }
+
     fn command(&mut self, command: &str, payload: Value) -> Result<(), &'static str> {
         if command == "snapshot" {
             return Ok(());
         }
         if command == "stop" {
+            let real_scan_stop = self.stop_real_scan();
             self.xray_latched = true;
             self.invalidate(Phase::Fault);
-            self.log("ERR", "system", "E-STOP latched · output disabled · repeat preflight and HOME");
-            return Ok(());
+            let xray_off = self.force_xray_off("E-STOP");
+            let nano_stop = self.nano.as_ref().map(|nano| nano.stop());
+            if real_scan_stop.is_err() {
+                return real_scan_stop;
+            }
+            if xray_off.is_err() {
+                if let Some(Err(error)) = nano_stop {
+                    self.log("ERR", "nano", &format!("E-STOP Nano STOP also failed: {error}"));
+                }
+                return Err("XRAY_OFF_UNCONFIRMED");
+            }
+            match nano_stop {
+                Some(Ok(())) => {
+                    self.last_error = None;
+                    self.log("ERR", "system", "E-STOP latched · Moxtek OFF + warning OFF + Nano STOP confirmed · repeat REARM, preflight and HOME");
+                    return Ok(());
+                }
+                Some(Err(error)) => return Err(self.nano_error("Nano STOP was not confirmed", error)),
+                None => {
+                    self.log("ERR", "system", "E-STOP latched · Moxtek OFF confirmed · output disabled · repeat preflight and HOME");
+                    return Ok(());
+                }
+            }
         }
         if command == "disconnect" {
+            let _ = self.stop_real_scan();
+            if self.real_scan.is_some() {
+                let deadline = Instant::now() + Duration::from_secs(70);
+                while self.real_scan.is_some() && Instant::now() < deadline {
+                    self.sync_real_scan();
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+            if self.real_scan.is_some() {
+                return Err("SCAN_SHUTDOWN_TIMEOUT");
+            }
+            let xray_off = self.force_xray_off("Disconnect");
+            if let Some(mut xray) = self.xray.take() {
+                if let Err(error) = xray.disconnect() {
+                    self.log("ERR", "xray", &format!("Disconnect cleanup could not reconfirm Moxtek OFF: {error}"));
+                }
+            }
+            if let Some(nano) = self.nano.take() {
+                if let Ok(mut nano) = Arc::try_unwrap(nano) {
+                    nano.disconnect();
+                }
+            }
+            if let Some(mut camera) = self.camera.take() {
+                camera.disconnect();
+            }
+            self.cached_camera_health = None;
+            self.cached_xray_health = None;
+            self.set_kv_confirmed = false;
+            self.set_ua_confirmed = false;
             self.connected = false;
-            self.invalidate(Phase::Idle);
-            self.log("WARN", "system", "Engine disconnected · safety conditions invalidated");
-            return Ok(());
-        }
-        if !self.preview {
-            return Err("PRODUCTION_LOCKED");
+            self.invalidate(if xray_off.is_ok() { Phase::Idle } else { Phase::Fault });
+            self.log("WARN", "system", "Engine disconnected · Moxtek OFF, warning OFF and Nano STOP attempted · safety conditions invalidated");
+            return xray_off;
         }
         match command {
             "connect" => {
-                if payload.get("adapter").and_then(Value::as_str) != Some("developer_preview") {
-                    return Err("HARDWARE_NOT_IMPLEMENTED");
-                }
                 if self.connected || self.busy() {
                     return Err("ALREADY_CONNECTED");
                 }
-                self.invalidate(Phase::Idle);
-                self.connected = true;
-                self.xray_latched = false;
-                self.log("INFO", "system", "DEVELOPER PREVIEW connected · NO REAL HARDWARE");
+                match payload.get("adapter").and_then(Value::as_str) {
+                    Some("developer_preview") if self.preview => {
+                        self.invalidate(Phase::Idle);
+                        self.connected = true;
+                        self.xray_latched = false;
+                        self.last_error = None;
+                        self.log("INFO", "system", "DEVELOPER PREVIEW connected · NO REAL HARDWARE");
+                    }
+                    Some("real_hardware") if !self.preview => {
+                        let mut nano = NanoAdapter::new();
+                        let identity = nano
+                            .discover_and_connect()
+                            .map_err(|error| self.nano_error("Nano auto-identification failed", error))?;
+                        let status = nano
+                            .status()
+                            .map_err(|error| self.nano_error("Nano initial STATUS failed", error))?;
+                        self.nano = Some(Arc::new(nano));
+                        self.connected = true;
+                        self.invalidate(Phase::Idle);
+                        self.xray_latched = false;
+                        self.last_error = None;
+                        self.log(
+                            "INFO",
+                            "nano",
+                            &format!(
+                                "{} v{} build {} connected · state={} · HOME not executed",
+                                identity.device, identity.version, identity.build, status.state
+                            ),
+                        );
+                    }
+                    Some("real_hardware") => return Err("PREVIEW_ADAPTER_MISMATCH"),
+                    Some("developer_preview") => return Err("PRODUCTION_LOCKED"),
+                    _ => return Err("INVALID_ADAPTER"),
+                }
             }
             "set_parameters" => {
+                if !self.preview {
+                    return Err("STAGE_1_NANO_ONLY");
+                }
                 if self.busy() {
                     return Err("SCAN_ACTIVE");
                 }
@@ -344,14 +674,148 @@ impl Engine {
                 if self.busy() {
                     return Err("SCAN_ACTIVE");
                 }
-                self.parameters.validate()?;
-                if !(1..=359_999).contains(&self.max_xray_sec) {
-                    return Err("INVALID_PARAMETERS");
+                if !self.preview {
+                    self.parameters.validate()?;
+                    if !(1..=359_999).contains(&self.max_xray_sec) {
+                        return Err("INVALID_PARAMETERS");
+                    }
+                    if !self
+                        .camera
+                        .as_ref()
+                        .is_some_and(|camera| camera.health().connected)
+                    {
+                        let mut camera = DigiCamControlAdapter::discover()
+                            .map_err(|_| "CAMERA_BACKEND_UNAVAILABLE")?;
+                        let health = match camera.connect() {
+                            Ok(health) => health,
+                            Err(error) => {
+                                let message = format!("D7100 auto-connect failed: {error}");
+                                self.last_error = Some(message.clone());
+                                self.log("ERR", "camera", &message);
+                                return Err("CAMERA_CONNECTION_FAILED");
+                            }
+                        };
+                        self.cached_camera_health = Some(health.clone());
+                        self.camera = Some(camera);
+                        self.log(
+                            "PASS",
+                            "camera",
+                            &format!(
+                                "D7100 auto-connected · serial={} · {}",
+                                health.serial.as_deref().unwrap_or("unknown"),
+                                health.transfer_policy.as_deref().unwrap_or("unverified")
+                            ),
+                        );
+                    }
+                    if self.xray.is_none() {
+                        let mut xray = MoxtekAdapter::new();
+                        let health = match xray.discover_and_connect() {
+                            Ok(health) => health,
+                            Err(error) => {
+                                let message = format!("Moxtek auto-connect failed: {error}");
+                                self.last_error = Some(message.clone());
+                                self.log("ERR", "xray", &message);
+                                return Err("XRAY_CONNECTION_FAILED");
+                            }
+                        };
+                        if let Err(error) = xray.set_usb_auto_shutdown(self.usb_auto_shut_down) {
+                            let message = format!("Moxtek USB auto-shutdown sync failed: {error}");
+                            self.last_error = Some(message.clone());
+                            self.log("ERR", "xray", &message);
+                            return Err("XRAY_CONNECTION_FAILED");
+                        }
+                        self.cached_xray_health = Some(health.clone());
+                        self.xray = Some(xray);
+                        if health.beam_on {
+                            self.log(
+                                "WARN",
+                                "xray",
+                                &format!(
+                                    "Moxtek auto-connected · port={} · BEAM WAS ON from a previous session · Preflight will force it OFF",
+                                    health.port.as_deref().unwrap_or("unknown")
+                                ),
+                            );
+                        } else {
+                            self.log(
+                                "PASS",
+                                "xray",
+                                &format!(
+                                    "Moxtek auto-connected SAFE OFF · port={} · serial={}",
+                                    health.port.as_deref().unwrap_or("unknown"),
+                                    health.serial.as_deref().unwrap_or("unknown")
+                                ),
+                            );
+                        }
+                    }
+                    if !self.set_kv_confirmed || !self.set_ua_confirmed {
+                        self.log(
+                            "WARN",
+                            "xray",
+                            "Setpoint confirmation required · click SEND V and SEND I before Preflight",
+                        );
+                        return Err("XRAY_SETPOINT_CONFIRMATION_REQUIRED");
+                    }
+                    self.force_xray_off("Preflight")?;
+                    let xray_result = self
+                        .xray
+                        .as_mut()
+                        .ok_or("XRAY_NOT_CONNECTED")?
+                        .set_parameters(self.set_kv, self.set_ua);
+                    let xray_health = match xray_result {
+                        Ok(health) => health,
+                        Err(error) => {
+                            let message = format!("Moxtek preflight failed: {error}");
+                            self.last_error = Some(message.clone());
+                            self.log("ERR", "xray", &message);
+                            return Err("XRAY_PREFLIGHT_FAILED");
+                        }
+                    };
+                    self.cached_xray_health = Some(xray_health.clone());
+                    if xray_health.locked != Some(false)
+                        || !xray_health.beam_off_confirmed
+                        || xray_health
+                            .temperature_c
+                            .is_none_or(|temperature| !temperature.is_finite() || temperature > 65.0)
+                    {
+                        return Err("XRAY_PREFLIGHT_FAILED");
+                    }
+                    let nano = self.nano.as_ref().ok_or("NANO_NOT_CONNECTED")?.clone();
+                    let nano_status = nano
+                        .status()
+                        .map_err(|error| self.nano_error("Nano preflight STATUS failed", error))?;
+                    if nano_status.state == "FAULT" {
+                        nano.clear_fault()
+                            .map_err(|error| self.nano_error("Nano CLEAR_FAULT failed", error))?;
+                        self.log("WARN", "nano", "Previous Nano fault cleared · reference remains invalid until HOME");
+                    }
+                    let status = nano
+                        .rearm()
+                        .map_err(|error| self.nano_error("Nano REARM failed", error))?;
+                    self.preflight = true;
+                    self.homed = false;
+                    self.phase = Phase::ReadyForHome;
+                    self.last_error = None;
+                    self.log(
+                        "PASS",
+                        "preflight",
+                        &format!(
+                            "8/8 real checks passed · Nano={} · D7100 host-only · Moxtek OFF/unlocked {:.1} kV / {:.1} µA · {:.1} C",
+                            status.state,
+                            self.set_kv,
+                            self.set_ua,
+                            xray_health.temperature_c.unwrap_or_default()
+                        ),
+                    );
+                } else {
+                    self.parameters.validate()?;
+                    if !(1..=359_999).contains(&self.max_xray_sec) {
+                        return Err("INVALID_PARAMETERS");
+                    }
+                    self.preflight = true;
+                    self.homed = false;
+                    self.phase = Phase::ReadyForHome;
+                    self.log("PASS", "preflight", "8/8 preview checks passed · real interlocks unverified");
                 }
-                self.preflight = true;
-                self.homed = false;
-                self.phase = Phase::ReadyForHome;
-                self.log("PASS", "preflight", "8/8 preview checks passed · real interlocks unverified");
             }
             "home" => {
                 self.require_connected()?;
@@ -364,12 +828,84 @@ impl Engine {
                 if self.xray_latched {
                     return Err("ESTOP_LATCHED");
                 }
-                self.homed = true;
-                self.current = 0;
-                self.phase = Phase::Ready;
-                self.log("INFO", "nano", "Preview HOME complete · 0.00°");
+                if !self.preview {
+                    self.force_xray_off("Before HOME")?;
+                    let nano = self.nano.as_ref().ok_or("NANO_NOT_CONNECTED")?;
+                    let status = nano
+                        .home()
+                        .map_err(|error| self.nano_error("Nano HOME failed", error))?;
+                    self.homed = true;
+                    self.current = 0;
+                    self.phase = Phase::Ready;
+                    self.last_error = None;
+                    self.log(
+                        "INFO",
+                        "nano",
+                        &format!(
+                            "Nano HOME verified · pos={} pulses · reference valid",
+                            status.position_pulses
+                        ),
+                    );
+                } else {
+                    self.homed = true;
+                    self.current = 0;
+                    self.phase = Phase::Ready;
+                    self.log("INFO", "nano", "Preview HOME complete · 0.00°");
+                }
             }
             "start_scan" => {
+                if !self.preview {
+                    self.require_connected()?;
+                    if self.busy() {
+                        return Err("SCAN_ACTIVE");
+                    }
+                    if !self.preflight {
+                        return Err("PREFLIGHT_REQUIRED");
+                    }
+                    if !self.homed {
+                        return Err("HOME_REQUIRED");
+                    }
+                    if self.xray_latched {
+                        return Err("ESTOP_LATCHED");
+                    }
+                    if self.usb_auto_shut_down {
+                        return Err("SAFETY_LOCK_REQUIRED");
+                    }
+                    self.parameters.validate()?;
+                    self.validate_setpoint(self.set_kv, self.set_ua)?;
+                    let nano = self.nano.as_ref().ok_or("NANO_NOT_CONNECTED")?.clone();
+                    let camera = self.camera.take().ok_or("CAMERA_NOT_CONNECTED")?;
+                    let xray = match self.xray.take() {
+                        Some(xray) => xray,
+                        None => {
+                            self.camera = Some(camera);
+                            return Err("XRAY_NOT_CONNECTED");
+                        }
+                    };
+                    self.cached_camera_health = Some(camera.health());
+                    self.cached_xray_health = Some(xray.health());
+                    self.current = 0;
+                    self.scan_angle_deg = Some(0.0);
+                    self.real_frames.clear();
+                    self.real_scan_revision = 0;
+                    self.real_scan_message_count = 0;
+                    self.phase = Phase::Running;
+                    self.beam_on = false;
+                    self.last_error = None;
+                    self.real_scan = Some(RealScanHandle::start(
+                        nano,
+                        camera,
+                        xray,
+                        RealScanConfig {
+                            parameters: self.parameters.clone(),
+                            max_xray_sec: self.max_xray_sec,
+                            voltage_kv: self.set_kv,
+                            current_ua: self.set_ua,
+                        },
+                    ));
+                    self.log("ACTION", "operator", "Real scan worker started · output remains OFF until first READY_TO_CAPTURE");
+                    return Ok(());
+                }
                 self.require_connected()?;
                 if self.busy() {
                     return Err("SCAN_ACTIVE");
@@ -393,6 +929,11 @@ impl Engine {
                 if self.phase != Phase::Running {
                     return Err("NOT_RUNNING");
                 }
+                if let Some(scan) = self.real_scan.as_ref() {
+                    scan.request_pause();
+                    self.log("ACTION", "operator", "Pause requested · takes effect after current projection closes");
+                    return Ok(());
+                }
                 self.phase = Phase::Paused;
                 self.beam_on = false;
                 self.log("WARN", "system", "Preview paused · output visualization disabled");
@@ -404,6 +945,12 @@ impl Engine {
                 }
                 if self.phase != Phase::Paused || !self.preflight || !self.homed {
                     return Err("NOT_RESUMABLE");
+                }
+                if let Some(scan) = self.real_scan.as_ref() {
+                    scan.resume();
+                    self.phase = Phase::Running;
+                    self.log("ACTION", "operator", "Real scan resumed");
+                    return Ok(());
                 }
                 self.phase = Phase::Running;
                 self.beam_on = true;
@@ -435,19 +982,225 @@ impl Engine {
                 if self.phase != Phase::Fault {
                     return Err("NOT_FAULTED");
                 }
+                if !self.preview {
+                    self.force_xray_off("E-STOP release")?;
+                    let nano = self.nano.as_ref().ok_or("RECONNECT_REQUIRED")?.clone();
+                    let status = nano.status().map_err(|error| {
+                        self.nano_error("Nano recovery STATUS failed", error)
+                    })?;
+                    if status.state == "FAULT" {
+                        nano.clear_fault().map_err(|error| {
+                            self.nano_error("Nano CLEAR_FAULT failed", error)
+                        })?;
+                    }
+                    self.xray_latched = false;
+                    self.invalidate(Phase::Stopped);
+                    self.log("WARN", "system", "E-STOP released · real preflight and HOME are required");
+                    return Ok(());
+                }
                 self.xray_latched = false;
                 self.invalidate(Phase::Stopped);
                 self.log("WARN", "system", "E-STOP released · preflight and HOME are required");
             }
             "retry_device" => {
-                self.require_connected()?;
                 let device = payload.get("device").and_then(Value::as_str).ok_or("INVALID_DEVICE")?;
                 if !matches!(device, "turntable" | "camera" | "xray") {
                     return Err("INVALID_DEVICE");
                 }
-                self.log("INFO", "system", &format!("{device} preview link check complete"));
+                if !self.preview {
+                    match device {
+                        "turntable" => {
+                            let ping_result = self
+                                .nano
+                                .as_ref()
+                                .ok_or("RECONNECT_REQUIRED")?
+                                .ping();
+                            if let Err(error) = ping_result {
+                                return Err(self.nano_error("Nano PING failed", error));
+                            }
+                            let status_result = self
+                                .nano
+                                .as_ref()
+                                .ok_or("RECONNECT_REQUIRED")?
+                                .status();
+                            let status = match status_result {
+                                Ok(status) => status,
+                                Err(error) => return Err(self.nano_error("Nano STATUS retry failed", error)),
+                            };
+                            self.last_error = None;
+                            self.log(
+                                "INFO",
+                                "nano",
+                                &format!("Nano link verified · state={}", status.state),
+                            );
+                        }
+                        "camera" => {
+                            let mut camera = DigiCamControlAdapter::discover()
+                                .map_err(|_| "CAMERA_BACKEND_UNAVAILABLE")?;
+                            let health = camera.connect().map_err(|_| "CAMERA_CONNECTION_FAILED")?;
+                            self.cached_camera_health = Some(health.clone());
+                            self.log(
+                                "PASS",
+                                "camera",
+                                &format!(
+                                    "D7100 connected · serial={} · transfer={}",
+                                    health.serial.as_deref().unwrap_or("unknown"),
+                                    health.transfer_policy.as_deref().unwrap_or("unverified")
+                                ),
+                            );
+                            self.camera = Some(camera);
+                            self.last_error = None;
+                        }
+                        "xray" => {
+                            let mut xray = MoxtekAdapter::new();
+                            let health = match xray.discover_and_connect() {
+                                Ok(health) => health,
+                                Err(error) => {
+                                    let message = format!("Moxtek connection failed: {error}");
+                                    self.last_error = Some(message.clone());
+                                    self.log("ERR", "xray", &message);
+                                    return Err("XRAY_CONNECTION_FAILED");
+                                }
+                            };
+                            // Sync the engine's deadman policy onto the device
+                            // so the hardware state always matches the UI.
+                            if let Err(error) = xray.set_usb_auto_shutdown(self.usb_auto_shut_down) {
+                                let message = format!("Moxtek USB auto-shutdown sync failed: {error}");
+                                self.last_error = Some(message.clone());
+                                self.log("ERR", "xray", &message);
+                                return Err("XRAY_CONNECTION_FAILED");
+                            }
+                            let shutdown_delay = xray.read_usb_shutdown_timer().ok();
+                            self.xray = Some(xray);
+                            self.cached_xray_health = Some(health.clone());
+                            self.set_kv_confirmed = false;
+                            self.set_ua_confirmed = false;
+                            if health.beam_on {
+                                // A previous session left the tube emitting.
+                                // Report it (the switch turns red) and let the
+                                // operator explicitly disable the beam.
+                                self.beam_on = true;
+                                self.log(
+                                    "WARN",
+                                    "xray",
+                                    &format!(
+                                        "Moxtek 12 W connected · port={} · BEAM CURRENTLY ON from a previous session · click Xray Disable to stop output",
+                                        health.port.as_deref().unwrap_or("unknown")
+                                    ),
+                                );
+                            } else {
+                                self.beam_on = false;
+                                self.log(
+                                    "PASS",
+                                    "xray",
+                                    &format!(
+                                        "Moxtek 12 W connected · port={} · serial={} · beam OFF confirmed · USB auto-shutdown {} (delay raw {:?})",
+                                        health.port.as_deref().unwrap_or("unknown"),
+                                        health.serial.as_deref().unwrap_or("unknown"),
+                                        if self.usb_auto_shut_down { "ARMED" } else { "RELEASED" },
+                                        shutdown_delay
+                                    ),
+                                );
+                            }
+                            self.last_error = None;
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    self.require_connected()?;
+                    self.log("INFO", "system", &format!("{device} preview link check complete"));
+                }
+            }
+            "camera_test_capture" => {
+                if self.preview {
+                    return Err("REAL_CAMERA_REQUIRED");
+                }
+                if self.busy() {
+                    return Err("SCAN_ACTIVE");
+                }
+                self.parameters.validate()?;
+                let save_path = Path::new(self.parameters.save_path.trim());
+                let task_id = self.parameters.task_id.clone();
+                let camera = self.camera.as_mut().ok_or("CAMERA_NOT_CONNECTED")?;
+                let path = match camera.capture_test(save_path, &task_id) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let message = format!("D7100 test capture failed: {error}");
+                        self.last_error = Some(message.clone());
+                        self.log("ERR", "camera", &message);
+                        return Err("CAMERA_CAPTURE_FAILED");
+                    }
+                };
+                self.log(
+                    "PASS",
+                    "camera",
+                    &format!("D7100 test capture saved · {}", path.display()),
+                );
+                self.cached_camera_health = self.camera.as_ref().map(DigiCamControlAdapter::health);
+                self.last_error = None;
             }
             "xray_toggle" => {
+                if !self.preview {
+                    if self.busy() {
+                        return Err("SCAN_ACTIVE");
+                    }
+                    if self.phase == Phase::Fault || self.xray_latched {
+                        return Err("ESTOP_LATCHED");
+                    }
+                    if self.xray.is_none() {
+                        return Err("XRAY_NOT_CONNECTED");
+                    }
+                    if self.beam_on {
+                        // Turning output OFF is never locked: a detected
+                        // leftover beam must always be killable.
+                        self.force_xray_off("Manual X-ray disable")?;
+                        self.cached_xray_health = self.xray.as_ref().map(MoxtekAdapter::health);
+                        self.log("PASS", "xray", "Manual beam OFF confirmed · output disabled");
+                        return Ok(());
+                    }
+                    if self.usb_auto_shut_down {
+                        self.log(
+                            "WARN",
+                            "xray",
+                            "Beam enable rejected · USB Auto Shut Down is armed (locked) · release the checkbox first",
+                        );
+                        return Err("SAFETY_LOCK_REQUIRED");
+                    }
+                    let xray = self.xray.as_mut().ok_or("XRAY_NOT_CONNECTED")?;
+                    if !self.set_kv_confirmed || !self.set_ua_confirmed {
+                        self.log(
+                            "WARN",
+                            "xray",
+                            "Setpoint confirmation required · click SEND V and SEND I before enabling the beam",
+                        );
+                        return Err("XRAY_SETPOINT_CONFIRMATION_REQUIRED");
+                    }
+                    let cancel = std::sync::atomic::AtomicBool::new(false);
+                    match xray.beam_on(&cancel) {
+                        Ok(health) => {
+                            self.beam_on = true;
+                            self.cached_xray_health = Some(health.clone());
+                            self.last_error = None;
+                            self.log(
+                                "WARN",
+                                "xray",
+                                &format!(
+                                    "MANUAL BEAM ON · {:.1} kV / {:.1} µA · click Xray Disable to stop output",
+                                    self.set_kv, self.set_ua
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            self.beam_on = false;
+                            self.cached_xray_health = Some(xray.health());
+                            let message = format!("Manual beam-on failed closed: {error}");
+                            self.last_error = Some(message.clone());
+                            self.log("ERR", "xray", &message);
+                            return Err("XRAY_BEAM_ON_FAILED");
+                        }
+                    }
+                    return Ok(());
+                }
                 self.require_connected()?;
                 if self.phase == Phase::Fault || self.xray_latched {
                     return Err("ESTOP_LATCHED");
@@ -456,6 +1209,9 @@ impl Engine {
                 self.log("WARN", "xray", if self.beam_on { "Preview beam visualization enabled · NO REAL HARDWARE" } else { "Preview beam visualization disabled" });
             }
             "timer_toggle" => {
+                if !self.preview {
+                    return Err("XRAY_STAGE_LOCKED");
+                }
                 if self.phase == Phase::Running {
                     return Err("SCAN_ACTIVE");
                 }
@@ -463,18 +1219,152 @@ impl Engine {
                 self.log("INFO", "xray", if self.timer_on { "Preview timer enabled" } else { "Preview timer disabled" });
             }
             "usb_auto_shut_down_toggle" => {
-                self.usb_auto_shut_down = !self.usb_auto_shut_down;
-                self.log("INFO", "xray", "Preview USB auto-shutdown setting updated");
+                if self.busy() {
+                    return Err("SCAN_ACTIVE");
+                }
+                let new_state = !self.usb_auto_shut_down;
+                if !self.preview {
+                    if new_state && self.beam_on {
+                        // Re-arming the deadman while emitting: stop output
+                        // first so the transition is deliberate, not a timeout.
+                        self.force_xray_off("USB auto-shutdown re-arm")?;
+                    }
+                    if let Some(xray) = self.xray.as_mut() {
+                        if let Err(error) = xray.set_usb_auto_shutdown(new_state) {
+                            let message = format!("Moxtek USB auto-shutdown write failed: {error}");
+                            self.last_error = Some(message.clone());
+                            self.log("ERR", "xray", &message);
+                            return Err("XRAY_CONFIG_FAILED");
+                        }
+                        self.cached_xray_health = Some(xray.health());
+                    }
+                }
+                self.usb_auto_shut_down = new_state;
+                self.log(
+                    "INFO",
+                    "xray",
+                    if self.usb_auto_shut_down {
+                        "USB Auto Shut Down ARMED on device · beam enable LOCKED · release the checkbox to authorize output"
+                    } else {
+                        "USB Auto Shut Down RELEASED on device · beam enable authorized · X-ray may run standalone"
+                    },
+                );
+            }
+            "set_usb_shutdown_delay" => {
+                if self.busy() {
+                    return Err("SCAN_ACTIVE");
+                }
+                let delay_raw = payload
+                    .get("delay")
+                    .and_then(Value::as_u64)
+                    .ok_or("INVALID_PARAMETERS")?;
+                let delay = u16::try_from(delay_raw).map_err(|_| "INVALID_PARAMETERS")?;
+                if delay == 0 {
+                    return Err("INVALID_PARAMETERS");
+                }
+                if self.preview {
+                    self.log("INFO", "xray", &format!("Preview USB shutdown delay set to {delay}"));
+                    return Ok(());
+                }
+                let xray = self.xray.as_mut().ok_or("XRAY_NOT_CONNECTED")?;
+                match xray.set_usb_shutdown_delay(delay) {
+                    Ok(health) => {
+                        let readback = health.usb_shutdown_delay.unwrap_or(u32::from(delay));
+                        self.cached_xray_health = Some(health);
+                        self.last_error = None;
+                        self.log(
+                            "PASS",
+                            "xray",
+                            &format!("USB shutdown delay written · requested {delay} · readback {readback}"),
+                        );
+                    }
+                    Err(error) => {
+                        let message = format!("USB shutdown delay write failed: {error}");
+                        self.last_error = Some(message.clone());
+                        self.log("ERR", "xray", &message);
+                        return Err("XRAY_CONFIG_FAILED");
+                    }
+                }
             }
             "send_voltage" => {
                 let kv = payload.get("kv").and_then(Value::as_f64).ok_or("INVALID_VOLTAGE")?;
                 self.validate_setpoint(kv, self.set_ua)?;
+                if !self.preview {
+                    if self.beam_on {
+                        return Err("XRAY_BEAM_ACTIVE");
+                    }
+                    let result = self
+                        .xray
+                        .as_mut()
+                        .ok_or("XRAY_NOT_CONNECTED")?
+                        .set_parameters(kv, self.set_ua);
+                    let health = match result {
+                        Ok(health) => health,
+                        Err(error) => {
+                            let message = format!("Moxtek setpoint write failed: {error}");
+                            self.last_error = Some(message.clone());
+                            self.log("ERR", "xray", &message);
+                            return Err("XRAY_SETPOINT_FAILED");
+                        }
+                    };
+                    self.force_xray_off("Moxtek voltage setpoint")?;
+                    self.set_kv = kv;
+                    self.set_kv_confirmed = true;
+                    self.cached_xray_health = Some(health.clone());
+                    self.last_error = None;
+                    self.log(
+                        "PASS",
+                        "xray",
+                        &format!(
+                            "Moxtek setpoint verified OFF · requested {kv:.1} kV / {:.1} µA · readback {:.3} kV / {:.3} µA",
+                            self.set_ua,
+                            health.set_voltage_kv.unwrap_or(kv),
+                            health.set_current_ua.unwrap_or(self.set_ua)
+                        ),
+                    );
+                    return Ok(());
+                }
                 self.set_kv = kv;
                 self.log("INFO", "xray", &format!("Preview voltage set to {kv:.1} kV"));
             }
             "send_current" => {
                 let ua = payload.get("ua").and_then(Value::as_f64).ok_or("INVALID_CURRENT")?;
                 self.validate_setpoint(self.set_kv, ua)?;
+                if !self.preview {
+                    if self.beam_on {
+                        return Err("XRAY_BEAM_ACTIVE");
+                    }
+                    let result = self
+                        .xray
+                        .as_mut()
+                        .ok_or("XRAY_NOT_CONNECTED")?
+                        .set_parameters(self.set_kv, ua);
+                    let health = match result {
+                        Ok(health) => health,
+                        Err(error) => {
+                            let message = format!("Moxtek setpoint write failed: {error}");
+                            self.last_error = Some(message.clone());
+                            self.log("ERR", "xray", &message);
+                            return Err("XRAY_SETPOINT_FAILED");
+                        }
+                    };
+                    self.force_xray_off("Moxtek current setpoint")?;
+                    self.set_ua = ua;
+                    self.set_ua_confirmed = true;
+                    self.cached_xray_health = Some(health.clone());
+                    self.last_error = None;
+                    self.log(
+                        "PASS",
+                        "xray",
+                        &format!(
+                            "Moxtek setpoint verified OFF · requested {:.1} kV / {ua:.1} µA · readback {:.3} kV / {:.3} µA",
+                            self.set_kv,
+                            health.set_voltage_kv.unwrap_or(self.set_kv),
+                            health.set_current_ua.unwrap_or(ua)
+                        ),
+                    );
+                    return Ok(());
+                }
                 self.set_ua = ua;
                 self.log("INFO", "xray", &format!("Preview current set to {ua:.1} µA"));
             }
@@ -484,10 +1374,14 @@ impl Engine {
     }
 
     fn validate_setpoint(&self, kv: f64, ua: f64) -> Result<(), &'static str> {
-        if !kv.is_finite() || !ua.is_finite() || !(20.0..=160.0).contains(&kv) || !(1.0..=500.0).contains(&ua) {
+        if !kv.is_finite()
+            || !ua.is_finite()
+            || !(MIN_VOLTAGE_KV..=MAX_VOLTAGE_KV).contains(&kv)
+            || !(0.0..=MAX_CURRENT_UA).contains(&ua)
+        {
             return Err("INVALID_XRAY_SETPOINT");
         }
-        if kv * ua / 1000.0 > MAX_POWER_W {
+        if kv * ua / 1000.0 > MAX_SETPOINT_POWER_W + 1e-12 {
             return Err("XRAY_POWER_LIMIT");
         }
         Ok(())
@@ -509,7 +1403,7 @@ impl Engine {
     }
 
     fn tick(&mut self) {
-        if self.phase != Phase::Running {
+        if !self.preview || self.phase != Phase::Running {
             return;
         }
         let steps = (self.last_tick.elapsed().as_millis() / 850) as u32;
@@ -526,7 +1420,13 @@ impl Engine {
     }
 
     fn angle_deg(&self) -> f64 {
-        if self.current == 0 { 0.0 } else { f64::from(self.current - 1) * self.parameters.angle_step_deg }
+        if let Some(angle) = self.scan_angle_deg {
+            angle
+        } else if self.current == 0 {
+            0.0
+        } else {
+            f64::from(self.current - 1) * self.parameters.angle_step_deg
+        }
     }
 
     fn data_state(&self) -> &'static str {
@@ -559,13 +1459,52 @@ impl Engine {
         let configured = self.parameters.validate().is_ok()
             && (1..=359_999).contains(&self.max_xray_sec);
         let is_preview = self.preview;
-        let identity = if is_preview { "DEVELOPER PREVIEW · NO REAL HARDWARE" } else { "PRODUCTION LOCKED · NO HARDWARE ADAPTER" };
-        let device_tone = if self.phase == Phase::Fault { "danger" } else if self.connected { "accent" } else { "muted" };
-        let xray_text = if self.phase == Phase::Fault || self.xray_latched { "LATCHED OFF" } else if self.beam_on { "PREVIEW BEAM" } else { "OUTPUT UNAVAILABLE" };
+        let nano_health = self.nano.as_ref().map(|nano| nano.health());
+        let nano_connected = nano_health
+            .as_ref()
+            .is_some_and(|health| health.state == NanoConnectionState::Connected);
+        let nano_faulted = nano_health.as_ref().is_some_and(|health| {
+            matches!(health.state, NanoConnectionState::Fault | NanoConnectionState::Lost)
+                || health.status.as_ref().is_some_and(|status| status.state == "FAULT")
+        });
+        let camera_health = self
+            .camera
+            .as_ref()
+            .map(DigiCamControlAdapter::health)
+            .or_else(|| self.cached_camera_health.clone());
+        let camera_connected = self.real_scan.is_some() || camera_health
+            .as_ref()
+            .is_some_and(|health| health.connected);
+        let xray_health = self
+            .xray
+            .as_ref()
+            .map(MoxtekAdapter::health)
+            .or_else(|| self.cached_xray_health.clone());
+        let xray_connected = self.real_scan.is_some() || xray_health
+            .as_ref()
+            .is_some_and(|health| health.connected);
+        let identity = if is_preview {
+            "DEVELOPER PREVIEW · NO REAL HARDWARE".to_owned()
+        } else if let Some(health) = nano_health.as_ref() {
+            if let Some(device) = health.identity.as_ref() {
+                format!(
+                    "{} v{} · {}",
+                    device.device,
+                    device.version,
+                    health.port.as_deref().unwrap_or("unknown port")
+                )
+            } else {
+                "PRODUCTION LOCKED · NANO DISCONNECTED".to_owned()
+            }
+        } else {
+            "PRODUCTION LOCKED · NANO DISCONNECTED".to_owned()
+        };
+        let device_tone = if self.phase == Phase::Fault || nano_faulted { "danger" } else if self.connected { "accent" } else { "muted" };
+        let xray_text = if self.phase == Phase::Fault || self.xray_latched { "LATCHED OFF" } else if self.beam_on { if self.preview {"PREVIEW BEAM"} else {"TUBE ON"} } else if xray_connected { "CONFIGURED OFF" } else { "OUTPUT UNAVAILABLE" };
         let safety_text = if self.phase == Phase::Fault {
             "SAFETY · FAULT · OUTPUT LATCHED OFF"
         } else if self.beam_on {
-            "SAFETY · PREVIEW BEAM · NO REAL HARDWARE"
+            if self.preview { "SAFETY · PREVIEW BEAM · NO REAL HARDWARE" } else { "SAFETY · REAL BEAM ON · INTERLOCK OK" }
         } else {
             "SAFETY · REAL OUTPUT UNAVAILABLE"
         };
@@ -588,40 +1527,54 @@ impl Engine {
                 "message": entry["message"],
             })
         }).collect();
-        let frames: Vec<Value> = (1..=captured).map(|index| json!({
-            "index": index,
-            "angleDeg": f64::from(index - 1) * self.parameters.angle_step_deg,
-            "exposureMs": self.parameters.exposure_ms,
-            "fileName": format!("preview-{index:04}.frame"),
-        })).collect();
+        let frames: Vec<Value> = if self.preview {
+            (1..=captured).map(|index| json!({
+                "index": index,
+                "angleDeg": f64::from(index - 1) * self.parameters.angle_step_deg,
+                "exposureMs": self.parameters.exposure_ms,
+                "fileName": format!("preview-{index:04}.frame"),
+            })).collect()
+        } else {
+            self.real_frames.clone()
+        };
         json!({
             "dataState": data_state,
             "phaseWord": self.phase_word(),
             "phaseTone": if self.phase == Phase::Fault { "danger" } else if self.phase == Phase::Running { "warn" } else { "accent" },
             "devices": [
-                {"id":"xray","name":"X-Ray Source","word": if self.xray_latched {"LOCKED"} else {"PREVIEW"},"tone":device_tone,"spec":format!("12 W · {identity}")},
-                {"id":"turntable","name":"Turntable-Nano","word":if self.phase == Phase::Running {"MOVING"} else {"PREVIEW"},"tone":device_tone,"spec":format!("POS {angle:.2}° · 60:1 · 8 µSTEP · PREVIEW")},
-                {"id":"camera","name":"Camera","word":"PREVIEW","tone":device_tone,"spec":"D7100 · NO REAL CAMERA CONNECTION"}
+                {"id":"xray","name":"X-Ray Source","word":if self.beam_on {"EMITTING"} else if xray_connected {"SAFE OFF"} else if self.preview {"LOCKED"} else {"OFFLINE"},"tone":if self.beam_on {"danger"} else if xray_connected {"accent"} else {"muted"},"spec":if let Some(health) = xray_health.as_ref() {format!("12 W · {} · PORT {} · SERIAL {}", if self.beam_on {"REAL BEAM"} else {"CONFIG SAFE OFF"}, health.port.as_deref().unwrap_or("unknown"), health.serial.as_deref().unwrap_or("unknown"))} else {"12 W · CONNECT FOR OFF + SETPOINT TEST".to_owned()}},
+                {"id":"turntable","name":"Turntable-Nano","word":if nano_faulted {"FAULT"} else if self.phase == Phase::Running {"MOVING"} else if nano_connected {"ONLINE"} else if self.preview {"PREVIEW"} else {"OFFLINE"},"tone":device_tone,"spec":if nano_connected {format!("{identity} · POS {angle:.2}° · 60:1 · 8 µSTEP")} else {format!("POS {angle:.2}° · 60:1 · 8 µSTEP · {}", if self.preview {"PREVIEW"} else {"DISCONNECTED"})}},
+                {"id":"camera","name":"Camera","word":if camera_connected {"ONLINE"} else if self.preview {"PREVIEW"} else {"OFFLINE"},"tone":if camera_connected {"accent"} else if self.preview {device_tone} else {"muted"},"spec":if let Some(health) = camera_health.as_ref() {format!("D7100 · SERIAL {} · {}", health.serial.as_deref().unwrap_or("unknown"), health.transfer_policy.as_deref().unwrap_or("transfer unverified"))} else if self.preview {"D7100 · NO REAL CAMERA CONNECTION".to_owned()} else {"D7100 · CONNECT VIA DIGICAMCONTROL".to_owned()}}
             ],
-            "onlineSummary": if self.preview { "PREVIEW · 0 REAL DEVICES" } else { "LOCKED · 0 REAL DEVICES" },
+            "onlineSummary": if self.preview { "PREVIEW · 0 REAL DEVICES".to_owned() } else { let count = u8::from(nano_connected) + u8::from(camera_connected) + u8::from(xray_connected); if count == 0 { "LOCKED · 0 REAL DEVICES".to_owned() } else if self.beam_on {format!("{count} REAL DEVICES · CONTROLLED EXPOSURE")} else { format!("{count} REAL DEVICE{} · OUTPUT LOCKED OFF", if count == 1 {""} else {"S"}) } },
             "preflight": {
                 "word": if self.preflight {"PASSED"} else {"WAITING"},
                 "percent": if self.preflight {100} else {0},
                 "tone": if self.preflight {"pass"} else {"warn"},
-                "subline": if self.preflight {"8/8 preview checks · real interlocks unverified"} else {"0/8 checks · no real hardware"}
+                "subline": if self.preflight && self.preview {"8/8 preview checks · real interlocks unverified"} else if self.preflight {"8/8 real checks · Nano + D7100 + Moxtek"} else if nano_connected {"Nano online · REARM and HOME not executed"} else {"0/8 checks · no real hardware"}
             },
             "floats": [
                 {"key":"X-RAY","text":xray_text,"tone":if self.phase == Phase::Fault || self.beam_on {"danger"} else {"muted"}},
-                {"key":"CAMERA","text":"PREVIEW ONLY","tone":"muted"},
+                {"key":"CAMERA","text":if camera_connected {"D7100 ONLINE"} else if self.preview {"PREVIEW ONLY"} else {"OFFLINE"},"tone":if camera_connected {"accent"} else {"muted"}},
                 {"key":"SAMPLE","text":format!("{angle:.2}°"),"tone":if self.phase == Phase::Fault {"danger"} else {"accent"}}
             ],
             "safetyBar":{"text":safety_text,"tone":if self.phase == Phase::Fault {"dangerBold"} else if self.beam_on {"danger"} else {"muted"}},
             "scene":{"angleDeg":angle,"rotated":angle.abs() > 0.005},
             "xray":{
-                "setKv":self.set_kv,"setUa":self.set_ua,"monKv":self.set_kv,"monUa":self.set_ua,
-                "powerW":self.set_kv * self.set_ua / 1000.0,"tempC":24.0,"beamOn":self.beam_on && self.preview,
-                "latched":self.xray_latched || !self.preview,"onSec":10,"offSec":20,"timerOn":self.timer_on,
-                "usbAutoShutDown":self.usb_auto_shut_down
+                "setKv":self.set_kv,"setUa":self.set_ua,
+                "monKv":xray_health.as_ref().and_then(|health| health.voltage_kv).unwrap_or(self.set_kv),
+                "monUa":xray_health.as_ref().and_then(|health| health.current_ua).unwrap_or(self.set_ua),
+                "powerW":xray_health.as_ref().and_then(|health| health.voltage_kv.zip(health.current_ua)).map(|(kv, ua)| kv * ua / 1000.0).unwrap_or(self.set_kv * self.set_ua / 1000.0),
+                "tempC":xray_health.as_ref().and_then(|health| health.temperature_c).unwrap_or(24.0),"beamOn":self.beam_on,
+                "latched":self.xray_latched,"onSec":10,"offSec":20,"timerOn":self.timer_on,
+                "usbAutoShutDown":self.usb_auto_shut_down,
+                "usbShutdownDelay":xray_health.as_ref().and_then(|health| health.usb_shutdown_delay),
+                "manualControlsEnabled":self.preview || (xray_connected && !self.busy() && !self.xray_latched),
+                "timerControlsEnabled":self.preview,
+                "setpointControlsEnabled":self.preview || (xray_connected && !self.busy() && !self.beam_on)
+                ,"voltageConfirmed":self.preview || self.set_kv_confirmed
+                ,"currentConfirmed":self.preview || self.set_ua_confirmed
+                ,"setpointConfirmed":self.preview || (self.set_kv_confirmed && self.set_ua_confirmed)
             },
             "progress":{
                 "captured":captured,"total":total,"percent":percent,"angleDeg":angle,"etaText":eta,
@@ -631,19 +1584,21 @@ impl Engine {
             "summary":{
                 "savePath":self.parameters.save_path,
                 "acquisition":if configured {format!("{total} views · {:.2}° · {} ms", self.parameters.angle_step_deg, self.parameters.exposure_ms)} else {"Scan setup not configured".to_owned()},
-                "output":if self.preview {format!("PREVIEW SET · {:.1} kV · {:.1} µA",self.set_kv,self.set_ua)} else {"LOCKED · NO REAL OUTPUT".to_owned()}
+                "output":if self.preview {format!("PREVIEW SET · {:.1} kV · {:.1} µA",self.set_kv,self.set_ua)} else if self.beam_on {format!("REAL BEAM · {:.1} kV · {:.1} µA",self.set_kv,self.set_ua)} else if xray_connected {format!("REAL SET · {:.1} kV · {:.1} µA · OUTPUT LOCKED OFF",self.set_kv,self.set_ua)} else {"LOCKED · NO REAL OUTPUT".to_owned()}
             },
             "statusbar":{
                 "left":if configured {format!("{identity} · {} · {captured} / {total} · {angle:.2}°",self.phase_word())} else {format!("{identity} · SETUP REQUIRED")},
-                "right":if self.preview {"ct-engine · JSONL v1 · PREVIEW"} else {"ct-engine · JSONL v1 · LOCKED"},
+                "right":if self.preview {"ct-engine · JSONL v1 · PREVIEW"} else if nano_connected {"ct-engine · JSONL v1 · NANO ONLINE"} else {"ct-engine · JSONL v1 · LOCKED"},
                 "dotTone":if self.phase == Phase::Fault {"danger"} else if self.phase == Phase::Running {"warn"} else if self.phase == Phase::Paused {"accent"} else {"muted"}
             },
             "dock":{
                 "home":self.connected && self.preflight && !self.busy() && !self.xray_latched,
-                "play":self.connected && !self.xray_latched && ((self.phase == Phase::Running || self.phase == Phase::Paused) || (self.preflight && self.homed && self.phase != Phase::Fault)),
+                "play":self.connected && !self.xray_latched && ((self.phase == Phase::Running || self.phase == Phase::Paused) || (self.preflight && self.homed && self.phase != Phase::Fault && (self.preview || !self.usb_auto_shut_down))),
                 "restore":self.connected && !self.busy() && self.preflight && self.homed && !self.xray_latched && !matches!(self.phase, Phase::Fault | Phase::Stopped),
                 "estop":true,
-                "playMode":if self.phase == Phase::Running {"pause"} else if self.phase == Phase::Paused {"resume"} else if self.phase == Phase::Fault {"disabled"} else {"start"}
+                "playMode":if self.phase == Phase::Running {"pause"} else if self.phase == Phase::Paused {"resume"} else if self.phase == Phase::Fault {"disabled"} else {"start"},
+                "homeReason":if !self.connected {"Connect the Nano first"} else if self.xray_latched || self.phase == Phase::Fault {"Release E-STOP, then run Preflight"} else if !self.preflight {"Complete scan setup and run Preflight first"} else if self.busy() {"HOME is unavailable while a scan is active"} else {""},
+                "playReason":if self.phase == Phase::Running {"Pause after the active transaction closes"} else if self.phase == Phase::Paused {"Resume the paused scan"} else if !self.connected {"Connect the Nano first"} else if self.xray_latched || self.phase == Phase::Fault {"Release E-STOP"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if !self.preview && self.usb_auto_shut_down {"Disable USB Auto Shut Down to authorize real X-ray output"} else {""}
             },
             "scanSetup":{
                 "savePath":self.parameters.save_path,"taskId":self.parameters.task_id,"projectionCount":total,
@@ -656,21 +1611,85 @@ impl Engine {
     pub fn snapshot(&self) -> Value {
         let (phase, label) = self.phase.value();
         let mode = if self.preview { "developer_preview" } else { "production_locked" };
-        let mode_label = if self.preview { "DEVELOPER PREVIEW · NO REAL HARDWARE" } else { "PRODUCTION LOCKED · NO HARDWARE ADAPTER" };
-        let connection_state = if self.connected { "connected" } else { "disconnected" };
-        let device_state = if !self.preview { "locked" } else if !self.connected { "offline" } else if self.phase == Phase::Running { "busy" } else { "connected" };
+        let nano_health = self.nano.as_ref().map(|nano| nano.health());
+        let nano_connected = nano_health
+            .as_ref()
+            .is_some_and(|health| health.state == NanoConnectionState::Connected);
+        let nano_faulted = nano_health.as_ref().is_some_and(|health| {
+            matches!(health.state, NanoConnectionState::Fault | NanoConnectionState::Lost)
+                || health.status.as_ref().is_some_and(|status| status.state == "FAULT")
+        });
+        let camera_health = self.camera.as_ref().map(DigiCamControlAdapter::health)
+            .or_else(|| self.cached_camera_health.clone());
+        let camera_connected = self.real_scan.is_some() || camera_health
+            .as_ref()
+            .is_some_and(|health| health.connected);
+        let xray_health = self.xray.as_ref().map(MoxtekAdapter::health)
+            .or_else(|| self.cached_xray_health.clone());
+        let xray_connected = self.real_scan.is_some() || xray_health
+            .as_ref()
+            .is_some_and(|health| health.connected);
+        let mode_label = if self.preview {
+            "DEVELOPER PREVIEW · NO REAL HARDWARE".to_owned()
+        } else if nano_connected && xray_connected {
+            "PRODUCTION · NANO + D7100 + MOXTEK".to_owned()
+        } else if nano_faulted {
+            "PRODUCTION · NANO FAULT · CLEAR + PREFLIGHT REQUIRED".to_owned()
+        } else if nano_connected {
+            "PRODUCTION · NANO ONLINE · CAMERA/X-RAY REQUIRED".to_owned()
+        } else if xray_connected {
+            "PRODUCTION · X-RAY SAFE CONFIG · NANO REQUIRED".to_owned()
+        } else {
+            "PRODUCTION LOCKED · NANO DISCONNECTED".to_owned()
+        };
+        let connection_state = if nano_faulted {
+            "degraded"
+        } else if nano_health
+            .as_ref()
+            .is_some_and(|health| matches!(health.state, NanoConnectionState::Lost | NanoConnectionState::Fault))
+        {
+            "lost"
+        } else if self.connected {
+            "connected"
+        } else {
+            "disconnected"
+        };
+        let device_state = if self.preview {
+            if !self.connected { "offline" } else if self.phase == Phase::Running { "busy" } else { "connected" }
+        } else if nano_faulted {
+            "fault"
+        } else if nano_connected {
+            "connected"
+        } else if self.phase == Phase::Fault {
+            "fault"
+        } else {
+            "offline"
+        };
+        let nano_detail = nano_health
+            .as_ref()
+            .and_then(|health| health.identity.as_ref().map(|identity| {
+                format!(
+                    "{} v{} build {} · {}",
+                    identity.device,
+                    identity.version,
+                    identity.build,
+                    health.port.as_deref().unwrap_or("unknown port")
+                )
+            }))
+            .unwrap_or_else(|| mode_label.clone());
         json!({
-            "mode":mode,"modeLabel":mode_label,"connectionState":connection_state,"adapterLabel":"ct-engine · JSONL stdio",
+            "mode":mode,"modeLabel":mode_label,"connectionState":connection_state,"adapterLabel":"ct-engine · Nano CH340 · JSONL stdio",
             "phase":phase,"phaseLabel":label,"preflightPassed":self.preflight,"homed":self.homed,
             "requiresPreflight":!self.preflight,"requiresHome":!self.homed,
             "safety":{
-                "xrayAvailable":false,"xrayEnabled":false,"interlockOk":false,
-                "lockReason":if self.preview {"Developer preview has no real X-ray hardware"} else {"Production is locked until real adapters are implemented"}
+                "xrayAvailable":xray_connected && self.preflight && self.homed && !self.xray_latched,"xrayEnabled":self.beam_on,
+                "interlockOk":xray_health.as_ref().and_then(|health| health.locked).is_some_and(|locked| !locked),
+                "lockReason":if self.preview {"Developer preview has no real X-ray hardware"} else if xray_connected {"Moxtek communication and setpoints verified; beam enable remains locked"} else {"Stage 1 Nano only · camera and X-ray are locked OFF"}
             },
             "devices":[
-                {"id":"turntable","label":"Precision Turntable","state":device_state,"detail":mode_label},
-                {"id":"camera","label":"Nikon D7100","state":device_state,"detail":mode_label},
-                {"id":"xray","label":"Moxtek 12 W","state":"locked","detail":"Fail-closed · no real output"}
+                {"id":"turntable","label":"Precision Turntable","state":device_state,"detail":nano_detail},
+                {"id":"camera","label":"Nikon D7100","state":if camera_connected {"connected"} else if self.preview {device_state} else {"offline"},"detail":if let Some(health) = camera_health.as_ref() {format!("digiCamControl · serial {} · {}", health.serial.as_deref().unwrap_or("unknown"), health.transfer_policy.as_deref().unwrap_or("transfer unverified"))} else if self.preview {mode_label.clone()} else {"Use Camera Retry to connect through digiCamControl".to_owned()}},
+                {"id":"xray","label":"Moxtek 12 W","state":if xray_connected {"connected"} else {"locked"},"detail":if let Some(health) = xray_health.as_ref() {format!("Safe-OFF configuration session · port {} · beam OFF confirmed", health.port.as_deref().unwrap_or("unknown"))} else {"Fail-closed · connect confirms OFF before allowing setpoint tests".to_owned()}}
             ],
             "parameters":self.parameters,
             "progress":{
@@ -679,7 +1698,7 @@ impl Engine {
                 "angleDeg":self.angle_deg(),
                 "etaSeconds":if self.phase == Phase::Running {Some(((self.parameters.projection_count - self.current) as f64 * 0.85).ceil() as u64)} else {None}
             },
-            "imageCount":0,"logs":self.logs,"lastError":Value::Null,"updatedAt":timestamp(),
+            "imageCount":self.real_frames.len(),"logs":self.logs,"lastError":self.last_error,"updatedAt":timestamp(),
             "workstation":self.workstation_view()
         })
     }
@@ -738,6 +1757,38 @@ mod tests {
         assert_eq!(snapshot["workstation"]["xray"]["beamOn"], false);
         assert!(send(&mut engine, "stop", json!({})).error_code.is_none());
         assert!(send(&mut engine, "disconnect", json!({})).error_code.is_none());
+    }
+
+    #[test]
+    fn production_requires_connected_devices_before_scan_or_manual_controls() {
+        let mut engine = Engine::new(false);
+        assert_eq!(
+            send(&mut engine, "start_scan", json!({}))
+                .error_code
+                .as_deref(),
+            Some("NOT_CONNECTED")
+        );
+        assert_eq!(
+            send(&mut engine, "xray_toggle", json!({}))
+                .error_code
+                .as_deref(),
+            Some("XRAY_NOT_CONNECTED")
+        );
+        assert_eq!(
+            send(&mut engine, "send_voltage", json!({"kv":60.0}))
+                .error_code
+                .as_deref(),
+            Some("XRAY_NOT_CONNECTED")
+        );
+        assert_eq!(
+            send(&mut engine, "send_current", json!({"ua":100.0}))
+                .error_code
+                .as_deref(),
+            Some("XRAY_NOT_CONNECTED")
+        );
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot["safety"]["xrayAvailable"], false);
+        assert_eq!(snapshot["workstation"]["xray"]["beamOn"], false);
     }
 
     #[test]
@@ -888,8 +1939,8 @@ mod tests {
             ("retry_device", json!({"device":"camera"})),
             ("timer_toggle", json!({})),
             ("usb_auto_shut_down_toggle", json!({})),
-            ("send_voltage", json!({"kv":70.0})),
-            ("send_current", json!({"ua":120.0})),
+            ("send_voltage", json!({"kv":60.0})),
+            ("send_current", json!({"ua":150.0})),
             ("xray_toggle", json!({})),
         ] {
             assert!(send(&mut engine, command, extra).error_code.is_none(), "{command}");
