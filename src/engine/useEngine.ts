@@ -17,7 +17,6 @@ export function useEngine() {
   const requestRevisionRef = useRef(0);
   const commandQueueRef = useRef<Promise<void>>(Promise.resolve());
   const commandActiveRef = useRef(false);
-  const hardwareConnectAttemptedRef = useRef(false);
   const disposedRef = useRef(false);
   const [adapterKind, setAdapterKind] = useState<AdapterKind>("developer_preview");
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
@@ -41,28 +40,8 @@ export function useEngine() {
       if (disposedRef.current || commandActiveRef.current) return;
       const revision = ++requestRevisionRef.current;
       try {
-        let next = await adapter.getSnapshot();
-        let connectError: string | null = null;
-        if (
-          adapter.kind === "tauri" &&
-          next.mode === "production_locked" &&
-          next.connectionState === "disconnected" &&
-          !hardwareConnectAttemptedRef.current
-        ) {
-          hardwareConnectAttemptedRef.current = true;
-          setBusy(true);
-          try {
-            next = await adapter.dispatch({ type: "connect", adapter: "real_hardware" });
-          } catch (reason) {
-            connectError = errorMessage(reason);
-          } finally {
-            setBusy(false);
-          }
-        }
+        const next = await adapter.getSnapshot();
         commitSnapshot(revision, next);
-        if (connectError && !disposedRef.current && revision === requestRevisionRef.current) {
-          setError(connectError);
-        }
       } catch (reason) {
         if (!disposedRef.current && revision === requestRevisionRef.current) {
           setError(errorMessage(reason));

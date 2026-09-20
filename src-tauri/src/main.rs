@@ -264,25 +264,9 @@ fn write_startup_snapshot(snapshot: &Value) -> Result<(), String> {
 fn connect_engine(app: &tauri::AppHandle) -> Result<(), String> {
     let mut engine = EngineClient::spawn()
         .map_err(|error| format!("Unable to start ct-engine: {error}"))?;
-    let initial_snapshot = engine
+    let startup_snapshot = engine
         .request("snapshot", serde_json::json!({}))
         .map_err(|error| format!("ct-engine startup snapshot failed: {error}"))?;
-    let startup_snapshot = if initial_snapshot.get("mode").and_then(Value::as_str)
-        == Some("production_locked")
-        && initial_snapshot
-            .get("connectionState")
-            .and_then(Value::as_str)
-            == Some("disconnected")
-    {
-        engine
-            .request(
-                "connect",
-                serde_json::json!({"type":"connect","adapter":"real_hardware"}),
-            )
-            .map_err(|error| format!("Nano startup connection failed: {error}"))?
-    } else {
-        initial_snapshot
-    };
     #[cfg(debug_assertions)]
     {
         eprintln!("CT_ENGINE_STARTUP_SNAPSHOT={startup_snapshot}");
