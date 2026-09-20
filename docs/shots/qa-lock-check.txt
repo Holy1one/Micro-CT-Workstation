@@ -1,3 +1,0 @@
-﻿SIDECAR_LOCK_RELEASED=False MSG=使用“4”个参数调用“Open”时发生异常:“未能找到文件“E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App\target\debug\ct-engine-x86_64-pc-windows-msvc.exe”。”
-EXE_LASTWRITE=2026-09-18T11:57:24.3727264+08:00
-SOURCE_TIMES: src-tauri\tauri.conf.json=2026-09-18T11:49:26.5535440+08:00 | src-tauri\src\main.rs=2026-09-18T11:49:37.1062725+08:00

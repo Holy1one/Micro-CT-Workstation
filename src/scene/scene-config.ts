@@ -1,3 +1,9 @@
+/**
+ * Single geometric source of truth for the visualization optical axis.
+ * Positions are display coordinates, not calibration or motion commands; the
+ * final assertion catches accidental loss of source/sample/detector collinearity.
+ */
+
 import type { ViewPreset } from "./types";
 
 export const OPTICAL_AXIS_Y = 30;

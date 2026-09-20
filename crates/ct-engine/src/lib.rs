@@ -1,10 +1,18 @@
 //! Desktop scan-state owner and protocol-v1 command processor.
-pub mod adapters;
+//! Production domain engine for the Micro-CT workstation.
+//!
+//! The engine is the single owner of device state, safety gates, scan state,
+//! and the versioned JSONL API exposed to the Tauri desktop shell. Device-
+//! specific I/O lives under `devices`; scan transaction execution lives under
+//! `scan`. Keeping those directions one-way prevents hardware drivers from
+//! acquiring a second copy of application state.
+
+pub mod devices;
 mod scan;
 
-use adapters::camera::{CameraHealth, DigiCamControlAdapter};
-use adapters::nano::{NanoAdapter, NanoConnectionState};
-use adapters::xray::{
+use devices::camera::{CameraHealth, DigiCamControlAdapter};
+use devices::turntable::{NanoAdapter, NanoConnectionState};
+use devices::xray::{
     MoxtekAdapter, XrayHealth, MAX_CURRENT_UA, MAX_SETPOINT_POWER_W, MAX_VOLTAGE_KV,
     MIN_VOLTAGE_KV,
 };
@@ -147,7 +155,7 @@ impl ScanSetupInput {
             parameters.exposure_ms = exposure_ms;
         }
         if let Some(value) = self.max_xray_sec {
-            if !(1..=359_999).contains(&value) {
+            if !(1..=600).contains(&value) {
                 return Err("INVALID_PARAMETERS");
             }
             max_xray_sec = value;
@@ -201,6 +209,7 @@ pub struct Engine {
     xray_latched: bool,
     timer_on: bool,
     usb_auto_shut_down: bool,
+    usb_auto_shut_down_confirmed: bool,
     set_kv: f64,
     set_ua: f64,
     set_kv_confirmed: bool,
@@ -238,6 +247,7 @@ impl Engine {
             xray_latched: false,
             timer_on: false,
             usb_auto_shut_down: true,
+            usb_auto_shut_down_confirmed: preview,
             set_kv: 60.0,
             set_ua: 200.0,
             set_kv_confirmed: false,
@@ -333,6 +343,9 @@ impl Engine {
                 .map(|frame| serde_json::to_value(frame).unwrap_or_else(|_| json!({})))
                 .collect();
             if let Some(health) = progress.xray_health {
+                self.usb_auto_shut_down = health
+                    .usb_auto_shutdown
+                    .unwrap_or(self.usb_auto_shut_down);
                 self.cached_xray_health = Some(health);
             }
             let messages = progress
@@ -442,21 +455,35 @@ impl Engine {
     }
 
     /// Polls the Moxtek for its live beam state (throttled, production only).
-    /// The hardware is the source of truth: an externally toggled beam is
-    /// reflected in `beam_on` so the switch shows red whenever output is live.
+    /// Active emission is checked more frequently and any safety failure is
+    /// latched after the device module has attempted an immediate OFF.
     fn sync_xray_live_status(&mut self) {
         if self.preview || self.real_scan.is_some() {
             return;
         }
-        if self.last_xray_poll.elapsed() < Duration::from_secs(2) {
+        let poll_interval = if self.beam_on {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(2)
+        };
+        if self.last_xray_poll.elapsed() < poll_interval {
             return;
         }
         let Some(xray) = self.xray.as_mut() else {
             return;
         };
         self.last_xray_poll = Instant::now();
-        match xray.refresh_status() {
+        let was_beam_on = self.beam_on;
+        let result = if was_beam_on {
+            xray.refresh_emission_status()
+        } else {
+            xray.refresh_status()
+        };
+        match result {
             Ok(health) => {
+                if let Some(warning) = health.telemetry_warning.as_deref() {
+                    self.log("WARN", "xray", warning);
+                }
                 if health.beam_on != self.beam_on {
                     self.log(
                         "WARN",
@@ -469,10 +496,22 @@ impl Engine {
                     );
                 }
                 self.beam_on = health.beam_on;
+                self.usb_auto_shut_down = health
+                    .usb_auto_shutdown
+                    .unwrap_or(self.usb_auto_shut_down);
                 self.cached_xray_health = Some(health);
             }
             Err(error) => {
-                self.cached_xray_health = Some(xray.health());
+                let health = xray.health();
+                self.beam_on = health.beam_on;
+                self.usb_auto_shut_down = health
+                    .usb_auto_shutdown
+                    .unwrap_or(self.usb_auto_shut_down);
+                self.cached_xray_health = Some(health);
+                if was_beam_on {
+                    self.xray_latched = true;
+                    self.invalidate(Phase::Fault);
+                }
                 self.log(
                     "ERR",
                     "xray",
@@ -588,6 +627,8 @@ impl Engine {
             self.cached_xray_health = None;
             self.set_kv_confirmed = false;
             self.set_ua_confirmed = false;
+            self.usb_auto_shut_down = true;
+            self.usb_auto_shut_down_confirmed = false;
             self.connected = false;
             self.invalidate(if xray_off.is_ok() { Phase::Idle } else { Phase::Fault });
             self.log("WARN", "system", "Engine disconnected · Moxtek OFF, warning OFF and Nano STOP attempted · safety conditions invalidated");
@@ -676,7 +717,7 @@ impl Engine {
                 }
                 if !self.preview {
                     self.parameters.validate()?;
-                    if !(1..=359_999).contains(&self.max_xray_sec) {
+                    if !(1..=600).contains(&self.max_xray_sec) {
                         return Err("INVALID_PARAMETERS");
                     }
                     if !self
@@ -718,12 +759,8 @@ impl Engine {
                                 return Err("XRAY_CONNECTION_FAILED");
                             }
                         };
-                        if let Err(error) = xray.set_usb_auto_shutdown(self.usb_auto_shut_down) {
-                            let message = format!("Moxtek USB auto-shutdown sync failed: {error}");
-                            self.last_error = Some(message.clone());
-                            self.log("ERR", "xray", &message);
-                            return Err("XRAY_CONNECTION_FAILED");
-                        }
+                        self.usb_auto_shut_down = true;
+                        self.usb_auto_shut_down_confirmed = false;
                         self.cached_xray_health = Some(health.clone());
                         self.xray = Some(xray);
                         if health.beam_on {
@@ -746,6 +783,14 @@ impl Engine {
                                 ),
                             );
                         }
+                    }
+                    if !self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down {
+                        self.log(
+                            "WARN",
+                            "xray",
+                            "CT scan requires the operator to disable USB Auto Shut Down in the X-ray panel",
+                        );
+                        return Err("USB_AUTO_SHUTDOWN_RELEASE_REQUIRED");
                     }
                     if !self.set_kv_confirmed || !self.set_ua_confirmed {
                         self.log(
@@ -808,7 +853,7 @@ impl Engine {
                     );
                 } else {
                     self.parameters.validate()?;
-                    if !(1..=359_999).contains(&self.max_xray_sec) {
+                    if !(1..=600).contains(&self.max_xray_sec) {
                         return Err("INVALID_PARAMETERS");
                     }
                     self.preflight = true;
@@ -868,8 +913,8 @@ impl Engine {
                     if self.xray_latched {
                         return Err("ESTOP_LATCHED");
                     }
-                    if self.usb_auto_shut_down {
-                        return Err("SAFETY_LOCK_REQUIRED");
+                    if !self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down {
+                        return Err("USB_AUTO_SHUTDOWN_RELEASE_REQUIRED");
                     }
                     self.parameters.validate()?;
                     self.validate_setpoint(self.set_kv, self.set_ua)?;
@@ -1052,6 +1097,9 @@ impl Engine {
                             self.last_error = None;
                         }
                         "xray" => {
+                            if self.xray.is_some() {
+                                return Err("XRAY_ALREADY_CONNECTED");
+                            }
                             let mut xray = MoxtekAdapter::new();
                             let health = match xray.discover_and_connect() {
                                 Ok(health) => health,
@@ -1062,17 +1110,11 @@ impl Engine {
                                     return Err("XRAY_CONNECTION_FAILED");
                                 }
                             };
-                            // Sync the engine's deadman policy onto the device
-                            // so the hardware state always matches the UI.
-                            if let Err(error) = xray.set_usb_auto_shutdown(self.usb_auto_shut_down) {
-                                let message = format!("Moxtek USB auto-shutdown sync failed: {error}");
-                                self.last_error = Some(message.clone());
-                                self.log("ERR", "xray", &message);
-                                return Err("XRAY_CONNECTION_FAILED");
-                            }
                             let shutdown_delay = xray.read_usb_shutdown_timer().ok();
                             self.xray = Some(xray);
                             self.cached_xray_health = Some(health.clone());
+                            self.usb_auto_shut_down = true;
+                            self.usb_auto_shut_down_confirmed = false;
                             self.set_kv_confirmed = false;
                             self.set_ua_confirmed = false;
                             if health.beam_on {
@@ -1094,10 +1136,9 @@ impl Engine {
                                     "PASS",
                                     "xray",
                                     &format!(
-                                        "Moxtek 12 W connected · port={} · serial={} · beam OFF confirmed · USB auto-shutdown {} (delay raw {:?})",
+                                        "Moxtek 12 W connected · port={} · serial={} · beam OFF confirmed · USB auto-shutdown awaits operator selection (delay raw {:?})",
                                         health.port.as_deref().unwrap_or("unknown"),
                                         health.serial.as_deref().unwrap_or("unknown"),
-                                        if self.usb_auto_shut_down { "ARMED" } else { "RELEASED" },
                                         shutdown_delay
                                     ),
                                 );
@@ -1110,6 +1151,36 @@ impl Engine {
                     self.require_connected()?;
                     self.log("INFO", "system", &format!("{device} preview link check complete"));
                 }
+            }
+            "xray_disconnect" => {
+                if self.busy() {
+                    return Err("SCAN_ACTIVE");
+                }
+                if self.preview {
+                    self.log("ACTION", "xray", "Preview X-ray disconnected · NO REAL HARDWARE");
+                    return Ok(());
+                }
+                if self.beam_on {
+                    return Err("XRAY_BEAM_ACTIVE");
+                }
+                let mut xray = self.xray.take().ok_or("XRAY_NOT_CONNECTED")?;
+                let result = xray.disconnect();
+                self.cached_xray_health = None;
+                self.set_kv_confirmed = false;
+                self.set_ua_confirmed = false;
+                self.usb_auto_shut_down = true;
+                self.usb_auto_shut_down_confirmed = false;
+                self.preflight = false;
+                self.homed = false;
+                self.phase = Phase::Idle;
+                result.map_err(|error| {
+                    let message = format!("Moxtek disconnect failed: {error}");
+                    self.last_error = Some(message.clone());
+                    self.log("ERR", "xray", &message);
+                    "XRAY_DISCONNECT_FAILED"
+                })?;
+                self.last_error = None;
+                self.log("PASS", "xray", "Moxtek OFF confirmed and manually disconnected");
             }
             "camera_test_capture" => {
                 if self.preview {
@@ -1158,14 +1229,6 @@ impl Engine {
                         self.log("PASS", "xray", "Manual beam OFF confirmed · output disabled");
                         return Ok(());
                     }
-                    if self.usb_auto_shut_down {
-                        self.log(
-                            "WARN",
-                            "xray",
-                            "Beam enable rejected · USB Auto Shut Down is armed (locked) · release the checkbox first",
-                        );
-                        return Err("SAFETY_LOCK_REQUIRED");
-                    }
                     let xray = self.xray.as_mut().ok_or("XRAY_NOT_CONNECTED")?;
                     if !self.set_kv_confirmed || !self.set_ua_confirmed {
                         self.log(
@@ -1179,6 +1242,9 @@ impl Engine {
                     match xray.beam_on(&cancel) {
                         Ok(health) => {
                             self.beam_on = true;
+                            self.usb_auto_shut_down = health
+                                .usb_auto_shutdown
+                                .unwrap_or(true);
                             self.cached_xray_health = Some(health.clone());
                             self.last_error = None;
                             self.log(
@@ -1224,6 +1290,9 @@ impl Engine {
                 }
                 let new_state = !self.usb_auto_shut_down;
                 if !self.preview {
+                    if self.xray.is_none() {
+                        return Err("XRAY_NOT_CONNECTED");
+                    }
                     if new_state && self.beam_on {
                         // Re-arming the deadman while emitting: stop output
                         // first so the transition is deliberate, not a timeout.
@@ -1240,13 +1309,14 @@ impl Engine {
                     }
                 }
                 self.usb_auto_shut_down = new_state;
+                self.usb_auto_shut_down_confirmed = true;
                 self.log(
                     "INFO",
                     "xray",
                     if self.usb_auto_shut_down {
-                        "USB Auto Shut Down ARMED on device · beam enable LOCKED · release the checkbox to authorize output"
+                        "USB Auto Shut Down ARMED · continuous output bounded by the device timer"
                     } else {
-                        "USB Auto Shut Down RELEASED on device · beam enable authorized · X-ray may run standalone"
+                        "USB Auto Shut Down RELEASED by operator · CT scan will not change it"
                     },
                 );
             }
@@ -1288,7 +1358,23 @@ impl Engine {
             }
             "send_voltage" => {
                 let kv = payload.get("kv").and_then(Value::as_f64).ok_or("INVALID_VOLTAGE")?;
-                self.validate_setpoint(kv, self.set_ua)?;
+                if !kv.is_finite() || !(MIN_VOLTAGE_KV..=MAX_VOLTAGE_KV).contains(&kv) {
+                    return Err("INVALID_XRAY_SETPOINT");
+                }
+                let requested_ua = self.set_ua;
+                let applied_ua =
+                    requested_ua.min(MAX_SETPOINT_POWER_W * 1_000.0 / kv);
+                let power_clamped = (applied_ua - requested_ua).abs() > 1e-12;
+                self.validate_setpoint(kv, applied_ua)?;
+                if power_clamped {
+                    self.log(
+                        "WARN",
+                        "xray",
+                        &format!(
+                            "SEND V requested {kv:.3} kV · current auto-adjusted from {requested_ua:.3} µA to {applied_ua:.3} µA · {MAX_SETPOINT_POWER_W:.0} W limit"
+                        ),
+                    );
+                }
                 if !self.preview {
                     if self.beam_on {
                         return Err("XRAY_BEAM_ACTIVE");
@@ -1297,7 +1383,7 @@ impl Engine {
                         .xray
                         .as_mut()
                         .ok_or("XRAY_NOT_CONNECTED")?
-                        .set_parameters(kv, self.set_ua);
+                        .set_parameters(kv, applied_ua);
                     let health = match result {
                         Ok(health) => health,
                         Err(error) => {
@@ -1308,28 +1394,57 @@ impl Engine {
                         }
                     };
                     self.force_xray_off("Moxtek voltage setpoint")?;
-                    self.set_kv = kv;
+                    let accepted_kv = health.set_voltage_kv.unwrap_or(kv);
+                    let accepted_ua = health.set_current_ua.unwrap_or(applied_ua);
+                    self.set_kv = accepted_kv;
+                    self.set_ua = accepted_ua;
                     self.set_kv_confirmed = true;
+                    if power_clamped {
+                        self.set_ua_confirmed = true;
+                    }
                     self.cached_xray_health = Some(health.clone());
                     self.last_error = None;
                     self.log(
                         "PASS",
                         "xray",
                         &format!(
-                            "Moxtek setpoint verified OFF · requested {kv:.1} kV / {:.1} µA · readback {:.3} kV / {:.3} µA",
-                            self.set_ua,
-                            health.set_voltage_kv.unwrap_or(kv),
-                            health.set_current_ua.unwrap_or(self.set_ua)
+                            "SEND V applied and verified OFF · final {accepted_kv:.3} kV / {accepted_ua:.3} µA"
                         ),
                     );
                     return Ok(());
                 }
                 self.set_kv = kv;
-                self.log("INFO", "xray", &format!("Preview voltage set to {kv:.1} kV"));
+                self.set_ua = applied_ua;
+                self.log(
+                    "INFO",
+                    "xray",
+                    &format!(
+                        "Preview SEND V applied · final {kv:.3} kV / {applied_ua:.3} µA"
+                    ),
+                );
             }
             "send_current" => {
                 let ua = payload.get("ua").and_then(Value::as_f64).ok_or("INVALID_CURRENT")?;
-                self.validate_setpoint(self.set_kv, ua)?;
+                if !ua.is_finite() || !(0.0..=MAX_CURRENT_UA).contains(&ua) {
+                    return Err("INVALID_XRAY_SETPOINT");
+                }
+                let requested_kv = self.set_kv;
+                let applied_kv = if ua > 0.0 {
+                    requested_kv.min(MAX_SETPOINT_POWER_W * 1_000.0 / ua)
+                } else {
+                    requested_kv
+                };
+                let power_clamped = (applied_kv - requested_kv).abs() > 1e-12;
+                self.validate_setpoint(applied_kv, ua)?;
+                if power_clamped {
+                    self.log(
+                        "WARN",
+                        "xray",
+                        &format!(
+                            "SEND I requested {ua:.3} µA · voltage auto-adjusted from {requested_kv:.3} kV to {applied_kv:.3} kV · {MAX_SETPOINT_POWER_W:.0} W limit"
+                        ),
+                    );
+                }
                 if !self.preview {
                     if self.beam_on {
                         return Err("XRAY_BEAM_ACTIVE");
@@ -1338,7 +1453,7 @@ impl Engine {
                         .xray
                         .as_mut()
                         .ok_or("XRAY_NOT_CONNECTED")?
-                        .set_parameters(self.set_kv, ua);
+                        .set_parameters(applied_kv, ua);
                     let health = match result {
                         Ok(health) => health,
                         Err(error) => {
@@ -1349,24 +1464,34 @@ impl Engine {
                         }
                     };
                     self.force_xray_off("Moxtek current setpoint")?;
-                    self.set_ua = ua;
+                    let accepted_kv = health.set_voltage_kv.unwrap_or(applied_kv);
+                    let accepted_ua = health.set_current_ua.unwrap_or(ua);
+                    self.set_kv = accepted_kv;
+                    self.set_ua = accepted_ua;
                     self.set_ua_confirmed = true;
+                    if power_clamped {
+                        self.set_kv_confirmed = true;
+                    }
                     self.cached_xray_health = Some(health.clone());
                     self.last_error = None;
                     self.log(
                         "PASS",
                         "xray",
                         &format!(
-                            "Moxtek setpoint verified OFF · requested {:.1} kV / {ua:.1} µA · readback {:.3} kV / {:.3} µA",
-                            self.set_kv,
-                            health.set_voltage_kv.unwrap_or(self.set_kv),
-                            health.set_current_ua.unwrap_or(ua)
+                            "SEND I applied and verified OFF · final {accepted_kv:.3} kV / {accepted_ua:.3} µA"
                         ),
                     );
                     return Ok(());
                 }
+                self.set_kv = applied_kv;
                 self.set_ua = ua;
-                self.log("INFO", "xray", &format!("Preview current set to {ua:.1} µA"));
+                self.log(
+                    "INFO",
+                    "xray",
+                    &format!(
+                        "Preview SEND I applied · final {applied_kv:.3} kV / {ua:.3} µA"
+                    ),
+                );
             }
             _ => return Err("UNKNOWN_COMMAND"),
         }
@@ -1483,6 +1608,10 @@ impl Engine {
         let xray_connected = self.real_scan.is_some() || xray_health
             .as_ref()
             .is_some_and(|health| health.connected);
+        let actual_usb_auto_shutdown = xray_health
+            .as_ref()
+            .and_then(|health| health.usb_auto_shutdown)
+            .unwrap_or(self.usb_auto_shut_down);
         let identity = if is_preview {
             "DEVELOPER PREVIEW · NO REAL HARDWARE".to_owned()
         } else if let Some(health) = nano_health.as_ref() {
@@ -1561,13 +1690,15 @@ impl Engine {
             "safetyBar":{"text":safety_text,"tone":if self.phase == Phase::Fault {"dangerBold"} else if self.beam_on {"danger"} else {"muted"}},
             "scene":{"angleDeg":angle,"rotated":angle.abs() > 0.005},
             "xray":{
+                "connected":xray_connected,
                 "setKv":self.set_kv,"setUa":self.set_ua,
                 "monKv":xray_health.as_ref().and_then(|health| health.voltage_kv).unwrap_or(self.set_kv),
                 "monUa":xray_health.as_ref().and_then(|health| health.current_ua).unwrap_or(self.set_ua),
                 "powerW":xray_health.as_ref().and_then(|health| health.voltage_kv.zip(health.current_ua)).map(|(kv, ua)| kv * ua / 1000.0).unwrap_or(self.set_kv * self.set_ua / 1000.0),
                 "tempC":xray_health.as_ref().and_then(|health| health.temperature_c).unwrap_or(24.0),"beamOn":self.beam_on,
                 "latched":self.xray_latched,"onSec":10,"offSec":20,"timerOn":self.timer_on,
-                "usbAutoShutDown":self.usb_auto_shut_down,
+                "usbAutoShutDown":actual_usb_auto_shutdown,
+                "usbAutoShutDownKnown":self.preview || self.usb_auto_shut_down_confirmed,
                 "usbShutdownDelay":xray_health.as_ref().and_then(|health| health.usb_shutdown_delay),
                 "manualControlsEnabled":self.preview || (xray_connected && !self.busy() && !self.xray_latched),
                 "timerControlsEnabled":self.preview,
@@ -1593,12 +1724,12 @@ impl Engine {
             },
             "dock":{
                 "home":self.connected && self.preflight && !self.busy() && !self.xray_latched,
-                "play":self.connected && !self.xray_latched && ((self.phase == Phase::Running || self.phase == Phase::Paused) || (self.preflight && self.homed && self.phase != Phase::Fault && (self.preview || !self.usb_auto_shut_down))),
+                "play":self.connected && !self.xray_latched && ((self.phase == Phase::Running || self.phase == Phase::Paused) || (self.preflight && self.homed && self.phase != Phase::Fault && (self.preview || (self.usb_auto_shut_down_confirmed && !self.usb_auto_shut_down)))),
                 "restore":self.connected && !self.busy() && self.preflight && self.homed && !self.xray_latched && !matches!(self.phase, Phase::Fault | Phase::Stopped),
                 "estop":true,
                 "playMode":if self.phase == Phase::Running {"pause"} else if self.phase == Phase::Paused {"resume"} else if self.phase == Phase::Fault {"disabled"} else {"start"},
                 "homeReason":if !self.connected {"Connect the Nano first"} else if self.xray_latched || self.phase == Phase::Fault {"Release E-STOP, then run Preflight"} else if !self.preflight {"Complete scan setup and run Preflight first"} else if self.busy() {"HOME is unavailable while a scan is active"} else {""},
-                "playReason":if self.phase == Phase::Running {"Pause after the active transaction closes"} else if self.phase == Phase::Paused {"Resume the paused scan"} else if !self.connected {"Connect the Nano first"} else if self.xray_latched || self.phase == Phase::Fault {"Release E-STOP"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if !self.preview && self.usb_auto_shut_down {"Disable USB Auto Shut Down to authorize real X-ray output"} else {""}
+                "playReason":if self.phase == Phase::Running {"Pause after the active transaction closes"} else if self.phase == Phase::Paused {"Resume the paused scan"} else if !self.connected {"Connect the Nano first"} else if self.xray_latched || self.phase == Phase::Fault {"Release E-STOP"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if !self.preview && (!self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down) {"Disable USB Auto Shut Down manually in the X-ray panel"} else {""}
             },
             "scanSetup":{
                 "savePath":self.parameters.save_path,"taskId":self.parameters.task_id,"projectionCount":total,
@@ -1948,11 +2079,70 @@ mod tests {
     }
 
     #[test]
-    fn xray_power_limit_is_transactional() {
+    fn xray_send_buttons_preserve_the_clicked_axis_and_clamp_the_other_to_12_w() {
+        let mut current_engine = Engine::new(true);
+        let current_response = send(&mut current_engine, "send_current", json!({"ua":500.0}));
+        assert!(current_response.error_code.is_none());
+        assert!((current_engine.set_kv - 24.0).abs() < 1e-9);
+        assert!((current_engine.set_ua - 500.0).abs() < 1e-9);
+        assert!((current_engine.set_kv * current_engine.set_ua / 1_000.0 - 12.0).abs() < 1e-9);
+
+        let mut voltage_engine = Engine::new(true);
+        voltage_engine.set_ua = 500.0;
+        let voltage_response = send(&mut voltage_engine, "send_voltage", json!({"kv":70.0}));
+        assert!(voltage_response.error_code.is_none());
+        assert!((voltage_engine.set_kv - 70.0).abs() < 1e-9);
+        assert!((voltage_engine.set_ua - (12_000.0 / 70.0)).abs() < 1e-9);
+        assert!((voltage_engine.set_kv * voltage_engine.set_ua / 1_000.0 - 12.0).abs() < 1e-9);
+
+        let snapshot = voltage_engine.snapshot();
+        assert_eq!(snapshot["workstation"]["xray"]["setKv"], 70.0);
+        assert_eq!(
+            snapshot["workstation"]["xray"]["setUa"].as_f64(),
+            Some(12_000.0 / 70.0)
+        );
+        assert!(voltage_engine.logs.iter().any(|entry| {
+            entry["level"] == "WARN"
+                && entry["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("SEND V requested 70.000 kV")
+                        && message.contains("500.000 µA to 171.429 µA")
+                        && message.contains("12 W limit"))
+        }));
+    }
+
+    #[test]
+    fn xray_send_zero_exact_limit_and_invalid_axis_values_are_safe_and_atomic() {
         let mut engine = Engine::new(true);
-        let before = engine.set_ua;
-        assert_eq!(send(&mut engine, "send_current", json!({"ua":500.0})).error_code.as_deref(), Some("XRAY_POWER_LIMIT"));
-        assert_eq!(engine.set_ua, before);
+
+        assert!(send(&mut engine, "send_current", json!({"ua":0.0}))
+            .error_code
+            .is_none());
+        assert_eq!(engine.set_kv, 60.0);
+        assert_eq!(engine.set_ua, 0.0);
+
+        assert!(send(&mut engine, "send_voltage", json!({"kv":60.0}))
+            .error_code
+            .is_none());
+        assert!(send(&mut engine, "send_current", json!({"ua":200.0}))
+            .error_code
+            .is_none());
+        assert_eq!(engine.set_kv, 60.0);
+        assert_eq!(engine.set_ua, 200.0);
+
+        let before = (engine.set_kv, engine.set_ua);
+        for (command, payload) in [
+            ("send_voltage", json!({"kv":3.999})),
+            ("send_voltage", json!({"kv":70.001})),
+            ("send_current", json!({"ua":-0.001})),
+            ("send_current", json!({"ua":1000.001})),
+        ] {
+            assert_eq!(
+                send(&mut engine, command, payload).error_code.as_deref(),
+                Some("INVALID_XRAY_SETPOINT")
+            );
+            assert_eq!((engine.set_kv, engine.set_ua), before);
+        }
     }
 
     #[test]
@@ -1994,6 +2184,26 @@ mod tests {
         assert_eq!(engine.parameters.angle_step_deg, 36.0);
         assert_eq!(engine.parameters.exposure_ms, 200);
         assert_eq!(engine.max_xray_sec, 60);
+
+        assert!(send(
+            &mut engine,
+            "update_scan_setup",
+            json!({"setup":{"maxXraySec":600}}),
+        )
+        .error_code
+        .is_none());
+        assert_eq!(engine.max_xray_sec, 600);
+        assert_eq!(
+            send(
+                &mut engine,
+                "update_scan_setup",
+                json!({"setup":{"maxXraySec":601}}),
+            )
+            .error_code
+            .as_deref(),
+            Some("INVALID_PARAMETERS")
+        );
+        assert_eq!(engine.max_xray_sec, 600);
     }
 
     #[test]

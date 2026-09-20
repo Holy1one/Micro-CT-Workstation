@@ -1,3 +1,9 @@
+/**
+ * Contract tests for the hosted-preview worker.
+ * These cases protect asset pass-through and single-page navigation fallback;
+ * they are unrelated to Tauri or real hardware behavior.
+ */
+
 import assert from "node:assert/strict";
 import { access } from "node:fs/promises";
 import test from "node:test";

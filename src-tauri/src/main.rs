@@ -1,4 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! Thin Windows desktop host for the Micro-CT workstation.
+//!
+//! This crate owns native paths, dialogs, window lifecycle, and forwarding to
+//! the ct-engine sidecar. It intentionally does not duplicate device, safety,
+//! or scan state from the production engine.
+
 mod engine_client;
 use engine_client::EngineClient;
 use serde_json::Value;

@@ -1,13 +1,11 @@
 /**
- * Nano transport layer. The workstation talks to the turntable controller
- * through the `NanoTransport` interface only, so the same command stream can
- * be routed to a physical CH340 serial port (sidecar / WebSerial bridge) or
- * to the on-board firmware executor bundled with the console.
+ * Browser-preview Nano transport abstraction.
+ * The current `FirmwareTransport` is deliberately in-memory and must never be
+ * extended to open CH340, WebSerial, or other physical-device connections.
  *
- * `FirmwareTransport` executes the exact rts9060_nano firmware semantics
- * (state machine, pulse counting, handshake lines) in-process. It is the
- * default link while no physical Nano is attached; the command/response
- * stream is identical to the serial one, byte for byte.
+ * `FirmwareTransport` approximates the historical RTS9060 semantics
+ * (state machine, pulse counting, handshake lines) in-process. It is a UI
+ * development aid and is never evidence of byte-for-byte firmware parity.
  */
 
 import { cmd, MICROSTEPS, parseLine, PULSES_PER_REV } from "./protocol";

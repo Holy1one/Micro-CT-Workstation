@@ -1,2 +1,0 @@
-LISTENER=True
-ERROR=²Ù×÷³¬Ê±¡£

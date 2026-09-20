@@ -1,6 +1,7 @@
 /**
- * RTS9060 Nano line protocol (ported from kernal/software/host/rts9060_link.py
- * and firmware rts9060_nano.ino). ASCII lines, `\n` terminated, space separated.
+ * RTS9060 Nano line-protocol helpers for the browser preview.
+ * Historical sources explain the vocabulary but are not active firmware.
+ * ASCII lines are `\n` terminated and space separated.
  * Command names are contractual and must not change:
  * HEARTBEAT / PING / STATUS / SET_MICROSTEPS / REARM / HOME /
  * MOVE_ABS / MOVE_REL / CAPTURE_DONE / STOP / GET_HALL / INFO / XRAY_WARNING

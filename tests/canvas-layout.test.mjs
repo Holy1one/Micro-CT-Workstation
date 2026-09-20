@@ -1,3 +1,9 @@
+/**
+ * Numeric regression tests for the fixed workstation canvas.
+ * The assertions cover supported aspect ratios and scale clamps so CSS cannot
+ * hide an oversized canvas and falsely appear to pass layout acceptance.
+ */
+
 import assert from "node:assert/strict";
 import test from "node:test";
 

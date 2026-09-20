@@ -1,4 +1,8 @@
-//! Process/IPC ownership only. Business rules live exclusively in ct-engine.
+//! Verified process and JSONL transport for the ct-engine sidecar.
+//!
+//! The client owns child-process handles, request sequencing, timeouts, and
+//! executable verification. It treats protocol mismatches as hard failures and
+//! contains no business rules; those live exclusively in ct-engine.
 use ct_engine::{timestamp, Request, Response, PROTOCOL_VERSION};
 use serde_json::Value;
 use sha2::{Digest, Sha256};

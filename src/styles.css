@@ -1,5 +1,11 @@
 @import "./tokens.css";
 
+/*
+ * Component layout and presentation for the fixed industrial console.
+ * All color values come from tokens.css; this file owns geometry, typography,
+ * responsive fitting, and state-dependent component styling only.
+ */
+
 /* ============================================================
    Micro-CT Workstation · Industrial Console
    Layout grid (design baseline 1920 x 1080, 16:9):
@@ -416,6 +422,26 @@ i.tone-danger { background: var(--danger); }
 
 /* ---------- 12 watt controller ---------- */
 
+.xray-mode-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 10px 14px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--neutralSoft);
+  color: var(--textSecondary);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.045em;
+}
+.xray-mode-banner strong { font-family: var(--fontMono); font-size: 9px; }
+.xray-mode-banner--manual { border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); }
+.xray-mode-banner--manual strong { color: var(--accentText); }
+.xray-mode-banner--locked { border-color: color-mix(in srgb, var(--warn) 42%, var(--line)); background: var(--warnSoft); }
+.xray-mode-banner--locked strong { color: var(--warnText); }
 .xray-channels { display: flex; flex-direction: column; gap: 12px; padding: 12px 14px 0; }
 .xray-channel__label { display: block; font-size: 9.5px; font-weight: 600; letter-spacing: 0.04em; color: var(--textMuted); margin-bottom: 5px; }
 .xray-channel__row { display: grid; grid-template-columns: minmax(0, 1fr) 76px; align-items: stretch; gap: 10px; }
@@ -448,7 +474,7 @@ i.tone-danger { background: var(--danger); }
   cursor: pointer;
 }
 
-.xray-meters { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 12px 14px 0; }
+.xray-meters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; padding: 12px 14px 0; }
 .xray-meter span { display: block; font-size: 9.5px; font-weight: 600; letter-spacing: 0.04em; color: var(--textMuted); margin-bottom: 5px; }
 .xray-meter__well {
   height: 34px;
@@ -463,8 +489,16 @@ i.tone-danger { background: var(--danger); }
   font-weight: 600;
   color: var(--textPrimary);
 }
+.xray-meter__well--safe { color: var(--accentText); background: var(--okSoft); }
+.xray-meter__well--danger { color: var(--dangerText); background: var(--dangerSoft); border-color: var(--danger); }
 
 .switch-btn--block { width: calc(100% - 28px); margin: 12px 14px 0; height: 40px; font-size: 12.5px; }
+.xray-connection-btn { height: 34px; font-size: 10.5px; letter-spacing: 0.04em; }
+.xray-connection-btn--connected {
+  color: var(--accentText);
+  background: var(--accentSoft);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
 
 .timer-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: end; gap: 10px; padding: 12px 14px 0; }
 .timer-field { text-align: center; }

@@ -1,6 +1,6 @@
 {
   "name": "micro-ct-app",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,11 +8,14 @@
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && npm run test:sites",
+    "module-map:generate": "node scripts/gen-module-graph.mjs",
+    "module-map:check": "node scripts/verify-module-map.mjs && node scripts/gen-module-graph.mjs --check",
+    "impact": "node scripts/impact.mjs",
     "engine:build": "node scripts/prepare-engine-sidecar.mjs",
     "tauri:dev": "npm run engine:build && tauri dev",
     "tauri:build": "npm run engine:build -- --release && tauri build",
     "preview": "vite preview",
-    "test:sites": "node --experimental-strip-types --test tests/*.test.mjs"
+    "test:sites": "npm run build && node --experimental-strip-types --test tests/*.test.mjs"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",

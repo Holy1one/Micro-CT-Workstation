@@ -1,3 +1,0 @@
-EXE=E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App\target\debug\ct-workstation.exe
-LENGTH=13454336
-LAST_WRITE=2026-09-18T10:37:22.4207191+08:00

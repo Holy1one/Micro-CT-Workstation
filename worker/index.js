@@ -1,3 +1,10 @@
+/**
+ * Static-site worker used only by the hosted preview build.
+ * It serves immutable assets first and falls back to index.html for browser
+ * navigation requests. This worker never participates in desktop IPC or
+ * physical-device control.
+ */
+
 export default {
   async fetch(request, env) {
     const response = await env.ASSETS.fetch(request);

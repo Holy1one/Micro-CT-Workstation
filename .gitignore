@@ -4,10 +4,19 @@ dist/
 target/
 release/
 src-tauri/binaries/
+.vite/
+# Approved local artifact hierarchy. AGENTS.md defines the required
+# tmp/{cache,tests,debug,sessions,screenshots}/<module>/<run-id> layout.
+tmp/
 
 # Logs and runtime crash output
 *.log
 *.stackdump
+*.dmp
+*.dump
+*.trace
+*.profraw
+*.profdata
 
 # Operating-system metadata
 .DS_Store
@@ -29,6 +38,7 @@ $RECYCLE.BIN/
 # Language/tool caches
 **/__pycache__/
 *.py[cod]
+*.tsbuildinfo
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

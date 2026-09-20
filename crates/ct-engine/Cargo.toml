@@ -1,3 +1,6 @@
+# Production domain-engine crate. Hardware I/O dependencies belong here rather
+# than in Tauri so the engine remains the only owner of device and scan state.
+
 [package]
 name = "ct-engine"
 version.workspace = true

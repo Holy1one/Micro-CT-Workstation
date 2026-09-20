@@ -1,3 +1,9 @@
+/**
+ * Three.js canvas host and bounded camera controller for the equipment scene.
+ * It fits the visual model, applies view presets, and reports context loss to
+ * the fallback hook without sending any device command.
+ */
+
 import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
 import { Canvas, useThree } from "@react-three/fiber";
 import { useEffect, useRef } from "react";

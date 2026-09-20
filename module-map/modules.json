@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "modules": [
+    {
+      "id": "engine-core",
+      "name": "Production engine and scan coordinator",
+      "owns": ["crates/ct-engine/AGENTS.md", "crates/ct-engine/README.md", "crates/ct-engine/src/lib.rs", "crates/ct-engine/src/main.rs", "crates/ct-engine/src/scan.rs", "crates/ct-engine/src/devices/README.md", "crates/ct-engine/src/devices/mod.rs", "crates/ct-engine/Cargo.toml"],
+      "publicApi": ["crates/ct-engine/src/lib.rs"],
+      "risk": "critical",
+      "description": "Owns the JSONL API, safety gates, authoritative device state, and projection transaction ordering.",
+      "execution": "Receives versioned requests from Tauri, invokes device modules, and emits complete snapshots.",
+      "gates": ["cargo test -p ct-engine"]
+    },
+    {
+      "id": "device-xray",
+      "name": "Moxtek X-ray source",
+      "owns": ["crates/ct-engine/src/devices/xray/**"],
+      "publicApi": ["crates/ct-engine/src/devices/xray/mod.rs"],
+      "risk": "critical",
+      "description": "Owns Moxtek discovery, binary serial transport, measured readback, and fail-closed beam shutdown.",
+      "execution": "The scan coordinator requests setpoints and beam transitions; this module verifies source responses.",
+      "gates": ["cargo test -p ct-engine devices::xray"]
+    },
+    {
+      "id": "device-camera",
+      "name": "Nikon D7100 camera",
+      "owns": ["crates/ct-engine/src/devices/camera/**", "bridges/digicam/**"],
+      "publicApi": ["crates/ct-engine/src/devices/camera/mod.rs"],
+      "risk": "critical",
+      "description": "Owns camera discovery, exposure configuration, host-side capture, and image-file confirmation.",
+      "execution": "The engine calls DigiCamControl and accepts a projection only after the expected host file is confirmed.",
+      "gates": ["cargo test -p ct-engine devices::camera"]
+    },
+    {
+      "id": "device-turntable",
+      "name": "RTS9060 Nano turntable",
+      "owns": ["crates/ct-engine/src/devices/turntable/**"],
+      "publicApi": ["crates/ct-engine/src/devices/turntable/mod.rs"],
+      "risk": "critical",
+      "description": "Owns Nano identity validation, line protocol, motion acknowledgement, warning output, and emergency stop.",
+      "execution": "A serial worker executes one versioned command stream while the engine waits for confirmed motion states.",
+      "gates": ["cargo test -p ct-engine devices::turntable"]
+    },
+    {
+      "id": "desktop-shell",
+      "name": "Tauri desktop shell",
+      "owns": ["src-tauri/**"],
+      "publicApi": ["src-tauri/src/main.rs", "src-tauri/src/engine_client.rs"],
+      "risk": "critical",
+      "description": "Owns native dialogs and paths, sidecar lifecycle, and IPC forwarding without owning scan state.",
+      "execution": "Tauri receives frontend commands, exchanges versioned JSONL with ct-engine, and returns engine snapshots.",
+      "gates": ["cargo test --workspace", "npm.cmd run test:sites"]
+    },
+    {
+      "id": "frontend-contract",
+      "name": "Frontend engine contract",
+      "owns": ["src/engine/types.ts"],
+      "publicApi": ["src/engine/types.ts"],
+      "risk": "critical",
+      "description": "Defines the TypeScript command and snapshot vocabulary shared by production and preview clients.",
+      "execution": "React reads complete snapshots and submits domain commands through EngineAdapter.",
+      "gates": ["npm.cmd run typecheck", "npm.cmd run test:sites"]
+    },
+    {
+      "id": "frontend-client",
+      "name": "Frontend engine client",
+      "owns": ["src/engine/adapter.ts", "src/engine/tauriAdapter.ts", "src/engine/useEngine.ts"],
+      "publicApi": ["src/engine/adapter.ts", "src/engine/useEngine.ts"],
+      "risk": "high",
+      "description": "Selects the runtime adapter and exposes engine snapshots to React without fallback after Tauri errors.",
+      "execution": "The browser selects preview only outside Tauri; production commands use Tauri invoke exclusively.",
+      "gates": ["npm.cmd run typecheck", "npm.cmd run test:sites"]
+    },
+    {
+      "id": "developer-preview",
+      "name": "Browser-only workstation preview",
+      "owns": ["src/engine/workstationAdapter.ts", "src/engine/rts9060/**"],
+      "publicApi": ["src/engine/workstationAdapter.ts"],
+      "risk": "high",
+      "description": "Simulates device and scan behavior for browser development; it never accesses physical hardware.",
+      "execution": "An in-memory firmware transport drives a preview workflow that emits the production view-model shape.",
+      "gates": ["npm.cmd run typecheck", "npm.cmd run test:sites"]
+    },
+    {
+      "id": "ui-shell",
+      "name": "React workstation shell",
+      "owns": ["src/AGENTS.md", "src/README.md", "src/App.tsx", "src/main.tsx", "src/canvas-layout.ts", "src/menuActions.ts", "src/styles.css", "src/tokens.css", "src/vite-env.d.ts", "public/**", "index.html"],
+      "publicApi": ["src/App.tsx"],
+      "risk": "medium",
+      "description": "Owns panels, menus, safety presentation, layout, themes, and static UI assets.",
+      "execution": "Renders only from engine snapshots and converts user gestures into EngineCommand values.",
+      "gates": ["npm.cmd run typecheck", "npm.cmd run test:sites", "npm.cmd run build"]
+    },
+    {
+      "id": "scene",
+      "name": "Read-only 3D equipment scene",
+      "owns": ["src/scene/**"],
+      "publicApi": ["src/scene/LiveSceneCanvas.tsx", "src/scene/types.ts"],
+      "risk": "medium",
+      "description": "Owns visualization geometry, theme conversion, camera navigation, and WebGL fallback.",
+      "execution": "Consumes a read-only scene view-model and never sends hardware commands.",
+      "gates": ["npm.cmd run typecheck", "npm.cmd run test:sites"]
+    },
+    {
+      "id": "platform",
+      "name": "Frontend platform integration",
+      "owns": ["src/platform/**"],
+      "publicApi": ["src/platform/desktopPaths.ts"],
+      "risk": "medium",
+      "description": "Provides desktop-only paths, dialogs, directory reveal, and log export behind small functions.",
+      "execution": "Calls Tauri only after confirming the desktop runtime; browser preview uses safe defaults.",
+      "gates": ["npm.cmd run typecheck", "npm.cmd run test:sites"]
+    },
+    {
+      "id": "build-tooling",
+      "name": "Build and verification tooling",
+      "owns": ["scripts/**", "tests/**", "package.json", "package-lock.json", "tsconfig.json", "vite.config.mjs", "Cargo.toml", "Cargo.lock", ".npmrc", ".gitignore", "module-map/**"],
+      "publicApi": ["package.json", "Cargo.toml", "module-map/modules.json"],
+      "risk": "medium",
+      "description": "Owns dependency locks, build entry points, contract tests, module-map generation, and impact analysis.",
+      "execution": "Selects and runs deterministic local gates; it must not contact real hardware.",
+      "gates": ["npm.cmd run module-map:check", "npm.cmd run test:sites"]
+    },
+    {
+      "id": "extensions",
+      "name": "Optional algorithms and service bridges",
+      "owns": ["algorithm-plugins/**", "worker/**"],
+      "publicApi": ["algorithm-plugins/README.md", "worker/index.js"],
+      "risk": "low",
+      "description": "Holds optional algorithm contracts and the Sites-compatible static worker, outside the safety control loop.",
+      "execution": "Extensions consume exported data or serve built assets; they cannot command production devices.",
+      "gates": ["npm.cmd run test:sites", "npm.cmd run build"]
+    },
+    {
+      "id": "documentation",
+      "name": "Architecture, guides, and evidence",
+      "owns": ["docs/**", "README.md", "AGENTS.md"],
+      "publicApi": ["README.md", "docs/architecture/README.md"],
+      "risk": "low",
+      "description": "Explains current architecture, operating constraints, historical plans, and verification evidence.",
+      "execution": "Current architecture documents follow source and tests; historical files must identify themselves as historical.",
+      "gates": ["npm.cmd run module-map:check"]
+    },
+    {
+      "id": "release-artifacts",
+      "name": "Generated release artifacts",
+      "owns": ["portable-release/**"],
+      "publicApi": [],
+      "risk": "low",
+      "description": "Contains replaceable packaged binaries and is never a source of design truth.",
+      "execution": "Release tooling regenerates these files from verified source builds.",
+      "gates": []
+    }
+  ]
+}

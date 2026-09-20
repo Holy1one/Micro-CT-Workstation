@@ -1,3 +1,9 @@
+/**
+ * Decorative stage, floor, backdrop, and lighting geometry for the 3D view.
+ * All exported behavior is visual. Optical equipment positions remain in
+ * scene-config.ts and safety state remains outside this module.
+ */
+
 import * as THREE from "three";
 import type { SceneTheme } from "./types";
 

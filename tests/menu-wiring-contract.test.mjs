@@ -1,3 +1,9 @@
+/**
+ * Static contract test that keeps every declared menu id connected to App.tsx.
+ * Reading source text here is intentional: it catches decorative menu entries
+ * without launching the browser or duplicating the React implementation.
+ */
+
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";

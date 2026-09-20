@@ -1,3 +1,9 @@
+/**
+ * Procedural visual model of the X-ray source, sample turntable, detector, and
+ * camera. Beam visibility and turntable angle are read from SceneViewModel;
+ * geometry here is illustrative and must never be used as hardware telemetry.
+ */
+
 import { Line, RoundedBox } from "@react-three/drei";
 import { useMemo } from "react";
 import * as THREE from "three";

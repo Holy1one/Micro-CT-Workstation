@@ -1,3 +1,9 @@
+/**
+ * Production frontend adapter for the two Tauri engine commands.
+ * Every response must contain the complete workstation view. IPC failures are
+ * surfaced to React and never trigger a fallback to the browser simulator.
+ */
+
 import { invoke } from "@tauri-apps/api/core";
 import type { EngineAdapter, EngineCommand, EngineSnapshot } from "./types";
 

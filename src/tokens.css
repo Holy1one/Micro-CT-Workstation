@@ -1,3 +1,9 @@
+/*
+ * Design-token source of truth for the workstation UI and Three.js theme.
+ * Components consume semantic variables from this file instead of hard-coded
+ * colors. Theme and safety-state selectors override values in one place.
+ */
+
 /* ============================================================
    Micro-CT Workstation · Industrial Console
    设计令牌 —— 由设计稿直接导出，可直接替换现有样式变量

@@ -1,5 +1,7 @@
 /**
- * Device models ported from kernal/software/host:
+ * Browser-only device models that reproduce the workstation interaction shape.
+ * Historical host implementations explain the names but are not active
+ * production drivers and are not evidence of real hardware behavior:
  * - XraySource12W  <- rts9060_xray.py / rts9060_moxtek_transport.py
  *   Moxtek 12 W controller over USB: set voltage/current, beam on/off,
  *   status readback. Hard limits 4-70 kV, 0-1000 uA, 12 W, 65 degC case.
@@ -30,7 +32,12 @@ function oneDecimal(value: number): number {
   return Math.round(value * 10) / 10;
 }
 
+function floorOneDecimal(value: number): number {
+  return Math.floor((value + Number.EPSILON) * 10) / 10;
+}
+
 export class XraySource12W {
+  private connected = true;
   private setKv = 60.0;
   private setUa = 200.0;
   private beam = false;
@@ -38,19 +45,38 @@ export class XraySource12W {
   private interlock = true;
   private tempC = 31.4;
 
+  get isConnected(): boolean {
+    return this.connected;
+  }
+
+  connect(): void {
+    this.connected = true;
+  }
+
+  disconnect(): void {
+    this.beam = false;
+    this.connected = false;
+  }
+
   setVoltage(kv: number): number {
-    if (!Number.isFinite(kv) || kv < KV_MIN || kv > KV_MAX || (kv * this.setUa) / 1000 > RATED_POWER_W) {
-      throw new Error("X-ray setpoint must remain within 4-70 kV and 12 W");
+    if (!Number.isFinite(kv) || kv < KV_MIN || kv > KV_MAX) {
+      throw new Error("X-ray voltage must remain within 4-70 kV");
     }
     this.setKv = oneDecimal(kv);
+    if ((this.setKv * this.setUa) / 1000 > RATED_POWER_W) {
+      this.setUa = floorOneDecimal((RATED_POWER_W * 1000) / this.setKv);
+    }
     return this.setKv;
   }
 
   setCurrent(ua: number): number {
-    if (!Number.isFinite(ua) || ua < 0 || ua > UA_MAX || (this.setKv * ua) / 1000 > RATED_POWER_W) {
-      throw new Error("X-ray setpoint must remain within 0-1000 uA and 12 W");
+    if (!Number.isFinite(ua) || ua < 0 || ua > UA_MAX) {
+      throw new Error("X-ray current must remain within 0-1000 uA");
     }
     this.setUa = oneDecimal(ua);
+    if (this.setUa > 0 && (this.setKv * this.setUa) / 1000 > RATED_POWER_W) {
+      this.setKv = floorOneDecimal((RATED_POWER_W * 1000) / this.setUa);
+    }
     return this.setUa;
   }
 

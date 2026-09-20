@@ -1,3 +1,9 @@
+/**
+ * React bridge to the selected EngineAdapter.
+ * It owns only the latest immutable snapshot and request lifecycle; it never
+ * predicts command success or advances production scan state locally.
+ */
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createEngineAdapter } from "./adapter";
 import type { AdapterKind, EngineAdapter, EngineCommand, EngineSnapshot } from "./types";

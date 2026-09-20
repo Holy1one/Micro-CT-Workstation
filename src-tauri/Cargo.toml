@@ -1,3 +1,6 @@
+# Thin desktop-shell crate. Dependencies are limited to Tauri, platform APIs,
+# sidecar verification, and the shared ct-engine request/response types.
+
 [package]
 name = "ct-workstation"
 version.workspace = true

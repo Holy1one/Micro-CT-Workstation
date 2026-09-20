@@ -1,3 +1,9 @@
+/**
+ * Read-only data contract for Three.js visualization.
+ * The scene receives already-decided safety and motion state and cannot expose
+ * commands back to the engine, which prevents a second control path.
+ */
+
 export type SceneThemeName = "light" | "dark";
 export type ViewPreset = "iso" | "front" | "top";
 export type SceneFallbackReason = "webgl-unavailable" | "context-lost";

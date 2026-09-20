@@ -1,6 +1,6 @@
-# Micro-CT Workstation 最终增量系统设计
+# Micro-CT Workstation 历史增量系统设计
 
-> 本文描述当前最终实现。系统保持 **Tauri 2 + React/TypeScript + Rust `ct-engine` sidecar**：React 负责表现与表单 draft，Tauri 负责窗口、原生目录对话框和 sidecar 传输，`ct-engine` 负责参数、安全门控与扫描状态。三维场景源码本轮不修改，使用方式见 [`3d-model-and-camera-guide.md`](./3d-model-and-camera-guide.md)。
+> 本文记录窗口、目录选择和 UI 增量实施时的设计，不再是完整系统架构入口。当前实现以 [`architecture/README.md`](./architecture/README.md)、源码和测试为准；三维场景使用方式见 [`3d-model-and-camera-guide.md`](./3d-model-and-camera-guide.md)。
 
 ## Part A：系统设计
 
@@ -82,7 +82,7 @@ export type ScanSetupUpdate = Partial<Omit<ScanSetup, "angleStepDeg">>;
 - 文本或数值字段只有通过前端格式/范围检查后才发送 partial patch。空字符串、非法数值、`NaN` 不进入 IPC。
 - Rust `ScanSetupInput` 使用 `Option<String>` / `Option<u32>` 并开启 `deny_unknown_fields`；先复制旧状态、验证 patch、计算派生 `angle_step_deg`，成功后一次替换，保证原子性。
 - Rust 与浏览器 preview 初始为未配置安全态：空 task/path、数值 0。`angleStepDeg` 和进度计算防除零。
-- preflight 对完整参数再次校验：Task ID、Save Path、投影数 1..360、曝光 1..10000 ms、最大 X-ray 时间 1..359999 秒缺一不可。
+- preflight 对完整参数再次校验：Task ID、Save Path、投影数 1..360、曝光 1..10000 ms、最大连续 X-ray 时间 1..600 秒缺一不可。
 - 每次成功修改扫描设置均清空当前进度并使 preflight/home 失效，防止参数改变后沿用旧安全检查。
 
 ### 1.7 安全恢复

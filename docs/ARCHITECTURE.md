@@ -1,5 +1,7 @@
 # 架构选型与边界
 
+> 本文保留高层技术选型理由。当前目录、设备模块和执行链以 `docs/architecture/README.md` 与生成的 module graph 为准；本文中的未来 bridge/worker 描述不表示已经实现。
+
 ## 结论
 
 采用“桌面壳 + Rust 模块化单体内核 + 平台设备桥 + Python 算法进程”的混合架构。当前需求不适合微服务，也不适合把设备控制、CT 计算和 UI 全塞进 Tauri 进程。

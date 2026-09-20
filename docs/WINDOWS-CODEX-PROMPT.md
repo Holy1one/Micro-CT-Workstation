@@ -1,5 +1,7 @@
 # 交给 Windows Codex 的提示词
 
+> **历史交接提示 / 禁止直接执行。** 本文包含旧机器路径和旧阶段目标，仅保留用于追溯。当前任务入口为仓库 `AGENTS.md`、`docs/architecture/README.md` 和实际源码。
+
 你现在接手 Windows 端的 Micro-CT-App 基线构建。项目路径是：
 
 `E:\Main\OneDrive\LanZhouUniv\Class\mluti-energy imaging\CT\Micro-CT-App`

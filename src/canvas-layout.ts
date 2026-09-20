@@ -1,3 +1,9 @@
+/**
+ * Pure layout mathematics for fitting the fixed industrial console canvas.
+ * The function accepts browser client dimensions and returns scale, offsets,
+ * and design height without reading the DOM, which keeps it easy to test.
+ */
+
 export const DESIGN_WIDTH = 1920;
 export const DESIGN_HEIGHT = 1080;
 /** Smallest allowed uniform scale of the design canvas (1920 x 1080 -> 1728 x 972). */

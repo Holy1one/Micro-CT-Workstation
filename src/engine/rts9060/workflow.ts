@@ -1,6 +1,7 @@
 /**
- * Scan workflow orchestrator, ported from the proven Python host
- * (kernal/software/host/rts9060_workflow.py + rts9060_scan.py + rts9060_gui.py).
+ * Browser-only scan workflow simulator retained for UI development.
+ * Historical Python-host references explain its origin but are not an active
+ * protocol source; production behavior is authoritative in the Rust engine.
  *
  * Pipeline per projection:
  *   MOVE_ABS -> READY_TO_CAPTURE -> settle -> beam on -> exposure window ->
@@ -397,8 +398,16 @@ export class ScanWorkflow {
     }
     const source: ConsoleLogSource = id === "turntable" ? "nano" : id;
     await delay(260);
+    if (id === "xray") this.source.connect();
     if (id === "turntable") await this.link.exec(cmd.ping("{id}"), ["PONG"]).catch(() => undefined);
     this.log("INFO", source, `${id === "turntable" ? "turntable" : id} retry · link OK`);
+    this.emit();
+  }
+
+  xrayDisconnect(): void {
+    if (this.phase === "scanning" || this.phase === "paused") return;
+    this.source.disconnect();
+    this.log("ACTION", "xray", "preview X-ray disconnected · NO DEVICE I/O");
     this.emit();
   }
 
@@ -427,9 +436,9 @@ export class ScanWorkflow {
     }
     if (
       "maxXraySec" in partial &&
-      (!Number.isInteger(next.maxXraySec) || next.maxXraySec < 1 || next.maxXraySec > 359999)
+      (!Number.isInteger(next.maxXraySec) || next.maxXraySec < 1 || next.maxXraySec > 600)
     ) {
-      throw new Error("Maximum X-ray duration must be between 1 and 359999 seconds");
+      throw new Error("Maximum continuous X-ray duration must be between 1 and 600 seconds");
     }
 
     this.params = next;
@@ -439,14 +448,24 @@ export class ScanWorkflow {
   }
 
   sendVoltage(kv: number): void {
-    const applied = this.source.setVoltage(kv);
-    this.log("INFO", "xray", `set ${applied.toFixed(1)} kV · ACK`);
+    const before = this.source.readback();
+    this.source.setVoltage(kv);
+    const applied = this.source.readback();
+    if (applied.setUa !== before.setUa) {
+      this.log("WARN", "xray", `SEND V requested ${kv.toFixed(1)} kV · current auto-adjusted from ${before.setUa.toFixed(1)} µA to ${applied.setUa.toFixed(1)} µA · 12 W limit`);
+    }
+    this.log("INFO", "xray", `SEND V applied · final ${applied.setKv.toFixed(1)} kV / ${applied.setUa.toFixed(1)} µA`);
     this.emit();
   }
 
   sendCurrent(ua: number): void {
-    const applied = this.source.setCurrent(ua);
-    this.log("INFO", "xray", `set ${applied.toFixed(1)} µA · ACK`);
+    const before = this.source.readback();
+    this.source.setCurrent(ua);
+    const applied = this.source.readback();
+    if (applied.setKv !== before.setKv) {
+      this.log("WARN", "xray", `SEND I requested ${ua.toFixed(1)} µA · voltage auto-adjusted from ${before.setKv.toFixed(1)} kV to ${applied.setKv.toFixed(1)} kV · 12 W limit`);
+    }
+    this.log("INFO", "xray", `SEND I applied · final ${applied.setKv.toFixed(1)} kV / ${applied.setUa.toFixed(1)} µA`);
     this.emit();
   }
 
@@ -502,8 +521,8 @@ export class ScanWorkflow {
     if (!Number.isInteger(params.exposureMs) || params.exposureMs < 1 || params.exposureMs > 10000) {
       throw new Error("Exposure must be between 1 and 10000 ms");
     }
-    if (!Number.isInteger(params.maxXraySec) || params.maxXraySec < 1 || params.maxXraySec > 359999) {
-      throw new Error("Maximum X-ray duration must be between 1 and 359999 seconds");
+    if (!Number.isInteger(params.maxXraySec) || params.maxXraySec < 1 || params.maxXraySec > 600) {
+      throw new Error("Maximum continuous X-ray duration must be between 1 and 600 seconds");
     }
   }
 

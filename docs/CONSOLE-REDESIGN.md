@@ -1,5 +1,7 @@
 # Console Redesign + RTS9060 Device Link Migration (v0.2.0-alpha)
 
+> Historical implementation snapshot from 2026-09-16. The current browser-only preview boundary and production device paths are documented under `docs/architecture/`; references below to archived host sources describe provenance, not current authority.
+
 Date: 2026-09-16. Scope: presentation-layer rebuild per `前端/重构交接说明.md` +
 device-side adaptation ported from the proven Python host in `kernal/software/host/`.
 

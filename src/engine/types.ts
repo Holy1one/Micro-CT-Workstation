@@ -1,3 +1,9 @@
+/**
+ * Shared frontend contract for commands, complete engine snapshots, and the
+ * derived workstation view-model. Changes here cross production Tauri IPC and
+ * the browser preview, so every consumer must be updated in the same change.
+ */
+
 export type EngineMode = "production_locked" | "developer_preview";
 
 export type EnginePhase =
@@ -100,6 +106,7 @@ export type EngineCommand =
   | { type: "set_parameters"; parameters: ScanParameters }
   | { type: "estop_release" }
   | { type: "retry_device"; device: DeviceId }
+  | { type: "xray_disconnect" }
   | { type: "camera_test_capture" }
   | { type: "xray_toggle" }
   | { type: "timer_toggle" }
@@ -172,6 +179,7 @@ export interface WorkstationView {
   safetyBar: { text: string; tone: "muted" | "danger" | "dangerBold" };
   scene: { angleDeg: number; rotated: boolean };
   xray: {
+    connected: boolean;
     setKv: number;
     setUa: number;
     monKv: number;
@@ -184,6 +192,7 @@ export interface WorkstationView {
     offSec: number;
     timerOn: boolean;
     usbAutoShutDown: boolean;
+    usbAutoShutDownKnown: boolean;
     usbShutdownDelay: number | null;
     manualControlsEnabled: boolean;
     timerControlsEnabled: boolean;

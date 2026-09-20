@@ -1,3 +1,10 @@
+/**
+ * Top-level workstation presentation and user-interaction composition.
+ * The UI renders complete engine snapshots and translates gestures into domain
+ * commands. It does not own production scan progress, device truth, or safety
+ * decisions; those remain authoritative in ct-engine.
+ */
+
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Folder } from "@phosphor-icons/react";
 import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
@@ -233,7 +240,7 @@ function DevicePanel({
     setup.exposureMs <= 10000 &&
     Number.isInteger(setup.maxXraySec) &&
     setup.maxXraySec >= 1 &&
-    setup.maxXraySec <= 359999;
+    setup.maxXraySec <= 600;
   const runRetry = async (device: DeviceId): Promise<void> => {
     setPendingDevice(device);
     try {
@@ -369,7 +376,7 @@ function ScanParamsPanel({
 
   const commitDuration = (): void => {
     const seconds = parseHms(maxXray);
-    if (seconds !== null && seconds >= 1 && seconds <= 359999) {
+    if (seconds !== null && seconds >= 1 && seconds <= 600) {
       void dispatch({ type: "update_scan_setup", setup: { maxXraySec: seconds } });
     }
   };
@@ -389,7 +396,7 @@ function ScanParamsPanel({
   const viewsInvalid = views !== "" && (!/^\d+$/.test(views) || Number(views) < 1 || Number(views) > 360);
   const exposureInvalid = exposure !== "" && (!/^\d+$/.test(exposure) || Number(exposure) < 1 || Number(exposure) > 10000);
   const durationSeconds = parseHms(maxXray);
-  const durationInvalid = maxXray !== "" && (durationSeconds === null || durationSeconds < 1 || durationSeconds > 359999);
+  const durationInvalid = maxXray !== "" && (durationSeconds === null || durationSeconds < 1 || durationSeconds > 600);
 
   // New Scan Task / Reset Parameters go through the engine, so the drafts are
   // refilled from the engine snapshot once the next poll lands.
@@ -461,9 +468,9 @@ function ScanParamsPanel({
             <small>1–10000 ms</small>
           </label>
           <label className={`numeric-field ${durationInvalid ? "is-invalid" : ""}`}>
-            <span>Max X-ray</span>
+            <span>Max Continuous X-ray</span>
             <input value={maxXray} disabled={locked} aria-invalid={durationInvalid} placeholder="hh:mm:ss" onChange={(event) => setMaxXray(event.target.value)} onBlur={commitDuration} />
-            <small>hh:mm:ss</small>
+            <small>00:00:01–00:10:00 · then 5 min cooldown</small>
           </label>
         </div>
       </div>
@@ -614,17 +621,32 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
     }
   }, [ws.xray.usbShutdownDelay]);
   const voltageDraftConfirmed =
-    ws.xray.voltageConfirmed && Number(kvDraft) === ws.xray.setKv;
+    ws.xray.voltageConfirmed && Number(kvDraft).toFixed(1) === ws.xray.setKv.toFixed(1);
   const currentDraftConfirmed =
-    ws.xray.currentConfirmed && Number(uaDraft) === ws.xray.setUa;
+    ws.xray.currentConfirmed && Number(uaDraft).toFixed(1) === ws.xray.setUa.toFixed(1);
   const pairConfirmed = voltageDraftConfirmed && currentDraftConfirmed;
+  const scanLocked = ws.dataState === "scanning";
 
   return (
     <section className="panel">
       <div className="panel__header">
         <h2>12 Watt Controller</h2>
-        <span className="chip chip--muted">USB LINK</span>
+        <span className={`chip chip--${ws.xray.beamOn ? "danger" : scanLocked ? "warn" : "ok"}`}>
+          {ws.xray.beamOn ? "EMITTING" : scanLocked ? "SCAN MONITOR" : "USB LINK"}
+        </span>
       </div>
+      <div className={`xray-mode-banner ${scanLocked ? "xray-mode-banner--locked" : "xray-mode-banner--manual"}`}>
+        <span>{scanLocked ? "CT SCAN · MANUAL CONTROLS LOCKED" : "STANDALONE SOURCE CONTROL"}</span>
+        <strong>{ws.xray.beamOn ? "LIVE OUTPUT" : "OUTPUT OFF"}</strong>
+      </div>
+      <button
+        type="button"
+        className={`switch-btn switch-btn--block xray-connection-btn ${ws.xray.connected ? "xray-connection-btn--connected" : "switch-btn--idle"}`}
+        disabled={busy || scanLocked || ws.xray.beamOn}
+        onClick={() => void dispatch(ws.xray.connected ? { type: "xray_disconnect" } : { type: "retry_device", device: "xray" })}
+      >
+        {ws.xray.connected ? "Xray Disconnect" : "Xray Connect"}
+      </button>
       <div className="xray-channels">
         <div className="xray-channel">
           <span className="xray-channel__label">VOLTAGE</span>
@@ -674,6 +696,12 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
           <span>TEMP</span>
           <div className="xray-meter__well">{ws.xray.tempC.toFixed(1)} °C</div>
         </div>
+        <div className="xray-meter">
+          <span>OUTPUT</span>
+          <div className={`xray-meter__well ${ws.xray.beamOn ? "xray-meter__well--danger" : "xray-meter__well--safe"}`}>
+            {ws.xray.beamOn ? "ON" : "OFF"}
+          </div>
+        </div>
       </div>
       <button
         type="button"
@@ -706,14 +734,20 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
         <div className="safety-block__head">
           <span className="safety-block__title">DEVICE SAFETY</span>
           <span className={`chip chip--${ws.xray.usbAutoShutDown ? "ok" : "warn"}`}>
-            {ws.xray.usbAutoShutDown ? "ARMED · BEAM LOCKED" : "RELEASED · STANDALONE"}
+            {!ws.xray.usbAutoShutDownKnown
+              ? "OPERATOR SETTING REQUIRED"
+              : ws.xray.usbAutoShutDown
+              ? "ARMED · FAIL-SAFE"
+              : scanLocked
+                ? "RELEASED · SCAN OWNED"
+                : "RELEASED · MANUAL"}
           </span>
         </div>
         <label className="check-row check-row--inset">
           <input
             type="checkbox"
             checked={ws.xray.usbAutoShutDown}
-            disabled={busy || ws.dataState === "scanning"}
+            disabled={busy || ws.dataState === "scanning" || !ws.xray.connected}
             onChange={() => void dispatch({ type: "usb_auto_shut_down_toggle" })}
           />
           <i aria-hidden="true" />
@@ -741,11 +775,17 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
         </div>
       </div>
       <p className="panel__footnote">
-        {ws.xray.usbAutoShutDown
-          ? "Deadman armed on device · beam enable locked · output dies if the host stops"
-          : pairConfirmed
-            ? "Released · setpoints confirmed · Xray Enable is live for standalone control"
-            : "Released · confirm both setpoints with SEND V and SEND I to unlock Xray Enable"}
+        {scanLocked
+          ? "CT scan owns beam commands only · USB AUTO SHUT DOWN remains operator-controlled"
+          : !ws.xray.connected
+            ? "Connect the Moxtek before changing setpoints or device safety settings"
+            : !ws.xray.usbAutoShutDownKnown
+              ? "Choose USB AUTO SHUT DOWN manually before Preflight"
+          : ws.xray.usbAutoShutDown
+            ? "Device timer armed · continuous output is bounded if the host stops responding"
+            : pairConfirmed
+              ? "Released by operator · CT scan will not restore it automatically"
+              : "Released by operator · confirm both setpoints before standalone Xray Enable"}
       </p>
     </section>
   );

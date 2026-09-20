@@ -1,3 +1,9 @@
+/**
+ * Translate CSS design tokens into Three.js material colors and opacities.
+ * Keeping this conversion centralized prevents scene components from drifting
+ * away from the light/dark workstation themes.
+ */
+
 import { useEffect, useState } from "react";
 import type { SceneTheme } from "./types";
 

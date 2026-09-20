@@ -1,3 +1,9 @@
+/**
+ * Cross-layer contract tests for desktop path and dialog commands.
+ * The tests verify that frontend invoke names and Rust handlers remain aligned
+ * without opening native dialogs or touching user files.
+ */
+
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -62,7 +68,7 @@ test("scan setup patches stay partial and are validated atomically by the sideca
   assert.match(engine, /task_id: String::new\(\)/);
   assert.match(engine, /projection_count: 0/);
   assert.match(engine, /max_xray_sec: 0/);
-  assert.match(engine, /!\(1\.\.=359_999\)\.contains\(&self\.max_xray_sec\)/);
+  assert.match(engine, /!\(1\.\.=600\)\.contains\(&self\.max_xray_sec\)/);
   assert.match(engine, /deny_unknown_fields/);
 });
 

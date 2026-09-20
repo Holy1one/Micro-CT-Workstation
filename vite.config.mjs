@@ -1,8 +1,13 @@
+/**
+ * Vite configuration for the React workstation.
+ * Production output is written to dist/client; temporary QA instrumentation
+ * must not be imported from docs or evidence directories.
+ */
+
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import { qaDomGeometryPlugin } from "./docs/shots/qa-dom-geometry-plugin.mjs";
 
-export default defineConfig(({ command }) => ({
+export default defineConfig({
   build: {
     outDir: "dist/client",
   },
@@ -16,5 +21,5 @@ export default defineConfig(({ command }) => ({
       clientFiles: ["./src/main.tsx"],
     },
   },
-  plugins: [react(), ...(command === "serve" ? [qaDomGeometryPlugin()] : [])],
-}));
+  plugins: [react()],
+});

@@ -1,3 +1,8 @@
+//! Tauri build script and sidecar build dependency declaration.
+//!
+//! Cargo rerun hints keep desktop packages synchronized with ct-engine source.
+//! The script prepares build metadata only and never launches hardware code.
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;

@@ -1,10 +1,14 @@
+# Rust workspace shared by the production engine and the thin Tauri shell.
+# Shared package metadata and dependency versions are declared once here so
+# both crates build against the same serialization and time representations.
+
 [workspace]
 members = ["crates/ct-engine", "src-tauri"]
 default-members = ["crates/ct-engine"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 

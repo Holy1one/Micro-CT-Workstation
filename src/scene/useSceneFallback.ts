@@ -1,3 +1,9 @@
+/**
+ * Detect WebGL support and convert runtime context loss into a UI fallback.
+ * This hook changes visualization only; it never changes engine safety state
+ * or attempts to recover production hardware.
+ */
+
 import { useEffect, useState } from "react";
 import type { SceneFallbackReason } from "./types";
 

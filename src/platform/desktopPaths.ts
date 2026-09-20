@@ -1,3 +1,9 @@
+/**
+ * Small frontend facade over native path, picker, reveal, and save operations.
+ * Browser preview calls return safe defaults or explicit unsupported errors;
+ * no device or scan state belongs in this platform integration module.
+ */
+
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 

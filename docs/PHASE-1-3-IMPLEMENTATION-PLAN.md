@@ -3,7 +3,7 @@
 > [!CAUTION]
 > **历史计划 / 已被取代（Superseded）**  
 > 本文保留用于追溯阶段 1–3 的早期实施决策，**不再是当前实现、维护或验收的权威依据**。正文中的旧窗口尺寸与最小限制、侧栏内部滚动、默认图片路径、三维改造范围及测试/验收口径仅作历史记录，可能与最终实现冲突。  
-> 当前权威依据为 [`system_design.md`](./system_design.md)、[`3d-model-and-camera-guide.md`](./3d-model-and-camera-guide.md) 与仓库实际源码；发生不一致时，一律以后述权威材料和实际源码为准。请勿依据本文恢复旧的 1366×768、1600×900、侧栏滚动或路径拼接方案。
+> 当前权威依据为 [`architecture/README.md`](./architecture/README.md)、[`3d-model-and-camera-guide.md`](./3d-model-and-camera-guide.md) 与仓库实际源码；发生不一致时，一律以后述权威材料和实际源码为准。请勿依据本文恢复旧的 1366×768、1600×900、侧栏滚动或路径拼接方案。
 
 > 文档原状态（历史）：已批准进入实施，曾供 Engineer 与 QA 作为阶段 1–3 实施基线。  
 > 范围：阶段 1（窗口与视觉）+ 阶段 2（中央可交互 3D）+ 阶段 3（Tauri IPC / `ct-engine` 唯一状态源）。  

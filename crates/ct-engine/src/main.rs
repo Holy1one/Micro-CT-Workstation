@@ -1,3 +1,9 @@
+//! Executable entry point for the `ct-engine` JSONL sidecar.
+//!
+//! The process reads one bounded request per stdin line, writes one response per
+//! stdout line, and shuts the domain engine down when its desktop parent closes
+//! the pipe. Business rules remain in the library so they are testable.
+
 use ct_engine::{timestamp, Engine, Request, Response, PROTOCOL_VERSION};
 use serde_json::json;
 use std::io::{self, BufRead, Write};

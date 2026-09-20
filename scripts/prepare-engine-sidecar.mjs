@@ -1,3 +1,9 @@
+/**
+ * Build ct-engine and copy it to Tauri's platform-specific sidecar location.
+ * The script chooses debug or release from `--release`, preserves Cargo target
+ * overrides, and never starts the resulting executable or contacts hardware.
+ */
+
 import { copyFileSync, chmodSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";

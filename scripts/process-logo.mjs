@@ -1,3 +1,9 @@
+/**
+ * One-time visual asset processor for the workstation logo.
+ * It removes neutral white pixels and adds icon-safe padding; it does not alter
+ * source code or participate in the application build unless run explicitly.
+ */
+
 import sharp from "sharp";
 
 // Asset-only transformation: remove neutral white pixels from the supplied logo

@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "description": "Approved immediate child directories for stable functional boundaries. Update only after applying the AGENTS.md directory-creation rules.",
+  "parents": [
+    {
+      "path": ".",
+      "allowedChildren": [
+        ".git", ".vite", "algorithm-plugins", "bridges", "crates", "dist", "docs",
+        "module-map", "node_modules", "portable-release", "public", "release", "scripts",
+        "src", "src-tauri", "target", "tests", "tmp", "worker"
+      ]
+    },
+    { "path": "algorithm-plugins", "allowedChildren": [] },
+    { "path": "bridges", "allowedChildren": ["digicam"] },
+    { "path": "bridges/digicam", "allowedChildren": [] },
+    { "path": "crates", "allowedChildren": ["ct-engine"] },
+    { "path": "crates/ct-engine", "allowedChildren": ["src"] },
+    { "path": "crates/ct-engine/src", "allowedChildren": ["devices"] },
+    { "path": "crates/ct-engine/src/devices", "allowedChildren": ["camera", "turntable", "xray"] },
+    { "path": "crates/ct-engine/src/devices/camera", "allowedChildren": [] },
+    { "path": "crates/ct-engine/src/devices/turntable", "allowedChildren": [] },
+    { "path": "crates/ct-engine/src/devices/xray", "allowedChildren": [] },
+    { "path": "docs", "allowedChildren": ["architecture", "decisions", "shots"] },
+    { "path": "module-map", "allowedChildren": [] },
+    { "path": "portable-release", "allowedChildren": [] },
+    { "path": "public", "allowedChildren": ["assets"] },
+    { "path": "scripts", "allowedChildren": ["lib"] },
+    { "path": "scripts/lib", "allowedChildren": [] },
+    { "path": "src", "allowedChildren": ["engine", "platform", "scene"] },
+    { "path": "src/engine", "allowedChildren": ["rts9060"] },
+    { "path": "src/engine/rts9060", "allowedChildren": [] },
+    { "path": "src/platform", "allowedChildren": [] },
+    { "path": "src/scene", "allowedChildren": [] },
+    { "path": "src-tauri", "allowedChildren": ["binaries", "capabilities", "gen", "icons", "src"] },
+    { "path": "src-tauri/src", "allowedChildren": [] },
+    { "path": "tests", "allowedChildren": [] },
+    { "path": "worker", "allowedChildren": [] }
+  ]
+}

@@ -1,3 +1,9 @@
+/**
+ * Runtime adapter selection boundary.
+ * Tauri always selects the production IPC adapter; a normal browser selects
+ * the isolated preview. Selection occurs once and does not change on errors.
+ */
+
 import { TauriEngineAdapter } from "./tauriAdapter";
 import type { EngineAdapter } from "./types";
 import { WorkstationAdapter } from "./workstationAdapter";

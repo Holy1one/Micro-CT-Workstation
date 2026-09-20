@@ -1,8 +1,8 @@
 /**
- * Workstation engine adapter: bridges the RTS9060 scan workflow (device link
- * layer) to the EngineAdapter contract consumed by `useEngine`. The console
+ * Browser-preview engine adapter: bridges the simulated RTS9060 workflow to
+ * the EngineAdapter contract consumed by `useEngine`. The console
  * renders from `snapshot.workstation`; base EngineSnapshot fields stay
- * coherent for the Tauri sidecar path.
+ * coherent with the Tauri sidecar path. This adapter never accesses hardware.
  */
 
 import { FIRMWARE_VERSION, LINK_LABEL } from "./rts9060/protocol";
@@ -106,6 +106,9 @@ export class WorkstationAdapter implements EngineAdapter {
         break;
       case "retry_device":
         void wf.retryDevice(command.device);
+        break;
+      case "xray_disconnect":
+        wf.xrayDisconnect();
         break;
       case "camera_test_capture":
         throw new Error("Real camera capture is available only in the desktop runtime");
@@ -229,7 +232,8 @@ export class WorkstationAdapter implements EngineAdapter {
             : dataState.toUpperCase();
     const phaseTone: WorkstationView["phaseTone"] = phase === "scanning" ? "warn" : phase === "fault" ? "danger" : "accent";
 
-    const xrayWord = phase === "fault" ? "FAILED" : rb.beamOn ? "EMITTING" : phase === "paused" ? "STANDBY" : "READY";
+    const xrayConnected = wf.source.isConnected;
+    const xrayWord = !xrayConnected ? "OFFLINE" : phase === "fault" ? "FAILED" : rb.beamOn ? "EMITTING" : phase === "paused" ? "STANDBY" : "READY";
     const xrayTone: ConsoleTone = phase === "fault" ? "danger" : rb.beamOn || phase === "paused" ? "warn" : "ok";
     const tableWord = phase === "fault" ? "HOME LOST" : phase === "scanning" ? "MOVING" : phase === "paused" ? "HOLD" : "READY";
     const tableTone: ConsoleTone = phase === "fault" ? "danger" : phase === "scanning" || phase === "paused" ? "warn" : "ok";
@@ -352,6 +356,7 @@ export class WorkstationAdapter implements EngineAdapter {
       safetyBar,
       scene: { angleDeg: angle, rotated: !(dataState === "ready" && angle === 0) },
       xray: {
+        connected: xrayConnected,
         setKv: rb.setKv,
         setUa: rb.setUa,
         monKv: rb.monKv,
@@ -364,10 +369,11 @@ export class WorkstationAdapter implements EngineAdapter {
         offSec: phase === "scanning" ? 6 : 20,
         timerOn: phase === "scanning" ? true : wf.timerOn,
         usbAutoShutDown: wf.usbAutoShutDown,
+        usbAutoShutDownKnown: true,
         usbShutdownDelay: wf.usbShutdownDelay,
-        manualControlsEnabled: true,
+        manualControlsEnabled: xrayConnected,
         timerControlsEnabled: true,
-        setpointControlsEnabled: true,
+        setpointControlsEnabled: xrayConnected,
         voltageConfirmed: true,
         currentConfirmed: true,
         setpointConfirmed: true,

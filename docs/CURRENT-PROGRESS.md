@@ -1,4 +1,6 @@
-# 当前进度（2026-09-16，第二轮）
+# 历史进度快照（2026-09-16，第二轮）
+
+> 本文件记录 2026-09-16 当时的验收状态，不是当前架构事实源。当前目录、设备实现和执行逻辑以 `docs/architecture/`、源码和测试为准。
 
 ## v0.2.0-alpha：控制台重构 + RTS9060 设备链路迁移
 
@@ -111,7 +113,7 @@
 - Windows 卸载注册表记录 digiCamControl `2.1.7.0`，缓存安装包为 `C:\ProgramData\Package Cache\{c33d2323-4e2f-4b42-92a7-9f89f14ea398}\digiCamControlsetup_2.1.7.0.exe`。
 - 注册的应用目录 `E:\Application\digiCamControl` 当前为空，常见路径中没有 `CameraControl.exe` 或 `CameraControl.Core.dll`；没有运行中的 digiCamControl 进程/服务。结合“没有 .NET SDK”，本机当前不能构建或验证真实 .NET bridge，也没有证据可选择 SDK 目标框架。
 - 最小 bridge 保持独立 .NET 进程、UTF-8 JSONL stdio 和版本化 envelope，只接受 engine 发出的 discover/connect/health/configure/capture/stop/disconnect；文件大小、SHA-256、远端删除确认与设置快照必须回传。详细 v1 契约已写入 `bridges/digicam/README.md`。
-- Nano、Nikon、Moxtek 的后续 Rust adapter 落点为 `crates/ct-engine/src/adapters/`；`ct-engine` 继续作为唯一设备/任务所有者。未获得实际 SDK/协议与明确硬件授权前不创建可启用实现，不猜测命令。
+- 当时计划的 `crates/ct-engine/src/adapters/` 已被当前设备角色目录取代：`crates/ct-engine/src/devices/{turntable,camera,xray}/`；`ct-engine` 继续作为唯一设备/任务所有者。
 
 ### 未完成项
 
