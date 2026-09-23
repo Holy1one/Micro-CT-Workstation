@@ -10,13 +10,13 @@
 pub mod devices;
 mod scan;
 
-use devices::camera::{CameraHealth, DigiCamControlAdapter};
-use devices::turntable::{NanoAdapter, NanoConnectionState};
+use devices::camera::{CameraHealth, DigiCamControlAdapter, valid_exposure_ms, EXPOSURE_MIN_MS, EXPOSURE_MAX_MS};
+use devices::turntable::{NanoAdapter, NanoConnectionState, NanoHealth};
 use devices::xray::{
     MoxtekAdapter, XrayHealth, MAX_CURRENT_UA, MAX_SETPOINT_POWER_W, MAX_VOLTAGE_KV,
     MIN_VOLTAGE_KV,
 };
-use scan::{RealScanConfig, RealScanHandle};
+use scan::{RealScanConfig, RealScanHandle, ScanCompletion};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,6 +30,20 @@ const MAX_LOGS: usize = 100;
 
 pub fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Last confirmed physical position, never the pending motion target.
+fn confirmed_nano_angle(health: &NanoHealth) -> Option<f64> {
+    if health.state != NanoConnectionState::Connected || health.last_error.is_some() {
+        return None;
+    }
+    let status = health.status.as_ref()?;
+    if !status.reference_valid || !status.homed || status.pulses_per_rev == 0
+        || matches!(status.state.as_str(), "FAULT" | "LOCKED" | "HOMING")
+    {
+        return None;
+    }
+    Some(status.position_pulses as f64 * 360.0 / f64::from(status.pulses_per_rev))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -63,7 +77,7 @@ pub struct Parameters {
     pub save_path: String,
     pub projection_count: u32,
     pub angle_step_deg: f64,
-    pub exposure_ms: u32,
+    pub exposure_ms: f64,
 }
 
 impl Default for Parameters {
@@ -73,7 +87,7 @@ impl Default for Parameters {
             save_path: String::new(),
             projection_count: 0,
             angle_step_deg: 0.0,
-            exposure_ms: 0,
+            exposure_ms: 0.0,
         }
     }
 }
@@ -83,12 +97,12 @@ impl Parameters {
         if self.task_id.trim().is_empty() || self.save_path.trim().is_empty() {
             return Err("INVALID_PARAMETERS");
         }
-        if !(1..=360).contains(&self.projection_count)
+        if !(1..=3600).contains(&self.projection_count)
             || !self.angle_step_deg.is_finite()
             || self.angle_step_deg <= 0.0
             || self.angle_step_deg > 360.0
             || (self.angle_step_deg * f64::from(self.projection_count) - 360.0).abs() > 0.01
-            || !(1..=10000).contains(&self.exposure_ms)
+            || !valid_exposure_ms(self.exposure_ms)
         {
             return Err("INVALID_PARAMETERS");
         }
@@ -106,7 +120,7 @@ struct ScanSetupInput {
     #[serde(default)]
     projection_count: Option<u32>,
     #[serde(default)]
-    exposure_ms: Option<u32>,
+    exposure_ms: Option<f64>,
     #[serde(default)]
     max_xray_sec: Option<u32>,
 }
@@ -142,14 +156,14 @@ impl ScanSetupInput {
             parameters.task_id = task_id.clone();
         }
         if let Some(projection_count) = self.projection_count {
-            if !(1..=360).contains(&projection_count) {
+            if !(1..=3600).contains(&projection_count) {
                 return Err("INVALID_PARAMETERS");
             }
             parameters.projection_count = projection_count;
             parameters.angle_step_deg = 360.0 / f64::from(projection_count);
         }
         if let Some(exposure_ms) = self.exposure_ms {
-            if !(1..=10_000).contains(&exposure_ms) {
+            if !valid_exposure_ms(exposure_ms) {
                 return Err("INVALID_PARAMETERS");
             }
             parameters.exposure_ms = exposure_ms;
@@ -172,6 +186,8 @@ enum Phase {
     Ready,
     Running,
     Paused,
+    Finishing,
+    Stopping,
     Stopped,
     Completed,
     Fault,
@@ -185,6 +201,8 @@ impl Phase {
             Self::Ready => ("ready", "Ready"),
             Self::Running => ("running", "Running"),
             Self::Paused => ("paused", "Paused"),
+            Self::Finishing => ("finishing", "Returning to start"),
+            Self::Stopping => ("stopping", "Ending scan"),
             Self::Stopped => ("stopped", "Stopped"),
             Self::Completed => ("completed", "Completed"),
             Self::Fault => ("fault", "Fault"),
@@ -204,9 +222,10 @@ pub struct Engine {
     sequence: u64,
     request_sequence: u64,
     last_tick: Instant,
+    preview_view_ms: Option<u64>,
     logs: Vec<Value>,
     beam_on: bool,
-    xray_latched: bool,
+    fault_latched: bool,
     timer_on: bool,
     usb_auto_shut_down: bool,
     usb_auto_shut_down_confirmed: bool,
@@ -237,19 +256,20 @@ impl Engine {
             homed: false,
             phase: Phase::Idle,
             parameters: Parameters::default(),
-            max_xray_sec: 0,
+            max_xray_sec: 600,
             current: 0,
             sequence: 0,
             request_sequence: 0,
             last_tick: Instant::now(),
+            preview_view_ms: None,
             logs: Vec::new(),
             beam_on: false,
-            xray_latched: false,
+            fault_latched: false,
             timer_on: false,
             usb_auto_shut_down: true,
             usb_auto_shut_down_confirmed: preview,
-            set_kv: 60.0,
-            set_ua: 200.0,
+            set_kv: 4.0,
+            set_ua: 10.0,
             set_kv_confirmed: false,
             set_ua_confirmed: false,
             nano: None,
@@ -317,13 +337,11 @@ impl Engine {
     }
 
     fn busy(&self) -> bool {
-        matches!(self.phase, Phase::Running | Phase::Paused)
+        self.real_scan.is_some() || matches!(self.phase, Phase::Running | Phase::Paused | Phase::Finishing | Phase::Stopping)
     }
 
     fn sync_real_scan(&mut self) {
-        let Some(handle) = self.real_scan.as_mut() else {
-            return;
-        };
+        let Some(handle) = self.real_scan.as_mut() else { return; };
         let progress = handle.progress();
         let outcome = handle.try_finish();
         if progress.revision != self.real_scan_revision {
@@ -331,83 +349,84 @@ impl Engine {
             self.current = progress.captured;
             self.scan_angle_deg = Some(progress.angle_deg);
             self.beam_on = progress.beam_on;
-            self.phase = match progress.phase {
-                "paused" => Phase::Paused,
-                "completed" => Phase::Completed,
-                "fault" => Phase::Fault,
-                _ => Phase::Running,
-            };
-            self.real_frames = progress
-                .frames
-                .iter()
-                .map(|frame| serde_json::to_value(frame).unwrap_or_else(|_| json!({})))
-                .collect();
+            if self.fault_latched || progress.phase == "fault" {
+                self.phase = Phase::Fault;
+            } else if self.phase != Phase::Stopping {
+                self.phase = match progress.phase {
+                    "paused" => Phase::Paused,
+                    "completed" | "finishing" => Phase::Finishing,
+                    "stopping" | "stopped" => Phase::Stopping,
+                    _ => Phase::Running,
+                };
+            }
+            self.real_frames = progress.frames.iter()
+                .map(|frame| serde_json::to_value(frame).unwrap_or_else(|_| json!({}))).collect();
             if let Some(health) = progress.xray_health {
-                self.usb_auto_shut_down = health
-                    .usb_auto_shutdown
-                    .unwrap_or(self.usb_auto_shut_down);
+                self.usb_auto_shut_down = health.usb_auto_shutdown.unwrap_or(self.usb_auto_shut_down);
                 self.cached_xray_health = Some(health);
             }
-            let messages = progress
-                .messages
-                .iter()
-                .skip(self.real_scan_message_count)
-                .cloned()
-                .collect::<Vec<_>>();
+            let messages = progress.messages.iter().skip(self.real_scan_message_count).cloned().collect::<Vec<_>>();
             self.real_scan_message_count = progress.messages.len();
-            for message in messages {
-                self.log(message.level, message.source, &message.message);
-            }
-            if let Some(error) = progress.error {
-                self.last_error = Some(error);
-            }
+            for message in messages { self.log(message.level, message.source, &message.message); }
+            if let Some(error) = progress.error { self.last_error = Some(error); }
         }
-        if let Some(outcome) = outcome {
-            let result = outcome.result;
-            self.cached_camera_health = Some(outcome.camera.health());
-            self.cached_xray_health = Some(outcome.xray.health());
-            self.camera = Some(outcome.camera);
-            self.xray = Some(outcome.xray);
-            let finished_handle = self.real_scan.take();
-            drop(finished_handle);
-            self.beam_on = false;
-            match result {
-                Ok(()) => {
-                    self.phase = Phase::Completed;
-                    self.last_error = None;
+        let Some(outcome) = outcome else { return; };
+        drop(self.real_scan.take());
+        match outcome {
+            Err(error) => {
+                self.last_error = Some(error.clone());
+                self.fault_latched = true;
+                self.preflight = false;
+                self.homed = false;
+                self.phase = Phase::Fault;
+                if let Some(health) = self.cached_xray_health.as_mut() {
+                    health.connected = false;
+                    health.beam_off_confirmed = false;
+                    health.last_error = Some(error.clone());
                 }
-                Err(error) => {
-                    self.last_error = Some(error);
-                    self.xray_latched = true;
-                    self.preflight = false;
-                    self.homed = false;
-                    self.phase = Phase::Fault;
+                if let Some(nano) = self.nano.as_ref() { let _ = nano.stop(); }
+                self.log("ERR", "system", &error);
+            }
+            Ok(outcome) => {
+                self.beam_on = outcome.xray.health().beam_on;
+                self.cached_camera_health = Some(outcome.camera.health());
+                self.cached_xray_health = Some(outcome.xray.health());
+                self.camera = Some(outcome.camera);
+                self.xray = Some(outcome.xray);
+                match outcome.result {
+                    Ok(ScanCompletion::Completed) if !self.fault_latched => {
+                        self.phase = Phase::Completed;
+                        self.last_error = None;
+                    }
+                    Ok(ScanCompletion::Stopped) if !self.fault_latched => {
+                        self.invalidate(Phase::Stopped);
+                        self.last_error = None;
+                        self.log("INFO", "system", "Scan ended; saved projections retained. Repeat Preflight and HOME before a new scan.");
+                    }
+                    result => {
+                        if let Err(error) = result { self.last_error = Some(error); }
+                        self.fault_latched = true;
+                        self.preflight = false;
+                        self.homed = false;
+                        self.phase = Phase::Fault;
+                    }
                 }
             }
         }
     }
 
     fn stop_real_scan(&mut self) -> Result<(), &'static str> {
-        let Some(handle) = self.real_scan.as_ref() else {
-            return Ok(());
-        };
-        let nano_stop = handle.request_stop();
+        let Some(handle) = self.real_scan.as_ref() else { return Ok(()); };
+        let result = handle.request_stop();
+        self.phase = Phase::Stopping;
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
+        while self.real_scan.is_some() && Instant::now() < deadline {
             self.sync_real_scan();
-            if self.real_scan.is_none() || !self.beam_on {
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
+            if self.real_scan.is_some() { thread::sleep(Duration::from_millis(25)); }
         }
-        if self.beam_on {
-            self.last_error = Some("real scan STOP did not confirm X-ray OFF within 3 seconds".into());
-            return Err("XRAY_OFF_UNCONFIRMED");
-        }
-        if let Err(error) = nano_stop {
-            self.last_error = Some(error);
-            return Err("NANO_COMMUNICATION_FAILED");
-        }
+        if let Err(error) = result { return Err(self.nano_error("Scan STOP failed", error)); }
+        if self.real_scan.is_some() { return Err("SCAN_CLEANUP_PENDING"); }
+        if self.phase == Phase::Fault { return Err("SCAN_STOP_FAILED"); }
         Ok(())
     }
 
@@ -422,18 +441,22 @@ impl Engine {
         let message = format!("{context}: {error}");
         self.last_error = Some(message.clone());
         self.connected = false;
-        self.xray_latched = true;
+        self.fault_latched = true;
         self.invalidate(Phase::Fault);
         self.log("ERR", "nano", &format!("{message} · STOP/OFF recovery required"));
         "NANO_COMMUNICATION_FAILED"
     }
 
     fn force_xray_off(&mut self, context: &str) -> Result<(), &'static str> {
+        if self.real_scan.is_some() { return Err("SCAN_CLEANUP_PENDING"); }
+        if self.xray.is_none() && self.cached_xray_health.as_ref().is_some_and(|h| !h.beam_off_confirmed) {
+            return Err("XRAY_OFF_UNCONFIRMED");
+        }
         if let Some(xray) = self.xray.as_mut() {
             if let Err(error) = xray.force_off() {
                 let message = format!("{context}: Moxtek OFF was not confirmed: {error}");
                 self.last_error = Some(message.clone());
-                self.xray_latched = true;
+                self.fault_latched = true;
                 self.invalidate(Phase::Fault);
                 self.log("ERR", "xray", &message);
                 return Err("XRAY_OFF_UNCONFIRMED");
@@ -444,7 +467,7 @@ impl Engine {
                 let message = format!("{context}: Nano XRAY_WARNING OFF was not confirmed: {error}");
                 self.last_error = Some(message.clone());
                 self.connected = false;
-                self.xray_latched = true;
+                self.fault_latched = true;
                 self.invalidate(Phase::Fault);
                 self.log("ERR", "nano", &message);
                 return Err("NANO_COMMUNICATION_FAILED");
@@ -509,7 +532,7 @@ impl Engine {
                     .unwrap_or(self.usb_auto_shut_down);
                 self.cached_xray_health = Some(health);
                 if was_beam_on {
-                    self.xray_latched = true;
+                    self.fault_latched = true;
                     self.invalidate(Phase::Fault);
                 }
                 self.log(
@@ -560,7 +583,7 @@ impl Engine {
                 .unwrap_or_else(|| format!("Nano state {:?}", health.state));
             self.last_error = Some(detail.clone());
             self.connected = false;
-            self.xray_latched = true;
+            self.fault_latched = true;
             self.invalidate(Phase::Fault);
         }
     }
@@ -570,32 +593,19 @@ impl Engine {
             return Ok(());
         }
         if command == "stop" {
-            let real_scan_stop = self.stop_real_scan();
-            self.xray_latched = true;
-            self.invalidate(Phase::Fault);
-            let xray_off = self.force_xray_off("E-STOP");
-            let nano_stop = self.nano.as_ref().map(|nano| nano.stop());
-            if real_scan_stop.is_err() {
-                return real_scan_stop;
+            if !matches!(self.phase, Phase::Running | Phase::Paused | Phase::Finishing) { return Ok(()); }
+            if let Some(handle) = self.real_scan.as_ref() {
+                let result = handle.request_stop();
+                self.phase = Phase::Stopping;
+                if let Err(error) = result { return Err(self.nano_error("Scan STOP failed", error)); }
+                self.log("ACTION", "operator", "Ending scan; waiting for capture cleanup and confirmed output OFF");
+                return Ok(());
             }
-            if xray_off.is_err() {
-                if let Some(Err(error)) = nano_stop {
-                    self.log("ERR", "nano", &format!("E-STOP Nano STOP also failed: {error}"));
-                }
-                return Err("XRAY_OFF_UNCONFIRMED");
-            }
-            match nano_stop {
-                Some(Ok(())) => {
-                    self.last_error = None;
-                    self.log("ERR", "system", "E-STOP latched · Moxtek OFF + warning OFF + Nano STOP confirmed · repeat REARM, preflight and HOME");
-                    return Ok(());
-                }
-                Some(Err(error)) => return Err(self.nano_error("Nano STOP was not confirmed", error)),
-                None => {
-                    self.log("ERR", "system", "E-STOP latched · Moxtek OFF confirmed · output disabled · repeat preflight and HOME");
-                    return Ok(());
-                }
-            }
+            self.force_xray_off("End scan")?;
+            self.invalidate(Phase::Stopped);
+            self.last_error = None;
+            self.log("INFO", "system", "Preview scan ended; saved progress retained; repeat Preflight and HOME");
+            return Ok(());
         }
         if command == "disconnect" {
             let _ = self.stop_real_scan();
@@ -643,7 +653,7 @@ impl Engine {
                     Some("developer_preview") if self.preview => {
                         self.invalidate(Phase::Idle);
                         self.connected = true;
-                        self.xray_latched = false;
+                        self.fault_latched = false;
                         self.last_error = None;
                         self.log("INFO", "system", "DEVELOPER PREVIEW connected · NO REAL HARDWARE");
                     }
@@ -658,7 +668,7 @@ impl Engine {
                         self.nano = Some(Arc::new(nano));
                         self.connected = true;
                         self.invalidate(Phase::Idle);
-                        self.xray_latched = false;
+                        self.fault_latched = false;
                         self.last_error = None;
                         self.log(
                             "INFO",
@@ -701,6 +711,17 @@ impl Engine {
                 .map_err(|_| "INVALID_PARAMETERS")?;
                 let (parameters, max_xray_sec) =
                     setup.apply(&self.parameters, self.max_xray_sec)?;
+                if setup.exposure_ms.is_some() {
+                    let health = self.camera.as_ref().map(DigiCamControlAdapter::health)
+                        .or_else(|| self.cached_camera_health.clone());
+                    if let Some(health) = health.filter(|health| health.connected) {
+                        if let Some((min, max)) = health.exposure_min_ms.zip(health.exposure_max_ms) {
+                            if !(min..=max).contains(&parameters.exposure_ms) {
+                                return Err("EXPOSURE_OUTSIDE_CAMERA_RANGE");
+                            }
+                        }
+                    }
+                }
                 self.parameters = parameters;
                 self.max_xray_sec = max_xray_sec;
                 self.current = 0;
@@ -709,9 +730,6 @@ impl Engine {
             }
             "preflight" => {
                 self.require_connected()?;
-                if self.xray_latched || self.phase == Phase::Fault {
-                    return Err("ESTOP_LATCHED");
-                }
                 if self.busy() {
                     return Err("SCAN_ACTIVE");
                 }
@@ -836,6 +854,7 @@ impl Engine {
                     let status = nano
                         .rearm()
                         .map_err(|error| self.nano_error("Nano REARM failed", error))?;
+                    self.fault_latched = false;
                     self.preflight = true;
                     self.homed = false;
                     self.phase = Phase::ReadyForHome;
@@ -856,6 +875,7 @@ impl Engine {
                     if !(1..=600).contains(&self.max_xray_sec) {
                         return Err("INVALID_PARAMETERS");
                     }
+                    self.fault_latched = false;
                     self.preflight = true;
                     self.homed = false;
                     self.phase = Phase::ReadyForHome;
@@ -870,8 +890,8 @@ impl Engine {
                 if !self.preflight {
                     return Err("PREFLIGHT_REQUIRED");
                 }
-                if self.xray_latched {
-                    return Err("ESTOP_LATCHED");
+                if self.fault_latched {
+                    return Err("FAULT_RECOVERY_REQUIRED");
                 }
                 if !self.preview {
                     self.force_xray_off("Before HOME")?;
@@ -910,8 +930,8 @@ impl Engine {
                     if !self.homed {
                         return Err("HOME_REQUIRED");
                     }
-                    if self.xray_latched {
-                        return Err("ESTOP_LATCHED");
+                    if self.fault_latched {
+                        return Err("FAULT_RECOVERY_REQUIRED");
                     }
                     if !self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down {
                         return Err("USB_AUTO_SHUTDOWN_RELEASE_REQUIRED");
@@ -961,13 +981,15 @@ impl Engine {
                 if !self.homed {
                     return Err("HOME_REQUIRED");
                 }
-                if self.xray_latched {
-                    return Err("ESTOP_LATCHED");
+                if self.fault_latched {
+                    return Err("FAULT_RECOVERY_REQUIRED");
                 }
                 self.current = 0;
+                self.scan_angle_deg = None;
                 self.phase = Phase::Running;
                 self.beam_on = true;
                 self.last_tick = Instant::now();
+                self.preview_view_ms = None;
                 self.log("ACTION", "operator", "Developer preview scan started · no device output");
             }
             "pause" => {
@@ -985,8 +1007,8 @@ impl Engine {
             }
             "resume" => {
                 self.require_connected()?;
-                if self.xray_latched || self.phase == Phase::Fault {
-                    return Err("ESTOP_LATCHED");
+                if self.fault_latched || self.phase == Phase::Fault {
+                    return Err("FAULT_RECOVERY_REQUIRED");
                 }
                 if self.phase != Phase::Paused || !self.preflight || !self.homed {
                     return Err("NOT_RESUMABLE");
@@ -1003,9 +1025,10 @@ impl Engine {
                 self.log("INFO", "system", "Preview resumed");
             }
             "restore_previous" => {
+                if !self.preview { return Err("RESTORE_UNAVAILABLE"); }
                 self.require_connected()?;
-                if self.xray_latched || self.phase == Phase::Fault {
-                    return Err("ESTOP_LATCHED");
+                if self.fault_latched || self.phase == Phase::Fault {
+                    return Err("FAULT_RECOVERY_REQUIRED");
                 }
                 if self.phase == Phase::Stopped {
                     return Err("RECOVERY_REQUIRED");
@@ -1022,30 +1045,6 @@ impl Engine {
                 self.current = (self.parameters.projection_count / 3).max(1);
                 self.phase = Phase::Paused;
                 self.log("WARN", "system", "Preview checkpoint restored · no real task file was read");
-            }
-            "estop_release" => {
-                if self.phase != Phase::Fault {
-                    return Err("NOT_FAULTED");
-                }
-                if !self.preview {
-                    self.force_xray_off("E-STOP release")?;
-                    let nano = self.nano.as_ref().ok_or("RECONNECT_REQUIRED")?.clone();
-                    let status = nano.status().map_err(|error| {
-                        self.nano_error("Nano recovery STATUS failed", error)
-                    })?;
-                    if status.state == "FAULT" {
-                        nano.clear_fault().map_err(|error| {
-                            self.nano_error("Nano CLEAR_FAULT failed", error)
-                        })?;
-                    }
-                    self.xray_latched = false;
-                    self.invalidate(Phase::Stopped);
-                    self.log("WARN", "system", "E-STOP released · real preflight and HOME are required");
-                    return Ok(());
-                }
-                self.xray_latched = false;
-                self.invalidate(Phase::Stopped);
-                self.log("WARN", "system", "E-STOP released · preflight and HOME are required");
             }
             "retry_device" => {
                 let device = payload.get("device").and_then(Value::as_str).ok_or("INVALID_DEVICE")?;
@@ -1215,8 +1214,8 @@ impl Engine {
                     if self.busy() {
                         return Err("SCAN_ACTIVE");
                     }
-                    if self.phase == Phase::Fault || self.xray_latched {
-                        return Err("ESTOP_LATCHED");
+                    if self.phase == Phase::Fault || self.fault_latched {
+                        return Err("FAULT_RECOVERY_REQUIRED");
                     }
                     if self.xray.is_none() {
                         return Err("XRAY_NOT_CONNECTED");
@@ -1268,8 +1267,8 @@ impl Engine {
                     return Ok(());
                 }
                 self.require_connected()?;
-                if self.phase == Phase::Fault || self.xray_latched {
-                    return Err("ESTOP_LATCHED");
+                if self.phase == Phase::Fault || self.fault_latched {
+                    return Err("FAULT_RECOVERY_REQUIRED");
                 }
                 self.beam_on = !self.beam_on;
                 self.log("WARN", "xray", if self.beam_on { "Preview beam visualization enabled · NO REAL HARDWARE" } else { "Preview beam visualization disabled" });
@@ -1528,7 +1527,14 @@ impl Engine {
     }
 
     fn tick(&mut self) {
-        if !self.preview || self.phase != Phase::Running {
+        if !self.preview || !matches!(self.phase, Phase::Running | Phase::Finishing) {
+            return;
+        }
+        if self.phase == Phase::Finishing {
+            if self.last_tick.elapsed() < Duration::from_millis(850) { return; }
+            self.scan_angle_deg = Some(0.0);
+            self.phase = Phase::Completed;
+            self.log("PASS", "system", "Developer preview completed at start orientation · no projection files created");
             return;
         }
         let steps = (self.last_tick.elapsed().as_millis() / 850) as u32;
@@ -1536,15 +1542,21 @@ impl Engine {
             return;
         }
         self.last_tick += Duration::from_millis(u64::from(steps) * 850);
+        self.preview_view_ms = Some(850);
         self.current = self.current.saturating_add(steps).min(self.parameters.projection_count);
         if self.current == self.parameters.projection_count {
-            self.phase = Phase::Completed;
+            self.phase = Phase::Finishing;
             self.beam_on = false;
-            self.log("PASS", "system", "Developer preview completed · no projection files created");
+            self.last_tick = Instant::now();
+            self.log("ACTION", "system", "Developer preview returning turntable to start orientation");
         }
     }
 
     fn angle_deg(&self) -> f64 {
+        if !self.preview {
+            return self.nano.as_ref().and_then(|nano| confirmed_nano_angle(&nano.health()))
+                .or(self.scan_angle_deg).unwrap_or(0.0);
+        }
         if let Some(angle) = self.scan_angle_deg {
             angle
         } else if self.current == 0 {
@@ -1554,9 +1566,20 @@ impl Engine {
         }
     }
 
+    fn estimated_remaining_seconds(&self) -> Option<u64> {
+        if self.phase != Phase::Running { return None; }
+        if self.preview {
+            return self.preview_view_ms.map(|millis| {
+                u64::from(self.parameters.projection_count.saturating_sub(self.current))
+                    .saturating_mul(millis).saturating_add(999) / 1000
+            });
+        }
+        self.real_scan.as_ref().and_then(|scan| scan.progress().estimated_remaining_seconds)
+    }
+
     fn data_state(&self) -> &'static str {
         match self.phase {
-            Phase::Running => "scanning",
+            Phase::Running | Phase::Finishing | Phase::Stopping => "scanning",
             Phase::Paused => "paused",
             Phase::Fault => "fault",
             _ => "ready",
@@ -1567,6 +1590,8 @@ impl Engine {
         match self.phase {
             Phase::Running => "SCANNING",
             Phase::Paused => "PAUSED",
+            Phase::Finishing => "FINISHING",
+            Phase::Stopping => "STOPPING",
             Phase::Fault => "FAULT",
             Phase::Completed => "COMPLETE",
             Phase::Stopped => "STANDBY",
@@ -1582,9 +1607,10 @@ impl Engine {
         let angle = self.angle_deg();
         let data_state = self.data_state();
         let configured = self.parameters.validate().is_ok()
-            && (1..=359_999).contains(&self.max_xray_sec);
+            && (1..=600).contains(&self.max_xray_sec);
         let is_preview = self.preview;
         let nano_health = self.nano.as_ref().map(|nano| nano.health());
+        let angle_known = self.phase != Phase::Stopping && (self.preview || nano_health.as_ref().and_then(confirmed_nano_angle).is_some());
         let nano_connected = nano_health
             .as_ref()
             .is_some_and(|health| health.state == NanoConnectionState::Connected);
@@ -1612,6 +1638,25 @@ impl Engine {
             .as_ref()
             .and_then(|health| health.usb_auto_shutdown)
             .unwrap_or(self.usb_auto_shut_down);
+        // Display only confirmed telemetry. Missing/disconnected/error readback is
+        // unknown, never an assumed zero, setpoint, room temperature, or safe OFF.
+        let live_xray = xray_health.as_ref()
+            .filter(|health| health.connected && health.last_error.is_none());
+        let mon_kv = if self.preview { Some(if self.beam_on { self.set_kv } else { 0.0 }) }
+            else { live_xray.and_then(|health| health.voltage_kv) };
+        let mon_ua = if self.preview { Some(if self.beam_on { self.set_ua } else { 0.0 }) }
+            else { live_xray.and_then(|health| health.current_ua) };
+        let temperature = if self.preview { Some(24.0) }
+            else { live_xray.and_then(|health| health.temperature_c) };
+        let beam_state = if self.preview {
+            if self.beam_on { "on" } else { "off" }
+        } else if live_xray.is_some_and(|health| health.beam_on) {
+            "on"
+        } else if live_xray.is_some_and(|health| health.beam_off_confirmed) && !self.beam_on {
+            "off"
+        } else {
+            "unknown"
+        };
         let identity = if is_preview {
             "DEVELOPER PREVIEW · NO REAL HARDWARE".to_owned()
         } else if let Some(health) = nano_health.as_ref() {
@@ -1629,22 +1674,28 @@ impl Engine {
             "PRODUCTION LOCKED · NANO DISCONNECTED".to_owned()
         };
         let device_tone = if self.phase == Phase::Fault || nano_faulted { "danger" } else if self.connected { "accent" } else { "muted" };
-        let xray_text = if self.phase == Phase::Fault || self.xray_latched { "LATCHED OFF" } else if self.beam_on { if self.preview {"PREVIEW BEAM"} else {"TUBE ON"} } else if xray_connected { "CONFIGURED OFF" } else { "OUTPUT UNAVAILABLE" };
+        let xray_text = match beam_state {
+            "on" => if self.preview { "PREVIEW BEAM" } else { "EMITTING" },
+            "off" => if self.preview { "PREVIEW OFF" } else { "OFF CONFIRMED" },
+            _ => "OUTPUT UNKNOWN",
+        };
         let safety_text = if self.phase == Phase::Fault {
-            "SAFETY · FAULT · OUTPUT LATCHED OFF"
-        } else if self.beam_on {
-            if self.preview { "SAFETY · PREVIEW BEAM · NO REAL HARDWARE" } else { "SAFETY · REAL BEAM ON · INTERLOCK OK" }
+            "FAULT · VERIFY OUTPUT STATE"
+        } else if beam_state == "on" {
+            if self.preview { "PREVIEW BEAM · NO REAL HARDWARE" } else { "OUTPUT ON · MONITOR DEVICE STATUS" }
+        } else if beam_state == "off" {
+            if self.preview { "PREVIEW ONLY · NO REAL HARDWARE" } else { "OUTPUT OFF CONFIRMED" }
         } else {
-            "SAFETY · REAL OUTPUT UNAVAILABLE"
+            "OUTPUT UNKNOWN · READBACK REQUIRED"
         };
         let eta = if self.phase == Phase::Paused {
             "held".to_owned()
-        } else if self.phase == Phase::Running {
-            let seconds = (total.saturating_sub(captured) as f64 * 0.85).ceil() as u64;
+        } else if let Some(seconds) = self.estimated_remaining_seconds() {
             format!("{:02}:{:02}", seconds / 60, seconds % 60)
         } else {
             "—".to_owned()
         };
+        let cooldown = self.real_scan.as_ref().and_then(|scan| scan.progress().cooldown_remaining_seconds);
         let console_logs: Vec<Value> = self.logs.iter().map(|entry| {
             let level = entry["level"].as_str().unwrap_or("INFO");
             let source = entry["source"].as_str().unwrap_or("system");
@@ -1668,14 +1719,19 @@ impl Engine {
         };
         json!({
             "dataState": data_state,
+            "cameraExposure":{
+                "minMs":camera_health.as_ref().filter(|health| health.connected).and_then(|health| health.exposure_min_ms).unwrap_or(EXPOSURE_MIN_MS),
+                "maxMs":camera_health.as_ref().filter(|health| health.connected).and_then(|health| health.exposure_max_ms).unwrap_or(EXPOSURE_MAX_MS),
+                "known":camera_health.as_ref().is_some_and(|health| health.connected && health.exposure_min_ms.is_some() && health.exposure_max_ms.is_some())
+            },
             "phaseWord": self.phase_word(),
             "phaseTone": if self.phase == Phase::Fault { "danger" } else if self.phase == Phase::Running { "warn" } else { "accent" },
             "devices": [
-                {"id":"xray","name":"X-Ray Source","word":if self.beam_on {"EMITTING"} else if xray_connected {"SAFE OFF"} else if self.preview {"LOCKED"} else {"OFFLINE"},"tone":if self.beam_on {"danger"} else if xray_connected {"accent"} else {"muted"},"spec":if let Some(health) = xray_health.as_ref() {format!("12 W · {} · PORT {} · SERIAL {}", if self.beam_on {"REAL BEAM"} else {"CONFIG SAFE OFF"}, health.port.as_deref().unwrap_or("unknown"), health.serial.as_deref().unwrap_or("unknown"))} else {"12 W · CONNECT FOR OFF + SETPOINT TEST".to_owned()}},
+                {"id":"xray","name":"X-Ray Source","word":if beam_state == "on" {"EMITTING"} else if beam_state == "off" {"OFF VERIFIED"} else if xray_connected {"UNKNOWN"} else {"OFFLINE"},"tone":if beam_state == "on" {"danger"} else if beam_state == "off" {"accent"} else {"muted"},"spec":if let Some(health) = xray_health.as_ref() {format!("12 W · {} · PORT {} · SERIAL {}", xray_text, health.port.as_deref().unwrap_or("unknown"), health.serial.as_deref().unwrap_or("unknown"))} else {"Moxtek · 12 W · awaiting connection".to_owned()}},
                 {"id":"turntable","name":"Turntable-Nano","word":if nano_faulted {"FAULT"} else if self.phase == Phase::Running {"MOVING"} else if nano_connected {"ONLINE"} else if self.preview {"PREVIEW"} else {"OFFLINE"},"tone":device_tone,"spec":if nano_connected {format!("{identity} · POS {angle:.2}° · 60:1 · 8 µSTEP")} else {format!("POS {angle:.2}° · 60:1 · 8 µSTEP · {}", if self.preview {"PREVIEW"} else {"DISCONNECTED"})}},
                 {"id":"camera","name":"Camera","word":if camera_connected {"ONLINE"} else if self.preview {"PREVIEW"} else {"OFFLINE"},"tone":if camera_connected {"accent"} else if self.preview {device_tone} else {"muted"},"spec":if let Some(health) = camera_health.as_ref() {format!("D7100 · SERIAL {} · {}", health.serial.as_deref().unwrap_or("unknown"), health.transfer_policy.as_deref().unwrap_or("transfer unverified"))} else if self.preview {"D7100 · NO REAL CAMERA CONNECTION".to_owned()} else {"D7100 · CONNECT VIA DIGICAMCONTROL".to_owned()}}
             ],
-            "onlineSummary": if self.preview { "PREVIEW · 0 REAL DEVICES".to_owned() } else { let count = u8::from(nano_connected) + u8::from(camera_connected) + u8::from(xray_connected); if count == 0 { "LOCKED · 0 REAL DEVICES".to_owned() } else if self.beam_on {format!("{count} REAL DEVICES · CONTROLLED EXPOSURE")} else { format!("{count} REAL DEVICE{} · OUTPUT LOCKED OFF", if count == 1 {""} else {"S"}) } },
+            "onlineSummary": if self.preview { "PREVIEW · 0 REAL DEVICES".to_owned() } else { let count = u8::from(nano_connected) + u8::from(camera_connected) + u8::from(xray_connected); if count == 0 { "LOCKED · 0 REAL DEVICES".to_owned() } else { format!("{count} REAL DEVICES · {xray_text}") } },
             "preflight": {
                 "word": if self.preflight {"PASSED"} else {"WAITING"},
                 "percent": if self.preflight {100} else {0},
@@ -1685,22 +1741,21 @@ impl Engine {
             "floats": [
                 {"key":"X-RAY","text":xray_text,"tone":if self.phase == Phase::Fault || self.beam_on {"danger"} else {"muted"}},
                 {"key":"CAMERA","text":if camera_connected {"D7100 ONLINE"} else if self.preview {"PREVIEW ONLY"} else {"OFFLINE"},"tone":if camera_connected {"accent"} else {"muted"}},
-                {"key":"SAMPLE","text":format!("{angle:.2}°"),"tone":if self.phase == Phase::Fault {"danger"} else {"accent"}}
+                {"key":"SAMPLE","text":if angle_known {format!("{angle:.2}°")} else {"UNKNOWN".to_owned()},"tone":if !angle_known {"muted"} else if self.phase == Phase::Fault {"danger"} else {"accent"}}
             ],
             "safetyBar":{"text":safety_text,"tone":if self.phase == Phase::Fault {"dangerBold"} else if self.beam_on {"danger"} else {"muted"}},
-            "scene":{"angleDeg":angle,"rotated":angle.abs() > 0.005},
+            "scene":{"angleDeg":angle,"rotated":angle.abs() > 0.005,"angleKnown":angle_known,"rotationDirection":if self.preview {1} else {-1}},
             "xray":{
                 "connected":xray_connected,
                 "setKv":self.set_kv,"setUa":self.set_ua,
-                "monKv":xray_health.as_ref().and_then(|health| health.voltage_kv).unwrap_or(self.set_kv),
-                "monUa":xray_health.as_ref().and_then(|health| health.current_ua).unwrap_or(self.set_ua),
-                "powerW":xray_health.as_ref().and_then(|health| health.voltage_kv.zip(health.current_ua)).map(|(kv, ua)| kv * ua / 1000.0).unwrap_or(self.set_kv * self.set_ua / 1000.0),
-                "tempC":xray_health.as_ref().and_then(|health| health.temperature_c).unwrap_or(24.0),"beamOn":self.beam_on,
-                "latched":self.xray_latched,"onSec":10,"offSec":20,"timerOn":self.timer_on,
+                "monKv":mon_kv,"monUa":mon_ua,
+                "powerW":mon_kv.zip(mon_ua).map(|(kv, ua)| kv * ua / 1000.0),
+                "tempC":temperature,"beamOn":self.beam_on,"beamState":beam_state,
+                "latched":self.fault_latched,"onSec":10,"offSec":20,"timerOn":self.timer_on,
                 "usbAutoShutDown":actual_usb_auto_shutdown,
-                "usbAutoShutDownKnown":self.preview || self.usb_auto_shut_down_confirmed,
-                "usbShutdownDelay":xray_health.as_ref().and_then(|health| health.usb_shutdown_delay),
-                "manualControlsEnabled":self.preview || (xray_connected && !self.busy() && !self.xray_latched),
+                "usbAutoShutDownKnown":self.preview || (live_xray.is_some() && self.usb_auto_shut_down_confirmed),
+                "usbShutdownDelay":live_xray.and_then(|health| health.usb_shutdown_delay),
+                "manualControlsEnabled":self.preview || (xray_connected && !self.busy() && !self.fault_latched),
                 "timerControlsEnabled":self.preview,
                 "setpointControlsEnabled":self.preview || (xray_connected && !self.busy() && !self.beam_on)
                 ,"voltageConfirmed":self.preview || self.set_kv_confirmed
@@ -1710,12 +1765,12 @@ impl Engine {
             "progress":{
                 "captured":captured,"total":total,"percent":percent,"angleDeg":angle,"etaText":eta,
                 "barTone":if self.phase == Phase::Fault {"danger"} else if self.phase == Phase::Paused {"warn"} else {"accent"},
-                "barLabel":format!("{captured} / {total} · {percent:.0}%")
+                "barLabel":if let Some(seconds) = cooldown {format!("{captured} / {total} · {percent:.0}% · cooling {:02}:{:02}", seconds / 60, seconds % 60)} else {format!("{captured} / {total} · {percent:.0}%")}
             },
             "summary":{
                 "savePath":self.parameters.save_path,
                 "acquisition":if configured {format!("{total} views · {:.2}° · {} ms", self.parameters.angle_step_deg, self.parameters.exposure_ms)} else {"Scan setup not configured".to_owned()},
-                "output":if self.preview {format!("PREVIEW SET · {:.1} kV · {:.1} µA",self.set_kv,self.set_ua)} else if self.beam_on {format!("REAL BEAM · {:.1} kV · {:.1} µA",self.set_kv,self.set_ua)} else if xray_connected {format!("REAL SET · {:.1} kV · {:.1} µA · OUTPUT LOCKED OFF",self.set_kv,self.set_ua)} else {"LOCKED · NO REAL OUTPUT".to_owned()}
+                "output":if self.preview {format!("PREVIEW · SET {:.1} kV / {:.1} µA",self.set_kv,self.set_ua)} else {xray_text.to_owned()}
             },
             "statusbar":{
                 "left":if configured {format!("{identity} · {} · {captured} / {total} · {angle:.2}°",self.phase_word())} else {format!("{identity} · SETUP REQUIRED")},
@@ -1723,13 +1778,13 @@ impl Engine {
                 "dotTone":if self.phase == Phase::Fault {"danger"} else if self.phase == Phase::Running {"warn"} else if self.phase == Phase::Paused {"accent"} else {"muted"}
             },
             "dock":{
-                "home":self.connected && self.preflight && !self.busy() && !self.xray_latched,
-                "play":self.connected && !self.xray_latched && ((self.phase == Phase::Running || self.phase == Phase::Paused) || (self.preflight && self.homed && self.phase != Phase::Fault && (self.preview || (self.usb_auto_shut_down_confirmed && !self.usb_auto_shut_down)))),
-                "restore":self.connected && !self.busy() && self.preflight && self.homed && !self.xray_latched && !matches!(self.phase, Phase::Fault | Phase::Stopped),
-                "estop":true,
-                "playMode":if self.phase == Phase::Running {"pause"} else if self.phase == Phase::Paused {"resume"} else if self.phase == Phase::Fault {"disabled"} else {"start"},
-                "homeReason":if !self.connected {"Connect the Nano first"} else if self.xray_latched || self.phase == Phase::Fault {"Release E-STOP, then run Preflight"} else if !self.preflight {"Complete scan setup and run Preflight first"} else if self.busy() {"HOME is unavailable while a scan is active"} else {""},
-                "playReason":if self.phase == Phase::Running {"Pause after the active transaction closes"} else if self.phase == Phase::Paused {"Resume the paused scan"} else if !self.connected {"Connect the Nano first"} else if self.xray_latched || self.phase == Phase::Fault {"Release E-STOP"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if !self.preview && (!self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down) {"Disable USB Auto Shut Down manually in the X-ray panel"} else {""}
+                "home":self.connected && self.preflight && !self.busy() && !self.fault_latched,
+                "play":self.connected && !self.fault_latched && ((self.phase == Phase::Running || self.phase == Phase::Paused) || (!self.busy() && self.preflight && self.homed && (self.preview || (self.usb_auto_shut_down_confirmed && !self.usb_auto_shut_down)))),
+                "restore":self.preview && self.connected && !self.busy() && self.preflight && self.homed && !self.fault_latched && !matches!(self.phase, Phase::Fault | Phase::Stopped),
+                "stop":matches!(self.phase, Phase::Running | Phase::Paused | Phase::Finishing),
+                "playMode":if self.phase == Phase::Running {"pause"} else if self.phase == Phase::Paused {"resume"} else if matches!(self.phase, Phase::Fault | Phase::Finishing | Phase::Stopping) {"disabled"} else {"start"},
+                "homeReason":if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to revalidate device safety"} else if !self.preflight {"Complete scan setup and run Preflight first"} else if self.busy() {"HOME is unavailable while a scan is active"} else {""},
+                "playReason":if self.phase == Phase::Running {"Pause after the active transaction closes"} else if self.phase == Phase::Paused {"Resume the paused scan"} else if matches!(self.phase, Phase::Finishing | Phase::Stopping) {"Wait for scan cleanup"} else if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to recover"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if !self.preview && (!self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down) {"Disable USB Auto Shut Down manually in the X-ray panel"} else {""}
             },
             "scanSetup":{
                 "savePath":self.parameters.save_path,"taskId":self.parameters.task_id,"projectionCount":total,
@@ -1813,7 +1868,7 @@ impl Engine {
             "phase":phase,"phaseLabel":label,"preflightPassed":self.preflight,"homed":self.homed,
             "requiresPreflight":!self.preflight,"requiresHome":!self.homed,
             "safety":{
-                "xrayAvailable":xray_connected && self.preflight && self.homed && !self.xray_latched,"xrayEnabled":self.beam_on,
+                "xrayAvailable":xray_connected && self.preflight && self.homed && !self.fault_latched,"xrayEnabled":self.beam_on,
                 "interlockOk":xray_health.as_ref().and_then(|health| health.locked).is_some_and(|locked| !locked),
                 "lockReason":if self.preview {"Developer preview has no real X-ray hardware"} else if xray_connected {"Moxtek communication and setpoints verified; beam enable remains locked"} else {"Stage 1 Nano only · camera and X-ray are locked OFF"}
             },
@@ -1827,7 +1882,7 @@ impl Engine {
                 "current":self.current,"total":self.parameters.projection_count,
                 "percent":if self.parameters.projection_count == 0 {0.0} else {(100.0 * f64::from(self.current) / f64::from(self.parameters.projection_count)).round()},
                 "angleDeg":self.angle_deg(),
-                "etaSeconds":if self.phase == Phase::Running {Some(((self.parameters.projection_count - self.current) as f64 * 0.85).ceil() as u64)} else {None}
+                "etaSeconds":self.estimated_remaining_seconds()
             },
             "imageCount":self.real_frames.len(),"logs":self.logs,"lastError":self.last_error,"updatedAt":timestamp(),
             "workstation":self.workstation_view()
@@ -1886,8 +1941,62 @@ mod tests {
         assert_eq!(snapshot["mode"], "production_locked");
         assert_eq!(snapshot["workstation"]["onlineSummary"], "LOCKED · 0 REAL DEVICES");
         assert_eq!(snapshot["workstation"]["xray"]["beamOn"], false);
+        assert_eq!(snapshot["workstation"]["scene"]["angleKnown"], false);
+        assert_eq!(snapshot["workstation"]["scene"]["rotationDirection"], -1);
+        assert_eq!(snapshot["workstation"]["xray"]["beamState"], "unknown");
+        for field in ["monKv", "monUa", "powerW", "tempC"] {
+            assert!(snapshot["workstation"]["xray"][field].is_null(), "{field} must not be fabricated");
+        }
         assert!(send(&mut engine, "stop", json!({})).error_code.is_none());
         assert!(send(&mut engine, "disconnect", json!({})).error_code.is_none());
+    }
+
+    #[test]
+    fn scene_angle_uses_confirmed_pulses_not_pending_target() {
+        use devices::turntable::NanoStatus;
+        let mut health = NanoHealth {
+            state: NanoConnectionState::Connected,
+            status: Some(NanoStatus {
+                state:"MOVING".into(), position_pulses:-24000, target_pulses:-48000,
+                microsteps:8, pulses_per_rev:96000, reference_valid:true, homed:true,
+                rearmed:true, hall_active:false, capture_id:1,
+            }), ..NanoHealth::default()
+        };
+        assert_eq!(confirmed_nano_angle(&health), Some(-90.0));
+        health.state = NanoConnectionState::Lost;
+        assert_eq!(confirmed_nano_angle(&health), None);
+        health.state = NanoConnectionState::Connected;
+        health.status.as_mut().unwrap().reference_valid = false;
+        assert_eq!(confirmed_nano_angle(&health), None);
+        health.status.as_mut().unwrap().reference_valid = true;
+        health.status.as_mut().unwrap().pulses_per_rev = 0;
+        assert_eq!(confirmed_nano_angle(&health), None);
+    }
+
+    #[test]
+    fn display_telemetry_requires_live_readback_and_confirmed_off() {
+        let mut engine = Engine::new(false);
+        engine.cached_xray_health = Some(XrayHealth {
+            connected: true, voltage_kv: Some(59.5), current_ua: Some(195.0),
+            temperature_c: Some(32.0), ..XrayHealth::default()
+        });
+        let snapshot = engine.workstation_view();
+        assert_eq!(snapshot["xray"]["monKv"], 59.5);
+        assert_eq!(snapshot["xray"]["tempC"], 32.0);
+        assert_eq!(snapshot["xray"]["beamState"], "unknown");
+        assert_eq!(snapshot["summary"]["output"], "OUTPUT UNKNOWN");
+        engine.cached_xray_health.as_mut().unwrap().beam_off_confirmed = true;
+        assert_eq!(engine.workstation_view()["xray"]["beamState"], "off");
+        engine.cached_xray_health.as_mut().unwrap().last_error = Some("readback timeout".into());
+        let failed = engine.workstation_view();
+        assert_eq!(failed["xray"]["beamState"], "unknown");
+        for field in ["monKv", "monUa", "powerW", "tempC"] {
+            assert!(failed["xray"][field].is_null(), "stale {field} must be unknown");
+        }
+        engine.cached_xray_health.as_mut().unwrap().last_error = None;
+        engine.cached_xray_health.as_mut().unwrap().connected = false;
+        assert!(engine.workstation_view()["xray"]["monKv"].is_null());
+        assert_eq!(engine.workstation_view()["xray"]["beamState"], "unknown");
     }
 
     #[test]
@@ -1923,6 +2032,35 @@ mod tests {
     }
 
     #[test]
+    fn scan_input_limits_accept_3600_and_fractional_ms_with_default_ten_minutes() {
+        let mut engine = Engine::new(false);
+        assert_eq!(engine.max_xray_sec, 600);
+        assert!(send(&mut engine, "update_scan_setup", json!({"setup":{
+            "projectionCount":3600,"exposureMs":0.125
+        }})).error_code.is_none());
+        assert_eq!(engine.parameters.projection_count, 3600);
+        assert_eq!(engine.parameters.angle_step_deg, 0.1);
+        assert_eq!(engine.parameters.exposure_ms, 0.125);
+        assert!(send(&mut engine, "update_scan_setup", json!({"setup":{"exposureMs":30000}})).error_code.is_none());
+        let before = engine.parameters.clone();
+        for patch in [
+            json!({"projectionCount":3601}), json!({"projectionCount":0}),
+            json!({"projectionCount":1.5}), json!({"exposureMs":0.124}),
+            json!({"exposureMs":30000.1}),
+        ] {
+            assert!(send(&mut engine, "update_scan_setup", json!({"setup":patch})).error_code.is_some());
+            assert_eq!(engine.parameters, before);
+        }
+        engine.cached_camera_health = Some(CameraHealth {
+            connected:true, exposure_min_ms:Some(1.0), exposure_max_ms:Some(2000.0),
+            ..CameraHealth::default()
+        });
+        assert_eq!(send(&mut engine, "update_scan_setup", json!({"setup":{"exposureMs":2500}}))
+            .error_code.as_deref(), Some("EXPOSURE_OUTSIDE_CAMERA_RANGE"));
+        assert_eq!(engine.parameters, before);
+    }
+
+    #[test]
     fn command_and_payload_type_must_match() {
         let mut engine = Engine::new(true);
         let response = engine.handle(Request {
@@ -1941,7 +2079,7 @@ mod tests {
     fn preflight_requires_every_scan_setup_field_before_home_and_start() {
         let mut engine = Engine::new(true);
         assert_eq!(engine.parameters, Parameters::default());
-        assert_eq!(engine.max_xray_sec, 0);
+        assert_eq!(engine.max_xray_sec, 600);
         assert_eq!(
             send(&mut engine, "preflight", json!({}))
                 .error_code
@@ -1990,37 +2128,20 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_estop_release_require_full_recovery() {
+    fn ordinary_stop_ends_active_scan_and_requires_fresh_preflight_and_home() {
         let mut engine = Engine::new(true);
         ready(&mut engine);
+        assert_eq!(engine.snapshot()["workstation"]["dock"]["stop"], false);
+        assert!(send(&mut engine, "stop", json!({})).error_code.is_none());
+        assert_eq!(engine.phase, Phase::Ready);
         send(&mut engine, "start_scan", json!({}));
+        assert_eq!(engine.snapshot()["workstation"]["dock"]["stop"], true);
         send(&mut engine, "stop", json!({}));
-        assert_eq!(engine.phase, Phase::Fault);
+        assert_eq!(engine.phase, Phase::Stopped);
+        assert!(!engine.fault_latched);
         assert!(!engine.beam_on && !engine.preflight && !engine.homed);
         assert_eq!(engine.snapshot()["workstation"]["dock"]["restore"], false);
-        assert_eq!(
-            send(&mut engine, "preflight", json!({}))
-                .error_code
-                .as_deref(),
-            Some("ESTOP_LATCHED")
-        );
-        assert_eq!(
-            send(&mut engine, "restore_previous", json!({}))
-                .error_code
-                .as_deref(),
-            Some("ESTOP_LATCHED")
-        );
-        assert_eq!(
-            send(&mut engine, "resume", json!({})).error_code.as_deref(),
-            Some("ESTOP_LATCHED")
-        );
-        assert_eq!(engine.phase, Phase::Fault);
-        assert!(!engine.beam_on && !engine.preflight && !engine.homed);
-
-        assert!(send(&mut engine, "estop_release", json!({}))
-            .error_code
-            .is_none());
-        assert_eq!(engine.phase, Phase::Stopped);
+        assert_eq!(engine.snapshot()["workstation"]["dock"]["stop"], false);
         assert_eq!(
             send(&mut engine, "restore_previous", json!({}))
                 .error_code
@@ -2060,6 +2181,16 @@ mod tests {
             .is_none());
         assert_eq!(engine.phase, Phase::Running);
         assert!(engine.beam_on);
+        assert!(send(&mut engine, "pause", json!({})).error_code.is_none());
+        assert_eq!(engine.phase, Phase::Paused);
+        assert!(send(&mut engine, "stop", json!({})).error_code.is_none());
+        assert_eq!(engine.phase, Phase::Stopped);
+        assert!(!engine.fault_latched);
+        engine.phase = Phase::Fault;
+        engine.fault_latched = true;
+        assert_eq!(engine.snapshot()["workstation"]["dock"]["stop"], false);
+        assert!(send(&mut engine, "stop", json!({})).error_code.is_none());
+        assert_eq!(engine.phase, Phase::Fault);
     }
 
     #[test]
@@ -2081,6 +2212,7 @@ mod tests {
     #[test]
     fn xray_send_buttons_preserve_the_clicked_axis_and_clamp_the_other_to_12_w() {
         let mut current_engine = Engine::new(true);
+        current_engine.set_kv = 60.0;
         let current_response = send(&mut current_engine, "send_current", json!({"ua":500.0}));
         assert!(current_response.error_code.is_none());
         assert!((current_engine.set_kv - 24.0).abs() < 1e-9);
@@ -2118,7 +2250,7 @@ mod tests {
         assert!(send(&mut engine, "send_current", json!({"ua":0.0}))
             .error_code
             .is_none());
-        assert_eq!(engine.set_kv, 60.0);
+        assert_eq!(engine.set_kv, 4.0);
         assert_eq!(engine.set_ua, 0.0);
 
         assert!(send(&mut engine, "send_voltage", json!({"kv":60.0}))
@@ -2143,6 +2275,17 @@ mod tests {
             );
             assert_eq!((engine.set_kv, engine.set_ua), before);
         }
+    }
+
+    #[test]
+    fn xray_panel_defaults_to_four_kv_ten_ua_without_confirming_device_output() {
+        let engine = Engine::new(false);
+        let xray = &engine.snapshot()["workstation"]["xray"];
+        assert_eq!(xray["setKv"], 4.0);
+        assert_eq!(xray["setUa"], 10.0);
+        assert_eq!(xray["voltageConfirmed"], false);
+        assert_eq!(xray["currentConfirmed"], false);
+        assert_eq!(xray["beamState"], "unknown");
     }
 
     #[test]
@@ -2182,7 +2325,7 @@ mod tests {
         .error_code
         .is_none());
         assert_eq!(engine.parameters.angle_step_deg, 36.0);
-        assert_eq!(engine.parameters.exposure_ms, 200);
+        assert_eq!(engine.parameters.exposure_ms, 200.0);
         assert_eq!(engine.max_xray_sec, 60);
 
         assert!(send(
@@ -2237,9 +2380,32 @@ mod tests {
         send(&mut engine, "start_scan", json!({}));
         engine.last_tick -= Duration::from_secs(10);
         engine.tick();
+        assert_eq!(engine.phase, Phase::Finishing);
+        assert_eq!(engine.snapshot()["workstation"]["dock"]["play"], false);
+        assert_eq!(engine.snapshot()["workstation"]["dock"]["stop"], true);
+        engine.last_tick -= Duration::from_secs(1);
+        engine.tick();
+        assert_eq!(engine.phase, Phase::Completed);
+        assert_eq!(engine.angle_deg(), 0.0);
+        assert_eq!(engine.snapshot()["workstation"]["dock"]["stop"], false);
+        assert!(send(&mut engine, "stop", json!({})).error_code.is_none());
         assert_eq!(engine.phase, Phase::Completed);
         assert_eq!(engine.snapshot()["imageCount"], 0);
         assert_eq!(engine.snapshot()["workstation"]["frames"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn preview_stop_during_final_return_is_an_ordinary_end() {
+        let mut engine = Engine::new(true);
+        ready(&mut engine);
+        send(&mut engine, "start_scan", json!({}));
+        engine.last_tick -= Duration::from_secs(10);
+        engine.tick();
+        assert_eq!(engine.phase, Phase::Finishing);
+        assert!(send(&mut engine, "stop", json!({})).error_code.is_none());
+        assert_eq!(engine.phase, Phase::Stopped);
+        assert!(!engine.fault_latched);
+        assert_eq!(engine.snapshot()["workstation"]["dock"]["stop"], false);
     }
 
     #[test]

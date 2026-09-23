@@ -6,6 +6,9 @@
 
 mod nano;
 
+#[cfg(test)]
+pub(crate) use nano::LineTransport;
+
 pub use nano::{
     MoveTicket, NanoAdapter, NanoConnectionState, NanoError, NanoHealth,
     NanoIdentity, NanoStatus, BAUD_RATE, EXPECTED_DEVICE, EXPECTED_PROTOCOL,

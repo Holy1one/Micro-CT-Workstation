@@ -12,13 +12,61 @@ export const SAMPLE_Z = 0;
 export const SCINTILLATOR_Z = 205;
 export const LENS_Z = 292;
 
+export const RING_TRACK = {
+  radius: 405,
+  innerRadius: 378,
+  outerRadius: 432,
+  bottomY: -112,
+  baseTopY: -94,
+  railTopY: -76,
+  raceWidth: 8,
+  scaleInnerRadius: 389,
+  scaleOuterRadius: 421,
+} as const;
+
+export const CARRIAGE = {
+  mounts: {
+    source: { width: 144, depth: 112, centerX: 0, centerZ: -6 },
+    camera: { width: 196, depth: 112, centerX: 9, centerZ: -6 },
+  },
+  plateThickness: 8,
+  mountingY: -42.8,
+  lift: {
+    source: { baseTopY: -42.8, topY: -1.5 },
+    camera: { baseTopY: -68, topY: -42.8 },
+    plateThickness: 8,
+    armInset: 24,
+    sideSpacing: 36,
+  },
+  guideRadius: 14,
+  guideHeight: 16,
+  guideY: -85,
+  guideHalfSpacing: 58,
+  loadRadius: 10,
+  loadWidth: 6,
+  loadHalfSpacing: 58,
+  // The camera's low lift overlaps the wheel height. Put its load wheels beyond
+  // the plate ends, where the tyre can turn without entering the lower deck.
+  cameraLoadHalfSpacing: 120,
+} as const;
+
+export function trackContactPose(radius: number, tangentOffset: number) {
+  const radialZ = Math.sqrt(radius * radius - tangentOffset * tangentOffset);
+  return {
+    x: tangentOffset,
+    z: radialZ - RING_TRACK.radius,
+    yaw: Math.atan2(tangentOffset, radialZ),
+  };
+}
+
 export const TURNTABLE = {
   baseRadius: 34,
-  baseHeight: 22,
-  baseY: -25,
+  baseHeight: 70,
+  baseY: RING_TRACK.bottomY + 35,
+  spindleRadius: 24,
   platterRadius: 44,
-  platterHeight: 7,
-  platterY: -4,
+  platterHeight: 9,
+  platterY: -16,
 } as const;
 
 export const SAMPLE = {

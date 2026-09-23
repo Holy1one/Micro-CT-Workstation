@@ -38,8 +38,8 @@ function floorOneDecimal(value: number): number {
 
 export class XraySource12W {
   private connected = true;
-  private setKv = 60.0;
-  private setUa = 200.0;
+  private setKv = 4.0;
+  private setUa = 10.0;
   private beam = false;
   private latched = false;
   private interlock = true;
@@ -98,7 +98,7 @@ export class XraySource12W {
     this.beam = false;
   }
 
-  /** E-stop path: hard output cut + latch. Only rearm() clears it. */
+  /** Device-fault path: hard output cut + latch. Successful preflight rearms it. */
   latchOff(): void {
     this.beam = false;
     this.latched = true;

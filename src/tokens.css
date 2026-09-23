@@ -12,7 +12,7 @@
         https://ardot.tencent.com/file/726485156717388
 
    ★ 设计要点
-     1) 视觉体系：Apple 系统风 —— 画布 #F5F5F7 / 纯白卡片 / 发丝分隔线 /
+     1) 视觉体系：Apple 系统风 —— 画布 #F2F4F7 / 纯白卡片 / 发丝分隔线 /
         单一 Action Blue 强调色 / 大圆角（18-20）/ 无装饰性渐变。
      2) 中央视口 =「真实感 3D 场景图（主题×角度四选一）+ 状态浮窗」：
         · 3D-scene-light.png / 3D-scene-dark.png = 转台 0°（Ready）
@@ -20,7 +20,7 @@
         构图：相机（左）→ 转台待测物（中）→ X 射线源（右），直线光路；
         只有待测物是卡通形象（默认宇航员手办，可替换），设备一律真实感渲染。
      3) 控制坞：磨砂玻璃底座（白色半透明 + backdrop-filter 磨砂 + 1px 高光描边 + 外投影），
-        内含 4 颗 54×54 圆键，默认只显图标、hover 才展开文字标签。
+        内含 4 颗 70×58 圆角操作键，图标和文字标签始终显示。
      4) 底部控制台（日志）、状态栏、射线/时间开关、系统预检进度条的令牌。
 
    主题：双主题
@@ -36,12 +36,12 @@
 :root,
 [data-theme="light"] {
   /* ---- 底色 / 机箱层级 ---- */
-  --appBg:        #F5F5F7;   /* 应用最底画布 */
+  --appBg:        #F2F4F7;   /* 应用最底画布 */
   --chassis:      #FFFFFF;   /* 菜单栏 / 状态栏 */
   --panel:        #FFFFFF;   /* 卡片面板 */
   --panelHeader:  #FAFAFC;   /* 卡片内嵌标题条 / 视口工具条 / 统计小块底 */
-  --well:         #F5F5F7;   /* 凹陷区：输入框、进度槽、预检条底槽 */
-  --line:         #F0F0F0;   /* 卡片内发丝分隔线（1px） */
+  --well:         #F2F4F7;   /* 凹陷区：输入框、进度槽、预检条底槽 */
+  --line:         #E3E7ED;   /* 卡片内发丝分隔线（1px） */
   --lineStrong:   #E0E0E0;   /* 区块之间分隔线（菜单栏/控制台/状态栏上下） */
   --lineField:    #D2D2D7;   /* 输入框描边 */
 
@@ -54,8 +54,8 @@
 
   /* ---- 文字层级 ---- */
   --textPrimary:   #1D1D1F;  /* 标题、读数、值 */
-  --textSecondary: #6E6E73;  /* 说明、字段名、次级信息 */
-  --textMuted:     #8E8E93;  /* 最弱提示、日志时间戳、脚注 */
+  --textSecondary: #536071;  /* 说明、字段名、次级信息 */
+  --textMuted:     #687485;  /* 最弱提示、日志时间戳、脚注 */
   --textDisabled:  #AEAEB2;  /* 置灰控件文字 */
   --onAccent:      #FFFFFF;
   --glassText:     #172025;
@@ -100,11 +100,11 @@
   --rayFault:    0;          /* 射线层透明度：故障（强制归零） */
 
   /* ---- 磨砂玻璃控制坞 ---- */
-  --dockBg:        rgba(255, 255, 255, 0.62);
-  --dockBorder:    rgba(255, 255, 255, 0.90);
-  --dockShadow:    rgba(16, 16, 23, 0.14);
-  --dockKeyBg:     rgba(255, 255, 255, 0.92);  /* 键帽底 */
-  --dockKeyBgHover:rgba(255, 255, 255, 1);
+  --dockBg:        rgba(255, 255, 255, 0.34);
+  --dockBorder:    rgba(255, 255, 255, 0.60);
+  --dockShadow:    rgba(16, 16, 23, 0.10);
+  --dockKeyBg:     rgba(255, 255, 255, 0.60);  /* 键帽底 */
+  --dockKeyBgHover:rgba(255, 255, 255, 0.76);
   --dockLabelBg:   rgba(255, 255, 255, 0.94);  /* hover 展开的文字标签底 */
 
   /* ---- 底部控制台（日志） ---- */
@@ -122,15 +122,20 @@
 
   /* ---- 圆角 / 间距 ---- */
   --radiusCard:    18px;   /* 卡片 */
-  --radiusCardCompact: 12px;
+  --radiusCardCompact: 14px;
   --radiusPanel:   16px;   /* 规范板 / 大面板 */
-  --radiusDock:    37px;   /* 控制坞（高 74 → 全圆角胶囊） */
-  --radiusKey:     27px;   /* 坞内键帽（54 直径） */
+  --radiusDock:    22px;   /* 控制坞（高 74 → 全圆角胶囊） */
+  --radiusKey:     14px;   /* 坞内键帽（54 直径） */
   --radiusChip:    11px;   /* 芯片 / 徽章 / 统计小块 */
   --radiusControl: 12px;   /* 按钮 / 开关 */
   --radiusSmall:   8px;    /* 标签页 / 小控件 */
   --space1: 4px;  --space2: 8px;  --space3: 12px;
   --space4: 16px; --space6: 24px; --space8: 32px;
+
+  --fontSizeHint: 11px;
+  --fontSizeLabel: 12px;
+  --fontSizeBody: 13px;
+  --fontSizeTitle: 14px;
 
   /* ---- 字体 ---- */
   --fontUi:   "IBM Plex Sans", "Source Sans 3", "Segoe UI", "Microsoft YaHei UI", sans-serif;
@@ -168,7 +173,7 @@
 
   --textPrimary:   #E8ECF2;
   --textSecondary: #9AA4B2;
-  --textMuted:     #7E8898;
+  --textMuted:     #9BA6B6;
   --textDisabled:  #5F6873;
   --onAccent:      #FFFFFF;
   --glassText:     #E8ECF2;
@@ -207,11 +212,11 @@
   --rayFault:    0;
 
   /* 深底玻璃：低透明度白 + 白色描边（与画布 Control Dock · Frosted 一致） */
-  --dockBg:        rgba(255, 255, 255, 0.10);
-  --dockBorder:    rgba(255, 255, 255, 0.18);
-  --dockShadow:    rgba(0, 0, 0, 0.55);
-  --dockKeyBg:     rgba(255, 255, 255, 0.13);
-  --dockKeyBgHover:rgba(255, 255, 255, 0.22);
+  --dockBg:        rgba(255, 255, 255, 0.07);
+  --dockBorder:    rgba(255, 255, 255, 0.16);
+  --dockShadow:    rgba(0, 0, 0, 0.30);
+  --dockKeyBg:     rgba(255, 255, 255, 0.08);
+  --dockKeyBgHover:rgba(255, 255, 255, 0.15);
   --dockLabelBg:   rgba(30, 37, 48, 0.94);
   --dockHighlight: rgba(255, 255, 255, 0.25);
 
@@ -239,7 +244,7 @@
 .theme-toggle { display: inline-flex; gap: 2px; padding: 2px;
   background: var(--segTrack); border-radius: 12px; }
 .theme-toggle__seg { height: 20px; padding: 0 9px; display: inline-flex;
-  align-items: center; border-radius: 10px; font-size: 10.5px; font-weight: 400;
+  align-items: center; border-radius: 10px; font-size: var(--fontSizeLabel); font-weight: 400;
   color: var(--segIdleFg); background: transparent; border: 0; cursor: pointer; }
 .theme-toggle__seg[aria-pressed="true"] { background: var(--segActiveBg);
   color: var(--segActiveFg); font-weight: 600; }
@@ -277,7 +282,7 @@
 .scene-object { position: absolute; pointer-events: none; }
 .status-float { position: absolute; right: 12px; display: inline-flex;
   align-items: center; gap: 6px; padding: 5px 10px; border-radius: 10px;
-  font-family: var(--fontMono); font-size: 9.5px;
+  font-family: var(--fontMono); font-size: var(--fontSizeHint);
   color: var(--glassText); background: var(--glassBg); border: 1px solid var(--glassBorder);
   -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
   box-shadow: 0 4px 12px var(--glassShadow); }
@@ -305,36 +310,29 @@
 
 /* ============================================================
    磨砂玻璃控制坞（按钮说明要求：底座采用苹果的磨砂玻璃效果）
-   · 默认只显示 4 颗圆键（54×54，全圆角）
-   · 鼠标靠近（hover / focus-within）才展开文字标签
+   · 4 颗圆角操作键，图标与文字常驻
+   · hover / focus 保持位置与标签稳定
    · 玻璃配方跟随主题，两套值都在主题令牌里
    ============================================================ */
 .control-dock {
   display: inline-flex; gap: 8px; padding: 10px;
   background: var(--dockBg);
-  -webkit-backdrop-filter: blur(20px) saturate(140%);
-  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(135%);
+  backdrop-filter: blur(18px) saturate(135%);
   border: 1px solid var(--dockBorder);
   border-radius: var(--radiusDock);
   box-shadow: 0 6px 20px var(--dockShadow), inset 0 1px 1px var(--dockHighlight, rgba(255,255,255,.85));
 }
-.dock-key { position: relative; width: 54px; height: 54px; border-radius: var(--radiusKey);
-  display: inline-flex; align-items: center; justify-content: center;
+.dock-key { position: relative; width: 70px; height: 58px; border-radius: var(--radiusKey);
+  display: inline-flex; flex-direction: column; gap: 5px; align-items: center; justify-content: center;
   background: var(--dockKeyBg); border: 0; cursor: pointer;
   transition: background 140ms ease-out, transform 140ms ease-out; }
 .control-dock:hover .dock-key { background: var(--dockKeyBgHover); }
 .dock-key:active { transform: scale(0.94); }
-.dock-key[disabled], .dock-key[aria-disabled="true"] { opacity: 0.35; cursor: not-allowed; }
+.dock-key[disabled], .dock-key[aria-disabled="true"] { opacity: 0.55; cursor: not-allowed; }
 
-/* 展开的文字标签：默认隐藏，hover 才出现（在坞的下方居中展开） */
-.dock-key__label { position: absolute; top: calc(100% + 8px); left: 50%;
-  transform: translateX(-50%) translateY(-4px);
-  padding: 4px 8px; border-radius: 8px; white-space: nowrap;
-  font-size: 10.5px; color: var(--textPrimary); background: var(--dockLabelBg);
-  box-shadow: 0 4px 12px var(--dockShadow);
-  opacity: 0; pointer-events: none; transition: opacity 140ms ease-out, transform 140ms ease-out; }
-.control-dock:hover .dock-key__label,
-.dock-key:focus-visible .dock-key__label { opacity: 1; transform: translateX(-50%) translateY(0); }
+/* Persistent action labels remain legible without hover. */
+.dock-key__label { font-size: 11px; font-weight: 600; color: var(--textPrimary); white-space: nowrap; pointer-events: none; }
 
 /* 第二槽位按状态循环：开始（绿）→ 暂停（黄）→ 继续（浅蓝）
    色值取自用户提供的按钮 SVG，直接内联在 <svg> 里，不要用滤镜改色 */
@@ -344,10 +342,7 @@
 [data-state="paused"]   .dock-key--play  .dock-icon--resume { display: block; }
 [data-state="paused"]   .dock-key--play  { background: var(--accentSoft); }
 [data-state="fault"]    .dock-key--play  { opacity: 0.45; pointer-events: none; }
-[data-state="fault"]    .dock-key--estop { background: var(--dangerSoft);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 26%, transparent); }
-
-/* 扫描中：回零与读取置灰（暂停时回零可用） */
+/* 扫描中：回零与读取置灰 */
 [data-state="scanning"] .dock-key--home,
 [data-state="scanning"] .dock-key--restore { opacity: 0.35; pointer-events: none; }
 [data-state="paused"]   .dock-key--restore { opacity: 0.45; pointer-events: none; }
@@ -365,7 +360,7 @@
 .switch-field { height: 40px; padding: 0 10px; border-radius: 10px;
   background: var(--well); display: inline-flex; align-items: center;
   justify-content: space-between; gap: 8px; }
-.switch-field__key { font-size: 8.5px; color: var(--textSecondary); }
+.switch-field__key { font-size: var(--fontSizeHint); color: var(--textSecondary); }
 .switch-field__val { font-family: var(--fontMono); font-size: 14px; color: var(--textPrimary); }
 
 /* ============================================================
@@ -389,7 +384,7 @@
   padding: 8px; display: flex; flex-direction: column; gap: 2px; }
 .console__tab { height: 30px; padding: 0 10px; border-radius: var(--radiusSmall);
   display: flex; align-items: center; justify-content: space-between;
-  font-size: 10.5px; color: var(--textMuted); background: transparent; border: 0; cursor: pointer; }
+  font-size: var(--fontSizeLabel); color: var(--textMuted); background: transparent; border: 0; cursor: pointer; }
 .console__tab[aria-selected="true"] { background: var(--consoleTabActive);
   color: var(--textPrimary); font-weight: 600; }
 .log-line { display: flex; gap: 10px; font-size: 11.5px; line-height: 1.45; }
@@ -405,7 +400,7 @@
 .statusbar { height: 30px; padding: 0 14px; background: var(--chassis);
   border-top: 1px solid var(--lineStrong);
   display: flex; align-items: center; justify-content: space-between;
-  font-size: 10px; color: var(--textSecondary); }
+  font-size: var(--fontSizeHint); color: var(--textSecondary); }
 .statusbar__state { color: var(--textPrimary); font-weight: 600; }
 .statusbar__dot { width: 6px; height: 6px; border-radius: 3px; background: var(--ok); }
 [data-state="scanning"] .statusbar__dot { background: var(--warn); }

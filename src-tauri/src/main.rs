@@ -174,20 +174,94 @@ fn calculate_min_inner_size(
     )
 }
 
-/// Applies the readable minimum only while the window is restored.
+/// Enforces monitor-aware maximization and applies readable minima when restored.
 ///
 /// `set_min_size` ends up in `SetWindowPos`, and positioning a maximized window
 /// drops the maximized state while keeping the maximized size: the window then
 /// looks maximized but is offset and `IsZoomed` stays false. Maximized windows
 /// therefore keep the startup state untouched; the minimum is applied on the
 /// first resize that leaves maximized mode.
+#[cfg(windows)]
+unsafe extern "system" fn window_policy_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND, message: u32,
+    wparam: usize, lparam: isize, subclass_id: usize, maximize_only: usize,
+) -> isize {
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_SYSCOMMAND,
+        SC_MOVE, SC_SIZE, SC_RESTORE, HTCAPTION, WM_GETMINMAXINFO, MINMAXINFO,
+    };
+    if maximize_only != 0 {
+        let command = (wparam & 0xfff0) as u32;
+        if message == WM_SYSCOMMAND
+            && (command == SC_MOVE || command == SC_SIZE
+                || (command == SC_RESTORE && IsIconic(hwnd) == 0))
+        {
+            return 0;
+        }
+        if message == WM_NCLBUTTONDBLCLK && wparam == HTCAPTION as usize {
+            return 0;
+        }
+    }
+    if message == WM_NCDESTROY {
+        RemoveWindowSubclass(hwnd, Some(window_policy_proc), subclass_id);
+    }
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    if maximize_only != 0 && message == WM_GETMINMAXINFO && lparam != 0 {
+        use windows_sys::Win32::Graphics::Gdi::{
+            MonitorFromWindow, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+        };
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            let sizes = &mut *(lparam as *mut MINMAXINFO);
+            // Preserve the native invisible frame while fitting the visible
+            // window to rcWork, including taskbars on non-primary monitors.
+            let frame_x = (-sizes.ptMaxPosition.x).max(0);
+            let frame_y = (-sizes.ptMaxPosition.y).max(0);
+            sizes.ptMaxPosition.x = info.rcWork.left - info.rcMonitor.left - frame_x;
+            sizes.ptMaxPosition.y = info.rcWork.top - info.rcMonitor.top - frame_y;
+            sizes.ptMaxSize.x = info.rcWork.right - info.rcWork.left + frame_x * 2;
+            sizes.ptMaxSize.y = info.rcWork.bottom - info.rcWork.top + frame_y * 2;
+        }
+    }
+    result
+}
+
 fn apply_dynamic_min_size(window: &tauri::WebviewWindow) -> tauri::Result<()> {
-    if window.is_maximized().unwrap_or(false) {
+    if window.is_minimized().unwrap_or(false) {
         return Ok(());
     }
     if let Some(monitor) = window.current_monitor()? {
         let scale = monitor.scale_factor();
         let work_area = monitor.work_area().size.to_logical::<f64>(scale);
+        let physical = monitor.size();
+        let maximize_only = requires_maximized_window(
+            physical.width, physical.height, work_area.width, work_area.height,
+        );
+        let was_maximized = window.is_maximized().unwrap_or(false);
+        // Keep Windows' resizable frame so maximization respects the taskbar.
+        // Block user restore/size/move commands instead of removing that frame.
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::UI::Shell::SetWindowSubclass;
+            if SetWindowSubclass(window.hwnd()?.0, Some(window_policy_proc), 1, usize::from(maximize_only)) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        if window.is_maximizable()? == maximize_only {
+            window.set_maximizable(!maximize_only)?;
+        }
+        if maximize_only {
+            if !was_maximized { window.set_min_size(None::<tauri::LogicalSize<f64>>)?; }
+            if !window.is_maximized().unwrap_or(false) { window.maximize()?; }
+            return Ok(());
+        }
+        if was_maximized {
+            if !window.is_maximized().unwrap_or(false) { window.maximize()?; }
+            return Ok(());
+        }
         let outer_size = window.outer_size()?.to_logical::<f64>(scale);
         let inner_size = window.inner_size()?.to_logical::<f64>(scale);
         let decoration_width = (outer_size.width - inner_size.width).max(0.0);
@@ -203,6 +277,17 @@ fn apply_dynamic_min_size(window: &tauri::WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
+/// "1K" means up to 1080p here. High-resolution monitors also lock maximized
+/// when their DPI-adjusted work area cannot leave room around a readable window.
+fn requires_maximized_window(
+    physical_width: u32, physical_height: u32,
+    work_width: f64, work_height: f64,
+) -> bool {
+    physical_width <= 1920 || physical_height <= 1080
+        || work_width < DESIGN_WIDTH * MIN_READABLE_SCALE + 160.0
+        || work_height < DESIGN_HEIGHT * MIN_READABLE_SCALE + 100.0
+}
+
 /// Startup order matters: the window is created restored so Windows can record
 /// restore bounds, the readable minimum is applied while it is still restored,
 /// and only then is the window maximized. Maximizing from the configuration
@@ -210,7 +295,8 @@ fn apply_dynamic_min_size(window: &tauri::WebviewWindow) -> tauri::Result<()> {
 /// `IsZoomed` false and no placement to restore to.
 fn configure_window(window: &tauri::WebviewWindow) -> tauri::Result<()> {
     apply_dynamic_min_size(window)?;
-    window.maximize()
+    window.maximize()?;
+    window.show()
 }
 
 fn schedule_dynamic_min_size(window: tauri::WebviewWindow) {
@@ -335,9 +421,20 @@ async fn engine_command(
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::{calculate_min_inner_size, export_session_log, open_directory_in_shell,
+    use super::{calculate_min_inner_size, requires_maximized_window, export_session_log, open_directory_in_shell,
                 select_image_directory};
     use std::path::PathBuf;
+
+    #[test]
+    fn small_and_high_dpi_work_areas_require_maximized_windows() {
+        assert!(requires_maximized_window(1920, 1080, 1920.0, 1040.0));
+        assert!(requires_maximized_window(1366, 768, 1366.0, 728.0));
+        assert!(!requires_maximized_window(2560, 1440, 2560.0, 1400.0));
+        assert!(!requires_maximized_window(2560, 1440, 2048.0, 1112.0));
+        assert!(!requires_maximized_window(3840, 2160, 2560.0, 1400.0));
+        assert!(requires_maximized_window(3840, 2160, 1920.0, 1040.0));
+        assert!(requires_maximized_window(3440, 1440, 1720.0, 680.0));
+    }
 
     #[test]
     fn minimum_inner_size_uses_readable_design_scale_when_space_allows() {

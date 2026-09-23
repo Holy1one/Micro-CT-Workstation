@@ -7,16 +7,16 @@
  *   MOVE_ABS -> READY_TO_CAPTURE -> settle -> beam on -> exposure window ->
  *   D7100 capture -> frame validation -> CAPTURE_DONE -> commit -> next view
  *
- * Pause takes effect at the commit boundary with the pulse counter retained;
- * E-STOP cuts the beam and the motion chain in parallel and latches FAULT
- * (home reference lost) until the operator releases it and re-homes.
+ * Pause takes effect at the projection commit boundary with completed frames
+ * retained. A normal stop ends the current scan and invalidates HOME; device
+ * faults latch the preview output until preflight and HOME re-establish state.
  */
 
 import { CameraD7100, delay, XraySource12W, type CapturedFrame } from "./devices";
 import { cmd, degreesForPulses, FIRMWARE_VERSION, milliDeg, parseLine, pulsesForDegrees, type NanoStatus, type ParsedLine, parseStatus, PULSES_PER_REV } from "./protocol";
 import { FirmwareTransport, type NanoTransport } from "./transport";
 
-export type WorkflowPhase = "booting" | "ready" | "scanning" | "paused" | "fault" | "stopped" | "completed";
+export type WorkflowPhase = "booting" | "ready" | "scanning" | "paused" | "finishing" | "stopping" | "fault" | "stopped" | "completed";
 export type ConsoleLogLevel = "PASS" | "INFO" | "OK" | "WARN" | "ERR" | "ACTION";
 export type ConsoleLogSource = "system" | "xray" | "nano" | "camera" | "preflight" | "operator";
 
@@ -47,7 +47,7 @@ interface Checkpoint {
 }
 
 const CHECKPOINT_KEY = "micro-ct-workstation.checkpoint";
-const PER_VIEW_MS = 2600;
+const XRAY_COOLDOWN_MS = 300_000;
 const MAX_LOGS = 64;
 
 class AbortView extends Error {
@@ -65,8 +65,12 @@ class NanoLink {
   private bannerResolve: (() => void) | null = null;
   readonly banner: Promise<void>;
   lastStatus: NanoStatus | null = null;
+  private transport: NanoTransport;
+  private onRx?: (line: ParsedLine) => void;
 
-  constructor(private transport: NanoTransport, private onRx?: (line: ParsedLine) => void) {
+  constructor(transport: NanoTransport, onRx?: (line: ParsedLine) => void) {
+    this.transport = transport;
+    this.onRx = onRx;
     this.banner = new Promise((resolve) => {
       this.bannerResolve = resolve;
     });
@@ -92,6 +96,10 @@ class NanoLink {
         this.take(line.id);
         waiter.resolve(line);
       }
+    }
+    if (line.token === "STOPPED") {
+      const interruptedIds = this.waiters.filter((waiter) => waiter.id !== line.id).map((waiter) => waiter.id);
+      for (const id of interruptedIds) this.take(id)?.reject(new Error("operation interrupted by turntable STOP"));
     }
     this.onRx?.(line);
   }
@@ -119,6 +127,7 @@ class NanoLink {
 
   close(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    for (const waiter of [...this.waiters]) this.take(waiter.id)?.reject(new Error("preview link closed"));
     this.transport.close();
   }
 }
@@ -144,7 +153,7 @@ export class ScanWorkflow {
     taskId: "",
     projectionCount: 0,
     exposureMs: 0,
-    maxXraySec: 0,
+    maxXraySec: 600,
   };
   preflightPassed = false;
   preflightChecks = 0;
@@ -160,9 +169,17 @@ export class ScanWorkflow {
   checkpointAvailable = false;
 
   private pauseRequested = false;
-  private estopRequested = false;
+  private stopRequested = false;
   private scanRunning = false;
+  private scanTask: Promise<void> | null = null;
+  private stopTask: Promise<void> | null = null;
+  private stopSignal: Promise<void> = new Promise(() => undefined);
+  private resolveStopSignal: (() => void) | null = null;
   private logCounter = 0;
+  private projectionSamplesMs: number[] = [];
+  private beamSamplesMs: number[] = [];
+  private beamStartedAt: number | null = null;
+  private cooldownUntil: number | null = null;
   private onChange: () => void;
 
   constructor(onChange: () => void, transport?: NanoTransport) {
@@ -182,9 +199,44 @@ export class ScanWorkflow {
   }
 
   get etaText(): string {
-    if (this.phase === "paused") return "held";
-    if (this.phase !== "scanning") return "—";
-    return formatMmSs(((this.params.projectionCount - this.captured) * PER_VIEW_MS) / 1000);
+    if (this.phase === "paused" && this.cooldownUntil === null) return "held";
+    const seconds = this.etaSeconds;
+    return seconds === null ? "—" : formatMmSs(seconds);
+  }
+
+  get etaSeconds(): number | null {
+    if (this.phase !== "scanning" || this.projectionSamplesMs.length === 0) return null;
+    const remaining = this.params.projectionCount - this.captured;
+    if (remaining <= 0) return 0;
+    const average = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
+    const projectionMs = average(this.projectionSamplesMs);
+    const beamMs = average(this.beamSamplesMs);
+    const limitMs = this.params.maxXraySec * 1000;
+    const coolingMs = this.cooldownUntil === null ? 0 : Math.max(0, this.cooldownUntil - Date.now());
+    const beamBudget = this.beamStartedAt === null ? 0 : Math.max(0, Date.now() - this.beamStartedAt);
+    const futureCoolingCount = Math.floor((beamBudget + Math.max(0, remaining - 1) * beamMs) / limitMs);
+    return Math.ceil((remaining * projectionMs + coolingMs + futureCoolingCount * XRAY_COOLDOWN_MS) / 1000);
+  }
+
+  get manualControlsEnabled(): boolean {
+    if (!this.source.isConnected || this.source.isLatched || this.preflightRunning) return false;
+    if (this.phase === "scanning") return true;
+    if (["booting", "paused", "finishing", "stopping", "fault"].includes(this.phase)) return false;
+    if (this.source.beamOn) return true;
+    return (this.phase === "ready" || this.phase === "completed") && this.preflightPassed && this.homed;
+  }
+
+  get setpointControlsEnabled(): boolean {
+    return (
+      this.source.isConnected &&
+      !this.source.isLatched &&
+      !this.preflightRunning &&
+      !["booting", "scanning", "paused", "finishing", "stopping", "fault"].includes(this.phase)
+    );
+  }
+
+  get timerControlsEnabled(): boolean {
+    return !this.preflightRunning && ["ready", "stopped", "completed"].includes(this.phase);
   }
 
   // ------------------------------------------------------------- lifecycle
@@ -218,6 +270,9 @@ export class ScanWorkflow {
       if (this.phase === "booting") this.phase = "ready";
       this.emit();
     } catch (err) {
+      this.source.latchOff();
+      this.preflightPassed = false;
+      this.homed = false;
       this.log("ERR", "system", `boot sequence failed · ${err instanceof Error ? err.message : String(err)}`);
       this.phase = "fault";
       this.emit();
@@ -226,29 +281,48 @@ export class ScanWorkflow {
 
   async runPreflight(): Promise<void> {
     if (this.preflightRunning) return;
-    if (this.phase === "fault") throw new Error("Release E-STOP before pre-inspection");
+    if (this.scanRunning || this.stopTask || ["scanning", "finishing", "stopping"].includes(this.phase)) {
+      throw new Error("Preflight is unavailable while a scan is active");
+    }
     this.validateCompleteParams(this.params);
+    const recovering = this.phase === "fault" || this.phase === "stopped";
     this.preflightRunning = true;
     this.preflightPassed = false;
     this.preflightChecks = 0;
     this.emit();
-    const checks = 8;
-    for (let i = 1; i <= checks; i++) {
-      await delay(130);
-      this.preflightChecks = i;
+    try {
+      const checks = 8;
+      for (let i = 1; i <= checks; i++) {
+        await delay(130);
+        this.preflightChecks = i;
+        this.emit();
+      }
+      // REARM is part of a successful preview preflight, never an operator
+      // supplied latch-release command. HOME remains a separate requirement.
+      await this.link.exec(cmd.rearm("{id}"), ["OK"]);
+      this.source.rearm();
+      this.preflightPassed = true;
+      if (recovering) {
+        this.homed = false;
+        this.phase = "stopped";
+      }
+      this.log("PASS", "preflight", "8/8 DEVELOPER PREVIEW checks passed · NO REAL HARDWARE · NO DEVICE I/O");
+    } catch (err) {
+      if (recovering) this.phase = "fault";
+      this.log("ERR", "preflight", `preview preflight failed · ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    } finally {
+      this.preflightRunning = false;
       this.emit();
     }
-    this.preflightPassed = true;
-    this.preflightRunning = false;
-    this.log("PASS", "preflight", "8/8 DEVELOPER PREVIEW checks passed · NO REAL HARDWARE · NO DEVICE I/O");
-    this.emit();
   }
 
   // --------------------------------------------------------------- commands
 
   async home(): Promise<void> {
     this.ensureNotScanning("HOME");
-    if (this.phase === "fault") throw new Error("Release E-STOP before homing");
+    if (this.phase === "fault") throw new Error("Run preflight before HOME to recover from the device fault");
+    if (!this.preflightPassed) throw new Error("Run preflight before HOME");
     if (this.phase === "paused") {
       this.captured = 0;
       this.frames = [];
@@ -268,57 +342,100 @@ export class ScanWorkflow {
     this.captured = 0;
     this.frames = [];
     this.log("INFO", "nano", "turntable homed · Hall LOW at 0.00°");
-    if (this.phase === "stopped") {
-      await this.runPreflight();
-      this.phase = "ready";
-      this.log("PASS", "system", "recovery complete · back to READY");
-    }
+    if (this.phase !== "booting") this.phase = "ready";
     this.emit();
   }
 
-  async startScan(): Promise<void> {
-    if (this.scanRunning) return;
-    if (this.phase === "fault" || this.estopRequested) throw new Error("FAULT latched · release E-STOP and re-home first");
+  startScan(): void {
+    if (this.scanRunning || this.stopTask) throw new Error("A scan is already active or stopping");
+    if (this.phase === "fault") throw new Error("Device fault latched · run preflight and HOME to recover");
+    if (!["ready", "completed", "paused"].includes(this.phase)) throw new Error("Scan is unavailable until the current operation has ended");
     if (!this.preflightPassed) throw new Error("Run pre-inspection first");
     if (!this.homed) throw new Error("Home the turntable first");
     const resumeFrom = this.phase === "paused" ? this.captured : 0;
     if (resumeFrom === 0) {
       this.frames = [];
       this.angleDeg = 0;
+      this.projectionSamplesMs = [];
+      this.beamSamplesMs = [];
+      this.beamStartedAt = null;
+      this.cooldownUntil = null;
     }
     this.log("ACTION", "operator", resumeFrom > 0 ? `resume requested · continuing from view ${resumeFrom + 1}` : "start requested · acquisition begins at view 1");
     this.pauseRequested = false;
-    this.estopRequested = false;
+    this.stopRequested = false;
+    this.stopSignal = new Promise<void>((resolve) => { this.resolveStopSignal = resolve; });
     this.phase = "scanning";
     this.scanRunning = true;
     this.emit();
-    try {
-      await this.scanLoop(resumeFrom + 1);
-    } finally {
+    const task = this.scanLoop(resumeFrom + 1).finally(() => {
       this.scanRunning = false;
+      this.scanTask = null;
+      this.resolveStopSignal = null;
       this.emit();
-    }
+    });
+    this.scanTask = task;
   }
 
   pause(): void {
     if (this.phase !== "scanning") return;
     this.pauseRequested = true;
+    this.log("ACTION", "operator", "pause requested · applying after the active projection commits");
+    this.emit();
+  }
+
+  stop(): Promise<void> {
+    if (this.stopTask) return this.stopTask;
+    if (!["scanning", "paused", "finishing"].includes(this.phase)) return Promise.resolve();
+    const task = this.performStop();
+    this.stopTask = task.finally(() => { this.stopTask = null; });
+    return this.stopTask;
+  }
+
+  private async performStop(): Promise<void> {
+    this.stopRequested = true;
+    this.pauseRequested = false;
+    this.phase = "stopping";
     this.source.disable();
-    const pulses = this.captured * this.pulsesPerView;
-    this.log("ACTION", "operator", "pause requested · beam cut, motion holds position");
-    this.log("WARN", "system", "beam disabled by pause · X-ray output latched off");
-    this.log("INFO", "nano", `PAUSE acknowledged · motion halted at ${this.angleDeg.toFixed(2)}°`);
-    this.log("INFO", "xray", "MOVE_ABS cancelled · waiting for resume or HOME");
-    this.log("OK", "camera", `${this.captured} / ${this.params.projectionCount} frames kept in buffer · no data loss`);
-    this.log("INFO", "nano", `pulse counter ${pulses} retained · ${this.pulsesPerView} pulses per view`);
-    this.phase = "paused";
+    this.resolveStopSignal?.();
+    this.log("ACTION", "operator", "scan stop requested · ending the active scan");
+    this.emit();
+
+    const scanTask = this.scanTask;
+    let stopError: unknown = null;
+    try {
+      await this.link.exec(cmd.stop("{id}"), ["STOPPED"], 2500);
+    } catch (err) {
+      stopError = err;
+      this.failClosed(`turntable STOP was not confirmed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      await this.link.exec(cmd.xrayWarning("{id}", false), ["OK"], 1500);
+    } catch (err) {
+      stopError ??= err;
+      this.failClosed(`XRAY_WARNING OFF was not confirmed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (scanTask) {
+      try {
+        await this.withTimeout(scanTask, 3000, "scan task did not terminate after STOP");
+      } catch (err) {
+        stopError ??= err;
+        this.failClosed(err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (stopError) throw stopError;
+
+    this.preflightPassed = false;
+    this.homed = false;
+    this.phase = "stopped";
+    this.log("PASS", "system", `scan stopped · ${this.captured} / ${this.params.projectionCount} committed · run preflight and HOME before another scan`);
     this.emit();
   }
 
   async restore(): Promise<void> {
     this.ensureNotScanning("restore");
-    if (this.phase === "fault" || this.estopRequested) {
-      throw new Error("FAULT latched · release E-STOP and repeat pre-inspection and HOME first");
+    if (this.phase === "fault") {
+      throw new Error("Device fault latched · run preflight and HOME before restoring");
     }
     if (this.phase === "stopped" || !this.preflightPassed || !this.homed) {
       throw new Error("Recovery required · repeat pre-inspection and HOME before restore");
@@ -357,42 +474,9 @@ export class ScanWorkflow {
     this.emit();
   }
 
-  async estop(): Promise<void> {
-    if (this.phase === "fault") return;
-    this.estopRequested = true;
-    this.pauseRequested = false;
-    this.source.latchOff();
-    try {
-      await this.link.exec(cmd.stop("{id}"), ["STOPPED"], 2000);
-    } catch {
-      /* link may already be torn down; latch stands regardless */
-    }
-    this.preflightPassed = false;
-    this.homed = false;
-    this.log("ACTION", "operator", "E-STOP pressed · all outputs cut");
-    this.log("ERR", "nano", "STOP · STOPPED POSITION_UNKNOWN · pulse counter invalidated");
-    this.log("ERR", "system", "safety latch engaged · X-ray output hard-disabled");
-    this.log("WARN", "xray", "beam off · interlock still closed · no dose leak");
-    this.log("INFO", "camera", `acquisition aborted · ${this.captured} / ${this.params.projectionCount} frames kept in buffer`);
-    this.log("ACTION", "operator", "press E-STOP to clear · then REARM + HOME to recover");
-    this.phase = "fault";
-    this.emit();
-  }
-
-  async estopRelease(): Promise<void> {
-    if (this.phase !== "fault") return;
-    this.source.rearm();
-    await this.link.exec(cmd.rearm("{id}"), ["OK"]).catch(() => undefined);
-    this.estopRequested = false;
-    this.log("ACTION", "operator", "E-STOP released · safety latch cleared");
-    this.log("WARN", "system", "home reference lost · run HOME, then pre-inspection, before scanning");
-    this.phase = "stopped";
-    this.emit();
-  }
-
   async retryDevice(id: "xray" | "turntable" | "camera"): Promise<void> {
     if (this.phase === "fault") {
-      this.log("WARN", "system", `${id} retry deferred · clear FAULT first`);
+      this.log("WARN", "system", `${id} retry deferred · run preflight and HOME to recover from the device fault`);
       this.emit();
       return;
     }
@@ -405,14 +489,14 @@ export class ScanWorkflow {
   }
 
   xrayDisconnect(): void {
-    if (this.phase === "scanning" || this.phase === "paused") return;
+    if (["scanning", "paused", "finishing", "stopping"].includes(this.phase)) return;
     this.source.disconnect();
     this.log("ACTION", "xray", "preview X-ray disconnected · NO DEVICE I/O");
     this.emit();
   }
 
   setParams(partial: Partial<ScanParams>): void {
-    if (this.phase === "scanning" || this.phase === "paused") return;
+    if (["scanning", "paused", "finishing", "stopping"].includes(this.phase)) return;
     if (Object.keys(partial).length === 0) throw new Error("Scan setup patch is empty");
 
     const next = { ...this.params, ...partial };
@@ -424,15 +508,15 @@ export class ScanWorkflow {
     }
     if (
       "projectionCount" in partial &&
-      (!Number.isInteger(next.projectionCount) || next.projectionCount < 1 || next.projectionCount > 360)
+      (!Number.isInteger(next.projectionCount) || next.projectionCount < 1 || next.projectionCount > 3600)
     ) {
-      throw new Error("Projection count must be between 1 and 360");
+      throw new Error("Projection count must be between 1 and 3600");
     }
     if (
       "exposureMs" in partial &&
-      (!Number.isInteger(next.exposureMs) || next.exposureMs < 1 || next.exposureMs > 10000)
+      (!Number.isFinite(next.exposureMs) || next.exposureMs < 0.125 || next.exposureMs > 30000)
     ) {
-      throw new Error("Exposure must be between 1 and 10000 ms");
+      throw new Error("Exposure must be between 0.125 and 30000 ms");
     }
     if (
       "maxXraySec" in partial &&
@@ -442,12 +526,16 @@ export class ScanWorkflow {
     }
 
     this.params = next;
+    this.preflightPassed = false;
+    this.homed = false;
+    if (this.phase !== "fault" && this.phase !== "booting" && this.phase !== "stopped") this.phase = "ready";
     this.camera.configure(this.params.savePath);
     this.log("INFO", "system", `parameters updated · ${this.params.projectionCount} views · ${this.angleStepDeg.toFixed(2)}°/view · ${this.params.exposureMs} ms`);
     this.emit();
   }
 
   sendVoltage(kv: number): void {
+    if (!this.setpointControlsEnabled) throw new Error("X-ray setpoint controls are unavailable in the current preview phase");
     const before = this.source.readback();
     this.source.setVoltage(kv);
     const applied = this.source.readback();
@@ -459,6 +547,7 @@ export class ScanWorkflow {
   }
 
   sendCurrent(ua: number): void {
+    if (!this.setpointControlsEnabled) throw new Error("X-ray setpoint controls are unavailable in the current preview phase");
     const before = this.source.readback();
     this.source.setCurrent(ua);
     const applied = this.source.readback();
@@ -475,12 +564,15 @@ export class ScanWorkflow {
       this.pause();
       return;
     }
-    if (this.phase === "fault") return;
+    if (["paused", "finishing", "stopping", "fault"].includes(this.phase)) return;
     if (this.source.beamOn) {
       this.source.disable();
       this.log("ACTION", "operator", "Xray Disable · tube off");
       this.log("INFO", "xray", "beam off · output disabled");
     } else {
+      if (!this.preflightPassed || !this.homed || this.preflightRunning) {
+        throw new Error("Run preflight and HOME before enabling preview X-ray output");
+      }
       this.source.enable();
       this.log("ACTION", "operator", "Xray Enable · tube on at setpoint");
       this.log("WARN", "xray", `beam on · ${this.source.readback().setKv.toFixed(1)} kV / ${this.source.readback().setUa.toFixed(1)} µA · interlock closed`);
@@ -489,7 +581,7 @@ export class ScanWorkflow {
   }
 
   timerToggle(): void {
-    if (this.phase === "scanning") return;
+    if (!this.timerControlsEnabled) return;
     this.timerOn = !this.timerOn;
     this.log("INFO", "xray", this.timerOn ? "exposure timer on · hardware window armed" : "exposure timer off");
     this.emit();
@@ -515,11 +607,11 @@ export class ScanWorkflow {
     if (requireText && !params.savePath.trim()) {
       throw new Error("Select a non-empty Save Path before pre-inspection");
     }
-    if (!Number.isInteger(params.projectionCount) || params.projectionCount < 1 || params.projectionCount > 360) {
-      throw new Error("Projection count must be between 1 and 360");
+    if (!Number.isInteger(params.projectionCount) || params.projectionCount < 1 || params.projectionCount > 3600) {
+      throw new Error("Projection count must be between 1 and 3600");
     }
-    if (!Number.isInteger(params.exposureMs) || params.exposureMs < 1 || params.exposureMs > 10000) {
-      throw new Error("Exposure must be between 1 and 10000 ms");
+    if (!Number.isFinite(params.exposureMs) || params.exposureMs < 0.125 || params.exposureMs > 30000) {
+      throw new Error("Exposure must be between 0.125 and 30000 ms");
     }
     if (!Number.isInteger(params.maxXraySec) || params.maxXraySec < 1 || params.maxXraySec > 600) {
       throw new Error("Maximum continuous X-ray duration must be between 1 and 600 seconds");
@@ -532,27 +624,50 @@ export class ScanWorkflow {
     const total = this.params.projectionCount;
     try {
       for (let view = startView; view <= total; view++) {
-        this.gate();
+        if (this.stopRequested) return;
+        if (this.cooldownUntil !== null) {
+          this.log("WARN", "xray", "Continuous X-ray limit reached · cooling for 300 seconds before resuming");
+          let cooldownTimer: ReturnType<typeof setTimeout> | null = null;
+          try {
+            await Promise.race([
+              new Promise<void>((resolve) => { cooldownTimer = setTimeout(resolve, Math.max(0, this.cooldownUntil! - Date.now())); }),
+              this.stopSignal.then(() => { throw new AbortView(); }),
+            ]);
+          } finally {
+            if (cooldownTimer !== null) clearTimeout(cooldownTimer);
+          }
+          this.cooldownUntil = null;
+          this.emit();
+        }
+        const projectionStartedAt = Date.now();
         const angle = (view - 1) * this.angleStepDeg;
-        await this.link.exec(cmd.moveAbs("{id}", milliDeg(angle)), ["READY_TO_CAPTURE"], 8000);
+        await this.awaitOrStop(this.link.exec(cmd.moveAbs("{id}", milliDeg(angle)), ["READY_TO_CAPTURE"], 8000));
         this.angleDeg = angle;
         this.log("INFO", "nano", `MOVE_ABS view ${view} → ${angle.toFixed(2)}° · ACK`);
         this.emit();
-        this.gate();
+        if (this.stopRequested) return;
         if (!this.source.beamOn) {
           this.source.enable();
-          await this.link.exec(cmd.xrayWarning("{id}", true), ["OK"]).catch(() => undefined);
+          this.beamStartedAt = Date.now();
+          await this.link.exec(cmd.xrayWarning("{id}", true), ["OK"]);
         }
         const rb = this.source.readback();
         this.log("INFO", "xray", `DEVELOPER PREVIEW exposure · PREVIEW DATA ${this.params.exposureMs} ms · ${rb.setKv.toFixed(1)} kV / ${rb.setUa.toFixed(1)} µA · NO DEVICE I/O`);
-        await delay(Math.max(this.params.exposureMs, 240));
-        this.gate();
-        const frame = await this.camera.capture(view, angle, this.params.exposureMs);
+        await this.awaitOrStop(delay(Math.max(this.params.exposureMs, 240)));
+        const frame = await this.awaitOrStop(this.camera.capture(view, angle, this.params.exposureMs));
+        if (this.stopRequested) return;
         if (!frame.shaOk) throw new Error(`frame ${frame.fileName} failed validation`);
+        await this.awaitOrStop(this.link.exec(cmd.captureDone("{id}"), ["IDLE"]));
         this.frames = [...this.frames, frame];
         this.captured = view;
+        this.projectionSamplesMs.push(Math.max(1, Date.now() - projectionStartedAt));
+        this.beamSamplesMs.push(Math.max(1, Date.now() - Math.max(projectionStartedAt, this.beamStartedAt ?? projectionStartedAt)));
+        if (this.beamStartedAt !== null && Date.now() - this.beamStartedAt >= this.params.maxXraySec * 1000 && view < total) {
+          await this.closeOutputAtBoundary("Continuous X-ray limit reached after completed exposure");
+          this.beamStartedAt = null;
+          this.cooldownUntil = Date.now() + XRAY_COOLDOWN_MS;
+        }
         this.log("OK", "camera", `captured view ${view} · stored ${this.captured} / ${total}`);
-        await this.link.exec(cmd.captureDone("{id}"), ["IDLE"]);
         this.log("INFO", "nano", "CAPTURE_DONE sent · awaiting next move");
         this.writeCheckpoint(view, angle);
         if (view < total) {
@@ -560,32 +675,112 @@ export class ScanWorkflow {
           this.log("INFO", "system", `view ${view + 1} queued → ${nextAngle.toFixed(2)}° · ETA ${this.etaText}`);
         }
         this.emit();
+        if (this.stopRequested) return;
+        if (this.pauseRequested) {
+          await this.closeOutputAtBoundary("Pause boundary");
+          this.pauseRequested = false;
+          this.phase = "paused";
+          this.log("PASS", "system", `scan paused at a committed projection · ${this.captured} / ${total} retained`);
+          this.emit();
+          return;
+        }
       }
-      this.source.disable();
-      await this.link.exec(cmd.xrayWarning("{id}", false), ["OK"]).catch(() => undefined);
-      this.phase = "completed";
-      this.clearCheckpoint();
-      this.log("PASS", "system", `scan complete · ${total} / ${total} views committed · ${this.params.savePath}`);
-      this.emit();
+      if (this.stopRequested) return;
+      if (this.pauseRequested) {
+        await this.closeOutputAtBoundary("Pause before finalization");
+        this.pauseRequested = false;
+        this.phase = "paused";
+        this.emit();
+        return;
+      }
+      await this.finishScan(total);
     } catch (err) {
-      if (err instanceof AbortView) return; // pause / e-stop already logged
-      if (this.estopRequested) return;
-      this.source.latchOff();
-      this.phase = "fault";
-      this.homed = false;
-      this.log("ERR", "nano", `${err instanceof Error ? err.message : String(err)}`);
-      this.log("ERR", "system", "safety latch engaged · X-ray output hard-disabled");
-      this.log("ACTION", "operator", "press E-STOP to clear · then REARM + HOME to recover");
-      this.emit();
+      if (this.stopRequested || (err instanceof AbortView && this.stopRequested)) return;
+      await this.failScan(err);
     }
   }
 
-  private gate(): void {
-    if (this.pauseRequested || this.estopRequested) throw new AbortView();
+  private async finishScan(total: number): Promise<void> {
+    this.source.disable();
+    await this.closeOutputAtBoundary("All projections committed");
+    if (this.stopRequested) return;
+    this.phase = "finishing";
+    this.log("ACTION", "nano", "returning to zero through the simulated forward-only 360.000° target");
+    this.emit();
+
+    await this.awaitOrStop(this.link.exec(cmd.moveAbs("{id}", milliDeg(360)), ["READY_TO_CAPTURE"], 8000));
+    if (this.stopRequested) return;
+    const statusLine = await this.awaitOrStop(this.link.exec(cmd.status("{id}"), ["STATUS"]));
+    const status = parseStatus(statusLine);
+    const expectedPulses = pulsesForDegrees(360);
+    if (status.state !== "CAPTURE_HOLD" || status.pos !== expectedPulses || !status.homed || !status.rearmed) {
+      throw new Error(`preview final zero check failed: state=${status.state} pos=${status.pos} expected=${expectedPulses} homed=${status.homed} rearmed=${status.rearmed}`);
+    }
+    await this.awaitOrStop(this.link.exec(cmd.captureDone("{id}"), ["IDLE"]));
+    if (this.stopRequested) return;
+    this.angleDeg = 0;
+    this.phase = "completed";
+    this.clearCheckpoint();
+    this.log("PASS", "nano", "preview turntable returned to the zero orientation · full forward turn confirmed");
+    this.log("PASS", "system", `scan complete · ${total} / ${total} views committed · ${this.params.savePath}`);
+    this.emit();
+  }
+
+  private async closeOutputAtBoundary(reason: string): Promise<void> {
+    this.source.disable();
+    await this.link.exec(cmd.xrayWarning("{id}", false), ["OK"]);
+    this.log("INFO", "xray", `${reason} · preview beam and warning output disabled`);
+  }
+
+  private async failScan(reason: unknown): Promise<void> {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    this.source.latchOff();
+    this.preflightPassed = false;
+    this.homed = false;
+    this.pauseRequested = false;
+    this.phase = "fault";
+    this.log("ERR", "nano", message);
+    this.log("ERR", "system", "device fault latched · preview X-ray output hard-disabled");
+    this.emit();
+    try { await this.link.exec(cmd.xrayWarning("{id}", false), ["OK"], 1500); } catch { /* keep the fault latched */ }
+    try { await this.link.exec(cmd.stop("{id}"), ["STOPPED"], 2500); } catch { /* keep the fault latched */ }
+  }
+
+  private failClosed(message: string): void {
+    this.source.latchOff();
+    this.preflightPassed = false;
+    this.homed = false;
+    this.phase = "fault";
+    this.log("ERR", "system", `preview stop failed closed · ${message}`);
+    this.emit();
+  }
+
+  private async awaitOrStop<T>(operation: Promise<T>): Promise<T> {
+    if (this.stopRequested) throw new AbortView();
+    return Promise.race([
+      operation,
+      this.stopSignal.then(() => { throw new AbortView(); }),
+    ]);
+  }
+
+  private async withTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<T>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private ensureNotScanning(what: string): void {
-    if (this.phase === "scanning") throw new Error(`${what} is unavailable during a scan`);
+    if (this.scanRunning || this.stopTask || ["scanning", "finishing", "stopping"].includes(this.phase)) {
+      throw new Error(`${what} is unavailable during a scan`);
+    }
   }
 
   // -------------------------------------------------------------- checkpoint
@@ -640,6 +835,11 @@ export class ScanWorkflow {
   }
 
   close(): void {
+    if (["scanning", "paused", "finishing", "stopping"].includes(this.phase)) {
+      void this.stop().catch(() => undefined).finally(() => this.link.close());
+      return;
+    }
+    this.source.disable();
     this.link.close();
   }
 }

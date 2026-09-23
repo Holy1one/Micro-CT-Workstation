@@ -7,7 +7,7 @@
 - `src/main.rs` 只负责 JSONL 循环和进程退出关束，不承载业务状态。
 - `src/devices/xray/` 只处理 Moxtek I/O、实测回读和 fail-closed 关束；设定值不得冒充实测值。
 - `src/devices/camera/` 只处理 D7100/DigiCamControl 与主机文件确认；不得静默回退到存储卡。
-- `src/devices/turntable/` 只处理 Nano 协议、运动确认、警告和 STOP/E-STOP；协议不得靠猜测改变。
+- `src/devices/turntable/` 只处理 Nano 协议、运动确认、警告和原生 STOP；协议不得靠猜测改变。硬件急停保护独立于界面普通 Stop。
 - 三类设备模块不得互相调用；跨设备顺序只存在于 `src/scan.rs`。
 - 不得让 Tauri、React 或设备 worker 推进第二份生产扫描状态。
 - 任何错误、超时、掉线或未知设备状态都 fail closed；关束未确认不得报告安全完成。

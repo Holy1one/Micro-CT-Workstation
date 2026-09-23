@@ -12,6 +12,8 @@ export type EnginePhase =
   | "ready"
   | "running"
   | "paused"
+  | "finishing"
+  | "stopping"
   | "stopped"
   | "completed"
   | "fault";
@@ -104,7 +106,6 @@ export type EngineCommand =
   | { type: "restore_previous" }
   | { type: "stop" }
   | { type: "set_parameters"; parameters: ScanParameters }
-  | { type: "estop_release" }
   | { type: "retry_device"; device: DeviceId }
   | { type: "xray_disconnect" }
   | { type: "camera_test_capture" }
@@ -164,6 +165,7 @@ export interface ConsoleFrame {
 }
 
 export interface WorkstationView {
+  cameraExposure: { minMs: number; maxMs: number; known: boolean };
   dataState: ConsoleDataState;
   phaseWord: string;
   phaseTone: "accent" | "warn" | "danger";
@@ -177,15 +179,16 @@ export interface WorkstationView {
   };
   floats: ConsoleFloatView[];
   safetyBar: { text: string; tone: "muted" | "danger" | "dangerBold" };
-  scene: { angleDeg: number; rotated: boolean };
+  scene: { angleDeg: number; rotated: boolean; angleKnown: boolean; rotationDirection: -1 | 1 };
   xray: {
     connected: boolean;
     setKv: number;
     setUa: number;
-    monKv: number;
-    monUa: number;
-    powerW: number;
-    tempC: number;
+    monKv: number | null;
+    monUa: number | null;
+    powerW: number | null;
+    tempC: number | null;
+    beamState: "on" | "off" | "unknown";
     beamOn: boolean;
     latched: boolean;
     onSec: number;
@@ -216,7 +219,7 @@ export interface WorkstationView {
     home: boolean;
     play: boolean;
     restore: boolean;
-    estop: boolean;
+    stop: boolean;
     playMode: "start" | "pause" | "resume" | "disabled";
     homeReason: string;
     playReason: string;

@@ -8,7 +8,8 @@
 - `App.tsx`: composes the workstation panels, menus, controls, dialogs, logs, and image area.
 - `tokens.css`: semantic color and state tokens for light/dark and safety states.
 - `styles.css`: workstation layout and component styling.
-- `canvas-layout.ts`: pure fixed-canvas scaling calculations.
+- `canvas-layout.ts`: pure client-filling grid dimensions and uniform control scale; never letterboxes.
+- `scan-input.ts`: validates projection/exposure drafts and converts minute input to the engine's seconds.
 - `menuActions.ts`: menu vocabulary and command availability.
 
 ## `engine/`
@@ -23,6 +24,8 @@
 ## `scene/`
 
 Read-only Three.js visualization. `scene-config.ts` owns display geometry, `EquipmentScene.tsx` builds the model, and `LiveSceneCanvas.tsx` owns camera interaction. WebGL fallback and theme conversion remain display-only.
+
+`angle-feedback.ts` linearly follows confirmed angle samples over 300 ms without extrapolation. The turntable platter, marker and sample share one animated transform; the camera and source stay fixed. Unknown feedback freezes the displayed pose; paused/stopped/completed snapshots settle at the confirmed angle. Long gaps and task changes re-anchor instead of replaying unobserved motion. Renderer diagnostics expose the actual mesh angle as a canvas data attribute for offline QA; they never feed device state back into the engine.
 
 ## `platform/`
 

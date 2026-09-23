@@ -1,88 +1,56 @@
 /**
- * Numeric regression tests for the fixed workstation canvas.
- * The assertions cover supported aspect ratios and scale clamps so CSS cannot
- * hide an oversized canvas and falsely appear to pass layout acceptance.
+ * Client-filling layout acceptance: controls use one scale and the grid adapts
+ * to the available width and height, without any letterboxing.
  */
-
 import assert from "node:assert/strict";
 import test from "node:test";
+import { computeCanvasLayout, DESIGN_HEIGHT, DESIGN_WIDTH } from "../src/canvas-layout.ts";
+import { readFileSync } from "node:fs";
 
-import {
-  computeCanvasLayout,
-  DESIGN_HEIGHT,
-  DESIGN_WIDTH,
-  MIN_CANVAS_SCALE,
-} from "../src/canvas-layout.ts";
-
-const bothAxesFlush = (layout, viewportWidth, viewportHeight) =>
-  Math.abs(viewportWidth - layout.scaledWidth) <= 0.001 &&
-  Math.abs(viewportHeight - layout.scaledHeight) <= 0.001;
-
-test("design canvas is authored at the fixed 16:9 baseline", () => {
+test("frontend, CSS and desktop share a 1920 by 1080 baseline", () => {
   assert.equal(DESIGN_WIDTH, 1920);
   assert.equal(DESIGN_HEIGHT, 1080);
-  assert.equal(MIN_CANVAS_SCALE, 0.9);
+  const config = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url)));
+  assert.equal(config.app.windows[0].width, DESIGN_WIDTH);
+  assert.equal(config.app.windows[0].height, DESIGN_HEIGHT);
+  const rust = readFileSync(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8");
+  assert.match(rust, new RegExp("const DESIGN_WIDTH: f64 = " + DESIGN_WIDTH + "\\.0"));
+  assert.match(rust, new RegExp("const DESIGN_HEIGHT: f64 = " + DESIGN_HEIGHT + "\\.0"));
 });
 
-test("1080p viewport fills both axes without any gutter", () => {
-  const layout = computeCanvasLayout(1920, 1080);
-  assert.equal(layout.mode, "fill");
-  assert.equal(layout.zoom, 1);
-  assert.equal(layout.designHeight, 1080);
-  assert.ok(bothAxesFlush(layout, 1920, 1080));
-  assert.equal(layout.gutterX, 0);
-  assert.equal(layout.gutterY, 0);
-});
-
-test("1K maximised client area leaves no side gutter", () => {
-  // 1920 x 1009 is what a 1080p screen leaves after the taskbar.
-  const layout = computeCanvasLayout(1920, 1009);
-  assert.equal(layout.mode, "fill");
-  assert.ok(Math.abs(layout.zoom - 1) < 1e-9);
-  assert.ok(Math.abs(layout.designHeight - 1009) < 1e-6);
-  assert.ok(bothAxesFlush(layout, 1920, 1009));
-  assert.equal(layout.gutterX, 0);
-  assert.equal(layout.gutterY, 0);
-});
-
-test("reported 1011 x 695 client area remains flush on both axes", () => {
-  const layout = computeCanvasLayout(1011, 695);
-  assert.equal(layout.mode, "fill");
-  assert.ok(bothAxesFlush(layout, 1011, 695));
-  assert.equal(layout.gutterX, 0);
-  assert.equal(layout.gutterY, 0);
-});
-
-test("smallest allowed window is 0.9 of the design canvas and still fills", () => {
-  const layout = computeCanvasLayout(1728, 972);
-  assert.equal(layout.mode, "fill");
-  assert.ok(Math.abs(layout.zoom - MIN_CANVAS_SCALE) < 1e-9);
-  assert.ok(Math.abs(layout.designHeight - 1080) < 1e-6);
-  assert.ok(bothAxesFlush(layout, 1728, 972));
-});
-
-test("extreme aspect ratios fall back to symmetric contain", () => {
-  // Ultrawide 3440 x 1440 would need a design height below the readable floor.
-  const layout = computeCanvasLayout(3440, 1440);
-  assert.equal(layout.mode, "contain");
-  assert.ok(Math.abs(layout.zoom - 1440 / 1080) < 1e-9);
-  assert.ok(Math.abs(layout.gutterX - (3440 - 1920 * (1440 / 1080)) / 2) < 1e-6);
-  assert.equal(layout.gutterY, 0);
-});
-
-test("degenerate viewports never produce negative sizes or gutters", () => {
-  for (const [width, height] of [
-    [0, 0],
-    [-10, 800],
-    [Number.NaN, 900],
-    [1024, Number.POSITIVE_INFINITY],
-  ]) {
+for (const [label, width, height] of [
+  ["1080p design", 1920, 1080], ["1080p desktop client", 1920, 1009],
+  ["1440p", 2560, 1440], ["4K", 3840, 2160],
+  ["1440p at 125% DPI", 2048, 1112], ["4K at 150% DPI", 2560, 1400],
+  ["4K at 200% DPI", 1920, 1040], ["window minimum", 1728, 972],
+  ["small desktop", 1366, 697], ["ultrawide", 3440, 1440], ["portrait", 1080, 1920],
+]) {
+  test(label + " fills all four client edges without cropping", () => {
     const layout = computeCanvasLayout(width, height);
-    assert.ok(layout.zoom >= 0);
-    assert.ok(layout.designHeight > 0);
-    assert.ok(layout.scaledWidth >= 0);
-    assert.ok(layout.scaledHeight >= 0);
-    assert.ok(layout.gutterX >= 0);
-    assert.ok(layout.gutterY >= 0);
+    assert.equal(layout.scaledWidth, width);
+    assert.equal(layout.scaledHeight, height);
+    assert.equal(layout.gutterX, 0);
+    assert.equal(layout.gutterY, 0);
+    assert.equal(layout.mode, "fill");
+    assert.ok(layout.designWidth >= 1920 - 0.001);
+    assert.ok(layout.designHeight >= 960 - 0.001);
+    assert.ok(layout.scaledWidth <= width + 0.001);
+    assert.ok(layout.scaledHeight <= height + 0.001);
+    assert.ok(Math.abs(layout.designWidth * layout.zoom - width) < 0.001);
+    assert.ok(Math.abs(layout.designHeight * layout.zoom - height) < 0.001);
+    assert.ok(Math.abs(layout.gutterX * 2 + layout.scaledWidth - width) < 0.001);
+    assert.ok(Math.abs(layout.gutterY * 2 + layout.scaledHeight - height) < 0.001);
+  });
+}
+test("2K and 4K enlarge the entire canvas", () => {
+  assert.equal(computeCanvasLayout(2560, 1440).zoom, 4 / 3);
+  assert.equal(computeCanvasLayout(3840, 2160).zoom, 2);
+});
+test("invalid dimensions cannot create negative sizes or scale", () => {
+  for (const [width, height] of [[0, 0], [-10, 800], [NaN, 900], [1024, Infinity]]) {
+    const layout = computeCanvasLayout(width, height);
+    for (const field of ["zoom", "scaledWidth", "scaledHeight", "gutterX", "gutterY"]) {
+      assert.ok(Number.isFinite(layout[field]) && layout[field] >= 0);
+    }
   }
 });

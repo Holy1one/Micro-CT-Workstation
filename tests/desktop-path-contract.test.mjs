@@ -47,7 +47,7 @@ test("directory picker has dialog-only permission and preview remains fail-close
   assert.match(workflow, /taskId: ""/);
   assert.match(workflow, /projectionCount: 0/);
   assert.match(workflow, /exposureMs: 0/);
-  assert.match(workflow, /maxXraySec: 0/);
+  assert.match(workflow, /maxXraySec: 600/);
   assert.match(workflow, /validateCompleteParams\(this\.params\)/);
   assert.match(workflow, /Select a non-empty Save Path before pre-inspection/);
   assert.match(adapter, /savePath: wf\.params\.savePath/);
@@ -67,7 +67,9 @@ test("scan setup patches stay partial and are validated atomically by the sideca
   assert.match(engine, /setup\.apply\(&self\.parameters, self\.max_xray_sec\)/);
   assert.match(engine, /task_id: String::new\(\)/);
   assert.match(engine, /projection_count: 0/);
-  assert.match(engine, /max_xray_sec: 0/);
+  assert.match(engine, /max_xray_sec: 600/);
+  assert.match(engine, /exposure_ms: Option<f64>/);
+  assert.match(engine, /1\.\.=3600/);
   assert.match(engine, /!\(1\.\.=600\)\.contains\(&self\.max_xray_sec\)/);
   assert.match(engine, /deny_unknown_fields/);
 });
@@ -96,7 +98,15 @@ test("window keeps browser arguments, maximizes from restored startup, and appli
   assert.doesNotMatch(config, /"minWidth"|"minHeight"/);
   assert.doesNotMatch(config, /"maximized": true/);
   assert.match(source, /window\.is_maximized\(\)\.unwrap_or\(false\)/);
-  assert.match(source, /apply_dynamic_min_size\(window\)\?;\s*\n\s*window\.maximize\(\)/);
+  assert.match(source, /requires_maximized_window/);
+  assert.match(source, /SetWindowSubclass/);
+  assert.match(source, /command == SC_MOVE \|\| command == SC_SIZE/);
+  assert.match(source, /command == SC_RESTORE && IsIconic\(hwnd\) == 0/);
+  assert.doesNotMatch(source, /set_resizable\(false\)|set_resizable\(!maximize_only\)/);
+  assert.match(source, /set_maximizable\(!maximize_only\)/);
+  assert.match(source, /window\.is_minimized\(\)/);
+  assert.match(source, /window\.maximize\(\)/);
+  assert.match(source, /window\.show\(\)/);
   assert.match(source, /WindowEvent::Moved/);
   assert.match(source, /WindowEvent::Resized/);
   assert.match(source, /WindowEvent::ScaleFactorChanged/);
@@ -118,16 +128,39 @@ test("fixed design canvas scales as one unit and side columns never scroll", asy
   assert.match(styles, /\.menu-dropdown \{[\s\S]*position: absolute;/);
   assert.doesNotMatch(app, /Math\.min\(window\.innerWidth \/ 1600/);
   assert.doesNotMatch(styles, /\.design-canvas\s*\{[^}]*transform:/);
-  assert.match(styles, /grid-template-rows: 34px 1px minmax\(0, 1fr\) 1px 206px 1px 30px/);
+  assert.match(styles, /grid-template-rows: 26px 1px minmax\(0, 1fr\) 1px 30px/);
   assert.match(styles, /grid-template-columns: 420px minmax\(0, 1fr\) 450px/);
-  assert.match(styles, /grid-template-rows: 34px 1px minmax\(0, 1fr\) 1px 206px 1px 30px/);
-  assert.match(styles, /\.viewport-shell \{[^}]*var\(--viewportGutter\)/);
-  assert.match(styles, /\.design-canvas \{[\s\S]*var\(--canvasBorder\)/);
+  assert.match(styles, /\.workspace-body \{[\s\S]*grid-template-rows: minmax\(0, 1fr\) 1px 270px;/);
+  // The bottom console stays full width over the left + centre columns only,
+  // and the right status column runs through to the bottom of the workspace.
+  assert.match(styles, /\.workspace-body > \.console \{[\s\S]*grid-column: 1 \/ 3;/);
+  assert.match(styles, /\.col--right \{[\s\S]*grid-row: 1 \/ 4;/);
+  assert.match(styles, /\.col--right \{[\s\S]*grid-template-rows: minmax\(0, 1fr\) auto;/);
+  assert.match(styles, /\.viewport-shell \{[^}]*var\(--appBg\)/);
+  assert.match(app, /width: `\$\{canvasLayout\.designWidth\}px`/);
   assert.ok((tokens.match(/--viewportGutter:/g) ?? []).length >= 2);
   assert.ok((tokens.match(/--canvasBorder:/g) ?? []).length >= 2);
   assert.match(styles, /\.col \{[^}]*overflow: hidden;/);
   assert.doesNotMatch(styles, /\.col \{[^}]*overflow-y: auto/);
+  // Industrial console rule: no in-panel scrolling. Only the bottom log
+  // console (log lines + image strip) and the modal overlay may scroll.
+  assert.match(styles, /\.panel \{[\s\S]*overflow: hidden;/);
+  assert.doesNotMatch(styles, /\.(panel|col)[a-z_-]* \{[^}]*overflow(-x|-y)?: auto/);
+  assert.doesNotMatch(styles, /\.xray-panel[^{]*\{[^}]*overflow(-y)?: auto/);
   assert.match(styles, /\.console__tabs \{[^}]*overflow: hidden;/);
   assert.match(styles, /\.log-lines\s*\{[^}]*overflow-y: auto;/);
   assert.match(styles, /\.image-strip\s*\{[^}]*overflow-x: auto;/);
+});
+
+test("engineering menus and numeric scan fields stay compact and free of branding", async () => {
+  const [app, styles] = await Promise.all([read("src/App.tsx"), read("src/styles.css")]);
+  const menu = app.slice(app.indexOf("function MenuBar("), app.indexOf("function DevicePanel("));
+  assert.doesNotMatch(menu, /app-identity|MICRO|Production|badge|theme-toggle/);
+  assert.doesNotMatch(app, /Production workstation|parseHms|formatHms|hh:mm:ss|setup-note|panel__footnote|dock-guidance/);
+  const scan = app.slice(app.indexOf("function ScanParamsPanel("), app.indexOf("function DockIcon("));
+  assert.doesNotMatch(scan, /<small>1[–-]/);
+  assert.match(scan, /minutesToSeconds\(maxXray\)/);
+  assert.match(scan, /secondsToMinutes\(setup\.maxXraySec \|\| 600\)/);
+  assert.match(app, /className="help-tip" title=\{text\}/);
+  assert.match(styles, /button\.help-tip[^}]*border-radius: 50%/);
 });

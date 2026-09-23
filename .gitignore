@@ -3,6 +3,7 @@ node_modules/
 dist/
 target/
 release/
+portable-release/build-info.json
 src-tauri/binaries/
 .vite/
 # Approved local artifact hierarchy. AGENTS.md defines the required

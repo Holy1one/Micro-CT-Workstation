@@ -5,4 +5,4 @@
 
 mod digicam_control;
 
-pub use digicam_control::{CameraError, CameraHealth, DigiCamControlAdapter};
+pub use digicam_control::{CameraError, CameraHealth, DigiCamControlAdapter, valid_exposure_ms, EXPOSURE_MIN_MS, EXPOSURE_MAX_MS};

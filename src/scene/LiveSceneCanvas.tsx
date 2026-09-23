@@ -5,7 +5,7 @@
  */
 
 import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useRef } from "react";
 import { Box3, MathUtils, PerspectiveCamera as PerspectiveCameraImpl, Vector3, type Mesh, type Object3D } from "three";
 import { EquipmentScene } from "./EquipmentScene";
@@ -18,23 +18,20 @@ const FIT_MARGIN = 0.96;
 /** Camera framing: a 40 degree vertical field gives readable perspective on a
  *  bench this long without the wide-angle distortion of a 60 degree lens. */
 const FIT_FOV = 40;
-const PRESET_ZOOM: Record<ViewPreset, number> = { iso: 1, front: 1.05, top: 1.15 };
-/** Orbit limits in world units - perspective cameras frame by distance, not zoom.
- *  The upper bound is locked inside the dome: STAGE_RADIUS is 1500 in
- *  stage-surroundings.tsx, and orbiting out past it would leave the camera behind
- *  the BackSide shell, where nothing renders - the table and background would
- *  simply vanish. The gap to leave here is driven by `computeFitDistance`, whose
- *  result depends on the viewport aspect; it can reach ~1300 in a narrow canvas,
- *  so anything above that point starts clipping the bench to stay in the dome. */
+const PRESET_ZOOM: Record<ViewPreset, number> = { iso: 1.18, front: 1.18, top: 0.95 };
 const MIN_DISTANCE = 320;
-const MAX_DISTANCE = 1350;
+const MAX_DISTANCE = 3600;
 
 /** Bounding box of everything that must stay visible, ignoring fit-excluded helpers. */
 function sceneBounds(root: Object3D): Box3 {
   const bounds = new Box3();
   const scratch = new Box3();
   root.traverse((object) => {
-    if (object.userData?.excludeFromFit) return;
+    let ancestor: Object3D | null = object;
+    while (ancestor) {
+      if (ancestor.userData?.excludeFromFit) return;
+      ancestor = ancestor.parent;
+    }
     if (!(object as Mesh).isMesh) return;
     scratch.setFromObject(object);
     if (!scratch.isEmpty()) bounds.union(scratch);
@@ -85,8 +82,9 @@ type OrbitLike = {
   removeEventListener?: (type: string, listener: () => void) => void;
 };
 
-function CameraRig({ preset }: { preset: ViewPreset }) {
-  const { camera, controls, invalidate, scene, size } = useThree();
+function CameraRig({ preset, presetRevision }: { preset: ViewPreset; presetRevision: number }) {
+  const { camera, controls, invalidate, scene, size, gl } = useThree();
+  useFrame(() => { gl.domElement.dataset.cameraPosition = camera.position.toArray().join(","); });
   /** Rounded viewport key. The live panel is a flex child whose neighbours keep
    *  changing height, and the whole layout is CSS-zoomed, so the ResizeObserver
    *  reports sub-pixel size changes constantly. Rounding collapses that jitter:
@@ -94,7 +92,7 @@ function CameraRig({ preset }: { preset: ViewPreset }) {
   const fitKey = `${Math.round(size.width)}x${Math.round(size.height)}`;
   /** Once the user orbits, the camera is theirs until they pick a preset again. */
   const userOrbited = useRef(false);
-  const lastPreset = useRef<ViewPreset | null>(null);
+  const lastPreset = useRef<string | null>(null);
 
   useEffect(() => {
     const orbit = controls as OrbitLike | null;
@@ -107,8 +105,9 @@ function CameraRig({ preset }: { preset: ViewPreset }) {
   }, [controls]);
 
   useEffect(() => {
-    const presetChanged = lastPreset.current !== preset;
-    lastPreset.current = preset;
+    const presetKey = preset + ":" + presetRevision;
+    const presetChanged = lastPreset.current !== presetKey;
+    lastPreset.current = presetKey;
     if (presetChanged) {
       // A preset click is an explicit request to re-frame, so it also clears the
       // manual-orbit lock and re-enables auto-fit on later resizes.
@@ -120,6 +119,7 @@ function CameraRig({ preset }: { preset: ViewPreset }) {
 
     const perspective = camera as PerspectiveCameraImpl;
     const target = new Vector3(...CAMERA_CONSTRAINTS.target);
+    if (preset === "top") target.z = -90;
     const eyeDirection = new Vector3(...CAMERA_PRESETS[preset]).sub(target);
     const eyeUnit = eyeDirection.clone().normalize();
 
@@ -152,7 +152,7 @@ function CameraRig({ preset }: { preset: ViewPreset }) {
       perspective.updateMatrixWorld();
       const orbit = controls as OrbitLike | null;
       if (orbit?.target) {
-        orbit.target.set(...CAMERA_CONSTRAINTS.target);
+        orbit.target.set(target.x, target.y, target.z);
         orbit.update?.();
       }
       invalidate();
@@ -162,17 +162,19 @@ function CameraRig({ preset }: { preset: ViewPreset }) {
     return () => {
       cancelled = true;
     };
-  }, [camera, controls, invalidate, preset, scene, fitKey]);
+  }, [camera, controls, invalidate, preset, presetRevision, scene, fitKey]);
   return null;
 }
 
 export function LiveSceneCanvas({
   view,
   preset,
+  presetRevision = 0,
   onContextLost,
 }: {
   view: SceneViewModel;
   preset: ViewPreset;
+  presetRevision?: number;
   onContextLost: () => void;
 }) {
   const sceneTheme = useSceneTheme();
@@ -200,7 +202,7 @@ export function LiveSceneCanvas({
         makeDefault
         fov={FIT_FOV}
         near={20}
-        far={6000}
+        far={9000}
         position={CAMERA_PRESETS.iso}
       />
       <OrbitControls
@@ -217,7 +219,7 @@ export function LiveSceneCanvas({
       {/* After the bench: the rig measures the scene, so it has to run once the
           geometry is in the graph. */}
       <EquipmentScene view={view} theme={sceneTheme} />
-      <CameraRig preset={preset} />
+      <CameraRig preset={preset} presetRevision={presetRevision} />
     </Canvas>
   );
 }

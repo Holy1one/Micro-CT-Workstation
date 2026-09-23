@@ -44,13 +44,15 @@ React / TypeScript
 1. UI 把操作转换为领域命令，生产模式只通过 Tauri 发送给 `ct-engine`。
 2. `ct-engine` 分别连接三类设备，验证身份与能力后才允许预检和扫描。
 3. 每个投影视为事务：转台到位并确认、射线警告与出束确认、相机拍摄及文件确认、关束确认、`CAPTURE_DONE`、提交进度。
-4. 暂停只在安全提交边界生效；STOP、E-STOP、掉线、超时和未知状态一律 fail-closed。
+4. 暂停只在安全提交边界生效；界面 Stop 结束当前扫描并等待关束确认，不锁存软件急停。真实设备故障、掉线、超时和未知状态一律 fail-closed；Nano STOP 和硬件急停保护继续有效。
 5. 恢复不得伪造旧安全条件；按当前状态重新建立设备连接、预检和 HOME 等必要条件。
 
 Nano 串口协议为外部设备契约，当前核心命令/响应包括 `HEARTBEAT/HBACK`、`PING`、`INFO`、`STATUS`、`SET_MICROSTEPS`、`REARM`、`HOME`、`MOVE_ABS`、`MOVE_REL`、`CAPTURE_DONE`、`STOP`、`GET_HALL` 和 `XRAY_WARNING`。当前工作区没有活动 Nano 固件源码；不得读取封存源码或靠猜测改变协议。确需升级时，先建立新的活动固件来源，再同步设备固件、Rust adapter、预览实现与测试。
 
 ## 不变量
 
+- 主界面为固定工业控制台：任何固定栏目不得出现栏内滚动条或依赖拖动才能看全的控件；唯一允许的栏内滚动是底部日志控制台（日志列表与图像条）和浮层菜单对话框。新增或调整面板时必须让全部功能在设计画幅（1920 宽）内完整可见，不得用滚动代替排版收敛。
+- 1920×1080 是布局设计基准，界面必须铺满实际窗口客户区，严禁为保持固定 16:9 而居中留边或裁切。控件使用统一缩放系数，网格宽高随客户区比例适配；验收必须比较画布四边与客户区四边。桌面默认最大化；物理宽度 ≤1920 或高度 ≤1080，或 DPI 换算后的工作区不足以容纳可读窗口时，限制为最大化（允许最小化和关闭）。高分辨率且有效空间充足时允许窗口化；移动显示器或改变 DPI 后重新应用策略。
 - Tauri IPC 失败时不得回退到浏览器模拟实现。
 - React、Tauri 和 3D 场景不得保存或推进第二份生产扫描状态。
 - 射线设定值不得冒充实测值；关束未确认时不得报告安全完成。
@@ -142,6 +144,8 @@ Verification: <新增后需要运行的门禁>
 | 覆盖率输出 | `coverage/` | 忽略 |
 | 经人工筛选的长期验收证据 | `docs/shots/<YYYY-MM-DD>-<topic>/` | 跟踪；必须有说明文件 |
 | 发布候选中间产物 | `release/` | 忽略；正式便携包按发布流程进入 `portable-release/` |
+
+免安装版的唯一交付入口为 `portable-release/micro-ct-workstation-portable.exe`，使用 `npm.cmd run portable:build` 同步编译前端、桌面壳和内嵌引擎，并生成同目录 `build-info.json`。`target/release/` 只承担编译输出与缓存职责，不作为日常启动入口。涉及免安装版交付的任务必须更新并验证正式 EXE；仅运行 `vite build` 或浏览器截图不能证明桌面版本已更新。
 
 `<module>` 使用稳定短名：`ct-engine`、`xray`、`camera`、`turntable`、`frontend`、`preview`、`scene`、`desktop`、`tooling`。`<run-id>` 使用 `YYYYMMDD-HHmmss-<short-topic>`，不得使用“final”“new”等无法追溯的名称。
 

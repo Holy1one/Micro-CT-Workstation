@@ -2,7 +2,7 @@
 
 本文面向后续维护三维设备场景的开发者，说明当前程序化几何、光轴坐标、相机预设，以及将现成 GLB/GLTF 模型接入 React Three Fiber 场景时应遵循的约束。
 
-> 本文基于当前源码整理，不代表程序已经接入外部 GLB/GLTF。当前实现仍由 Three.js / React Three Fiber 程序化几何组成。
+> 当前装配：`RingTrack` → `MountedEquipment` → `RailCarriage`（含共享的固定高度 `ScissorLift`）→ 原设备模型。射线源保持 `SOURCE.bodySize = [144, 126, 184]` 与模型内高度除以 2 的计算（机壳实际高 63）；相机和 `AirPod` 几何保持原版。两侧各有黑色上下台板、成对 X 形剪叉、银色铰接销、穿过螺母横梁的水平丝杆及与丝杆同轴的侧手轮。射线源台板从 y=-42.8 到机壳底面 y=-1.5；相机底面恰在 y=-42.8，因此相机侧剪叉置于 y=-68 至 -42.8。相机侧下台板占 y=-76 至 -68，承重轮占 y=-76 至 -56；相机承重轮沿切向移至台板两端以外，并由横向支承臂接回台板，避免轮胎穿板。台板切向×径向尺寸分别为射线源 144×112、相机 196×112，板厚 8；机构仅作固定高度展示，不参与运动或控制。尺寸均为展示坐标，不是制造依据。轮轨接触继续由 `trackContactPose` 求解，转台和耳机仍只跟随 `FeedbackAngle` 的确认反馈。
 
 ## 1. 当前三维场景入口
 
@@ -10,15 +10,15 @@
 
 1. `src/App.tsx` 根据 `useSceneFallback()` 的结果，在实时 Canvas 和静态降级图之间选择。
 2. `src/scene/LiveSceneCanvas.tsx` 创建 React Three Fiber `Canvas`、透视相机和轨道控制器，并按包围盒自动取景。
-3. `src/scene/EquipmentScene.tsx` 是设备几何的主入口，负责光源、转台与样品、相机、光束、光轴线和地面阴影；`src/scene/stage-surroundings.tsx` 负责上半球球壁与桌面圆盘（`STAGE_RADIUS = 1500`、桌面 `y = -40`）。
+3. `src/scene/EquipmentScene.tsx` 是设备几何的主入口，负责光源、转台与样品、相机、光束和光轴线；`src/scene/stage-surroundings.tsx` 负责上半球球壁与桌面圆盘（当前半径 4000，桌面高度取 `RING_TRACK.bottomY`，即 y=-112）。
 4. `src/scene/scene-config.ts` 集中保存光轴坐标、设备尺寸、转台参数、相机约束和视角预设。
-5. `src/scene/StaticSceneFallback.tsx` 在 WebGL 不可用、用户启用减少动态效果或 WebGL 上下文丢失时展示静态图片。
+5. `src/scene/StaticSceneFallback.tsx` 在 WebGL 不可用或 WebGL 上下文丢失时展示静态图片。
 
 `EquipmentScene` 当前组合的程序化组件为：
 
 - `SourceAssembly`：X 射线源机体、出射端和散热片；
 - `TurntableAndSample`：转台底座、旋转盘、角度标记和样品；
-- `Scintillator`：闪烁体及背板；
+- 闪烁体及背板：由场景内的几何直接组合，中心由 `SCINTILLATOR` 配置；
 - `CameraAssembly`：相机机身、镜头和尾部面板；
 - `Beam`：从焦点到闪烁体的半透明锥形光束；
 - `Line`：依次连接焦点、样品、闪烁体和镜头中心的光轴辅助线。
@@ -81,20 +81,20 @@ React Three Fiber 中的变换与 Three.js 一致：
 1. **先修正模型自身轴向和原点，再设置场景 position。** 不要用多层临时旋转和偏移叠加来掩盖导出问题。
 2. **整台设备使用统一的毫米换算比例。** 不要分别把射线源、样品、闪烁体和镜头“缩放到看起来差不多”，否则真实距离、光束锥角和共线关系会失真。
 3. 若外部模型必须缩放，应在导入模型的最外层组做一次等比缩放，并让模型内部用于对齐的光学基准点与 `scene-config.ts` 中的中心点对应。
-4. 转台角度是绕 Y 轴旋转：当前代码使用 `rotation={[0, -angleDeg * Math.PI / 180, 0]}`。需要随扫描角度转动的样品模型必须放进该旋转父组内；转台底座、射线源、闪烁体和相机不能放入此组。
+4. 转台角度是绕 Y 轴旋转。`TurntableAndSample` 用 `FeedbackAngle` 接收有效的确认反馈，再把插值后的角度写入旋转组的 `rotation.y`；需要随转台转动的样品模型必须放进该组，固定底座与其他光学组件留在组外。
 
 ## 4. 相机视角和 OrbitControls
 
 ### 4.1 PerspectiveCamera
 
-`LiveSceneCanvas.tsx` 使用 `PerspectiveCamera`（`fov = 40`、`near = 20`、`far = 6000`）：
+`LiveSceneCanvas.tsx` 使用 `PerspectiveCamera`（当前 `fov = 40`、`near = 20`、`far = 9000`）：
 
 ```tsx
 <PerspectiveCamera
   makeDefault
   fov={FIT_FOV}
   near={20}
-  far={6000}
+  far={9000}
   position={CAMERA_PRESETS.iso}
 />
 ```
@@ -103,10 +103,7 @@ React Three Fiber 中的变换与 Three.js 一致：
 
 1. 从 `CAMERA_PRESETS[preset]` 读取相机位置，只取其方向（单位向量）；
 2. 用 `Box3` 量出整机包围盒，结合视口宽高比算出刚好装下它的距离；
-3. 按 `PRESET_ZOOM[preset]` 缩放该距离，并夹在 `MIN_DISTANCE`（320）与
-   `MAX_DISTANCE`（1350）之间；`MAX_DISTANCE` 必须小于 `stage-surroundings.tsx`
-   里的 `STAGE_RADIUS`（1500），否则相机会跑到上半球壳背后，背景整片消失——
-   改球半径必须同步改这个上限；
+3. 按 `PRESET_ZOOM[preset]` 缩放该距离，并夹在 `MIN_DISTANCE`（320）与 `MAX_DISTANCE`（3600）之间；背景半球半径为 4000，调整最大距离时须保持相机位于半球内；
 4. 把控制器 target 重设为 `CAMERA_CONSTRAINTS.target`；
 5. 调用 `invalidate()` 触发按需渲染。
 
@@ -116,7 +113,7 @@ React Three Fiber 中的变换与 Three.js 一致：
 |---|---|---:|
 | `iso` | `[760, 430, 760]` | `1` |
 | `front` | `[780, 95, 0]` | `1.05` |
-| `top` | `[0, 1050, 0.001]` | `1.15` |
+| `top` | `[0, 1050, 0.001]` | `0.84` |
 
 `top` 的 Z 使用 `0.001` 而不是完全为 0，可避免相机朝向计算处于退化方向。新增预设时，应同时更新 `ViewPreset` 类型、`CAMERA_PRESETS` 和对应 UI 入口。
 
@@ -127,10 +124,10 @@ React Three Fiber 中的变换与 Three.js 一致：
 - 启用阻尼，`dampingFactor = 0.08`；
 - 禁止平移，避免用户把设备移出视野；
 - 垂直旋转角限制为 12° 到 78°；
-- 轨道距离限制为 `MIN_DISTANCE`（320）到 `MAX_DISTANCE`（1350），必须留在半球内；
+- 轨道距离限制为 `MIN_DISTANCE`（320）到 `MAX_DISTANCE`（3600），并与背景半球半径配合；
 - 观察目标为 `[0, 20, 0]`。
 
-如果模型整体尺寸发生改变，优先统一调整 `CAMERA_PRESETS`、`CAMERA_CONSTRAINTS.target` 或相机 zoom，不要通过破坏设备各组件的相对比例来迁就视野。
+如果模型整体尺寸发生改变，优先统一调整 `CAMERA_PRESETS`、`CAMERA_CONSTRAINTS.target` 或取景倍率，不要通过破坏设备各组件的相对比例来迁就视野。本轮集成目标还包括把视角控制坞放到场景顶部、重复点击 ISO 时复位视角，以及拉近预设构图；具体参数和验收结果以集成后的源码与截图为准。
 
 ## 5. 外部 GLB/GLTF 模型的目录建议
 
@@ -295,7 +292,7 @@ Box3 只解决“整体尺寸”问题，不会自动知道：
 
 ## 10. 静态 fallback 必须同步维护
 
-实时三维场景并非唯一显示路径。`StaticSceneFallback.tsx` 当前根据主题和样品是否发生旋转选择：
+实时三维场景并非唯一显示路径。`StaticSceneFallback.tsx` 当前根据主题以及确认角度绝对值是否大于 0.005° 选择：
 
 ```text
 /assets/3D-scene-light.png
@@ -307,7 +304,6 @@ Box3 只解决“整体尺寸”问题，不会自动知道：
 触发原因包括：
 
 - `webgl-unavailable`；
-- `reduced-motion`；
 - `context-lost`。
 
 如果设备造型、构图、颜色或关键旋转状态发生明显变化，必须重新生成上述静态图，否则实时场景和降级场景会表现不一致。静态图仍应放在 `public/assets`，并保持 `StaticSceneFallback.tsx` 使用的文件名契约，除非同步修改代码和所有引用。

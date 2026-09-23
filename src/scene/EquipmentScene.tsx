@@ -5,14 +5,19 @@
  */
 
 import { Line, RoundedBox } from "@react-three/drei";
-import { useMemo } from "react";
+import { useFrame, useThree } from "@react-three/fiber";
+import { useEffect, useMemo, useRef } from "react";
+import { FeedbackAngle } from "./angle-feedback";
 import * as THREE from "three";
 import {
   CAMERA,
+  CARRIAGE,
   OPTICAL_AXIS_Y,
+  RING_TRACK,
   SAMPLE,
   SOURCE,
   TURNTABLE,
+  trackContactPose,
 } from "./scene-config";
 import { StageSurroundings } from "./stage-surroundings";
 import type { SceneTheme, SceneViewModel } from "./types";
@@ -120,11 +125,11 @@ function beamFace(view: SceneViewModel, theme: SceneTheme): { color: string; opa
   if (view.xrayLatched || view.dataState === "fault") {
     return { color: theme.beam, opacity: theme.rayFault };
   }
-  if (view.dataState === "scanning" && view.beamOn) {
+  if (view.beamOn) {
     return { color: theme.beam, opacity: theme.rayScanning };
   }
-  const idleWeight = view.dataState === "paused" ? theme.rayPaused : theme.rayReady;
-  return { color: BEAM_PATH_COLOR, opacity: idleWeight };
+  // The dashed optical axis remains visible; a luminous cone requires beam ON.
+  return { color: BEAM_PATH_COLOR, opacity: 0 };
 }
 
 function Beam({ view, theme }: { view: SceneViewModel; theme: SceneTheme }) {
@@ -925,8 +930,259 @@ function AirPod({
   );
 }
 
+function AnnularSolid({ inner, outer, bottom, top, color }: {
+  inner: number; outer: number; bottom: number; top: number; color: string;
+}) {
+  const profile = useMemo(() => [
+    new THREE.Vector2(inner, bottom), new THREE.Vector2(outer, bottom),
+    new THREE.Vector2(outer, top), new THREE.Vector2(inner, top),
+    new THREE.Vector2(inner, bottom),
+  ], [inner, outer, bottom, top]);
+  return (
+    <mesh>
+      <latheGeometry args={[profile, 256]} />
+      <meshStandardMaterial color={color} roughness={0.32} metalness={0.48} />
+    </mesh>
+  );
+}
+
+function RingTrack() {
+  const [scaleTexture] = useMemo(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 2048;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      const unit = canvas.width / (2 * RING_TRACK.scaleOuterRadius);
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      ctx.scale(unit, unit);
+      ctx.fillStyle = "#c9cbcd";
+      ctx.fillRect(-432, -432, 864, 864);
+      ctx.strokeStyle = ctx.fillStyle = "#25282b";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.font = "600 11px Arial";
+      for (let degree = 0; degree < 360; degree += 1) {
+        ctx.save();
+        ctx.rotate(degree * Math.PI / 180);
+        const length = degree % 30 === 0 ? 12 : degree % 10 === 0 ? 9 : degree % 5 === 0 ? 6 : 3;
+        ctx.lineWidth = degree % 10 === 0 ? 0.8 : 0.4;
+        ctx.beginPath();
+        ctx.moveTo(0, -RING_TRACK.scaleInnerRadius);
+        ctx.lineTo(0, -RING_TRACK.scaleInnerRadius - length);
+        ctx.stroke();
+        if (degree % 30 === 0) ctx.fillText(String(degree), 0, -412);
+        ctx.restore();
+      }
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.anisotropy = 8;
+    return [texture];
+  }, []);
+  useEffect(() => () => scaleTexture.dispose(), [scaleTexture]);
+  const rail = RING_TRACK;
+  return (
+    <group name="stationary-circular-track">
+      <AnnularSolid inner={rail.innerRadius} outer={rail.outerRadius} bottom={rail.bottomY} top={rail.baseTopY} color="#a7abad" />
+      <AnnularSolid inner={rail.innerRadius} outer={rail.innerRadius + rail.raceWidth} bottom={rail.baseTopY} top={rail.railTopY} color="#d3d5d6" />
+      <AnnularSolid inner={rail.outerRadius - rail.raceWidth} outer={rail.outerRadius} bottom={rail.baseTopY} top={rail.railTopY} color="#d3d5d6" />
+      <AnnularSolid inner={rail.scaleInnerRadius} outer={rail.scaleOuterRadius} bottom={rail.baseTopY} top={rail.railTopY - 2} color="#b9bdc0" />
+      <mesh position={[0, rail.railTopY - 1.9, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[rail.scaleInnerRadius, rail.scaleOuterRadius, 256]} />
+        <meshStandardMaterial map={scaleTexture} roughness={0.53} metalness={0.22} />
+      </mesh>
+      {[rail.innerRadius + 1, rail.outerRadius - 1].map((radius) => (
+        <mesh key={radius} position={[0, rail.bottomY + 5, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+          <torusGeometry args={[radius, 1.1, 8, 256]} />
+          <meshStandardMaterial color="#64696d" roughness={0.4} metalness={0.45} />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+function ScissorLift({ side }: { side: "source" | "camera" }) {
+  const mount = CARRIAGE.mounts[side];
+  const lift = CARRIAGE.lift;
+  const { baseTopY, topY } = lift[side];
+  const lowerY = baseTopY + 1.5;
+  const upperY = topY - lift.plateThickness - 1.5;
+  const halfSpan = mount.width / 2 - lift.armInset;
+  const armLength = Math.hypot(2 * halfSpan, upperY - lowerY);
+  const armAngle = Math.atan2(upperY - lowerY, 2 * halfSpan);
+  const screwY = baseTopY + 8;
+  const screwEndX = mount.centerX + mount.width / 2 + 17;
+  const steel = { color: "#aeb4b8", metalness: 0.55, roughness: 0.34 };
+  const black = { color: "#303539", metalness: 0.32, roughness: 0.62 };
+  return (
+    <group name={`${side}-fixed-scissor-lift`}>
+      {[baseTopY - lift.plateThickness / 2, topY - lift.plateThickness / 2].map((y, index) => (
+        <RoundedBox key={index} args={[mount.width, lift.plateThickness, mount.depth]} radius={2} smoothness={2} position={[mount.centerX, y, mount.centerZ]}>
+          <meshStandardMaterial {...black} />
+        </RoundedBox>
+      ))}
+      {[-lift.sideSpacing, lift.sideSpacing].map((z) => (
+        <group key={z} position={[mount.centerX, 0, mount.centerZ + z]}>
+          {[1, -1].map((direction) => (
+            <mesh key={direction} position={[0, (lowerY + upperY) / 2, 0]} rotation={[0, 0, direction * armAngle]}>
+              <boxGeometry args={[armLength, 5, 5]} />
+              <meshStandardMaterial {...steel} />
+            </mesh>
+          ))}
+          {[-halfSpan, 0, halfSpan].flatMap((x) => (x === 0 ? [(lowerY + upperY) / 2] : [lowerY, upperY]).map((y) => (
+            <mesh key={`${x}-${y}`} position={[x, y, 0]} rotation={[Math.PI / 2, 0, 0]}>
+              <cylinderGeometry args={[3.6, 3.6, 9, 20]} />
+              <meshStandardMaterial color="#dde0e1" metalness={0.72} roughness={0.2} />
+            </mesh>
+          )))}
+        </group>
+      ))}
+      <mesh position={[mount.centerX, screwY, mount.centerZ]}>
+        <boxGeometry args={[14, 10, lift.sideSpacing * 2 + 12]} />
+        <meshStandardMaterial {...steel} />
+      </mesh>
+      <mesh position={[(mount.centerX + screwEndX) / 2, screwY, mount.centerZ]} rotation={[0, 0, Math.PI / 2]}>
+        <cylinderGeometry args={[2.4, 2.4, screwEndX - mount.centerX, 24]} />
+        <meshStandardMaterial color="#c4c8ca" metalness={0.7} roughness={0.27} />
+      </mesh>
+      <mesh position={[screwEndX - 9, screwY, mount.centerZ]}>
+        <boxGeometry args={[12, 13, 18]} />
+        <meshStandardMaterial {...steel} />
+      </mesh>
+      <mesh position={[screwEndX + 1, screwY, mount.centerZ]} rotation={[0, Math.PI / 2, 0]}>
+        <torusGeometry args={[12, 2.5, 10, 40]} />
+        <meshStandardMaterial {...black} />
+      </mesh>
+      <mesh position={[screwEndX + 1, screwY, mount.centerZ]} rotation={[0, 0, Math.PI / 2]}>
+        <cylinderGeometry args={[4, 4, 5, 20]} />
+        <meshStandardMaterial {...steel} />
+      </mesh>
+      {[0, Math.PI / 2, Math.PI, 3 * Math.PI / 2].map((angle) => (
+        <mesh key={angle} position={[screwEndX + 1, screwY + Math.cos(angle) * 6, mount.centerZ + Math.sin(angle) * 6]} rotation={[angle, 0, 0]}>
+          <boxGeometry args={[2, 12, 2]} />
+          <meshStandardMaterial {...steel} />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+function RailCarriage({ side }: { side: "source" | "camera" }) {
+  const c = CARRIAGE;
+  const mount = c.mounts[side];
+  const plateBottom = c.lift[side].baseTopY - c.lift.plateThickness;
+  const loadHalfSpacing = side === "camera" ? c.cameraLoadHalfSpacing : c.loadHalfSpacing;
+  const loadY = RING_TRACK.railTopY + c.loadRadius;
+  const guideRadii = [RING_TRACK.innerRadius - c.guideRadius, RING_TRACK.outerRadius + c.guideRadius];
+  const loadRadii = [RING_TRACK.innerRadius + RING_TRACK.raceWidth / 2, RING_TRACK.outerRadius - RING_TRACK.raceWidth / 2];
+  return (
+    <group name={`${side}-rail-carriage`}>
+      <ScissorLift side={side} />
+      {guideRadii.flatMap((radius) => [-c.guideHalfSpacing, c.guideHalfSpacing].map((offset) => {
+        const pose = trackContactPose(radius, offset);
+        return (
+          <group key={`guide-${radius}-${offset}`} name="side-guide-roller" position={[pose.x, 0, pose.z]} rotation={[0, pose.yaw, 0]}>
+            <mesh position={[0, c.guideY, 0]}>
+              <cylinderGeometry args={[c.guideRadius, c.guideRadius, c.guideHeight, 40]} />
+              <meshStandardMaterial color="#bec3c6" roughness={0.25} metalness={0.58} />
+            </mesh>
+            {[-5, 5].map((y) => (
+              <mesh key={y} position={[0, c.guideY + y, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <torusGeometry args={[c.guideRadius - 0.4, 0.4, 8, 40]} />
+                <meshStandardMaterial color="#4e5357" metalness={0.35} roughness={0.45} />
+              </mesh>
+            ))}
+            <mesh position={[0, (c.guideY + plateBottom) / 2, 0]}>
+              <cylinderGeometry args={[4.5, 4.5, plateBottom - c.guideY, 24]} />
+              <meshStandardMaterial color="#777e83" metalness={0.55} roughness={0.3} />
+            </mesh>
+            <mesh position={[0, plateBottom - 3, 0]}>
+              <cylinderGeometry args={[9, 9, 6, 24]} />
+              <meshStandardMaterial color="#979da1" metalness={0.4} roughness={0.4} />
+            </mesh>
+          </group>
+        );
+      }))}
+      {loadRadii.flatMap((radius) => [-loadHalfSpacing, loadHalfSpacing].map((offset) => {
+        const pose = trackContactPose(radius, offset);
+        const plateEdgeX = mount.centerX + Math.sign(offset) * mount.width / 2;
+        return (
+          <group key={`load-${radius}-${offset}`} name="radial-axle-load-roller" position={[pose.x, loadY, pose.z]} rotation={[0, pose.yaw, 0]}>
+            <mesh rotation={[Math.PI / 2, 0, 0]}>
+              <cylinderGeometry args={[c.loadRadius, c.loadRadius, c.loadWidth, 36]} />
+              <meshStandardMaterial color="#666c70" roughness={0.4} metalness={0.45} />
+            </mesh>
+            <mesh rotation={[Math.PI / 2, 0, 0]}>
+              <cylinderGeometry args={[3, 3, 16, 24]} />
+              <meshStandardMaterial color="#d3d6d8" roughness={0.22} metalness={0.55} />
+            </mesh>
+            {[-6, 6].map((z) => (
+              <mesh key={z} position={[0, (plateBottom - loadY) / 2, z]}>
+                <boxGeometry args={[7, Math.abs(plateBottom - loadY), 3]} />
+                <meshStandardMaterial color="#aeb4b8" roughness={0.38} metalness={0.42} />
+              </mesh>
+            ))}
+            {side === "camera" && (
+              <mesh position={[(plateEdgeX - pose.x) / 2, plateBottom - loadY + 2, 0]}>
+                <boxGeometry args={[Math.abs(plateEdgeX - pose.x) + 10, 4, 18]} />
+                <meshStandardMaterial color="#aeb4b8" roughness={0.38} metalness={0.42} />
+              </mesh>
+            )}
+          </group>
+        );
+      }))}
+    </group>
+  );
+}
+
+function MountedEquipment({ side, theme }: { side: "source" | "camera"; theme: SceneTheme }) {
+  const source = side === "source";
+  return (
+    <group name={`${side}-track-mount`} rotation={[0, source ? Math.PI : 0, 0]}>
+      <group position={[0, 0, RING_TRACK.radius]}>
+        <RailCarriage side={side} />
+        {source ? (
+          <group rotation={[0, Math.PI, 0]} position={[0, 0, -RING_TRACK.radius]}>
+            <SourceAssembly theme={theme} />
+          </group>
+        ) : (
+          <group position={[0, OPTICAL_AXIS_Y * (1 - DETECTOR_SCALE), DETECTOR_FRONT_Z * (1 - DETECTOR_SCALE) - RING_TRACK.radius]} scale={DETECTOR_SCALE}>
+            <CameraAssembly />
+          </group>
+        )}
+      </group>
+    </group>
+  );
+}
+
 function TurntableAndSample({ view, theme }: { view: SceneViewModel; theme: SceneTheme }) {
-  const rotation = (-view.angleDeg * Math.PI) / 180;
+  const movingGroup = useRef<THREE.Group>(null);
+  const motion = useRef(new FeedbackAngle());
+  const { invalidate, gl } = useThree();
+  const applyRotation = (now: number): void => {
+    if (!movingGroup.current) return;
+    movingGroup.current.rotation.y = -motion.current.value(now) * Math.PI / 180;
+    // Read-only renderer diagnostics expose the actual model transform for QA.
+    gl.domElement.dataset.turntableAngle = String(-movingGroup.current.rotation.y * 180 / Math.PI);
+    gl.domElement.dataset.turntableFeedbackAngle = String(view.angleDeg);
+    gl.domElement.dataset.turntableRenderedAt = String(now);
+    gl.domElement.dataset.turntableFeedbackKnown = String(view.feedbackValid);
+  };
+  useEffect(() => {
+    const now = performance.now();
+    motion.current.accept({
+      id: view.feedbackId, taskId: view.taskId, angleDeg: view.angleDeg,
+      direction: view.rotationDirection, valid: view.feedbackValid,
+      running: view.dataState === "scanning",
+    }, now);
+    applyRotation(now);
+    invalidate();
+  }, [view.feedbackId, view.taskId, view.angleDeg, view.rotationDirection, view.feedbackValid, view.dataState, invalidate]);
+  useFrame(() => {
+    const now = performance.now();
+    applyRotation(now);
+    if (motion.current.animating(now)) invalidate();
+  });
   const markerPosition = useMemo<readonly [number, number, number]>(
     () => [0, TURNTABLE.platterY + TURNTABLE.platterHeight / 2 + 1.4, TURNTABLE.platterRadius - 7],
     [],
@@ -937,7 +1193,11 @@ function TurntableAndSample({ view, theme }: { view: SceneViewModel; theme: Scen
         <cylinderGeometry args={[TURNTABLE.baseRadius, TURNTABLE.baseRadius, TURNTABLE.baseHeight, 48]} />
         <meshStandardMaterial color={theme.chassis} roughness={0.4} metalness={0.45} />
       </mesh>
-      <group rotation={[0, rotation, 0]}>
+      <group ref={movingGroup} name="feedback-turntable">
+        <mesh position={[0, (TURNTABLE.baseY + TURNTABLE.baseHeight / 2 + TURNTABLE.platterY - TURNTABLE.platterHeight / 2) / 2, 0]}>
+          <cylinderGeometry args={[TURNTABLE.spindleRadius, TURNTABLE.spindleRadius, TURNTABLE.platterY - TURNTABLE.platterHeight / 2 - TURNTABLE.baseY - TURNTABLE.baseHeight / 2, 48]} />
+          <meshStandardMaterial color="#b8bdc1" roughness={0.3} metalness={0.5} />
+        </mesh>
         <mesh position={[0, TURNTABLE.platterY, 0]}>
           <cylinderGeometry args={[TURNTABLE.platterRadius, TURNTABLE.platterRadius, TURNTABLE.platterHeight, 64]} />
           {/* No environment map is bound, and a near-mirror face without one
@@ -998,7 +1258,7 @@ export function EquipmentScene({ view, theme }: { view: SceneViewModel; theme: S
     : theme;
   return (
     <group>
-      <hemisphereLight color={dark ? "#eef0f2" : theme.panelHeader} groundColor={surfaces.well} intensity={dark ? 0.5 : 0.85} />
+      <hemisphereLight color={dark ? "#eef0f2" : theme.panelHeader} groundColor={surfaces.well} intensity={0.85} />
       {dark ? (
         <>
           {/* Straight above the turntable axis (x = z = 0), pointing down at the
@@ -1016,13 +1276,8 @@ export function EquipmentScene({ view, theme }: { view: SceneViewModel; theme: S
             decay={2}
             distance={3600}
           />
-          {/* A weak fill from the viewing side. Light straight down leaves every
-              vertical face at a cosine of zero, and with no environment map a
-              metal-ish housing has almost no diffuse term to fall back on -
-              which is why the source read as a black box. At 0.3 it lifts the
-              faces turned towards the camera without flattening the scene or
-              lighting the room up. */}
-          <directionalLight position={[620, 520, 780]} intensity={0.3} color="#e8e9ea" />
+          <directionalLight position={[620, 520, 780]} intensity={0.65} color="#e8e9ea" />
+          <directionalLight position={[-420, 260, -360]} intensity={0.3} color="#e6e8ea" />
         </>
       ) : (
         <>
@@ -1032,16 +1287,10 @@ export function EquipmentScene({ view, theme }: { view: SceneViewModel; theme: S
       )}
       {/* The room first, so the shells of the beam composite over it. */}
       <StageSurroundings theme={theme} />
-      <SourceAssembly theme={surfaces} />
+      <RingTrack />
+      <MountedEquipment side="source" theme={surfaces} />
       <TurntableAndSample view={view} theme={surfaces} />
-      {/* Scaling about the lens face rather than the body centre is what keeps
-          the barrel clear of the scintillator once the rig grows. */}
-      <group
-        position={[0, OPTICAL_AXIS_Y * (1 - DETECTOR_SCALE), DETECTOR_FRONT_Z * (1 - DETECTOR_SCALE)]}
-        scale={DETECTOR_SCALE}
-      >
-        <CameraAssembly />
-      </group>
+      <MountedEquipment side="camera" theme={surfaces} />
       <Beam view={view} theme={theme} />
       {/* optical axis as a long-dashed light grey rule - a construction line
           rather than a coloured spine, so it reads the same on either theme */}
@@ -1059,7 +1308,7 @@ export function EquipmentScene({ view, theme }: { view: SceneViewModel; theme: S
         transparent
         opacity={0.9}
       />
-      <mesh position={[0, -39, 0]} rotation={[-Math.PI / 2, 0, 0]} userData={{ excludeFromFit: true }}>
+      <mesh position={[0, RING_TRACK.bottomY + 0.1, 0]} rotation={[-Math.PI / 2, 0, 0]} userData={{ excludeFromFit: true }}>
         <planeGeometry args={[1000, 1000]} />
         <shadowMaterial color={theme.sceneLine} transparent opacity={0.18} />
       </mesh>

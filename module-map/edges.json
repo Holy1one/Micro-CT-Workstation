@@ -1,15 +1,18 @@
 {
   "version": 1,
   "edges": [
+    { "from": "release-artifacts", "to": "build-tooling", "type": "release-pipeline", "strength": "strong", "reason": "portable:build must compile current assets and publish the verified desktop executable with build metadata." },
+    { "from": "release-artifacts", "to": "desktop-shell", "type": "embedded-release", "strength": "strong", "reason": "The portable executable contains the desktop host, frontend assets and verified engine payload." },
+    { "from": "desktop-shell", "to": "ui-shell", "type": "embedded-assets", "strength": "strong", "reason": "Tauri embeds current frontend assets and shares its 1920x1080 design baseline; DPI-aware window limits and edge-to-edge client filling must stay aligned." },
     { "from": "ui-shell", "to": "frontend-client", "type": "consumes-contract", "strength": "strong", "reason": "UI actions and rendering depend on the client hook and complete engine snapshots." },
-    { "from": "frontend-client", "to": "frontend-contract", "type": "consumes-contract", "strength": "strong", "reason": "Both runtime adapters must implement the exact EngineAdapter command and snapshot contract." },
+    { "from": "frontend-client", "to": "frontend-contract", "type": "consumes-contract", "strength": "strong", "reason": "Both adapters implement the snapshot contract, including nullable measured telemetry and on/off/unknown beamState; failed IPC invalidates displayed readings." },
     { "from": "developer-preview", "to": "frontend-contract", "type": "consumes-contract", "strength": "strong", "reason": "Preview output must stay structurally and semantically compatible with production snapshots." },
     { "from": "frontend-client", "to": "desktop-shell", "type": "ipc-command", "strength": "strong", "reason": "Tauri invoke command names and payload fields are string-based runtime contracts." },
-    { "from": "desktop-shell", "to": "engine-core", "type": "jsonl-protocol", "strength": "strong", "reason": "The shell and sidecar exchange versioned, sequence-checked JSONL request and response envelopes." },
+    { "from": "desktop-shell", "to": "engine-core", "type": "jsonl-protocol", "strength": "strong", "reason": "Versioned JSONL carries fractional exposureMs, native camera exposure limits, projection counts up to 3600 and maxXraySec; UI minutes must convert without changing the seconds contract." },
     { "from": "engine-core", "to": "device-xray", "type": "safety-device-contract", "strength": "strong", "reason": "Every exposure transaction depends on verified X-ray readback and fail-closed shutdown." },
     { "from": "engine-core", "to": "device-camera", "type": "capture-contract", "strength": "strong", "reason": "Projection commit requires a confirmed host-side image file." },
     { "from": "engine-core", "to": "device-turntable", "type": "serial-protocol", "strength": "strong", "reason": "Motion, warning, emergency stop, and CAPTURE_DONE use the external Nano protocol." },
-    { "from": "ui-shell", "to": "scene", "type": "ui-contract", "strength": "medium", "reason": "The application supplies a read-only scene view-model and owns all device commands." },
+    { "from": "ui-shell", "to": "scene", "type": "ui-contract", "strength": "strong", "reason": "The application supplies angleKnown, signed rotationDirection, task identity and feedback freshness; scene interpolation must never predict device motion or update scan state." },
     { "from": "scene", "to": "ui-shell", "type": "design-token-contract", "strength": "medium", "reason": "Scene colors and visibility semantics must follow the shared theme and safety state." },
     { "from": "ui-shell", "to": "platform", "type": "platform-service", "strength": "medium", "reason": "Directory selection and log export cross the browser-to-desktop boundary." }
   ]

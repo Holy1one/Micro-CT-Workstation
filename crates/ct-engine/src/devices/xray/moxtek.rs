@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 const MOXTEK_VID: u16 = 0x277B;
 const MOXTEK_PID: u16 = 0x07D1;
-const MOXTEK_SERIAL: &str = "168249";
+const MOXTEK_SERIAL: &str = "183616";
 const BAUD_RATE: u32 = 57_600;
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
 const PACKET_HEADER: u8 = 0x1B;
@@ -853,7 +853,7 @@ fn is_moxtek_serial(value: &str) -> bool {
         return true;
     }
     // FTDI's Windows VCP child appends the interface letter to the USB
-    // descriptor serial (FTDIBUS ... +168249A). Accept exactly that one
+    // descriptor serial (FTDIBUS ... +<serial>A). Accept exactly that one
     // documented interface suffix; other serials remain rejected.
     cfg!(windows) && value == format!("{MOXTEK_SERIAL}A")
 }
@@ -1171,10 +1171,10 @@ mod tests {
     fn windows_ftdi_interface_suffix_preserves_exact_device_identity() {
         assert!(is_moxtek_serial(MOXTEK_SERIAL));
         if cfg!(windows) {
-            assert!(is_moxtek_serial("168249A"));
+            assert!(is_moxtek_serial(&format!("{MOXTEK_SERIAL}A")));
         }
-        assert!(!is_moxtek_serial("168249B"));
-        assert!(!is_moxtek_serial("1682490"));
+        assert!(!is_moxtek_serial(&format!("{MOXTEK_SERIAL}B")));
+        assert!(!is_moxtek_serial(&format!("{MOXTEK_SERIAL}0")));
         assert!(!is_moxtek_serial("OTHER"));
     }
 

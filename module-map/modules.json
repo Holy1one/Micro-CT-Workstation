@@ -84,11 +84,11 @@
     {
       "id": "ui-shell",
       "name": "React workstation shell",
-      "owns": ["src/AGENTS.md", "src/README.md", "src/App.tsx", "src/main.tsx", "src/canvas-layout.ts", "src/menuActions.ts", "src/styles.css", "src/tokens.css", "src/vite-env.d.ts", "public/**", "index.html"],
+      "owns": ["src/AGENTS.md", "src/README.md", "src/App.tsx", "src/main.tsx", "src/canvas-layout.ts", "src/scan-input.ts", "src/menuActions.ts", "src/styles.css", "src/tokens.css", "src/vite-env.d.ts", "public/**", "index.html"],
       "publicApi": ["src/App.tsx"],
       "risk": "medium",
       "description": "Owns panels, menus, safety presentation, layout, themes, and static UI assets.",
-      "execution": "Renders only from engine snapshots and converts user gestures into EngineCommand values.",
+      "execution": "Fills the client area with an adaptive grid and one control scale, validates numeric scan drafts, and renders confirmed or unknown engine readings.",
       "gates": ["npm.cmd run typecheck", "npm.cmd run test:sites", "npm.cmd run build"]
     },
     {
@@ -98,7 +98,7 @@
       "publicApi": ["src/scene/LiveSceneCanvas.tsx", "src/scene/types.ts"],
       "risk": "medium",
       "description": "Owns visualization geometry, theme conversion, camera navigation, and WebGL fallback.",
-      "execution": "Consumes a read-only scene view-model and never sends hardware commands.",
+      "execution": "Interpolates confirmed turntable feedback for read-only rendering, freezes unknown motion and never sends hardware commands.",
       "gates": ["npm.cmd run typecheck", "npm.cmd run test:sites"]
     },
     {
@@ -118,7 +118,7 @@
       "publicApi": ["package.json", "Cargo.toml", "module-map/modules.json"],
       "risk": "medium",
       "description": "Owns dependency locks, build entry points, contract tests, module-map generation, and impact analysis.",
-      "execution": "Selects and runs deterministic local gates; it must not contact real hardware.",
+      "execution": "Selects deterministic local gates and builds verified portable releases via scripts/build-portable.mjs; it must not contact real hardware.",
       "gates": ["npm.cmd run module-map:check", "npm.cmd run test:sites"]
     },
     {
@@ -148,7 +148,7 @@
       "publicApi": [],
       "risk": "low",
       "description": "Contains replaceable packaged binaries and is never a source of design truth.",
-      "execution": "Release tooling regenerates these files from verified source builds.",
+      "execution": "npm.cmd run portable:build publishes the current Tauri release EXE and build-info.json here; target/release remains compiler output only.",
       "gates": []
     }
   ]

@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "ct-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "serde",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "ct-workstation"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ct-engine",
  "serde",

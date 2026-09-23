@@ -22,6 +22,9 @@ flowchart LR
   extensions["Optional algorithms and service bridges"]
   documentation["Architecture, guides, and evidence"]
   release_artifacts["Generated release artifacts"]
+  release_artifacts -->|release-pipeline| build_tooling
+  release_artifacts -->|embedded-release| desktop_shell
+  desktop_shell -->|embedded-assets| ui_shell
   ui_shell -->|consumes-contract| frontend_client
   frontend_client -->|consumes-contract| frontend_contract
   developer_preview -->|consumes-contract| frontend_contract
@@ -59,14 +62,17 @@ flowchart LR
 
 | Consumer | Provider | Type | Strength | Reason |
 |---|---|---|---|---|
+| `release-artifacts` | `build-tooling` | release-pipeline | strong | portable:build must compile current assets and publish the verified desktop executable with build metadata. |
+| `release-artifacts` | `desktop-shell` | embedded-release | strong | The portable executable contains the desktop host, frontend assets and verified engine payload. |
+| `desktop-shell` | `ui-shell` | embedded-assets | strong | Tauri embeds current frontend assets and shares its 1920x1080 design baseline; DPI-aware window limits and edge-to-edge client filling must stay aligned. |
 | `ui-shell` | `frontend-client` | consumes-contract | strong | UI actions and rendering depend on the client hook and complete engine snapshots. |
-| `frontend-client` | `frontend-contract` | consumes-contract | strong | Both runtime adapters must implement the exact EngineAdapter command and snapshot contract. |
+| `frontend-client` | `frontend-contract` | consumes-contract | strong | Both adapters implement the snapshot contract, including nullable measured telemetry and on/off/unknown beamState; failed IPC invalidates displayed readings. |
 | `developer-preview` | `frontend-contract` | consumes-contract | strong | Preview output must stay structurally and semantically compatible with production snapshots. |
 | `frontend-client` | `desktop-shell` | ipc-command | strong | Tauri invoke command names and payload fields are string-based runtime contracts. |
-| `desktop-shell` | `engine-core` | jsonl-protocol | strong | The shell and sidecar exchange versioned, sequence-checked JSONL request and response envelopes. |
+| `desktop-shell` | `engine-core` | jsonl-protocol | strong | Versioned JSONL carries fractional exposureMs, native camera exposure limits, projection counts up to 3600 and maxXraySec; UI minutes must convert without changing the seconds contract. |
 | `engine-core` | `device-xray` | safety-device-contract | strong | Every exposure transaction depends on verified X-ray readback and fail-closed shutdown. |
 | `engine-core` | `device-camera` | capture-contract | strong | Projection commit requires a confirmed host-side image file. |
 | `engine-core` | `device-turntable` | serial-protocol | strong | Motion, warning, emergency stop, and CAPTURE_DONE use the external Nano protocol. |
-| `ui-shell` | `scene` | ui-contract | medium | The application supplies a read-only scene view-model and owns all device commands. |
+| `ui-shell` | `scene` | ui-contract | strong | The application supplies angleKnown, signed rotationDirection, task identity and feedback freshness; scene interpolation must never predict device motion or update scan state. |
 | `scene` | `ui-shell` | design-token-contract | medium | Scene colors and visibility semantics must follow the shared theme and safety state. |
 | `ui-shell` | `platform` | platform-service | medium | Directory selection and log export cross the browser-to-desktop boundary. |

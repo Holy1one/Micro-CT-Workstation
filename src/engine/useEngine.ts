@@ -17,16 +17,19 @@ export function useEngine() {
   const requestRevisionRef = useRef(0);
   const commandQueueRef = useRef<Promise<void>>(Promise.resolve());
   const commandActiveRef = useRef(false);
+  const refreshActiveRef = useRef(false);
   const disposedRef = useRef(false);
   const [adapterKind, setAdapterKind] = useState<AdapterKind>("developer_preview");
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [transportError, setTransportError] = useState<string | null>(null);
 
   const commitSnapshot = useCallback((revision: number, next: EngineSnapshot): void => {
     if (!disposedRef.current && revision === requestRevisionRef.current) {
       setSnapshot(next);
       setError(null);
+      setTransportError(null);
     }
   }, []);
 
@@ -37,7 +40,8 @@ export function useEngine() {
     setAdapterKind(adapter.kind);
 
     const refresh = async (): Promise<void> => {
-      if (disposedRef.current || commandActiveRef.current) return;
+      if (disposedRef.current || commandActiveRef.current || refreshActiveRef.current) return;
+      refreshActiveRef.current = true;
       const revision = ++requestRevisionRef.current;
       try {
         const next = await adapter.getSnapshot();
@@ -45,7 +49,10 @@ export function useEngine() {
       } catch (reason) {
         if (!disposedRef.current && revision === requestRevisionRef.current) {
           setError(errorMessage(reason));
+          setTransportError(errorMessage(reason));
         }
+      } finally {
+        refreshActiveRef.current = false;
       }
     };
 
@@ -62,12 +69,18 @@ export function useEngine() {
 
   const refresh = useCallback(async (): Promise<void> => {
     const adapter = adapterRef.current;
-    if (!adapter || commandActiveRef.current) return;
+    if (!adapter || commandActiveRef.current || refreshActiveRef.current) return;
+    refreshActiveRef.current = true;
     const revision = ++requestRevisionRef.current;
     try {
       commitSnapshot(revision, await adapter.getSnapshot());
     } catch (reason) {
-      if (revision === requestRevisionRef.current) setError(errorMessage(reason));
+      if (revision === requestRevisionRef.current) {
+        setError(errorMessage(reason));
+        setTransportError(errorMessage(reason));
+      }
+    } finally {
+      refreshActiveRef.current = false;
     }
   }, [commitSnapshot]);
 
@@ -82,7 +95,11 @@ export function useEngine() {
         try {
           commitSnapshot(revision, await adapter.dispatch(command));
         } catch (reason) {
-          if (revision === requestRevisionRef.current) setError(errorMessage(reason));
+          if (revision === requestRevisionRef.current) {
+            const message = errorMessage(reason);
+            setError(message);
+            if (!message.startsWith("ENGINE:")) setTransportError(message);
+          }
         } finally {
           commandActiveRef.current = false;
           setBusy(false);
@@ -95,5 +112,5 @@ export function useEngine() {
     [commitSnapshot],
   );
 
-  return { adapterKind, snapshot, busy, error, refresh, dispatch };
+  return { adapterKind, snapshot, busy, error, transportError, refresh, dispatch };
 }

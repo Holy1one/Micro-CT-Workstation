@@ -11,6 +11,10 @@ export type SceneFallbackReason = "webgl-unavailable" | "context-lost";
 export interface SceneViewModel {
   dataState: "ready" | "scanning" | "paused" | "fault";
   angleDeg: number;
+  feedbackId: string;
+  feedbackValid: boolean;
+  rotationDirection: -1 | 1;
+  taskId: string;
   theme: SceneThemeName;
   beamOn: boolean;
   xrayLatched: boolean;

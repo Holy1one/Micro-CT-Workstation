@@ -17,7 +17,7 @@ export interface NanoTransport {
   close(): void;
 }
 
-type FirmwareState = "IDLE" | "HOMING" | "MOVING" | "CAPTURE_HOLD" | "ESTOPPED";
+type FirmwareState = "IDLE" | "HOMING" | "MOVING" | "CAPTURE_HOLD" | "STOPPED";
 
 interface PendingTimer {
   handle: ReturnType<typeof setTimeout>;
@@ -146,8 +146,8 @@ export class FirmwareTransport implements NanoTransport {
   }
 
   private handleMove(id: number, parsed: ReturnType<typeof parseLine>, relative: boolean): void {
-    if (this.state === "ESTOPPED") {
-      this.emit(`ERR ${id} ESTOP_LATCHED`);
+    if (this.state === "STOPPED") {
+      this.emit(`ERR ${id} HOME_REQUIRED`);
       return;
     }
     if (!this.homed || !this.rearmed) {
@@ -163,8 +163,24 @@ export class FirmwareTransport implements NanoTransport {
       this.emit(`ERR ${id} BAD_ARG`);
       return;
     }
-    const deltaPulses = Math.round((mdeg / 1000 / 360) * PULSES_PER_REV);
-    const destination = relative ? this.pos + deltaPulses : deltaPulses;
+    const requestedPulses = Math.round((mdeg / 360_000) * PULSES_PER_REV);
+    let destination: number;
+    if (relative) {
+      destination = this.pos + requestedPulses;
+    } else {
+      if (requestedPulses < 0) {
+        this.emit(`ERR ${id} REVERSE_FORBIDDEN`);
+        return;
+      }
+      const targetWithinTurn = requestedPulses % PULSES_PER_REV;
+      const requestedTurn = Math.floor(requestedPulses / PULSES_PER_REV);
+      let targetTurn = Math.max(Math.floor(this.pos / PULSES_PER_REV), requestedTurn);
+      destination = targetTurn * PULSES_PER_REV + targetWithinTurn;
+      if (destination < this.pos) {
+        targetTurn += 1;
+        destination = targetTurn * PULSES_PER_REV + targetWithinTurn;
+      }
+    }
     if (destination < this.pos) {
       this.emit(`ERR ${id} REVERSE_FORBIDDEN`);
       return;
@@ -184,12 +200,12 @@ export class FirmwareTransport implements NanoTransport {
   private handleStop(id: number): void {
     for (const timer of this.timers) timer.cancel();
     this.timers = [];
-    this.state = "ESTOPPED";
+    this.state = "STOPPED";
     this.homed = false;
     this.rearmed = false;
     this.hall = false;
     this.emit(`ACK ${id} STOP`);
-    this.later(12, () => this.emit(`STOPPED ${id} POSITION_UNKNOWN reason=ESTOP`));
+    this.later(12, () => this.emit(`STOPPED ${id} POSITION_UNKNOWN reason=STOP`));
   }
 
   private emit(line: string): void {

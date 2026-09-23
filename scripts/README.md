@@ -1,6 +1,7 @@
 # Build and verification scripts
 
 - `prepare-engine-sidecar.mjs`: builds `ct-engine` and copies it to Tauri's target-specific sidecar name.
+- `build-portable.mjs`: runs a fresh native Windows Tauri release build and publishes the verified EXE and build metadata to `portable-release/`.
 - `prepare-sites-build.mjs`: assembles the optional hosted-preview output.
 - `process-logo.mjs`: explicit one-time logo asset transformation.
 - `gen-module-graph.mjs`: generates the human-readable module graph.

@@ -5,6 +5,7 @@
  */
 
 import * as THREE from "three";
+import { RING_TRACK } from "./scene-config";
 import type { SceneTheme } from "./types";
 
 // The stage: a fabric-covered table under a dome whose shell carries the wall
@@ -12,16 +13,8 @@ import type { SceneTheme } from "./types";
 // to leak through - whichever way the camera looks, including straight up, it is
 // looking at the inside of the same shell.
 //
-// The radius is pinned to the camera, not chosen on its own. `computeFitDistance`
-// slides the camera back until every corner of the bench clears the frustum, and
-// that distance tracks the viewport: on a wide canvas it lands near 940, but the
-// horizontal fov shrinks with the aspect ratio, so a narrow canvas pushes it past
-// 1300. The dome has to stay outside the orbit limit or the camera ends up behind
-// the BackSide shell, where nothing renders and the background simply disappears.
-// MAX_DISTANCE in LiveSceneCanvas is read at build time against this number; the
-// two have to move together.
-const STAGE_RADIUS = 1500;
-const TABLE_Y = -40;
+const STAGE_RADIUS = 4000;
+const TABLE_Y = RING_TRACK.bottomY;
 
 /** Builds a tiling greyscale grain map. Grey-only on purpose: the surface takes
  *  its colour from `material.color`, so the same map survives a theme switch and
@@ -63,11 +56,11 @@ const CLOTH_MAP = createGrainMap((ctx, size) => {
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, size, size);
   const step = 4;
-  ctx.fillStyle = "rgba(0,0,0,0.12)";
+  ctx.fillStyle = "rgba(0,0,0,0.035)";
   for (let x = 0; x < size; x += step) ctx.fillRect(x, 0, 2, size);
-  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.fillStyle = "rgba(255,255,255,0.035)";
   for (let y = 0; y < size; y += step) ctx.fillRect(0, y, size, 2);
-  addGrain(ctx, size, 16);
+  addGrain(ctx, size, 5);
 }, [8, 8]);
 
 // Paper: soft blotches rather than lines. Radial gradients instead of hard

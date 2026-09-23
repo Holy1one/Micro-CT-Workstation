@@ -24,6 +24,8 @@ const phaseToEngine: Record<WorkflowPhase, EnginePhase> = {
   booting: "idle",
   ready: "ready",
   scanning: "running",
+  finishing: "finishing",
+  stopping: "stopping",
   paused: "paused",
   fault: "fault",
   stopped: "stopped",
@@ -99,10 +101,7 @@ export class WorkstationAdapter implements EngineAdapter {
         void wf.restore();
         break;
       case "stop":
-        void wf.estop();
-        break;
-      case "estop_release":
-        await wf.estopRelease();
+        await wf.stop();
         break;
       case "retry_device":
         void wf.retryDevice(command.device);
@@ -187,7 +186,7 @@ export class WorkstationAdapter implements EngineAdapter {
         total: ws.progress.total,
         percent: ws.progress.percent,
         angleDeg: ws.progress.angleDeg,
-        etaSeconds: null,
+        etaSeconds: wf.etaSeconds,
       },
       imageCount: wf.frames.length,
       logs: wf.logs.map((entry) => ({
@@ -219,8 +218,9 @@ export class WorkstationAdapter implements EngineAdapter {
       wf.params.exposureMs > 0 &&
       wf.params.maxXraySec > 0;
 
+    const activePhase = ["scanning", "finishing", "stopping"].includes(phase);
     const dataState: ConsoleDataState =
-      phase === "scanning" ? "scanning" : phase === "paused" ? "paused" : phase === "fault" ? "fault" : "ready";
+      activePhase ? "scanning" : phase === "paused" ? "paused" : phase === "fault" ? "fault" : "ready";
 
     const phaseWord =
       phase === "booting"
@@ -229,15 +229,19 @@ export class WorkstationAdapter implements EngineAdapter {
           ? "STANDBY"
           : phase === "completed"
             ? "COMPLETE"
-            : dataState.toUpperCase();
-    const phaseTone: WorkstationView["phaseTone"] = phase === "scanning" ? "warn" : phase === "fault" ? "danger" : "accent";
+            : phase === "finishing"
+              ? "FINISHING"
+              : phase === "stopping"
+                ? "STOPPING"
+                : dataState.toUpperCase();
+    const phaseTone: WorkstationView["phaseTone"] = activePhase ? "warn" : phase === "fault" ? "danger" : "accent";
 
     const xrayConnected = wf.source.isConnected;
     const xrayWord = !xrayConnected ? "OFFLINE" : phase === "fault" ? "FAILED" : rb.beamOn ? "EMITTING" : phase === "paused" ? "STANDBY" : "READY";
     const xrayTone: ConsoleTone = phase === "fault" ? "danger" : rb.beamOn || phase === "paused" ? "warn" : "ok";
-    const tableWord = phase === "fault" ? "HOME LOST" : phase === "scanning" ? "MOVING" : phase === "paused" ? "HOLD" : "READY";
-    const tableTone: ConsoleTone = phase === "fault" ? "danger" : phase === "scanning" || phase === "paused" ? "warn" : "ok";
-    const cameraWord = phase === "scanning" || phase === "paused" || phase === "fault" ? "ARMED" : "READY";
+    const tableWord = phase === "fault" ? "HOME LOST" : activePhase ? "MOVING" : phase === "paused" ? "HOLD" : "READY";
+    const tableTone: ConsoleTone = phase === "fault" ? "danger" : activePhase || phase === "paused" ? "warn" : "ok";
+    const cameraWord = activePhase || phase === "paused" || phase === "fault" ? "ARMED" : "READY";
     const cameraTone: ConsoleTone = cameraWord === "ARMED" ? "accent" : "ok";
 
     const xraySpec =
@@ -263,8 +267,8 @@ export class WorkstationAdapter implements EngineAdapter {
       },
       {
         key: "CAMERA",
-        text: phase === "scanning" ? "EXPOSING" : phase === "ready" || phase === "completed" ? "READY" : "STANDBY",
-        tone: phase === "scanning" ? "warn" : phase === "ready" || phase === "completed" ? "ok" : "muted",
+        text: phase === "scanning" ? "EXPOSING" : activePhase ? "ENDING" : phase === "ready" || phase === "completed" ? "READY" : "STANDBY",
+        tone: activePhase ? "warn" : phase === "ready" || phase === "completed" ? "ok" : "muted",
       },
       {
         key: "SAMPLE",
@@ -275,7 +279,7 @@ export class WorkstationAdapter implements EngineAdapter {
 
     const safetyBar: WorkstationView["safetyBar"] =
       phase === "fault"
-        ? { text: "SAFETY · FAULT · OUTPUT LATCHED OFF", tone: "dangerBold" }
+        ? { text: "SAFETY · DEVICE FAULT · OUTPUT LATCHED OFF", tone: "dangerBold" }
         : rb.beamOn
           ? { text: "SAFETY · BEAM ON · INTERLOCK OK", tone: "danger" }
           : phase === "paused"
@@ -283,11 +287,11 @@ export class WorkstationAdapter implements EngineAdapter {
             : { text: "SAFETY · OUTPUT DISABLED", tone: "muted" };
 
     const barTone: WorkstationView["progress"]["barTone"] =
-      phase === "paused" ? "warn" : phase === "fault" ? "danger" : "accent";
+      phase === "paused" || phase === "stopping" || phase === "finishing" ? "warn" : phase === "fault" ? "danger" : "accent";
     const barLabel =
       phase === "paused"
         ? `${captured} / ${total} · ${percent}% · held`
-        : phase === "fault"
+      : phase === "fault"
           ? `${captured} / ${total} · ${percent}% · aborted`
           : `${captured} / ${total} · ${percent}%`;
 
@@ -313,7 +317,7 @@ export class WorkstationAdapter implements EngineAdapter {
           };
 
     const dock: WorkstationView["dock"] = {
-      home: phase !== "scanning" && phase !== "fault" && phase !== "booting",
+      home: wf.preflightPassed && !activePhase && phase !== "fault" && phase !== "booting",
       play:
         phase === "scanning" || phase === "paused"
           ? true
@@ -325,22 +329,26 @@ export class WorkstationAdapter implements EngineAdapter {
         wf.preflightPassed &&
         wf.homed &&
         wf.checkpointAvailable,
-      estop: phase !== "booting",
-      playMode: phase === "scanning" ? "pause" : phase === "paused" ? "resume" : phase === "fault" ? "disabled" : "start",
-      homeReason: phase === "fault" ? "Release E-STOP, then run Preflight" : !wf.preflightPassed ? "Run Preflight first" : "",
-      playReason: phase === "fault" ? "Release E-STOP" : !wf.preflightPassed ? "Run Preflight first" : !wf.homed ? "Run HOME first" : "",
+      stop: phase === "scanning" || phase === "paused" || phase === "finishing",
+      playMode: phase === "scanning" ? "pause" : phase === "paused" ? "resume" : phase === "fault" || phase === "finishing" || phase === "stopping" ? "disabled" : "start",
+      homeReason: phase === "fault" ? "Run Preflight to recover from the device fault" : !wf.preflightPassed ? "Run Preflight first" : "",
+      playReason: phase === "fault" ? "Run Preflight and HOME to recover from the device fault" : !wf.preflightPassed ? "Run Preflight first" : !wf.homed ? "Run HOME first" : "",
     };
 
     const statusLeft = !configured
       ? "SETUP REQUIRED  enter Task ID, Save Path, projections, exposure, and maximum X-ray time"
       : phase === "scanning"
         ? `SCANNING  view ${Math.min(captured + 1, total)} / ${total} · ${fixed2(step)}°/view · ${captured} / ${total} captured · ${fixed2(angle)}° · exposing · ETA ${wf.etaText}`
+        : phase === "finishing"
+          ? `FINISHING  ${captured} / ${total} committed · returning the turntable to zero · Stop is available`
+          : phase === "stopping"
+            ? `STOPPING  ${captured} / ${total} committed · output disabled · waiting for the scan task to exit`
         : phase === "paused"
           ? `PAUSED  view ${Math.min(captured + 1, total)} / ${total} · held at ${fixed2(angle)}° · pulse counter kept · resume to continue`
           : phase === "fault"
-            ? "FAULT  E-STOP latched · output disabled · re-home to recover"
-            : phase === "stopped"
-              ? "STANDBY  latch cleared · HOME then pre-inspection required"
+            ? "FAULT  device checks required · output latched off · preflight then HOME to recover"
+        : phase === "stopped"
+              ? `STANDBY  scan ended · ${wf.preflightPassed ? "HOME required" : "preflight then HOME required"}`
               : phase === "completed"
                 ? `COMPLETE  ${total} / ${total} captured · ${fixed2(angle)}° · projections on disk`
                 : `READY  ${total} views · ${fixed2(step)}°/view · ${captured} / ${total} captured · queue idle · awaiting operator`;
@@ -351,18 +359,20 @@ export class WorkstationAdapter implements EngineAdapter {
       phaseTone,
       devices,
       onlineSummary: "PREVIEW · 0 REAL DEVICES",
+      cameraExposure: { minMs: 0.125, maxMs: 30000, known: false },
       preflight,
       floats,
       safetyBar,
-      scene: { angleDeg: angle, rotated: !(dataState === "ready" && angle === 0) },
+      scene: { angleDeg: angle, rotated: !(dataState === "ready" && angle === 0), angleKnown: phase !== "fault" && phase !== "stopped" && phase !== "stopping", rotationDirection: 1 },
       xray: {
         connected: xrayConnected,
         setKv: rb.setKv,
         setUa: rb.setUa,
-        monKv: rb.monKv,
-        monUa: rb.monUa,
-        powerW: rb.powerW,
-        tempC: rb.tempC,
+        monKv: xrayConnected ? rb.monKv : null,
+        monUa: xrayConnected ? rb.monUa : null,
+        powerW: xrayConnected ? rb.powerW : null,
+        tempC: xrayConnected ? rb.tempC : null,
+        beamState: !xrayConnected ? "unknown" : rb.beamOn ? "on" : "off",
         beamOn: rb.beamOn,
         latched: rb.latched,
         onSec: phase === "scanning" ? 14 : 10,
@@ -371,9 +381,9 @@ export class WorkstationAdapter implements EngineAdapter {
         usbAutoShutDown: wf.usbAutoShutDown,
         usbAutoShutDownKnown: true,
         usbShutdownDelay: wf.usbShutdownDelay,
-        manualControlsEnabled: xrayConnected,
-        timerControlsEnabled: true,
-        setpointControlsEnabled: xrayConnected,
+        manualControlsEnabled: wf.manualControlsEnabled,
+        timerControlsEnabled: wf.timerControlsEnabled,
+        setpointControlsEnabled: wf.setpointControlsEnabled,
         voltageConfirmed: true,
         currentConfirmed: true,
         setpointConfirmed: true,
@@ -389,7 +399,7 @@ export class WorkstationAdapter implements EngineAdapter {
       statusbar: {
         left: `DEVELOPER PREVIEW · ${statusLeft}`,
         right: `NO REAL HARDWARE · ${LINK_LABEL} · fw ${FIRMWARE_VERSION} · ${fixed1(rb.powerW)} W SET`,
-        dotTone: phase === "scanning" ? "warn" : phase === "paused" ? "accent" : phase === "fault" ? "danger" : "ok",
+        dotTone: activePhase ? "warn" : phase === "paused" ? "accent" : phase === "fault" ? "danger" : "ok",
       },
       dock,
       scanSetup: {

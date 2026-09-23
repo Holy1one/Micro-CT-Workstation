@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Folder } from "@phosphor-icons/react";
 import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
+import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } from "./scan-input";
 import { useEngine } from "./engine/useEngine";
 import {
   chooseImageDirectory,
@@ -65,23 +66,17 @@ function logTime(timestamp: string): string {
   return `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}.${p(date.getMilliseconds(), 3)}`;
 }
 
-function parseHms(text: string): number | null {
-  const match = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec(text.trim());
-  if (!match) return null;
-  return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+function HelpTip({ text }: { text: string }) {
+  return <button type="button" className="help-tip" title={text} aria-label={text}>?</button>;
 }
 
 const toneClass = (tone: string) => `tone-${tone}`;
+const measured = (value: number | null, stale = false): string =>
+  stale || value == null ? "—" : value.toFixed(1);
 
 /* ------------------------------------------------------------------ */
 /* Menu bar + floating drop-down submenu                               */
 /* ------------------------------------------------------------------ */
-
-/** Seconds -> hh:mm:ss, the format the Max X-ray field accepts. */
-function formatHms(total: number): string {
-  const p = (value: number): string => String(value).padStart(2, "0");
-  return `${p(Math.floor(total / 3600))}:${p(Math.floor((total % 3600) / 60))}:${p(total % 60)}`;
-}
 
 /** Plain-text session log for `File → Export Session Log…`. */
 function sessionLogText(ws: WorkstationView, adapterKind: "developer_preview" | "tauri"): string {
@@ -104,17 +99,9 @@ function sessionLogText(ws: WorkstationView, adapterKind: "developer_preview" | 
 }
 
 function MenuBar({
-  theme,
-  onTheme,
-  snapshot,
-  adapterKind,
   availability,
   onAction,
 }: {
-  theme: Theme;
-  onTheme: (theme: Theme) => void;
-  snapshot: EngineSnapshot;
-  adapterKind: "developer_preview" | "tauri";
   availability: MenuAvailability;
   onAction: (id: MenuActionId) => void;
 }) {
@@ -175,7 +162,6 @@ function MenuBar({
                         }}
                       >
                         {entry.label}
-                        {state.reason ? <small className="menu-dropdown__note">{state.reason}</small> : null}
                       </button>
                     );
                   })}
@@ -185,27 +171,6 @@ function MenuBar({
           );
         })}
       </nav>
-      <span className="menu-spacer" />
-      <div className="theme-toggle" role="group" aria-label="Theme">
-        {(["light", "dark"] as const).map((value) => (
-          <button
-            key={value}
-            type="button"
-            className="theme-toggle__seg"
-            aria-pressed={theme === value}
-            onClick={() => onTheme(value)}
-          >
-            {value === "light" ? "Light" : "Dark"}
-          </button>
-        ))}
-      </div>
-      <span className={`badge ${snapshot.mode === "developer_preview" ? "badge--dev" : "badge--locked"}`}>
-        {snapshot.modeLabel}
-      </span>
-      <span className={`badge badge--engine badge--${snapshot.connectionState}`}>
-        <i aria-hidden="true" />
-        {adapterKind === "tauri" ? "TAURI / CT-ENGINE" : "BROWSER PREVIEW"} · {snapshot.connectionState.toUpperCase()}
-      </span>
     </header>
   );
 }
@@ -220,12 +185,16 @@ function DevicePanel({
   hardwareConnected,
   desktopRuntime,
   dispatch,
+  stale,
+  setupInvalid,
 }: {
   ws: WorkstationView;
   busy: boolean;
   hardwareConnected: boolean;
   desktopRuntime: boolean;
   dispatch: (c: EngineCommand) => Promise<void>;
+  stale: boolean;
+  setupInvalid: boolean;
 }) {
   const [pendingDevice, setPendingDevice] = useState<DeviceId | null>(null);
   const setup = ws.scanSetup;
@@ -234,13 +203,13 @@ function DevicePanel({
     setup.savePath.trim().length > 0 &&
     Number.isInteger(setup.projectionCount) &&
     setup.projectionCount >= 1 &&
-    setup.projectionCount <= 360 &&
-    Number.isInteger(setup.exposureMs) &&
-    setup.exposureMs >= 1 &&
-    setup.exposureMs <= 10000 &&
+    setup.projectionCount <= 3600 &&
+    Number.isFinite(setup.exposureMs) &&
+    setup.exposureMs >= ws.cameraExposure.minMs &&
+    setup.exposureMs <= ws.cameraExposure.maxMs &&
     Number.isInteger(setup.maxXraySec) &&
     setup.maxXraySec >= 1 &&
-    setup.maxXraySec <= 600;
+    setup.maxXraySec <= 600 && !setupInvalid;
   const runRetry = async (device: DeviceId): Promise<void> => {
     setPendingDevice(device);
     try {
@@ -258,6 +227,7 @@ function DevicePanel({
     <section className="panel device-panel">
       <div className="panel__header">
         <h2>Device Connection Status</h2>
+        <HelpTip text={`Preflight: ${ws.preflight.subline}`} />
       </div>
       <div className="device-list">
         {ws.devices.map((device) => {
@@ -266,7 +236,8 @@ function DevicePanel({
             <div className="device-row" key={device.id}>
               <div className="device-row__top">
                 <strong>{device.name}</strong>
-                <span className={`device-row__word ${toneClass(device.tone)}`}>{device.word}</span>
+                <HelpTip text={stale ? "Device status unavailable" : device.spec} />
+                <span className={`device-row__word ${toneClass(stale ? "muted" : device.tone)}`}>{stale ? "UNKNOWN" : device.word}</span>
                 <button
                   type="button"
                   className="retry-btn"
@@ -288,7 +259,6 @@ function DevicePanel({
                   </button>
                 ) : null}
               </div>
-              <div className="device-row__spec">{device.spec}</div>
             </div>
           );
         })}
@@ -311,7 +281,6 @@ function DevicePanel({
         <div className={`preflight preflight--${ws.preflight.tone === "running" ? "pass" : ws.preflight.tone}`} role="progressbar" aria-valuenow={ws.preflight.percent} aria-valuemin={0} aria-valuemax={100}>
           <span className="preflight__fill" style={{ width: `${ws.preflight.percent}%` }} />
         </div>
-        <div className="preflight-block__sub">{ws.preflight.subline}</div>
       </div>
       <div className="device-online-summary">
         <span>LINK SUMMARY</span>
@@ -327,6 +296,8 @@ function ScanParamsPanel({
   desktopRuntime,
   dispatch,
   syncRevision,
+  onInvalidChange,
+  onValidationError,
 }: {
   ws: WorkstationView;
   busy: boolean;
@@ -334,6 +305,8 @@ function ScanParamsPanel({
   dispatch: (c: EngineCommand) => Promise<void>;
   /** Bumped when a menu command changed the setup, so drafts refill from the engine. */
   syncRevision: number;
+  onInvalidChange: (invalid: boolean) => void;
+  onValidationError: (message: string | null) => void;
 }) {
   const setup = ws.scanSetup;
   const locked = busy || ws.dataState === "scanning" || ws.dataState === "paused";
@@ -343,7 +316,7 @@ function ScanParamsPanel({
   const [taskId, setTaskId] = useState("");
   const [views, setViews] = useState("");
   const [exposure, setExposure] = useState("");
-  const [maxXray, setMaxXray] = useState("");
+  const [maxXray, setMaxXray] = useState(() => secondsToMinutes(setup.maxXraySec || 600));
   const [pathError, setPathError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -366,16 +339,16 @@ function ScanParamsPanel({
     if (trimmed) void dispatch({ type: "update_scan_setup", setup: { [field]: trimmed } });
   };
 
-  const commitInteger = (field: "projectionCount" | "exposureMs", value: string, min: number, max: number): void => {
-    if (!/^\d+$/.test(value)) return;
+  const commitNumber = (field: "projectionCount" | "exposureMs", value: string): void => {
+    const invalid = field === "projectionCount" ? projectionError(value)
+      : exposureError(value, ws.cameraExposure.minMs, ws.cameraExposure.maxMs);
+    if (invalid) return;
     const parsed = Number(value);
-    if (Number.isInteger(parsed) && parsed >= min && parsed <= max) {
-      void dispatch({ type: "update_scan_setup", setup: { [field]: parsed } });
-    }
+    void dispatch({ type: "update_scan_setup", setup: { [field]: parsed } });
   };
 
   const commitDuration = (): void => {
-    const seconds = parseHms(maxXray);
+    const seconds = minutesToSeconds(maxXray);
     if (seconds !== null && seconds >= 1 && seconds <= 600) {
       void dispatch({ type: "update_scan_setup", setup: { maxXraySec: seconds } });
     }
@@ -393,10 +366,18 @@ function ScanParamsPanel({
     }
   };
 
-  const viewsInvalid = views !== "" && (!/^\d+$/.test(views) || Number(views) < 1 || Number(views) > 360);
-  const exposureInvalid = exposure !== "" && (!/^\d+$/.test(exposure) || Number(exposure) < 1 || Number(exposure) > 10000);
-  const durationSeconds = parseHms(maxXray);
-  const durationInvalid = maxXray !== "" && (durationSeconds === null || durationSeconds < 1 || durationSeconds > 600);
+  const viewsIssue = views === "" ? null : projectionError(views);
+  const exposureIssue = exposure === "" ? null : exposureError(exposure, ws.cameraExposure.minMs, ws.cameraExposure.maxMs);
+  const durationSeconds = minutesToSeconds(maxXray);
+  const durationIssue = maxXray !== "" && durationSeconds === null ? "Max X-ray time must be 0–10 min, positive and in whole-second increments." : null;
+  const viewsInvalid = Boolean(viewsIssue);
+  const exposureInvalid = Boolean(exposureIssue);
+  const durationInvalid = Boolean(durationIssue);
+  const invalidDraft = !taskId.trim() || !savePath.trim() || !views || !exposure || !maxXray || viewsInvalid || exposureInvalid || durationInvalid;
+  useEffect(() => { onInvalidChange(invalidDraft); }, [invalidDraft, onInvalidChange]);
+  useEffect(() => {
+    onValidationError([viewsIssue, exposureIssue, durationIssue].filter(Boolean).join(" ") || null);
+  }, [viewsIssue, exposureIssue, durationIssue, onValidationError]);
 
   // New Scan Task / Reset Parameters go through the engine, so the drafts are
   // refilled from the engine snapshot once the next poll lands.
@@ -406,7 +387,7 @@ function ScanParamsPanel({
     setSavePath(setup.savePath);
     setViews(setup.projectionCount > 0 ? String(setup.projectionCount) : "");
     setExposure(setup.exposureMs > 0 ? String(setup.exposureMs) : "");
-    setMaxXray(setup.maxXraySec > 0 ? formatHms(setup.maxXraySec) : "");
+    setMaxXray(secondsToMinutes(setup.maxXraySec || 600));
     taskIdRef.current?.focus();
   }, [syncRevision]);
 
@@ -423,6 +404,7 @@ function ScanParamsPanel({
           <span>Task ID</span>
           <input
             ref={taskIdRef}
+            placeholder="Enter a task name"
             value={taskId}
             disabled={locked}
             onChange={(event) => setTaskId(event.target.value)}
@@ -434,6 +416,7 @@ function ScanParamsPanel({
           <div className={`path-control ${pathError ? "is-invalid" : ""}`}>
             <input
               value={savePath}
+              title={savePath}
               disabled={locked}
               aria-invalid={Boolean(pathError)}
               placeholder={desktopRuntime ? "Windows image directory unavailable" : "Unavailable in developer preview"}
@@ -458,19 +441,16 @@ function ScanParamsPanel({
         </label>
         <div className="scan-input-grid">
           <label className={`numeric-field ${viewsInvalid ? "is-invalid" : ""}`}>
-            <span>Total Projections</span>
-            <input value={views} disabled={locked} inputMode="numeric" aria-invalid={viewsInvalid} onChange={(event) => setViews(event.target.value)} onBlur={() => commitInteger("projectionCount", views, 1, 360)} />
-            <small>1–360 views</small>
+            <span>Total projections <HelpTip text="Any positive integer up to 3600. The engine calculates the angular step." /></span>
+            <input value={views} disabled={locked} inputMode="numeric" aria-label="Total projections" aria-invalid={viewsInvalid} onChange={(event) => setViews(event.target.value)} onBlur={() => commitNumber("projectionCount", views)} />
           </label>
           <label className={`numeric-field ${exposureInvalid ? "is-invalid" : ""}`}>
-            <span>Exposure</span>
-            <input value={exposure} disabled={locked} inputMode="numeric" aria-invalid={exposureInvalid} onChange={(event) => setExposure(event.target.value)} onBlur={() => commitInteger("exposureMs", exposure, 1, 10000)} />
-            <small>1–10000 ms</small>
+            <span>Exposure · ms <HelpTip text={`${ws.cameraExposure.known ? "Connected camera" : "Nikon D7100 timed shutter"}: ${ws.cameraExposure.minMs}–${ws.cameraExposure.maxMs} ms. The value must match a supported camera shutter setting; unsupported values are rejected.`} /></span>
+            <input value={exposure} disabled={locked} inputMode="decimal" aria-label="Exposure in milliseconds" aria-invalid={exposureInvalid} onChange={(event) => setExposure(event.target.value)} onBlur={() => commitNumber("exposureMs", exposure)} />
           </label>
           <label className={`numeric-field ${durationInvalid ? "is-invalid" : ""}`}>
-            <span>Max Continuous X-ray</span>
-            <input value={maxXray} disabled={locked} aria-invalid={durationInvalid} placeholder="hh:mm:ss" onChange={(event) => setMaxXray(event.target.value)} onBlur={commitDuration} />
-            <small>00:00:01–00:10:00 · then 5 min cooldown</small>
+            <span>Max X-ray · min <HelpTip text="Default 10 min. Maximum continuous output is limited to 10 min, followed by 5 min cooldown. Fractional minutes such as 0.5 are allowed." /></span>
+            <input value={maxXray} disabled={locked} inputMode="decimal" aria-label="Maximum X-ray time in minutes" aria-invalid={durationInvalid} onChange={(event) => setMaxXray(event.target.value)} onBlur={commitDuration} />
           </label>
         </div>
       </div>
@@ -486,7 +466,7 @@ function DockIcon({ src, alt }: { src: string; alt: string }) {
   return <img className="dock-icon" src={src} alt={alt} draggable={false} />;
 }
 
-function ControlDock({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void }) {
+function ControlDock({ ws, dispatch, stale = false }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void; stale?: boolean }) {
   const dock = ws.dock;
   const play =
     dock.playMode === "pause"
@@ -502,7 +482,7 @@ function ControlDock({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engi
         className="dock-key dock-key--home"
         aria-label="Home"
         title={dock.homeReason || "Home turntable"}
-        disabled={!dock.home}
+        disabled={stale || !dock.home}
         onClick={() => void dispatch({ type: "home" })}
       >
         <DockIcon src="/assets/dock-home.svg" alt="" />
@@ -513,7 +493,7 @@ function ControlDock({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engi
         className="dock-key dock-key--play"
         aria-label={play.label}
         title={dock.playReason || play.label}
-        disabled={!dock.play}
+        disabled={stale || !dock.play}
         onClick={() => void dispatch(play.command)}
       >
         <DockIcon src={play.src} alt="" />
@@ -523,7 +503,7 @@ function ControlDock({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engi
         type="button"
         className="dock-key dock-key--restore"
         aria-label="Restore"
-        disabled={!dock.restore}
+        disabled={stale || !dock.restore}
         onClick={() => void dispatch({ type: "restore_previous" })}
       >
         <DockIcon src="/assets/dock-restore.svg" alt="" />
@@ -531,33 +511,40 @@ function ControlDock({ ws, dispatch }: { ws: WorkstationView; dispatch: (c: Engi
       </button>
       <button
         type="button"
-        className="dock-key dock-key--estop"
-        aria-label={ws.dataState === "fault" ? "Release E-Stop" : "E-Stop"}
-        disabled={!dock.estop}
-        onClick={() => void dispatch(ws.dataState === "fault" ? { type: "estop_release" } : { type: "stop" })}
+        className="dock-key dock-key--stop"
+        aria-label="End scan"
+        title={dock.stop ? "End the active scan; already saved projections are retained" : "No active scan to end"}
+        disabled={stale || !dock.stop}
+        onClick={() => void dispatch({ type: "stop" })}
       >
-        <DockIcon src="/assets/dock-estop.svg" alt="" />
-        <span className="dock-key__label">{ws.dataState === "fault" ? "Release" : "E-Stop"}</span>
+        <DockIcon src="/assets/dock-stop.svg" alt="" />
+        <span className="dock-key__label">Stop</span>
       </button>
     </div>
   );
 }
 
-function LiveScene({ ws, theme, dispatch }: { ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void }) {
+function LiveScene({ ws, theme, dispatch, stale, setupInvalid, feedbackId }: { ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string }) {
   const [viewPreset, setViewPreset] = useState<ViewPreset>("iso");
+  const [presetRevision, setPresetRevision] = useState(0);
   const fallback = useSceneFallback();
   const sceneView = {
     dataState: ws.dataState,
     angleDeg: ws.scene.angleDeg,
+    feedbackId,
+    feedbackValid: !stale && ws.scene.angleKnown,
+    rotationDirection: ws.scene.rotationDirection,
+    taskId: ws.scanSetup.taskId,
     theme,
-    beamOn: ws.xray.beamOn,
+    beamOn: !stale && ws.xray.beamState === "on",
     xrayLatched: ws.xray.latched,
   } as const;
   return (
     <section className="panel live-panel">
       <div className="scene-toolbar">
         <span className="chip chip--accent">3D RENDER</span>
-        <h2>Live Scene</h2>
+        <h2>Equipment View</h2>
+        <HelpTip text={`Read-only geometry view. ${setupInvalid ? "Complete valid scan parameters first." : ws.dock.playReason || "Ready for the next operation."}`} />
         <span className="menu-spacer" />
         {(["iso", "front", "top"] as const).map((preset) => (
           <button
@@ -565,7 +552,7 @@ function LiveScene({ ws, theme, dispatch }: { ws: WorkstationView; theme: Theme;
             type="button"
             className={`scene-view-btn ${viewPreset === preset ? "active" : ""}`}
             aria-pressed={viewPreset === preset}
-            onClick={() => setViewPreset(preset)}
+            onClick={() => { setViewPreset(preset); setPresetRevision(value => value + 1); }}
           >
             {preset.toUpperCase()}
           </button>
@@ -575,29 +562,29 @@ function LiveScene({ ws, theme, dispatch }: { ws: WorkstationView; theme: Theme;
         {fallback.reason ? (
           <StaticSceneFallback view={sceneView} reason={fallback.reason} />
         ) : (
-          <LiveSceneCanvas view={sceneView} preset={viewPreset} onContextLost={fallback.setContextLost} />
+          <LiveSceneCanvas view={sceneView} preset={viewPreset} presetRevision={presetRevision} onContextLost={fallback.setContextLost} />
         )}
         <span className="live-indicator">
           <i aria-hidden="true" />
-          LIVE RENDER
+          GEOMETRY VIEW · {stale ? "STATUS UNAVAILABLE" : "OPTICAL AXIS"}
         </span>
         <div className="status-floats">
           {ws.floats.map((float) => (
             <span className="status-float" key={float.key}>
-              <i className={`status-float__dot ${toneClass(float.tone)}`} aria-hidden="true" />
+              <i className={`status-float__dot ${toneClass(stale ? "muted" : float.tone)}`} aria-hidden="true" />
               {float.key}
-              <b>{float.text}</b>
+              <b>{stale ? "UNKNOWN" : float.text}</b>
             </span>
           ))}
         </div>
         <div className="scene-readout-block">
-          <span className="scene-label">TURNTABLE ANGLE</span>
-          <strong className="scene-readout">{ws.scene.angleDeg.toFixed(2)}°</strong>
+          <span className="scene-label">TURNTABLE ANGLE <HelpTip text="Latest confirmed turntable angle. The model follows these feedback samples with a short constant-speed transition; it does not predict the next position." /></span>
+          <strong className="scene-readout">{stale || !ws.scene.angleKnown ? "—" : ws.scene.angleDeg.toFixed(2)}°</strong>
           <span className={`scene-safety ${ws.safetyBar.tone !== "muted" ? "scene-safety--danger" : ""} ${ws.safetyBar.tone === "dangerBold" ? "scene-safety--bold" : ""}`}>
-            {ws.safetyBar.text}
+            {stale ? "Control service unavailable · readings are unknown" : ws.safetyBar.text}
           </span>
         </div>
-        <ControlDock ws={ws} dispatch={dispatch} />
+        <ControlDock ws={ws} dispatch={dispatch} stale={stale || setupInvalid} />
       </div>
     </section>
   );
@@ -607,7 +594,7 @@ function LiveScene({ ws, theme, dispatch }: { ws: WorkstationView; theme: Theme;
 /* Right column                                                        */
 /* ------------------------------------------------------------------ */
 
-function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean; dispatch: (c: EngineCommand) => Promise<void> }) {
+function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: boolean; dispatch: (c: EngineCommand) => Promise<void>; stale: boolean }) {
   const [kvDraft, setKvDraft] = useState(ws.xray.setKv.toFixed(1));
   const [uaDraft, setUaDraft] = useState(ws.xray.setUa.toFixed(1));
   const [delayDraft, setDelayDraft] = useState(String(ws.xray.usbShutdownDelay ?? 5));
@@ -626,18 +613,33 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
     ws.xray.currentConfirmed && Number(uaDraft).toFixed(1) === ws.xray.setUa.toFixed(1);
   const pairConfirmed = voltageDraftConfirmed && currentDraftConfirmed;
   const scanLocked = ws.dataState === "scanning";
+  const beamState = stale ? "unknown" : ws.xray.beamState;
+  const outputText = beamState === "on" ? "ON" : beamState === "off" ? "OFF · VERIFIED" : "UNKNOWN";
+  const connected = !stale && ws.xray.connected;
+  const sourceHelp = scanLocked
+          ? "CT scan owns beam commands only · USB AUTO SHUT DOWN remains operator-controlled"
+          : !ws.xray.connected
+            ? "Connect the Moxtek before changing setpoints or device safety settings"
+            : !ws.xray.usbAutoShutDownKnown
+              ? "Choose USB AUTO SHUT DOWN manually before Preflight"
+          : ws.xray.usbAutoShutDown
+            ? "Device timer armed · continuous output is bounded if the host stops responding"
+            : pairConfirmed
+              ? "Released by operator · CT scan will not restore it automatically"
+              : "Released by operator · confirm both setpoints before standalone Xray Enable";
 
   return (
-    <section className="panel">
+    <section className="panel xray-panel">
       <div className="panel__header">
         <h2>12 Watt Controller</h2>
-        <span className={`chip chip--${ws.xray.beamOn ? "danger" : scanLocked ? "warn" : "ok"}`}>
-          {ws.xray.beamOn ? "EMITTING" : scanLocked ? "SCAN MONITOR" : "USB LINK"}
+        <HelpTip text={sourceHelp} />
+        <span className={`chip chip--${beamState === "on" ? "danger" : connected ? "accent" : "muted"}`}>
+          {beamState === "on" ? "EMITTING" : connected ? "CONNECTED" : "NOT CONNECTED"}
         </span>
       </div>
       <div className={`xray-mode-banner ${scanLocked ? "xray-mode-banner--locked" : "xray-mode-banner--manual"}`}>
-        <span>{scanLocked ? "CT SCAN · MANUAL CONTROLS LOCKED" : "STANDALONE SOURCE CONTROL"}</span>
-        <strong>{ws.xray.beamOn ? "LIVE OUTPUT" : "OUTPUT OFF"}</strong>
+        <span>{scanLocked ? "Scan control · manual locked" : "Manual source control"}</span>
+        <strong className={beamState === "on" ? "tone-danger" : beamState === "off" ? "tone-ok" : "tone-muted"}>{outputText}</strong>
       </div>
       <button
         type="button"
@@ -649,18 +651,19 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
       </button>
       <div className="xray-channels">
         <div className="xray-channel">
-          <span className="xray-channel__label">VOLTAGE</span>
+          <span className="xray-channel__label">Voltage · kV <HelpTip text="SET is the requested voltage. Measured is device readback; a dash means unknown." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
               <span className="xray-channel__key">SET</span>
               <input
                 className="xray-channel__well"
+                aria-label="Voltage setpoint in kV"
                 value={kvDraft}
                 disabled={busy || !ws.xray.setpointControlsEnabled}
                 inputMode="decimal"
                 onChange={(event) => setKvDraft(event.target.value)}
               />
-              <span className="xray-channel__monitor">MON {ws.xray.monKv.toFixed(1)} kV</span>
+              <span className="xray-channel__monitor">Measured <b>{measured(ws.xray.monKv, stale)}</b></span>
             </div>
             <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(kvDraft))} onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) })}>
               {voltageDraftConfirmed ? "V SENT" : "SEND V"}
@@ -668,18 +671,19 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
           </div>
         </div>
         <div className="xray-channel">
-          <span className="xray-channel__label">CURRENT</span>
+          <span className="xray-channel__label">Current · µA <HelpTip text="SET is the requested current. Measured is device readback; a dash means unknown." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
               <span className="xray-channel__key">SET</span>
               <input
                 className="xray-channel__well"
                 value={uaDraft}
+                aria-label="Current setpoint in microamps"
                 disabled={busy || !ws.xray.setpointControlsEnabled}
                 inputMode="decimal"
                 onChange={(event) => setUaDraft(event.target.value)}
               />
-              <span className="xray-channel__monitor">MON {ws.xray.monUa.toFixed(1)} µA</span>
+              <span className="xray-channel__monitor">Measured <b>{measured(ws.xray.monUa, stale)}</b></span>
             </div>
             <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(uaDraft))} onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) })}>
               {currentDraftConfirmed ? "I SENT" : "SEND I"}
@@ -689,17 +693,17 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
       </div>
       <div className="xray-meters">
         <div className="xray-meter">
-          <span>POWER</span>
-          <div className="xray-meter__well">{ws.xray.powerW.toFixed(1)} W</div>
+          <span>Measured power</span>
+          <div className="xray-meter__well">{measured(ws.xray.powerW, stale)} <small>W</small></div>
         </div>
         <div className="xray-meter">
-          <span>TEMP</span>
-          <div className="xray-meter__well">{ws.xray.tempC.toFixed(1)} °C</div>
+          <span>Temperature</span>
+          <div className="xray-meter__well">{measured(ws.xray.tempC, stale)} <small>°C</small></div>
         </div>
         <div className="xray-meter">
-          <span>OUTPUT</span>
-          <div className={`xray-meter__well ${ws.xray.beamOn ? "xray-meter__well--danger" : "xray-meter__well--safe"}`}>
-            {ws.xray.beamOn ? "ON" : "OFF"}
+          <span>Output state</span>
+          <div className={`xray-meter__well ${beamState === "on" ? "xray-meter__well--danger" : beamState === "off" ? "xray-meter__well--safe" : "xray-meter__well--unknown"}`}>
+            {beamState === "on" ? "ON" : beamState === "off" ? "OFF" : "UNKNOWN"}
           </div>
         </div>
       </div>
@@ -733,11 +737,11 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
       <div className="safety-block">
         <div className="safety-block__head">
           <span className="safety-block__title">DEVICE SAFETY</span>
-          <span className={`chip chip--${ws.xray.usbAutoShutDown ? "ok" : "warn"}`}>
-            {!ws.xray.usbAutoShutDownKnown
-              ? "OPERATOR SETTING REQUIRED"
+          <span className={`chip chip--${stale || !ws.xray.usbAutoShutDownKnown ? "muted" : ws.xray.usbAutoShutDown ? "ok" : "warn"}`}>
+            {stale || !ws.xray.usbAutoShutDownKnown
+              ? "NOT VERIFIED"
               : ws.xray.usbAutoShutDown
-              ? "ARMED · FAIL-SAFE"
+              ? "TIMER ARMED"
               : scanLocked
                 ? "RELEASED · SCAN OWNED"
                 : "RELEASED · MANUAL"}
@@ -746,7 +750,8 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
         <label className="check-row check-row--inset">
           <input
             type="checkbox"
-            checked={ws.xray.usbAutoShutDown}
+            checked={!stale && ws.xray.usbAutoShutDownKnown && ws.xray.usbAutoShutDown}
+            ref={(element) => { if (element) element.indeterminate = stale || !ws.xray.usbAutoShutDownKnown; }}
             disabled={busy || ws.dataState === "scanning" || !ws.xray.connected}
             onChange={() => void dispatch({ type: "usb_auto_shut_down_toggle" })}
           />
@@ -771,53 +776,41 @@ function XrayPanel({ ws, busy, dispatch }: { ws: WorkstationView; busy: boolean;
           >
             SET
           </button>
-          <span className="delay-row__device">DEV {ws.xray.usbShutdownDelay ?? "—"}</span>
+          <span className="delay-row__device">Device {stale ? "—" : ws.xray.usbShutdownDelay ?? "—"}</span>
         </div>
       </div>
-      <p className="panel__footnote">
-        {scanLocked
-          ? "CT scan owns beam commands only · USB AUTO SHUT DOWN remains operator-controlled"
-          : !ws.xray.connected
-            ? "Connect the Moxtek before changing setpoints or device safety settings"
-            : !ws.xray.usbAutoShutDownKnown
-              ? "Choose USB AUTO SHUT DOWN manually before Preflight"
-          : ws.xray.usbAutoShutDown
-            ? "Device timer armed · continuous output is bounded if the host stops responding"
-            : pairConfirmed
-              ? "Released by operator · CT scan will not restore it automatically"
-              : "Released by operator · confirm both setpoints before standalone Xray Enable"}
-      </p>
+
     </section>
   );
 }
 
-function OperationPanel({ ws }: { ws: WorkstationView }) {
+function OperationPanel({ ws, stale }: { ws: WorkstationView; stale: boolean }) {
   return (
     <section className="panel operation-panel">
       <div className="panel__header">
         <h2>Operation Status</h2>
-        <span className={`chip chip--${ws.phaseTone}`}>{ws.phaseWord}</span>
+        <span className={`chip chip--${stale ? "muted" : ws.phaseTone}`}>{stale ? "UNKNOWN" : ws.phaseWord}</span>
       </div>
       <div className="op-stats">
         <div className="op-stat">
           <span>CAPTURED</span>
           <strong>
-            {ws.progress.captured} / {ws.progress.total}
+            {stale || ws.progress.total === 0 ? "— / —" : `${ws.progress.captured} / ${ws.progress.total}`}
           </strong>
         </div>
         <div className="op-stat">
           <span>ANGLE</span>
-          <strong>{ws.progress.angleDeg.toFixed(2)}°</strong>
+          <strong>{stale || !ws.scene.angleKnown ? "—" : ws.progress.angleDeg.toFixed(2)}°</strong>
         </div>
         <div className="op-stat">
-          <span>ETA</span>
-          <strong>{ws.progress.etaText}</strong>
+          <span title="Estimated from completed projection cycles, including X-ray cooling">EST. REMAINING</span>
+          <strong>{stale ? "—" : ws.progress.etaText}</strong>
         </div>
       </div>
       <div className="op-progress">
         <div className="op-progress__head">
           <span>VIEW PROGRESS</span>
-          <small>{ws.progress.barLabel}</small>
+          <small>{stale ? "Status unavailable" : ws.progress.total ? ws.progress.barLabel : "Awaiting scan setup"}</small>
         </div>
         <div className={`op-progress__bar op-progress__bar--${ws.progress.barTone}`} role="progressbar" aria-valuenow={ws.progress.percent} aria-valuemin={0} aria-valuemax={100}>
           <span style={{ width: `${ws.progress.percent}%` }} />
@@ -827,7 +820,7 @@ function OperationPanel({ ws }: { ws: WorkstationView }) {
         <span className="op-summary__title">PROCESS SUMMARY</span>
         <div>
           <span>Save Path</span>
-          <strong>{ws.summary.savePath}</strong>
+          <strong title={ws.summary.savePath}>{ws.summary.savePath || "Not selected"}</strong>
         </div>
         <div>
           <span>Acquisition</span>
@@ -835,7 +828,7 @@ function OperationPanel({ ws }: { ws: WorkstationView }) {
         </div>
         <div>
           <span>Output</span>
-          <strong>{ws.summary.output}</strong>
+          <strong title={ws.summary.output}>{stale ? "UNKNOWN · service unavailable" : ws.summary.output}</strong>
         </div>
       </div>
     </section>
@@ -863,11 +856,19 @@ const logLevelClass: Record<ConsoleLogLine["level"], string> = {
   ACTION: "log-line--pass",
 };
 
-function LogLines({ logs }: { logs: ConsoleLogLine[] }) {
+function LogLines({ logs, follow, onFollow }: { logs: ConsoleLogLine[]; follow: boolean; onFollow: (value: boolean) => void }) {
+  const list = useRef<HTMLDivElement | null>(null);
+  const ordered = useMemo(() => [...logs].sort((a, b) => a.timestamp.localeCompare(b.timestamp)), [logs]);
+  useEffect(() => {
+    if (follow && list.current) list.current.scrollTop = list.current.scrollHeight;
+  }, [ordered, follow]);
   if (!logs.length) return <div className="log-empty">No records in this channel.</div>;
   return (
-    <div className="log-lines">
-      {logs.map((entry) => (
+    <div className="log-lines" ref={list} onScroll={(event) => {
+      const node = event.currentTarget;
+      onFollow(node.scrollHeight - node.scrollTop - node.clientHeight < 8);
+    }}>
+      {ordered.map((entry) => (
         <div className={`log-line ${logLevelClass[entry.level]}`} key={entry.id}>
           <time className="log-line__time">[{logTime(entry.timestamp)}]</time>
           <span className="log-line__tag">
@@ -882,6 +883,7 @@ function LogLines({ logs }: { logs: ConsoleLogLine[] }) {
 
 function BottomConsole({ ws }: { ws: WorkstationView }) {
   const [tab, setTab] = useState<BottomTab>("aggregate");
+  const [follow, setFollow] = useState(true);
   const logs = ws.consoleLogs;
   const filtered = useMemo(() => {
     if (tab === "aggregate" || tab === "images") return logs;
@@ -901,8 +903,8 @@ function BottomConsole({ ws }: { ws: WorkstationView }) {
     tab === "images"
       ? `CAPTURED IMAGES · ${ws.scanSetup.taskId} · ${ws.progress.captured} / ${ws.progress.total} VIEWS · ${ws.scanSetup.angleStepDeg.toFixed(2)}° STEP · ${ws.scanSetup.exposureMs} ms`
       : tab === "aggregate"
-        ? "AGGREGATED STREAM · 5 SOURCES · FOLLOW TAIL"
-        : `${tab === "xray" ? "X-RAY" : tab === "nano" ? "TURNTABLE" : "CAMERA"} STREAM · FOLLOW TAIL`;
+        ? "SESSION EVENTS · ALL SOURCES"
+        : `${tab === "xray" ? "X-RAY" : tab === "nano" ? "TURNTABLE" : "CAMERA"} EVENTS`;
 
   return (
     <section className="console">
@@ -922,9 +924,14 @@ function BottomConsole({ ws }: { ws: WorkstationView }) {
         ))}
       </div>
       <div className="console__body" role="tabpanel">
-        <div className="console__head">{header}</div>
+        <div className="console__head"><span>{header}</span>{tab !== "images" && (
+          <button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => setFollow(!follow)}>
+            {follow ? "Following latest" : "Resume live log"}
+          </button>
+        )}</div>
         {tab === "images" ? (
           <div className="image-strip">
+            {ws.progress.total === 0 && <div className="log-empty">No projections yet. Configure a scan task to view its image sequence.</div>}
             {Array.from({ length: ws.progress.total }, (_, index) => {
               const frame = ws.frames.find((item) => item.index === index + 1);
               return (
@@ -936,7 +943,7 @@ function BottomConsole({ ws }: { ws: WorkstationView }) {
             })}
           </div>
         ) : (
-          <LogLines logs={filtered} />
+          <LogLines logs={filtered} follow={follow} onFollow={setFollow} />
         )}
       </div>
     </section>
@@ -982,7 +989,7 @@ function InfoDialog({
       <ol className="modal-list">
         <li>
           <strong>Configure the scan.</strong> Task ID, Save Path, Total Projections, Exposure and Max X-ray
-          (hh:mm:ss) must all be filled: preflight stays blocked until every field is set.
+          (minutes, default 10) must be valid. Projections accept 1–3600; exposure follows the camera's timed shutter limits.
         </li>
         <li>
           <strong>Run preflight</strong> (Tools → Run Preflight). Eight checks run over the link; the engine
@@ -993,12 +1000,11 @@ function InfoDialog({
           exposure and is invalidated whenever a parameter changes.
         </li>
         <li>
-          <strong>Start the scan.</strong> Pause holds the pulse counter, Resume continues, E-STOP latches the
-          output off.
+          <strong>Start the scan.</strong> Pause takes effect after a safe projection boundary, Resume continues,
+          and Stop ends the active scan while retaining committed images.
         </li>
         <li>
-          <strong>After E-STOP</strong> repeat HOME and preflight: the latch is released by the engine, never by
-          the operator alone.
+          <strong>After Stop</strong> run Preflight and HOME again before starting a new scan.
         </li>
       </ol>
     );
@@ -1006,8 +1012,8 @@ function InfoDialog({
     body = (
       <ul className="modal-list">
         <li>
-          <strong>E-STOP is fail-closed.</strong> It latches the X-ray output off and invalidates preflight and
-          HOME in the engine.
+          <strong>Device faults fail closed.</strong> The engine attempts to turn off X-rays and stop motion,
+          then invalidates Preflight and HOME. A physical emergency stop remains part of the hardware safety system.
         </li>
         <li>
           <strong>Preflight before HOME, HOME before exposure.</strong> The engine rejects HOME without
@@ -1086,7 +1092,7 @@ function InfoDialog({
           </div>
           <div>
             <dt>Safety model</dt>
-            <dd>Engine-owned · fail-closed E-STOP · preflight then HOME</dd>
+            <dd>Engine-owned scan state · device fault protection · preflight then HOME</dd>
           </div>
         </dl>
       </div>
@@ -1141,10 +1147,12 @@ function InfoDialog({
 /* ------------------------------------------------------------------ */
 
 export function App() {
-  const { adapterKind, snapshot, busy, error, dispatch } = useEngine();
+  const { adapterKind, snapshot, busy, error, transportError, dispatch } = useEngine();
   const [theme, setTheme] = useTheme();
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [setupDraftInvalid, setSetupDraftInvalid] = useState(true);
+  const [setupDraftError, setSetupDraftError] = useState<string | null>(null);
   const [canvasLayout, setCanvasLayout] = useState<CanvasLayout>(() =>
     computeCanvasLayout(window.innerWidth, window.innerHeight),
   );
@@ -1194,8 +1202,8 @@ export function App() {
         setup.maxXraySec > 0,
     );
     const desktop = adapterKind === "tauri";
-    const estopLatched = ws?.dataState === "fault";
-    return {
+    const faulted = ws?.dataState === "fault";
+    const entries: MenuAvailability = {
       "file.newTask": running ? blocked("scan active") : ok,
       "file.openImageFolder": desktop
         ? running
@@ -1209,13 +1217,11 @@ export function App() {
       "edit.redo": blocked("engine has no undo stack"),
       "edit.resetParameters": running ? blocked("scan active") : ok,
       "edit.preferences": ok,
-      "tools.runPreflight": estopLatched
-        ? blocked("E-STOP latched")
-        : configured
-          ? ok
-          : blocked("setup incomplete"),
-      "tools.homeAllAxes": estopLatched
-        ? blocked("E-STOP latched")
+      "tools.runPreflight": configured
+        ? ok
+        : blocked("setup incomplete"),
+      "tools.homeAllAxes": faulted
+        ? blocked("run Preflight to revalidate device safety")
         : snapshot?.preflightPassed
           ? ok
           : blocked("preflight required"),
@@ -1227,7 +1233,18 @@ export function App() {
       "help.safetyNotes": ok,
       "help.about": ok,
     };
-  }, [adapterKind, snapshot?.preflightPassed, ws]);
+    if (transportError || busy) {
+      for (const id of ["file.newTask", "file.openImageFolder", "edit.resetParameters", "tools.runPreflight", "tools.homeAllAxes", "tools.restorePrevious"] as const) {
+        entries[id] = blocked(transportError ? "control service unavailable" : "command in progress");
+      }
+    }
+    if (setupDraftInvalid) {
+      for (const id of ["tools.runPreflight", "tools.homeAllAxes", "tools.restorePrevious"] as const) {
+        entries[id] = blocked("complete valid scan parameters");
+      }
+    }
+    return entries;
+  }, [adapterKind, snapshot?.preflightPassed, ws, transportError, busy, setupDraftInvalid]);
 
   const handleMenuAction = useCallback(
     async (id: MenuActionId): Promise<void> => {
@@ -1341,54 +1358,71 @@ export function App() {
     <main className="viewport-shell">
       <div
         className="design-canvas"
-        style={{ zoom: canvasLayout.zoom, height: `${canvasLayout.designHeight}px` }}
+        style={{ zoom: canvasLayout.zoom, width: `${canvasLayout.designWidth}px`, height: `${canvasLayout.designHeight}px` }}
       >
         <MenuBar
-          theme={theme}
-          onTheme={setTheme}
-          snapshot={snapshot}
-          adapterKind={adapterKind}
           availability={availability}
           onAction={(id) => void handleMenuAction(id)}
         />
         <div className="app-divider" />
-        {error || actionError ? (
+        {error || actionError || setupDraftError ? (
           <div className="error-toast" role="alert">
-            {actionError ?? error}
+            {setupDraftError ?? actionError ?? error}
           </div>
         ) : null}
-        <section className="main-console">
-          <aside className="col">
-            <DevicePanel
-              ws={ws}
-              busy={busy}
-              hardwareConnected={snapshot.connectionState === "connected"}
-              desktopRuntime={adapterKind === "tauri"}
-              dispatch={dispatch}
-            />
-            <ScanParamsPanel
-              ws={ws}
-              busy={busy}
-              desktopRuntime={adapterKind === "tauri"}
-              dispatch={dispatch}
-              syncRevision={setupSync}
-            />
-          </aside>
-          <LiveScene ws={ws} theme={theme} dispatch={dispatch} />
-          <aside className="col">
-            <XrayPanel ws={ws} busy={busy} dispatch={dispatch} />
-            <OperationPanel ws={ws} />
+        {/* Main row and log row share one grid: the right column reaches the
+            bottom of the workspace and the console covers left + centre only. */}
+        <section className="workspace-body">
+          <section className="main-console">
+            <aside className="col">
+              <DevicePanel
+                ws={ws}
+                busy={busy || Boolean(transportError)}
+                stale={Boolean(transportError)}
+                setupInvalid={setupDraftInvalid}
+                hardwareConnected={snapshot.connectionState === "connected"}
+                desktopRuntime={adapterKind === "tauri"}
+                dispatch={dispatch}
+              />
+              <ScanParamsPanel
+                ws={ws}
+                busy={busy || Boolean(transportError)}
+                desktopRuntime={adapterKind === "tauri"}
+                dispatch={dispatch}
+                syncRevision={setupSync}
+                onInvalidChange={setSetupDraftInvalid}
+                onValidationError={setSetupDraftError}
+              />
+            </aside>
+            <LiveScene ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} />
+          </section>
+          <div className="app-divider" />
+          <BottomConsole ws={ws} />
+          <aside className="col col--right">
+            <XrayPanel ws={ws} busy={busy || Boolean(transportError)} dispatch={dispatch} stale={Boolean(transportError)} />
+            <OperationPanel ws={ws} stale={Boolean(transportError)} />
           </aside>
         </section>
-        <div className="app-divider" />
-        <BottomConsole ws={ws} />
         <div className="app-divider" />
         <footer className="status-bar">
           <span className="status-bar__left">
             <i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} aria-hidden="true" />
-            <strong>{ws.statusbar.left}</strong>
+            <strong>{transportError ? "Control service unavailable · device states unknown" : ws.dock.playReason || ws.phaseWord}</strong>
           </span>
-          <span className="status-bar__right">{ws.statusbar.right}</span>
+          <div className="status-bar__right">
+            <span>{ws.scanSetup.taskId || "No task selected"}</span>
+            {snapshot.mode === "developer_preview" && <span className="badge badge--dev">Offline preview</span>}
+            <span className={`badge badge--engine badge--${transportError ? "lost" : "connected"}`}>
+              <i aria-hidden="true" />Control service · {transportError ? "Unavailable" : "Ready"}
+            </span>
+            <div className="theme-toggle" role="group" aria-label="Theme">
+              {(["light", "dark"] as const).map(value => (
+                <button type="button" key={value} className="theme-toggle__seg" aria-pressed={theme === value} onClick={() => setTheme(value)}>
+                  {value === "light" ? "Light" : "Dark"}
+                </button>
+              ))}
+            </div>
+          </div>
         </footer>
         {dialog ? (
           <InfoDialog

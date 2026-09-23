@@ -80,6 +80,13 @@ impl EngineClient {
 
     fn spawn_at(path: &Path, preview: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let mut command = Command::new(path);
+        // Keep JSONL pipes and shutdown ownership without creating a Windows console.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         if preview {
             command.arg("--preview");
         }
@@ -224,5 +231,17 @@ mod tests {
             .to_string();
         assert!(error.contains("failed to launch ct-engine sidecar at"));
         assert!(error.contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn background_sidecar_exchanges_snapshots_and_exits_on_drop() {
+        let path = embedded_engine_path().expect("embedded engine must extract");
+        let mut engine = EngineClient::spawn_at(&path, true).expect("preview engine must start");
+        let snapshot = engine.request("snapshot", serde_json::json!({})).expect("JSONL must work");
+        assert!(snapshot.is_object());
+        assert!(engine.child.try_wait().unwrap().is_none());
+        let started = std::time::Instant::now();
+        drop(engine);
+        assert!(started.elapsed() < Duration::from_secs(8), "engine must shut down without kill timeout");
     }
 }
