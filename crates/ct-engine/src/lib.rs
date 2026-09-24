@@ -1392,7 +1392,9 @@ impl Engine {
                             return Err("XRAY_SETPOINT_FAILED");
                         }
                     };
-                    self.force_xray_off("Moxtek voltage setpoint")?;
+                    // set_parameters already verifies both readbacks and OFF.
+                    // A second OFF transaction can fail after a successful
+                    // write and make SEND V appear to have done nothing.
                     let accepted_kv = health.set_voltage_kv.unwrap_or(kv);
                     let accepted_ua = health.set_current_ua.unwrap_or(applied_ua);
                     self.set_kv = accepted_kv;
@@ -1462,7 +1464,7 @@ impl Engine {
                             return Err("XRAY_SETPOINT_FAILED");
                         }
                     };
-                    self.force_xray_off("Moxtek current setpoint")?;
+                    // The adapter has already confirmed OFF and both values.
                     let accepted_kv = health.set_voltage_kv.unwrap_or(applied_kv);
                     let accepted_ua = health.set_current_ua.unwrap_or(ua);
                     self.set_kv = accepted_kv;

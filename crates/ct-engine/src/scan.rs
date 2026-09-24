@@ -1,8 +1,9 @@
 //! Transactional projection-scan coordinator.
 //!
 //! A projection is committed only after turntable arrival, warning assertion,
-//! verified X-ray exposure, host-side camera file confirmation, verified beam
-//! shutdown, and `CAPTURE_DONE`. Pause is observed only at safe transaction
+//! verified X-ray exposure, host-side camera file confirmation, and
+//! `CAPTURE_DONE`. A verified beam stays on across views until the configured
+//! continuous limit, pause, stop, or final view. Pause is observed at transaction
 //! boundaries. USB auto-shutdown is an operator-owned device setting: the
 //! coordinator never changes it. Every exit path still attempts verified beam
 //! OFF and warning OFF before returning.
@@ -14,7 +15,6 @@ use crate::{timestamp, Parameters};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::collections::VecDeque;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -324,7 +324,17 @@ fn run_scan(
         let _ = nano.stop();
     }
 
-    finish_scan_result(result, off.map(|_| ()).map_err(|e| e.to_string()), warning_off.map_err(|e| e.to_string()))
+    let completion = finish_scan_result(result, off.map(|_| ()).map_err(|e| e.to_string()), warning_off.map_err(|e| e.to_string()))?;
+    if completion == ScanCompletion::Completed {
+        let frames = progress.lock().expect("scan progress mutex poisoned").frames.clone();
+        let root = Path::new(config.parameters.save_path.trim()).join(config.parameters.task_id.trim());
+        persist(&root, &config.parameters, config, &frames, true)?;
+        update_phase(progress, "completed");
+        push_message(progress, "PASS", "system", format!(
+            "Real scan complete · {} projections · X-ray OFF", frames.len()
+        ));
+    }
+    Ok(completion)
 }
 
 fn finish_scan_result(result: Result<(), String>, off: Result<(), String>, warning: Result<(), String>) -> Result<ScanCompletion, String> {
@@ -369,40 +379,17 @@ fn run_scan_inner(
     let block_limit = Duration::from_secs(u64::from(config.max_xray_sec));
     let mut beam_started: Option<Instant> = None;
     let mut cooldown_until: Option<Instant> = None;
-    let mut jobs: VecDeque<ProjectionJob> = (0..parameters.projection_count)
-        .map(|zero_index| projection_job(zero_index, parameters.projection_count))
-        .collect();
-    let mut prefetched: Option<(ProjectionJob, MoveTicket)> = None;
     persist(&root, parameters, config, &[], false)?;
     update(progress, |value| {
         value.projection_count = parameters.projection_count;
         value.block_limit = block_limit;
     });
 
-    while let Some(job) = jobs.pop_front() {
+    for zero_index in 0..parameters.projection_count {
+        let job = projection_job(zero_index, parameters.projection_count);
         check_cancel(cancel)?;
         if let Some(cooldown_deadline) = cooldown_until.take() {
-            update_phase(progress, "cooling");
-            update(progress, |value| value.cooldown_until = Some(cooldown_deadline));
-            push_message(
-                progress,
-                "WARN",
-                "xray",
-                "Continuous X-ray limit reached · cooling for 300 seconds before resuming"
-                    .to_owned(),
-            );
-            while Instant::now() < cooldown_deadline {
-                check_cancel(cancel)?;
-                thread::sleep(Duration::from_millis(250));
-            }
-            update_phase(progress, "running");
-            update(progress, |value| value.cooldown_until = None);
-            push_message(
-                progress,
-                "PASS",
-                "xray",
-                "Five-minute X-ray cooldown complete · scan resuming".to_owned(),
-            );
+            wait_for_cooldown(progress, cancel, cooldown_deadline)?;
         }
         if pause.load(Ordering::SeqCst) && beam_started.is_some() {
             close_scan_beam(
@@ -422,24 +409,16 @@ fn run_scan_inner(
         }
         update_phase(progress, "running");
         update(progress, |value| value.projection_started = Some(Instant::now()));
-        let ticket = match prefetched.take() {
-            Some((prefetched_job, ticket)) if prefetched_job == job => {
-                let confirmed_angle = verify_capture_hold(nano, &ticket, job)?;
-                set_angle(progress, confirmed_angle);
-                push_message(
-                    progress,
-                    "PASS",
-                    "nano",
-                    format!(
-                        "Queued view={} already at {:.3}° · READY_TO_CAPTURE id={} pos={}",
-                        job.index, job.angle_deg, ticket.command_id, ticket.position_pulses
-                    ),
-                );
-                ticket
-            }
-            Some(_) => return Err("prefetched projection queue order mismatch".into()),
-            None => move_to_projection(nano, progress, job, cancel)?,
-        };
+        let ticket = move_to_projection_monitored(
+            nano, xray, progress, job, cancel, &mut beam_started, block_limit,
+            &mut cooldown_until,
+        )?;
+
+        // The limit can expire during a long MOVE_ABS. The next exposure must
+        // wait for the entire OFF interval, even though the move has completed.
+        if let Some(deadline) = cooldown_until.take() {
+            wait_for_cooldown(progress, cancel, deadline)?;
+        }
 
         if beam_started.is_none() {
             nano.set_xray_warning(true)
@@ -470,7 +449,6 @@ fn run_scan_inner(
         let capture_started = Instant::now();
         let exposure_evidence_timeout = Duration::from_secs_f64(parameters.exposure_ms / 1000.0)
             .saturating_add(CAMERA_TRIGGER_MARGIN);
-        let mut projection_released = false;
         let mut transfer_announced = false;
         let camera_for_capture = &mut *camera;
         let capture_result = thread::scope(|scope| {
@@ -574,28 +552,7 @@ fn run_scan_inner(
                                     }
                                 }
                             }
-                            if transfer_started && !projection_released {
-                                // MOVE_ABS can block beyond the beam deadline. Confirm OFF
-                                // before CAPTURE_DONE can initiate the next movement.
-                                if beam_started.is_some() {
-                                    match close_scan_beam(
-                                        nano, xray, progress, &mut beam_started,
-                                        "Projection exposure complete before turntable movement",
-                                    ) {
-                                        Ok(elapsed) => {
-                                            if elapsed >= block_limit && !final_projection {
-                                                cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
-                                                update(progress, |value| value.cooldown_until = cooldown_until);
-                                            }
-                                        }
-                                        Err(error) => {
-                                            abort_reason = Some(error);
-                                            cancel.store(true, Ordering::SeqCst);
-                                            let _ = nano.stop();
-                                        }
-                                    }
-                                }
-                                if abort_reason.is_some() { continue; }
+                            if transfer_started {
                                 if !transfer_announced {
                                     push_message(
                                         progress,
@@ -607,30 +564,6 @@ fn run_scan_inner(
                                         ),
                                     );
                                     transfer_announced = true;
-                                }
-                                let next_job = if pause.load(Ordering::SeqCst) {
-                                    None
-                                } else {
-                                    jobs.front().copied()
-                                };
-                                match release_projection_and_prefetch(
-                                    nano,
-                                    progress,
-                                    &ticket,
-                                    next_job,
-                                    &mut prefetched,
-                                    cancel,
-                                ) {
-                                    Ok(()) => projection_released = true,
-                                    Err(error) => {
-                                        abort_reason = Some(error);
-                                        cancel.store(true, Ordering::SeqCst);
-                                        let _ = xray.force_off();
-                                        let _ = nano.set_xray_warning(false);
-                                        set_xray_health(progress, xray.health());
-                                        set_beam(progress, xray.health().beam_on);
-                                        let _ = nano.stop();
-                                    }
                                 }
                             }
                         }
@@ -672,46 +605,12 @@ fn run_scan_inner(
                 update(progress, |value| value.cooldown_until = cooldown_until);
             }
         }
-        if !projection_released {
-            if beam_started.is_some() {
-                let elapsed = close_scan_beam(
-                    nano, xray, progress, &mut beam_started,
-                    "Projection capture complete before turntable movement",
-                )?;
-                if elapsed >= block_limit && !final_projection {
-                    cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
-                    update(progress, |value| value.cooldown_until = cooldown_until);
-                }
-            }
-            let next_job = if pause.load(Ordering::SeqCst) {
-                None
-            } else {
-                jobs.front().copied()
-            };
-            release_projection_and_prefetch(
-                nano,
-                progress,
-                &ticket,
-                next_job,
-                &mut prefetched,
-                cancel,
-            )?;
-        }
-        let (bytes, sha256) = hash_file(&path)?;
-        let frame = RealFrame {
-            index: frame_index,
-            angle_deg: job.angle_deg,
-            exposure_ms: parameters.exposure_ms,
-            file_name: path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("frame.nef")
-                .to_owned(),
-            path: path.display().to_string(),
-            bytes,
-            sha256,
-        };
-        let frames = push_frame(progress, frame.clone());
+        let frame = commit_projection_monitored(
+            nano, xray, progress, &root, parameters, config, cancel,
+            &path, job, &ticket, &mut beam_started, block_limit,
+            &mut cooldown_until, final_projection,
+        )?;
+        push_frame(progress, frame.clone());
         update(progress, |value| {
             if let Some(started) = value.projection_started.take() {
                 let elapsed = started.elapsed();
@@ -721,7 +620,9 @@ fn run_scan_inner(
                 });
             }
         });
-        persist(&root, parameters, config, &frames, false)?;
+        push_message(progress, "PASS", "nano", format!(
+            "CAPTURE_DONE view={} id={} · committed file confirmed", job.index, ticket.command_id
+        ));
         push_message(progress, "PASS", "camera", format!(
             "Projection committed · view={} · {} bytes · SHA-256 {}",
             frame.index, frame.bytes, frame.sha256
@@ -754,7 +655,8 @@ fn run_scan_inner(
         .map_err(|error| format!("final zero CAPTURE_DONE failed: {error}"))?;
     validate_final_position(return_ticket.position_pulses, &zero_status)?;
     check_cancel(cancel)?;
-    set_angle(progress, zero_status.position_pulses as f64 * 360.0 / f64::from(zero_status.pulses_per_rev));
+    // A verified whole revolution is the same start orientation as zero.
+    set_angle(progress, 0.0);
     push_message(
         progress,
         "PASS",
@@ -762,13 +664,6 @@ fn run_scan_inner(
         format!("Turntable returned to start orientation · {} pulses · reference valid", zero_status.position_pulses),
     );
 
-    let frames = progress.lock().expect("scan progress mutex poisoned").frames.clone();
-    persist(&root, parameters, config, &frames, true)?;
-    update_phase(progress, "completed");
-    push_message(progress, "PASS", "system", format!(
-        "Real scan complete · {} projections · X-ray OFF",
-        frames.len()
-    ));
     Ok(())
 }
 
@@ -778,6 +673,23 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn wait_for_cooldown(
+    progress: &Mutex<RealScanProgress>, cancel: &AtomicBool, deadline: Instant,
+) -> Result<(), String> {
+    update_phase(progress, "cooling");
+    update(progress, |value| value.cooldown_until = Some(deadline));
+    push_message(progress, "WARN", "xray",
+        "Continuous X-ray limit reached · cooling for 300 seconds before resuming".into());
+    while Instant::now() < deadline {
+        check_cancel(cancel)?;
+        thread::sleep(Duration::from_millis(250));
+    }
+    update(progress, |value| value.cooldown_until = None);
+    update_phase(progress, "running");
+    push_message(progress, "PASS", "xray", "Five-minute X-ray cooldown complete · scan resuming".into());
+    Ok(())
 }
 
 fn validate_final_position(ticket_position: i64, status: &crate::devices::turntable::NanoStatus) -> Result<(), String> {
@@ -907,41 +819,192 @@ fn move_to_projection(
     Ok(ticket)
 }
 
-fn release_projection_and_prefetch(
+fn move_to_projection_monitored(
     nano: &NanoAdapter,
+    xray: &mut MoxtekAdapter,
     progress: &Mutex<RealScanProgress>,
-    ticket: &MoveTicket,
-    next_job: Option<ProjectionJob>,
-    prefetched: &mut Option<(ProjectionJob, MoveTicket)>,
+    job: ProjectionJob,
     cancel: &AtomicBool,
-) -> Result<(), String> {
-    check_cancel(cancel)?;
-    let release = nano.capture_done(ticket.command_id);
-    check_cancel(cancel)?;
-    release.map_err(|error| format!("CAPTURE_DONE failed: {error}"))?;
-    push_message(
-        progress,
-        "PASS",
-        "nano",
-        format!("CAPTURE_DONE id={} · current exposure released", ticket.command_id),
-    );
-    if let Some(job) = next_job {
-        if prefetched.is_some() {
-            return Err("projection prefetch queue is already occupied".into());
-        }
-        let next_ticket = move_to_projection(nano, progress, job, cancel)?;
-        push_message(
-            progress,
-            "INFO",
-            "nano",
-            format!(
-                "View {} positioned while previous NEF transfer continues; capture remains queued",
-                job.index
-            ),
-        );
-        *prefetched = Some((job, next_ticket));
+    beam_started: &mut Option<Instant>,
+    block_limit: Duration,
+    cooldown_until: &mut Option<Instant>,
+) -> Result<MoveTicket, String> {
+    if beam_started.is_some_and(|started| started.elapsed() >= block_limit) {
+        close_scan_beam(nano, xray, progress, beam_started,
+            "Continuous X-ray limit reached before turntable movement")?;
+        let deadline = Instant::now() + XRAY_COOLDOWN;
+        wait_for_cooldown(progress, cancel, deadline)?;
     }
-    Ok(())
+    if beam_started.is_none() {
+        return move_to_projection(nano, progress, job, cancel);
+    }
+    // Nano MOVE_ABS may block for minutes. Keep the Moxtek watchdog alive and
+    // enforce the continuous-output deadline while Nano owns its serial worker.
+    thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        scope.spawn(move || { let _ = sender.send(move_to_projection(nano, progress, job, cancel)); });
+        let mut last_poll = Instant::now();
+        let mut abort: Option<String> = None;
+        let mut warning_off_after_move = false;
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(result) => {
+                    if warning_off_after_move {
+                        nano.set_xray_warning(false).map_err(|error|
+                            format!("XRAY_WARNING OFF failed after timed move: {error}"))?;
+                    }
+                    if abort.is_none() && beam_started.is_some_and(|started| started.elapsed() >= block_limit) {
+                        close_scan_beam(nano, xray, progress, beam_started,
+                            "Continuous X-ray limit reached at turntable arrival")?;
+                        *cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
+                        update(progress, |value| value.cooldown_until = *cooldown_until);
+                    }
+                    return abort.map_or(result, Err);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) =>
+                    return Err("Nano move worker terminated without a result".into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if abort.is_some() { continue; }
+            if cancel.load(Ordering::SeqCst) {
+                abort = Some(CANCELLED.into());
+                let _ = xray.force_off();
+                set_xray_health(progress, xray.health());
+                set_beam(progress, xray.health().beam_on);
+                let _ = nano.stop();
+                continue;
+            }
+            if beam_started.is_some_and(|started| started.elapsed() >= block_limit) {
+                // Moxtek is independent of Nano's serial worker. Shut the beam
+                // immediately; queue warning OFF only once MOVE_ABS returns.
+                match xray.force_off() {
+                    Ok(health) => {
+                        set_xray_health(progress, health);
+                        set_beam(progress, false);
+                        update(progress, |value| value.beam_started = None);
+                        *beam_started = None;
+                        warning_off_after_move = true;
+                        *cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
+                        update(progress, |value| value.cooldown_until = *cooldown_until);
+                        push_message(progress, "WARN", "xray",
+                            "Continuous X-ray limit reached during movement · beam OFF confirmed".into());
+                    }
+                    Err(error) => {
+                        abort = Some(format!("Moxtek OFF failed during move: {error}"));
+                        let _ = nano.stop();
+                    }
+                }
+            } else if beam_started.is_some() && last_poll.elapsed() >= Duration::from_millis(250) {
+                last_poll = Instant::now();
+                match xray.refresh_emission_status() {
+                    Ok(health) => set_xray_health(progress, health),
+                    Err(error) => {
+                        abort = Some(format!("Moxtek emission monitor failed during move: {error}"));
+                        set_xray_health(progress, xray.health());
+                        set_beam(progress, xray.health().beam_on);
+                        let _ = nano.stop();
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn commit_projection_monitored(
+    nano: &NanoAdapter,
+    xray: &mut MoxtekAdapter,
+    progress: &Mutex<RealScanProgress>,
+    root: &Path,
+    parameters: &Parameters,
+    config: &RealScanConfig,
+    cancel: &AtomicBool,
+    path: &Path,
+    job: ProjectionJob,
+    ticket: &MoveTicket,
+    beam_started: &mut Option<Instant>,
+    block_limit: Duration,
+    cooldown_until: &mut Option<Instant>,
+    final_projection: bool,
+) -> Result<RealFrame, String> {
+    let mut frames = progress.lock().expect("scan progress mutex poisoned").frames.clone();
+    thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        scope.spawn(move || {
+            let result = (|| {
+                let (bytes, sha256) = hash_file(path)?;
+                let frame = RealFrame {
+                    index: job.index,
+                    angle_deg: job.angle_deg,
+                    exposure_ms: parameters.exposure_ms,
+                    file_name: path.file_name().and_then(|value| value.to_str())
+                        .unwrap_or("frame.nef").to_owned(),
+                    path: path.display().to_string(), bytes, sha256,
+                };
+                check_cancel(cancel)?;
+                nano.capture_done(ticket.command_id)
+                    .map_err(|error| format!("CAPTURE_DONE view {} failed: {error}", job.index))?;
+                check_cancel(cancel)?;
+                frames.push(frame.clone());
+                persist(root, parameters, config, &frames, false)?;
+                Ok(frame)
+            })();
+            let _ = sender.send(result);
+        });
+        let mut last_poll = Instant::now();
+        let mut abort: Option<String> = None;
+        let mut warning_off_after_commit = false;
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(result) => {
+                    if warning_off_after_commit {
+                        nano.set_xray_warning(false).map_err(|error|
+                            format!("XRAY_WARNING OFF failed after frame commit: {error}"))?;
+                    }
+                    return abort.map_or(result, Err);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) =>
+                    return Err("frame commit worker terminated without a result".into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if abort.is_some() || beam_started.is_none() { continue; }
+            if cancel.load(Ordering::SeqCst) {
+                abort = Some(CANCELLED.into());
+                let _ = xray.force_off();
+                set_xray_health(progress, xray.health());
+                set_beam(progress, xray.health().beam_on);
+                let _ = nano.stop();
+            } else if beam_started.is_some_and(|started| started.elapsed() >= block_limit) {
+                match xray.force_off() {
+                    Ok(health) => {
+                        set_xray_health(progress, health);
+                        set_beam(progress, false);
+                        update(progress, |value| value.beam_started = None);
+                        *beam_started = None;
+                        warning_off_after_commit = true;
+                        if !final_projection {
+                            *cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
+                            update(progress, |value| value.cooldown_until = *cooldown_until);
+                        }
+                    }
+                    Err(error) => {
+                        abort = Some(format!("Moxtek OFF failed during frame commit: {error}"));
+                        let _ = nano.stop();
+                    }
+                }
+            } else if last_poll.elapsed() >= Duration::from_millis(250) {
+                last_poll = Instant::now();
+                match xray.refresh_emission_status() {
+                    Ok(health) => set_xray_health(progress, health),
+                    Err(error) => {
+                        abort = Some(format!("Moxtek emission monitor failed during frame commit: {error}"));
+                        set_xray_health(progress, xray.health());
+                        set_beam(progress, xray.health().beam_on);
+                        let _ = nano.stop();
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn exposure_is_complete(
@@ -990,14 +1053,13 @@ fn push_message(
     });
 }
 
-fn push_frame(progress: &Mutex<RealScanProgress>, frame: RealFrame) -> Vec<RealFrame> {
+fn push_frame(progress: &Mutex<RealScanProgress>, frame: RealFrame) {
     update(progress, |value| {
         value.captured = frame.index;
         // A prefetched move may already have reached the next view while this
         // older image transfers. Committing a frame must not rewind live position.
         value.frames.push(frame);
     });
-    progress.lock().expect("scan progress mutex poisoned").frames.clone()
 }
 
 fn hash_file(path: &Path) -> Result<(u64, String), String> {
@@ -1083,6 +1145,7 @@ fn io_error(error: std::io::Error) -> String {
 mod tests {
     use super::*;
     use crate::devices::turntable::{LineTransport, NanoStatus, EXPECTED_DEVICE};
+    use std::collections::VecDeque;
 
     #[test]
     fn stopped_outcome_requires_confirmed_beam_and_warning_off() {
@@ -1230,6 +1293,11 @@ mod tests {
         assert_eq!(projection_job(1, 2).angle_mdeg, -180_000);
         assert_eq!(expected_pulses(-180_000, 96_000), -48_000);
         assert_eq!(expected_pulses(-360_000, 96_000), 0);
+        let jobs: Vec<_> = (0..180).map(|index| projection_job(index, 180)).collect();
+        assert_eq!(jobs.len(), 180);
+        assert!(jobs.iter().enumerate().all(|(index, job)|
+            job.index == index as u32 + 1 && job.angle_mdeg == -(index as i32 * 2_000)));
+        assert_eq!(jobs.last().unwrap().angle_mdeg, -358_000);
     }
 
     #[test]

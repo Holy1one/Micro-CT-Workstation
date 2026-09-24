@@ -8,7 +8,7 @@ Micro-CT-App 是 Windows 工业上位机工程：React 提供操作界面，Taur
 - Tauri 只管理窗口、原生路径/对话框、sidecar 生命周期和 IPC 转发。
 - React 只发送领域命令并渲染完整快照；3D 场景只读展示。
 - 浏览器开发预览完全离线，不能访问真实设备；Tauri IPC 失败时不能回退到预览。
-- 每个投影在转台到位、出束/关束确认、主机侧图像文件确认和 `CAPTURE_DONE` 全部成功后才提交。
+- 每个投影在转台到位、出束状态监测、主机侧图像文件确认和 `CAPTURE_DONE` 全部成功后才提交；射线在设定的连续出束时间内跨投影保持开启，到时关束冷却。
 
 完整架构入口见 [`docs/architecture/README.md`](docs/architecture/README.md)，逐目录说明见 [`docs/architecture/directory-map.md`](docs/architecture/directory-map.md)，PC 直控与未来 Arduino 主控双线方案见 [`docs/architecture/dual-control-topology.md`](docs/architecture/dual-control-topology.md)。
 

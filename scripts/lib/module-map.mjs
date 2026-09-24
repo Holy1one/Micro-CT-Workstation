@@ -75,7 +75,7 @@ export async function listRepositoryFiles(directory = repositoryRoot) {
   const entries = await readdir(directory, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (entry.isDirectory() && ignoredDirectoryNames.has(entry.name)) continue;
+    if (ignoredDirectoryNames.has(entry.name)) continue;
     const absolutePath = path.join(directory, entry.name);
     if (entry.isDirectory()) {
       files.push(...(await listRepositoryFiles(absolutePath)));

@@ -162,6 +162,9 @@ export interface ConsoleFrame {
   angleDeg: number;
   exposureMs: number;
   fileName: string;
+  path?: string;
+  bytes?: number;
+  sha256?: string;
 }
 
 export interface WorkstationView {

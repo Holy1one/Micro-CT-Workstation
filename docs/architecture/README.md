@@ -51,12 +51,13 @@ turntable MOVE_ABS + arrival confirmation
   -> XRAY_WARNING asserted
   -> X-ray setpoints + verified beam ON
   -> camera capture + host file confirmation
-  -> verified beam OFF
   -> Nano CAPTURE_DONE
   -> manifest/progress commit
+  -> next confirmed MOVE_ABS while beam remains monitored ON
+  -> verified beam OFF at time limit, pause, stop, or final exposure
 ```
 
-暂停只在完整事务边界生效。界面 Stop 请求普通结束并等待工作线程的关束读回；它不锁存软件急停。真实故障、掉线和超时必须尝试关束与停止运动，不能跳过关束确认。再次扫描必须重新建立当前设备证据，不能复用旧预检或 HOME 状态；硬件急停及 Nano STOP 保护继续有效。
+每段连续出束受 `maxXraySec` 限制；到时关束确认后冷却 300 秒，随后继续未提交的投影。移动期间持续监测出束。暂停只在完整事务边界生效。界面 Stop 请求普通结束并等待工作线程的关束读回；它不锁存软件急停。真实故障、掉线和超时必须尝试关束与停止运动，不能跳过关束确认。再次扫描必须重新建立当前设备证据，不能复用旧预检或 HOME 状态；硬件急停及 Nano STOP 保护继续有效。
 
 ## 当前与未来控制拓扑
 

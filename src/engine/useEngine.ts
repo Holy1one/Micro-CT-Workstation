@@ -28,7 +28,6 @@ export function useEngine() {
   const commitSnapshot = useCallback((revision: number, next: EngineSnapshot): void => {
     if (!disposedRef.current && revision === requestRevisionRef.current) {
       setSnapshot(next);
-      setError(null);
       setTransportError(null);
     }
   }, []);
@@ -94,6 +93,7 @@ export function useEngine() {
         const revision = ++requestRevisionRef.current;
         try {
           commitSnapshot(revision, await adapter.dispatch(command));
+          setError(null);
         } catch (reason) {
           if (revision === requestRevisionRef.current) {
             const message = errorMessage(reason);

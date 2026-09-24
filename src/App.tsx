@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Folder } from "@phosphor-icons/react";
+import { invoke } from "@tauri-apps/api/core";
 import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
 import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } from "./scan-input";
 import { useEngine } from "./engine/useEngine";
@@ -29,6 +30,7 @@ import { useSceneFallback } from "./scene/useSceneFallback";
 import type { ViewPreset } from "./scene/types";
 import type {
   ConsoleLogLine,
+  ConsoleFrame,
   DeviceId,
   EngineCommand,
   EngineSnapshot,
@@ -666,7 +668,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
               <span className="xray-channel__monitor">Measured <b>{measured(ws.xray.monKv, stale)}</b></span>
             </div>
             <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(kvDraft))} onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) })}>
-              {voltageDraftConfirmed ? "V SENT" : "SEND V"}
+              SEND V
             </button>
           </div>
         </div>
@@ -686,7 +688,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
               <span className="xray-channel__monitor">Measured <b>{measured(ws.xray.monUa, stale)}</b></span>
             </div>
             <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(uaDraft))} onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) })}>
-              {currentDraftConfirmed ? "I SENT" : "SEND I"}
+              SEND I
             </button>
           </div>
         </div>
@@ -881,7 +883,37 @@ function LogLines({ logs, follow, onFollow }: { logs: ConsoleLogLine[]; follow: 
   );
 }
 
-function BottomConsole({ ws }: { ws: WorkstationView }) {
+function FrameThumbnail({ frame, production }: { frame: ConsoleFrame; production: boolean }) {
+  const element = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+  const [url, setUrl] = useState<string | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  useEffect(() => {
+    if (!production || !element.current) return;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) { setVisible(true); observer.disconnect(); }
+    });
+    observer.observe(element.current);
+    return () => observer.disconnect();
+  }, [production]);
+  useEffect(() => {
+    if (!production || !visible) return;
+    let active = true;
+    let objectUrl: string | null = null;
+    void invoke<number[]>("frame_preview", { index: frame.index }).then(bytes => {
+      if (!active) return;
+      objectUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "image/jpeg" }));
+      setUrl(objectUrl);
+    }).catch(reason => { if (active) setFailure(String(reason)); });
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [frame.index, frame.sha256, production, visible]);
+  return <div className="image-tile image-tile--captured" ref={element} title={failure || frame.fileName}>
+    {url ? <img src={url} alt={`Camera projection ${frame.index}`} /> : <span>{failure ? "Preview unavailable" : production ? "Loading image…" : "Offline preview"}</span>}
+    <div className="image-tile__caption"><strong>VIEW {String(frame.index).padStart(2, "0")}</strong><span>{frame.angleDeg.toFixed(2)}° · {frame.exposureMs} ms</span></div>
+  </div>;
+}
+
+function BottomConsole({ ws, production }: { ws: WorkstationView; production: boolean }) {
   const [tab, setTab] = useState<BottomTab>("aggregate");
   const [follow, setFollow] = useState(true);
   const logs = ws.consoleLogs;
@@ -935,10 +967,8 @@ function BottomConsole({ ws }: { ws: WorkstationView }) {
             {Array.from({ length: ws.progress.total }, (_, index) => {
               const frame = ws.frames.find((item) => item.index === index + 1);
               return (
-                <div className={`image-tile ${frame ? "image-tile--captured" : ""}`} key={index}>
-                  <strong>VIEW {String(index + 1).padStart(2, "0")}</strong>
-                  <span>{frame ? `${frame.angleDeg.toFixed(2)}° · ${frame.exposureMs} ms · 16-bit` : "queued"}</span>
-                </div>
+                frame ? <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} /> :
+                <div className="image-tile" key={index}><strong>VIEW {String(index + 1).padStart(2, "0")}</strong><span>queued</span></div>
               );
             })}
           </div>
@@ -1397,7 +1427,7 @@ export function App() {
             <LiveScene ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} />
           </section>
           <div className="app-divider" />
-          <BottomConsole ws={ws} />
+          <BottomConsole ws={ws} production={adapterKind === "tauri"} />
           <aside className="col col--right">
             <XrayPanel ws={ws} busy={busy || Boolean(transportError)} dispatch={dispatch} stale={Boolean(transportError)} />
             <OperationPanel ws={ws} stale={Boolean(transportError)} />
@@ -1407,7 +1437,7 @@ export function App() {
         <footer className="status-bar">
           <span className="status-bar__left">
             <i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} aria-hidden="true" />
-            <strong>{transportError ? "Control service unavailable · device states unknown" : ws.dock.playReason || ws.phaseWord}</strong>
+            <strong>{transportError ? "Control service unavailable · device states unknown" : error || (ws.dataState === "fault" && snapshot.lastError) || ws.dock.playReason || ws.phaseWord}</strong>
           </span>
           <div className="status-bar__right">
             <span>{ws.scanSetup.taskId || "No task selected"}</span>

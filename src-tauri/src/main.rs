@@ -419,11 +419,82 @@ async fn engine_command(
         .request(name, command.clone())
 }
 
+/// Read a committed camera frame through the engine's snapshot. The renderer
+/// supplies only an index; it cannot use this command to read arbitrary files.
+#[tauri::command]
+async fn frame_preview(index: u32, state: tauri::State<'_, EngineState>) -> Result<Vec<u8>, String> {
+    let snapshot = {
+        let mut guard = state.0.lock().map_err(|_| "Engine client unavailable")?;
+        guard.as_mut().ok_or("ct-engine is still starting")?
+            .request("snapshot", serde_json::json!({}))?
+    };
+    let workstation = snapshot.get("workstation").ok_or("Workstation snapshot missing")?;
+    let frame = workstation.get("frames").and_then(Value::as_array)
+        .and_then(|frames| frames.iter().find(|frame| frame.get("index").and_then(Value::as_u64) == Some(u64::from(index))))
+        .ok_or("Committed frame unavailable")?;
+    let path = frame.get("path").and_then(Value::as_str).ok_or("Camera file path missing")?;
+    let expected_size = frame.get("bytes").and_then(Value::as_u64).ok_or("Camera file size missing")?;
+    let expected_hash = frame.get("sha256").and_then(Value::as_str).ok_or("Camera file hash missing")?;
+    let file = std::path::Path::new(path);
+    if file.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("nef")) != Some(true)
+        || expected_size == 0 || expected_size > 150 * 1024 * 1024 {
+        return Err("Unsupported camera frame".into());
+    }
+    let bytes = std::fs::read(file).map_err(|error| format!("Camera file read failed: {error}"))?;
+    if bytes.len() as u64 != expected_size {
+        return Err("Camera file changed since scan commit".into());
+    }
+    use sha2::{Digest, Sha256};
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
+        return Err("Camera file hash changed since scan commit".into());
+    }
+    embedded_jpeg(&bytes).ok_or_else(|| "NEF contains no displayable embedded JPEG".into())
+}
+
+fn embedded_jpeg(nef: &[u8]) -> Option<Vec<u8>> {
+    let mut largest: Option<(usize, usize)> = None;
+    let mut cursor = 0;
+    while cursor + 1 < nef.len() {
+        if nef[cursor] == 0xff && nef[cursor + 1] == 0xd8 {
+            let start = cursor;
+            cursor += 2;
+            while cursor + 1 < nef.len() && cursor - start <= 16 * 1024 * 1024 {
+                if nef[cursor] == 0xff && nef[cursor + 1] == 0xd9 {
+                    let end = cursor + 2;
+                    if end - start >= 4 * 1024
+                        && largest.is_none_or(|(old_start, old_end)| end - start > old_end - old_start) {
+                        largest = Some((start, end));
+                    }
+                    cursor = end;
+                    break;
+                }
+                cursor += 1;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    largest.map(|(start, end)| nef[start..end].to_vec())
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::{calculate_min_inner_size, requires_maximized_window, export_session_log, open_directory_in_shell,
-                select_image_directory};
+                select_image_directory, embedded_jpeg};
     use std::path::PathBuf;
+
+    #[test]
+    fn nef_preview_selects_the_largest_complete_embedded_jpeg() {
+        let mut small = vec![0xff, 0xd8];
+        small.extend(vec![1_u8; 4_096]);
+        small.extend([0xff, 0xd9]);
+        let mut large = vec![0xff, 0xd8];
+        large.extend(vec![2_u8; 8_192]);
+        large.extend([0xff, 0xd9]);
+        let nef = [&small[..], &[0; 12], &large[..]].concat();
+        assert_eq!(embedded_jpeg(&nef), Some(large));
+        assert!(embedded_jpeg(&[0xff, 0xd8, 1, 2]).is_none());
+    }
 
     #[test]
     fn small_and_high_dpi_work_areas_require_maximized_windows() {
@@ -610,6 +681,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             engine_snapshot,
             engine_command,
+            frame_preview,
             resolve_default_image_directory,
             open_directory_in_shell,
             export_session_log

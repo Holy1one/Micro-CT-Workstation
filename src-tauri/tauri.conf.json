@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Micro-CT Workstation",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "identifier": "edu.lzu.microct.workstation",
   "build": {
     "beforeDevCommand": "npm run engine:build && npm run dev -- --port 4173 --strictPort",
@@ -11,7 +11,7 @@
   },
   "app": {
     "windows": [{"title": "Micro-CT Workstation", "width": 1920, "height": 1080, "visible": false, "fullscreen": false, "decorations": true, "resizable": true, "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu-sandbox"}],
-    "security": {"csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"}
+    "security": {"csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost"}
   },
   "bundle": {
     "active": true,
