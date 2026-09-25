@@ -58,7 +58,7 @@ Nano 串口协议为外部设备契约，当前核心命令/响应包括 `HEARTB
 - 射线设定值不得冒充实测值；关束未确认时不得报告安全完成。
 - D7100 使用主机侧保存与文件确认，不得静默回退到相机存储卡。
 - 真实设备动作遵循根 `AGENTS.md` 的授权要求；测试和开发预览不得访问真实设备。
-- `target/`、`dist/`、`node_modules/`、`src-tauri/binaries/`、日志、崩溃转储和会话记忆都是可再生成内容，不进入设计事实源。
+- `target/`、`dist/`、`node_modules/`、`src-tauri/binaries/`、`portable-release/` 中的打包产物、日志、崩溃转储和会话记忆都是可再生成内容，不进入版本控制，也不进入设计事实源。
 
 ## 修改边界
 
@@ -143,9 +143,10 @@ Verification: <新增后需要运行的门禁>
 | 未筛选截图和视觉对比 | `tmp/screenshots/<module>/<run-id>/` | 忽略 |
 | 覆盖率输出 | `coverage/` | 忽略 |
 | 经人工筛选的长期验收证据 | `docs/shots/<YYYY-MM-DD>-<topic>/` | 跟踪；必须有说明文件 |
-| 发布候选中间产物 | `release/` | 忽略；正式便携包按发布流程进入 `portable-release/` |
+| 发布候选中间产物 | `release/` | 忽略 |
+| 免安装交付包（EXE、`build-info.json`） | `portable-release/` | 忽略；只跟踪说明文件 `README.md` |
 
-免安装版的唯一交付入口为 `portable-release/micro-ct-workstation-portable.exe`，使用 `npm.cmd run portable:build` 同步编译前端、桌面壳和内嵌引擎，并生成同目录 `build-info.json`。`target/release/` 只承担编译输出与缓存职责，不作为日常启动入口。涉及免安装版交付的任务必须更新并验证正式 EXE；仅运行 `vite build` 或浏览器截图不能证明桌面版本已更新。
+免安装版的唯一交付入口为 `portable-release/micro-ct-workstation-portable.exe`，使用 `npm.cmd run portable:build` 同步编译前端、桌面壳和内嵌引擎，并生成同目录 `build-info.json`。这两个文件都是可再生成的打包产物，只在本机构建与分发，不进入版本控制：`.gitignore` 忽略 `portable-release/*`，目录中只跟踪说明用 `README.md`。发布留档用 tag 记录源码提交，由接收方按 tag 在本机重新构建，而不是从仓库下载二进制。`target/release/` 只承担编译输出与缓存职责，不作为日常启动入口。涉及免安装版交付的任务必须在本机构建并验证正式 EXE；仅运行 `vite build` 或浏览器截图不能证明桌面版本已更新。
 
 `<module>` 使用稳定短名：`ct-engine`、`xray`、`camera`、`turntable`、`frontend`、`preview`、`scene`、`desktop`、`tooling`。`<run-id>` 使用 `YYYYMMDD-HHmmss-<short-topic>`，不得使用“final”“new”等无法追溯的名称。
 

@@ -22,7 +22,7 @@
 | `crates/` | Rust workspace 的领域 crate | 当前只有 `ct-engine`；新增 crate 必须保持 Tauri 壳轻量 |
 | `docs/` | 当前架构、使用指南、历史方案和验收证据 | 当前事实必须与源码同步；历史内容必须明确标记 |
 | `module-map/` | 模块归属与隐藏依赖的声明式事实源 | 由 `scripts/` 生成图谱并计算影响面 |
-| `portable-release/` | 唯一免安装版交付入口及构建校验信息 | 由 `npm.cmd run portable:build` 更新；不是源码或设计事实源 |
+| `portable-release/` | 免安装版本机构建输出及构建校验信息 | 由 `npm.cmd run portable:build` 更新；EXE 与 `build-info.json` 不提交，只跟踪说明用 `README.md`；不是源码或设计事实源 |
 | `target/release/` | Cargo/Tauri release 编译输出和缓存 | 不作为日常启动入口；可清理，下次构建自动再生成 |
 | `public/` | Vite 原样复制的静态资源 | `assets/` 只保存 UI 图片和 SVG，不包含运行逻辑 |
 | `scripts/` | 构建、打包、图谱和验证脚本 | 只能编排确定性工具，不得访问真实设备 |

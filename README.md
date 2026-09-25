@@ -28,9 +28,9 @@ Windows 11 x64 是真实设备集成与最终发布平台。安装 MSVC Build To
 
 ## 免安装版发布与启动
 
-运行 `npm.cmd run portable:build`，将当前前端、桌面壳和内嵌引擎一起编译，并更新唯一交付入口 `portable-release/micro-ct-workstation-portable.exe`。直接双击该 EXE，无需 CMD 或批处理启动器；Windows 需具备 WebView2 运行时。同目录 `build-info.json` 记录构建时间、源提交、工作区是否含未提交改动和 EXE SHA256。
+运行 `npm.cmd run portable:build`，将当前前端、桌面壳和内嵌引擎一起编译，并更新唯一交付入口 `portable-release/micro-ct-workstation-portable.exe`。直接双击该 EXE，无需 CMD 或批处理启动器；Windows 需具备 WebView2 运行时。同目录 `build-info.json` 记录构建时间、源提交、工作区是否含未提交改动和 EXE SHA256。EXE 与 `build-info.json` 都是本机可再生成的打包产物，不提交到 Git：仓库只跟踪 `portable-release/README.md`，版本留档用 tag 记录源码提交，接收方按 tag 在本机重新构建。
 
-`npm.cmd run build` 只更新网页产物，不能更新桌面 EXE。`target/release/` 是 Cargo/Tauri 编译输出和缓存，不作为用户启动入口；关闭相关程序后可删除该目录，但下次构建会重新生成并增加编译时间。日常保留编译缓存，只使用 `portable-release/` 中的正式交付副本。
+`npm.cmd run build` 只更新网页产物，不能更新桌面 EXE。`target/release/` 是 Cargo/Tauri 编译输出和缓存，不作为用户启动入口；关闭相关程序后可删除该目录，但下次构建会重新生成并增加编译时间。日常保留编译缓存，只使用本机 `portable-release/` 中的正式交付副本。
 
 应用将内嵌 `ct-engine` 校验并释放到本机运行时目录，在后台通过管道通信。引擎进程必须运行，但无需显示控制台；退出时请关闭主窗口，由应用执行停止、关闭管道和引擎清理。
 
