@@ -33,7 +33,7 @@ export class FeedbackAngle {
     return this.duration > 0 && now < this.startedAt + this.duration;
   }
 
-  accept(feedback: AngleFeedback, now: number): void {
+  accept(feedback: AngleFeedback, now: number, reducedMotion = false): void {
     if (!Number.isFinite(now)) return;
     const current = this.value(now);
     const prior = this.previous;
@@ -46,6 +46,15 @@ export class FeedbackAngle {
     if (!usable) {
       snap(current);
       this.previous = { ...feedback, valid: false };
+      return;
+    }
+
+    // Reduced motion uses the same confirmed input but removes interpolation.
+    // This also snaps an in-progress transition when the preference changes.
+    if (reducedMotion) {
+      snap(feedback.angleDeg);
+      this.rawTarget = feedback.angleDeg;
+      this.previous = { ...feedback };
       return;
     }
 

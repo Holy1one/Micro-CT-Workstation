@@ -466,8 +466,367 @@ function DockIcon({ src, alt }: { src: string; alt: string }) {
   return <img className="dock-icon" src={src} alt={alt} draggable={false} />;
 }
 
-function ControlDock({ ws, dispatch, stale = false }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void; stale?: boolean }) {
+/* ------------------------------------------------------------------ */
+/* Console feedback: the eight states the operator must be able to     */
+/* read off the console. Every field is derived in React from the       */
+/* existing EngineSnapshot; no IPC field, DTO or device command is      */
+/* added, and the engine stays the only source of production truth.     */
+/* ------------------------------------------------------------------ */
+
+/** The eight console feedback states. Each one renders its own name. */
+const CONSOLE_FEEDBACK_STATES = [
+  "Running",
+  "Paused",
+  "Cooling",
+  "Finishing",
+  "Stopping",
+  "Stopped",
+  "Completed",
+  "Fault",
+] as const;
+
+type ConsoleStateName = (typeof CONSOLE_FEEDBACK_STATES)[number];
+type ConsoleStateTone = "accent" | "warn" | "danger" | "muted" | "ok";
+
+interface ConsoleFeedback {
+  state: ConsoleStateName;
+  tone: ConsoleStateTone;
+  /** One-line reading. Never claims more than the snapshot proves. */
+  detail: string;
+  /** True while the scan itself is still in flight. */
+  active: boolean;
+}
+
+/**
+ * Evidence checks that keep the console fail-closed. Every condition is read
+ * from fields that already exist on EngineSnapshot / WorkstationView.
+ */
+interface FeedbackEvidence {
+  linkLost: boolean;
+  phaseFault: boolean;
+  beamUnconfirmed: boolean;
+  /** A scan attempt exists, so a cooldown could be in play. */
+  scanAttempted: boolean;
+}
+
+function evaluateFeedbackEvidence(
+  snapshot: EngineSnapshot,
+  ws: WorkstationView,
+  stale: boolean,
+): FeedbackEvidence {
+  const connection = snapshot.connectionState;
+  return {
+    // A lost link, a degraded link or a stale snapshot means every reading below
+    // is unknown, so the console must not present it as a normal state.
+    linkLost: stale || connection === "lost" || connection === "disconnected" || connection === "degraded",
+    phaseFault: snapshot.phase === "fault" || ws.dataState === "fault",
+    // Fail closed: a beam that is not a CONFIRMED off/on reading stays a warning.
+    beamUnconfirmed: ws.xray.beamState === "unknown" || (!ws.xray.setpointConfirmed && ws.xray.beamOn),
+    scanAttempted: Number.isFinite(snapshot.parameters.projectionCount) && snapshot.parameters.projectionCount > 0,
+  };
+}
+
+/** Projection progress is only "known" when the engine reported a target count. */
+function progressPercent(snapshot: EngineSnapshot, ws: WorkstationView, stale: boolean): number | null {
+  if (stale) return null;
+  if (!Number.isFinite(ws.progress.total) || ws.progress.total <= 0) return null;
+  const percent = Number.isFinite(ws.progress.percent) ? ws.progress.percent : snapshot.progress.percent;
+  if (!Number.isFinite(percent)) return null;
+  return Math.max(0, Math.min(100, Math.round(percent)));
+}
+
+const feedbackPercentText = (percent: number | null): string => (percent === null ? "UNKNOWN" : `${percent}%`);
+
+function feedbackToneClass(tone: ConsoleStateTone): string {
+  return tone === "ok" ? "tone-accent" : `tone-${tone}`;
+}
+
+/**
+ * Derive the single console feedback state from a complete snapshot.
+ *
+ * Ordering is deliberate. A fail-closed condition always wins; 100% projection
+ * progress still reads as Finishing until the engine itself reports `completed`;
+ * a Stopping pose is frozen (the snapshot angle is repeated, never advanced);
+ * and Cooling is only ever reported from real cooldown evidence — the snapshot
+ * exposes none today, so it reports UNKNOWN instead of inventing a cooldown.
+ */
+function deriveConsoleFeedback(
+  snapshot: EngineSnapshot,
+  ws: WorkstationView,
+  stale: boolean,
+): ConsoleFeedback {
+  const evidence = evaluateFeedbackEvidence(snapshot, ws, stale);
+
+  if (evidence.linkLost) {
+    return {
+      state: "Fault",
+      tone: "danger",
+      detail: "Control service unavailable · device states and progress are unknown",
+      active: false,
+    };
+  }
+  if (evidence.phaseFault) {
+    return {
+      state: "Fault",
+      tone: "danger",
+      detail: ws.xray.latched
+        ? "Device fault latched · X-ray output disabled · preflight then HOME to recover"
+        : "Device fault · output and motion commands fail closed",
+      active: false,
+    };
+  }
+  if (evidence.beamUnconfirmed && (ws.phaseTone === "danger" || ws.xray.beamOn)) {
+    return {
+      state: "Fault",
+      tone: "danger",
+      detail: "X-ray output state is not confirmed · treated as unsafe until the engine reports it",
+      active: false,
+    };
+  }
+
+  const percent = progressPercent(snapshot, ws, stale);
+  const percentText = feedbackPercentText(percent);
+  const captured = ws.progress.captured;
+  const total = ws.progress.total;
+  const angleText = ws.scene.angleKnown ? `${ws.scene.angleDeg.toFixed(2)}°` : "unknown pose";
+
+  switch (snapshot.phase) {
+    case "running":
+      return {
+        state: "Running",
+        tone: "accent",
+        detail: `Acquiring view ${Math.min(captured + 1, Math.max(total, 1))} of ${total} · ${percentText} committed · ${angleText}`,
+        active: true,
+      };
+    case "paused":
+      return {
+        state: "Paused",
+        tone: "warn",
+        detail: `Held after a committed projection · ${captured} of ${total} retained · ${percentText} · ${angleText}`,
+        active: true,
+      };
+    case "finishing":
+      // Projection progress may already read 100%, but return-to-start
+      // orientation, manifest commit and cleanup are still outstanding.
+      return {
+        state: "Finishing",
+        tone: "warn",
+        detail: `All ${total} projections committed · returning to the start orientation, committing the manifest and cleaning up · not complete yet`,
+        active: true,
+      };
+    case "stopping":
+      return {
+        state: "Stopping",
+        tone: "warn",
+        detail: `Ending the active scan · output disabled · pose frozen at ${ws.scene.angleKnown ? angleText : "an unknown reading"} · awaiting beam-off and task exit`,
+        active: true,
+      };
+    case "completed":
+      return {
+        state: "Completed",
+        tone: "ok",
+        detail: `Return to start orientation, manifest commit and cleanup confirmed · ${total} of ${total} projections stored`,
+        active: false,
+      };
+    case "stopped":
+      return {
+        state: "Stopped",
+        tone: "muted",
+        detail: `Scan ended by the operator · ${captured} of ${total} committed · preflight and HOME are required before another scan`,
+        active: false,
+      };
+    default:
+      break;
+  }
+
+  // A scan attempt exists, so a cooldown could be in play. The snapshot does
+  // carry a temperature readback (ws.xray.tempC), but temperature alone cannot
+  // prove an active cooldown, and the engine's cooldown deadline is private and
+  // never projected. So the state is reported as UNKNOWN rather than assumed
+  // active or assumed absent — never as a confirmed "cooling" or "ready".
+  if (evidence.scanAttempted) {
+    return {
+      state: "Cooling",
+      tone: "muted",
+      detail: `Cooling state unknown · the snapshot projects no cooldown deadline, and a temperature reading alone cannot confirm one · verify at the source before exposure`,
+      active: false,
+    };
+  }
+  return {
+    state: "Stopped",
+    tone: "muted",
+    detail: `Queue idle · no scan in flight · ${total > 0 ? `${total} projections configured` : "scan setup not configured"}`,
+    active: false,
+  };
+}
+
+/** Ring progress read-out. Unknown progress is never drawn as 0%. */
+function RingReadout({
+  percent,
+  tone,
+  label,
+  known,
+}: {
+  percent: number;
+  tone: ConsoleStateTone;
+  label: string;
+  known: boolean;
+}) {
+  const radius = 13;
+  const circumference = 2 * Math.PI * radius;
+  const offset = known ? circumference * (1 - percent / 100) : 0;
+  return (
+    <span className={`dock-ring dock-ring--${known ? "known" : "unknown"} ${feedbackToneClass(tone)}`}>
+      <svg className="dock-ring__svg" viewBox="0 0 36 36" aria-hidden="true" focusable="false">
+        <circle className="dock-ring__track" cx="18" cy="18" r={radius} fill="none" strokeWidth="3" />
+        <circle
+          className="dock-ring__value"
+          cx="18"
+          cy="18"
+          r={radius}
+          fill="none"
+          strokeWidth="3"
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          transform="rotate(-90 18 18)"
+        />
+      </svg>
+      <span className="dock-ring__text">{known ? `${percent}` : label}</span>
+    </span>
+  );
+}
+
+function DockKey({
+  variant,
+  src,
+  label,
+  title,
+  disabled,
+  onClick,
+}: {
+  variant: string;
+  src: string;
+  label: string;
+  title: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`dock-key dock-key--${variant}`}
+      aria-label={label}
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <DockIcon src={src} alt="" />
+      <span className="dock-key__label">{label}</span>
+    </button>
+  );
+}
+
+/**
+ * Dynamic-Island control dock.
+ *
+ * Collapsed it is a small frosted capsule with a ring progress indicator and a
+ * readable numeric read-out. It expands into the four frosted keys through
+ * hover, keyboard focus, an explicit click and touch. `aria-expanded` is bound
+ * to the shipped state; the toggle keeps its footprint while expanding, so a
+ * mis-tap between the two states is not possible; and only the committed
+ * snapshot progress reaches the ring.
+ */
+function ControlDock({
+  snapshot,
+  ws,
+  dispatch,
+  stale = false,
+  setupInvalid = false,
+}: {
+  snapshot: EngineSnapshot;
+  ws: WorkstationView;
+  dispatch: (c: EngineCommand) => void;
+  stale?: boolean;
+  setupInvalid?: boolean;
+}) {
+  const [hoverOpen, setHoverOpen] = useState(false);
+  const [focusInside, setFocusInside] = useState(false);
+  // An explicit click pins the dock open and wins over hover, so hovering a
+  // collapsed capsule can never leave the pointer sitting on a key it did not
+  // aim at, and an explicit click can always close the dock again.
+  const [clickOpen, setClickOpen] = useState(false);
+  // A touch tap has no hover: pointerdown expands the capsule and the click that
+  // the same tap generates must not immediately fold it away again.
+  const touchHandled = useRef(false);
+  const expandTimer = useRef<number | null>(null);
+  const feedback = deriveConsoleFeedback(snapshot, ws, stale);
   const dock = ws.dock;
+
+  const expanded = hoverOpen || focusInside || clickOpen;
+  const percent = progressPercent(snapshot, ws, stale);
+  const percentKnown = percent !== null;
+  const progressReadout = percentKnown ? `${percent}% · ${ws.progress.captured}/${ws.progress.total}` : "UNKNOWN";
+
+  const clearExpandTimer = useCallback((): void => {
+    if (expandTimer.current !== null) {
+      window.clearTimeout(expandTimer.current);
+      expandTimer.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearExpandTimer, [clearExpandTimer]);
+
+  const openForHover = useCallback((): void => {
+    clearExpandTimer();
+    setHoverOpen(true);
+  }, [clearExpandTimer]);
+
+  // Collapsing is delayed by less than the expand transition so the pointer can
+  // travel from the capsule onto the keys without the dock folding underneath it.
+  const scheduleHoverClose = useCallback((): void => {
+    clearExpandTimer();
+    expandTimer.current = window.setTimeout(() => {
+      expandTimer.current = null;
+      setHoverOpen(false);
+    }, 260);
+  }, [clearExpandTimer]);
+
+  const collapse = useCallback((): void => {
+    clearExpandTimer();
+    setHoverOpen(false);
+    setFocusInside(false);
+    setClickOpen(false);
+  }, [clearExpandTimer]);
+
+  // Only an already-pinned dock closes on a click; otherwise the click pins the
+  // hover-expanded dock open instead of folding it away under the pointer.
+  const toggleOpen = useCallback((): void => {
+    clearExpandTimer();
+    if (touchHandled.current) {
+      // The tap already expanded the dock on pointerdown.
+      touchHandled.current = false;
+      return;
+    }
+    if (clickOpen) {
+      collapse();
+      return;
+    }
+    setClickOpen(true);
+  }, [clickOpen, collapse, clearExpandTimer]);
+
+  // Escape collapses the dock from anywhere, not only while one of its own keys
+  // holds focus: the dock can also be expanded by hover, and requiring focus
+  // would leave the pointer as the only way back to the collapsed state.
+  useEffect(() => {
+    if (!expanded) return;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") collapse();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [collapse, expanded]);
+
   const play =
     dock.playMode === "pause"
       ? { src: "/assets/dock-pause.svg", label: "Pause", command: { type: "pause" } as EngineCommand }
@@ -475,59 +834,139 @@ function ControlDock({ ws, dispatch, stale = false }: { ws: WorkstationView; dis
         ? { src: "/assets/dock-resume.svg", label: "Resume", command: { type: "resume" } as EngineCommand }
         : { src: "/assets/dock-play.svg", label: "Start", command: { type: "start_scan" } as EngineCommand };
 
+  // Availability comes from the engine's own `ws.dock` flags, plus the stale
+  // (control-service-lost) override. On top of that, a locally invalid setup
+  // draft must not be able to drive an operation that consumes scan parameters,
+  // which is the same rule the engineering menu applies. Stop is deliberately
+  // exempt: ending a scan must never depend on parameter-validity checks.
+  const keysDisabled = stale;
+  const setupBlocked = keysDisabled || setupInvalid;
+  const announcement = `${feedback.state}. ${feedback.detail} Progress ${progressReadout}.`;
+
   return (
-    <div className="control-dock" aria-label="Scan controls">
+    <div
+      className={`control-dock ${expanded ? "is-expanded" : "is-collapsed"} dock-state--${feedback.state.toLowerCase()}`}
+      aria-label="Scan controls"
+      aria-expanded={expanded}
+      onMouseEnter={openForHover}
+      onMouseLeave={scheduleHoverClose}
+      onFocusCapture={() => {
+        clearExpandTimer();
+        setFocusInside(true);
+      }}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocusInside(false);
+      }}
+      // Touch has no hover: a tap on the collapsed capsule expands it, and the
+      // four keys are only reachable once the capsule has visibly expanded.
+      onPointerDown={(event) => {
+        if (event.pointerType !== "touch") return;
+        clearExpandTimer();
+        openForHover();
+        setClickOpen(true);
+        touchHandled.current = true;
+      }}
+    >
       <button
         type="button"
-        className="dock-key dock-key--home"
-        aria-label="Home"
-        title={dock.homeReason || "Home turntable"}
-        disabled={stale || !dock.home}
-        onClick={() => void dispatch({ type: "home" })}
+        className="dock-capsule"
+        aria-expanded={expanded}
+        aria-controls="control-dock-keys"
+        aria-label={
+          expanded
+            ? `Collapse scan controls. ${feedback.state}. Progress ${progressReadout}.`
+            : `Expand scan controls. ${feedback.state}. Progress ${progressReadout}.`
+        }
+        title={`${feedback.state} · ${feedback.detail}`}
+        onClick={toggleOpen}
       >
-        <DockIcon src="/assets/dock-home.svg" alt="" />
-        <span className="dock-key__label">Home</span>
+        <span className="dock-capsule__lead">
+          <RingReadout percent={percent ?? 0} tone={feedback.tone} label="–" known={percentKnown} />
+          <span className="dock-capsule__text">
+            <span className="dock-capsule__state">{feedback.state}</span>
+            <span className="dock-capsule__progress">{progressReadout}</span>
+          </span>
+        </span>
+        <span className="dock-capsule__chevron" aria-hidden="true" />
       </button>
-      <button
-        type="button"
-        className="dock-key dock-key--play"
-        aria-label={play.label}
-        title={dock.playReason || play.label}
-        disabled={stale || !dock.play}
-        onClick={() => void dispatch(play.command)}
-      >
-        <DockIcon src={play.src} alt="" />
-        <span className="dock-key__label">{play.label}</span>
-      </button>
-      <button
-        type="button"
-        className="dock-key dock-key--restore"
-        aria-label="Restore"
-        disabled={stale || !dock.restore}
-        onClick={() => void dispatch({ type: "restore_previous" })}
-      >
-        <DockIcon src="/assets/dock-restore.svg" alt="" />
-        <span className="dock-key__label">Restore</span>
-      </button>
-      <button
-        type="button"
-        className="dock-key dock-key--stop"
-        aria-label="End scan"
-        title={dock.stop ? "End the active scan; already saved projections are retained" : "No active scan to end"}
-        disabled={stale || !dock.stop}
-        onClick={() => void dispatch({ type: "stop" })}
-      >
-        <DockIcon src="/assets/dock-stop.svg" alt="" />
-        <span className="dock-key__label">Stop</span>
-      </button>
+      <div className="dock-key-row" id="control-dock-keys" hidden={!expanded}>
+        <DockKey
+          variant="home"
+          src="/assets/dock-home.svg"
+          label="Home"
+          title={setupInvalid ? "Complete valid scan parameters first" : dock.homeReason || "Home turntable"}
+          disabled={setupBlocked || !dock.home}
+          onClick={() => void dispatch({ type: "home" })}
+        />
+        <DockKey
+          variant="play"
+          src={play.src}
+          label={play.label}
+          title={setupInvalid ? "Complete valid scan parameters first" : dock.playReason || play.label}
+          disabled={setupBlocked || !dock.play}
+          onClick={() => void dispatch(play.command)}
+        />
+        <DockKey
+          variant="restore"
+          src="/assets/dock-restore.svg"
+          label="Restore"
+          title={setupInvalid ? "Complete valid scan parameters first" : "Restore the previous scan progress from the on-disk checkpoint"}
+          disabled={setupBlocked || !dock.restore}
+          onClick={() => void dispatch({ type: "restore_previous" })}
+        />
+        <DockKey
+          variant="stop"
+          src="/assets/dock-stop.svg"
+          label="Stop"
+          title={dock.stop ? "End the active scan; already saved projections are retained" : "No active scan to end"}
+          disabled={keysDisabled || !dock.stop}
+          onClick={() => void dispatch({ type: "stop" })}
+        />
+      </div>
+      <span className="sr-only" role="status" aria-live="polite">{announcement}</span>
     </div>
   );
 }
 
-function LiveScene({ ws, theme, dispatch, stale, setupInvalid, feedbackId }: { ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string }) {
+/**
+ * Read-only eight-state console feedback strip. The active state is emphasised;
+ * its detail line always carries the meaning as text, so no reading depends on
+ * the colour of a dot. The strip scrolls horizontally inside its own row when
+ * the column is narrow, which never clips a fixed column.
+ */
+function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: boolean }) {
+  const active = stale ? "Fault" : feedback.state;
+  return (
+    <div className={`op-feedback ${feedback.active ? "is-hot" : ""}`}>
+      <div
+        className={`op-feedback__row ${feedbackToneClass(feedback.tone)}`}
+        role="status"
+        aria-live="polite"
+        aria-label={`Console feedback state: ${active}`}
+        title={feedback.detail}
+      >
+        <span className="op-feedback__word">{active}</span>
+        <span className="op-feedback__detail">{feedback.detail}</span>
+      </div>
+      <div className="op-feedback__states">
+        {CONSOLE_FEEDBACK_STATES.map((state) => (
+          <span
+            key={state}
+            className={`op-feedback__chip ${state.toLowerCase()} ${state === active ? "is-active" : "is-idle"}`}
+          >
+            {state}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbackId }: { snapshot: EngineSnapshot; ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string }) {
   const [viewPreset, setViewPreset] = useState<ViewPreset>("iso");
   const [presetRevision, setPresetRevision] = useState(0);
   const fallback = useSceneFallback();
+  const feedback = deriveConsoleFeedback(snapshot, ws, stale);
   const sceneView = {
     dataState: ws.dataState,
     angleDeg: ws.scene.angleDeg,
@@ -562,7 +1001,7 @@ function LiveScene({ ws, theme, dispatch, stale, setupInvalid, feedbackId }: { w
         {fallback.reason ? (
           <StaticSceneFallback view={sceneView} reason={fallback.reason} />
         ) : (
-          <LiveSceneCanvas view={sceneView} preset={viewPreset} presetRevision={presetRevision} onContextLost={fallback.setContextLost} />
+          <LiveSceneCanvas view={sceneView} status={feedback} preset={viewPreset} presetRevision={presetRevision} onContextLost={fallback.setContextLost} />
         )}
         <span className="live-indicator">
           <i aria-hidden="true" />
@@ -578,13 +1017,19 @@ function LiveScene({ ws, theme, dispatch, stale, setupInvalid, feedbackId }: { w
           ))}
         </div>
         <div className="scene-readout-block">
-          <span className="scene-label">TURNTABLE ANGLE <HelpTip text="Latest confirmed turntable angle. The model follows these feedback samples with a short constant-speed transition; it does not predict the next position." /></span>
+          <span className="scene-label">TURNTABLE ANGLE <HelpTip text="Latest confirmed turntable angle. The model follows confirmed feedback without predicting a position; reduced motion jumps directly between samples." /></span>
           <strong className="scene-readout">{stale || !ws.scene.angleKnown ? "—" : ws.scene.angleDeg.toFixed(2)}°</strong>
           <span className={`scene-safety ${ws.safetyBar.tone !== "muted" ? "scene-safety--danger" : ""} ${ws.safetyBar.tone === "dangerBold" ? "scene-safety--bold" : ""}`}>
             {stale ? "Control service unavailable · readings are unknown" : ws.safetyBar.text}
           </span>
         </div>
-        <ControlDock ws={ws} dispatch={dispatch} stale={stale || setupInvalid} />
+        <ControlDock
+          snapshot={snapshot}
+          ws={ws}
+          dispatch={dispatch}
+          stale={stale}
+          setupInvalid={setupInvalid}
+        />
       </div>
     </section>
   );
@@ -784,13 +1229,15 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
   );
 }
 
-function OperationPanel({ ws, stale }: { ws: WorkstationView; stale: boolean }) {
+function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws: WorkstationView; stale: boolean }) {
+  const feedback = deriveConsoleFeedback(snapshot, ws, stale);
   return (
     <section className="panel operation-panel">
       <div className="panel__header">
         <h2>Operation Status</h2>
         <span className={`chip chip--${stale ? "muted" : ws.phaseTone}`}>{stale ? "UNKNOWN" : ws.phaseWord}</span>
       </div>
+      <StateFeedback feedback={feedback} stale={stale} />
       <div className="op-stats">
         <div className="op-stat">
           <span>CAPTURED</span>
@@ -1394,13 +1841,13 @@ export function App() {
                 onValidationError={setSetupDraftError}
               />
             </aside>
-            <LiveScene ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} />
+            <LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} />
           </section>
           <div className="app-divider" />
           <BottomConsole ws={ws} />
           <aside className="col col--right">
             <XrayPanel ws={ws} busy={busy || Boolean(transportError)} dispatch={dispatch} stale={Boolean(transportError)} />
-            <OperationPanel ws={ws} stale={Boolean(transportError)} />
+            <OperationPanel snapshot={snapshot} ws={ws} stale={Boolean(transportError)} />
           </aside>
         </section>
         <div className="app-divider" />

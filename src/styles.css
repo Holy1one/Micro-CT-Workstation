@@ -448,6 +448,178 @@ i.tone-danger { background: var(--danger); }
 }
 .dock-icon { width: 34px; height: 34px; flex-shrink: 0; object-fit: contain; display: block; pointer-events: none; }
 
+/* ---------- Dynamic-Island control dock ----------
+   Collapsed, the dock is a small frosted capsule carrying a ring progress
+   indicator and a readable numeric read-out. It expands into the four frosted
+   keys through hover, keyboard focus, an explicit click and touch. The capsule
+   keeps the same footprint while the dock expands, so the pointer never lands
+   on a different control than the one it aimed at.
+
+   The key geometry is declared here (styles.css) so the single dock component
+   rule set owns the shipped size; tokens.css keeps only the colour tokens and
+   the theme/state overrides. */
+
+.control-dock {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0;
+  padding: 0;
+  min-height: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  pointer-events: none;
+  touch-action: manipulation;
+}
+.control-dock > * { pointer-events: auto; }
+
+.control-dock .dock-capsule {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  height: 46px;
+  padding: 0 12px 0 9px;
+  border: 1px solid var(--dockBorder);
+  border-radius: 23px;
+  background: var(--dockBg);
+  -webkit-backdrop-filter: blur(18px) saturate(135%);
+  backdrop-filter: blur(18px) saturate(135%);
+  box-shadow: 0 6px 20px var(--dockShadow), inset 0 1px 1px var(--dockHighlight, rgba(255, 255, 255, 0.85));
+  color: var(--textPrimary);
+  cursor: pointer;
+  transition: background-color 180ms ease-out, border-color 180ms ease-out, box-shadow 180ms ease-out;
+}
+.control-dock .dock-capsule:hover { background: var(--dockKeyBgHover); }
+.control-dock .dock-capsule:active { transform: none; box-shadow: 0 6px 20px var(--dockShadow); }
+
+.dock-ring { position: relative; display: block; flex: 0 0 34px; width: 34px; height: 34px; }
+.dock-ring__svg { display: block; width: 34px; height: 34px; }
+.dock-ring__track { stroke: color-mix(in srgb, var(--textPrimary) 16%, transparent); }
+.dock-ring__value { stroke: currentColor; transition: stroke-dashoffset 120ms linear; }
+.dock-ring__text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--fontMono);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: currentColor;
+}
+.dock-ring--unknown .dock-ring__text { font-size: 13px; }
+
+/* The read-out is per-line text, not a roll: the ring may saturate at 100 %
+   while Finishing, but only the engine can make the console read Completed. */
+.dock-capsule__lead { display: flex; flex-direction: row; align-items: center; gap: 10px; min-width: 0; }
+.dock-capsule__text { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
+.dock-capsule__state {
+  font-family: var(--fontMono);
+  font-size: var(--fontSizeHint);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--textPrimary);
+  white-space: nowrap;
+}
+.dock-capsule__progress {
+  font-family: var(--fontMono);
+  font-size: var(--fontSizeLabel);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--textSecondary);
+  white-space: nowrap;
+}
+.dock-capsule__chevron {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid var(--textMuted);
+  border-bottom: 1.5px solid var(--textMuted);
+  transform: rotate(-45deg);
+  transition: transform 180ms ease-out;
+}
+.control-dock.is-expanded .dock-capsule__chevron { transform: rotate(45deg); }
+
+.dock-key-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  margin-left: 8px;
+  padding: 10px;
+  border: 1px solid var(--dockBorder);
+  border-radius: var(--radiusDock);
+  background: var(--dockBg);
+  -webkit-backdrop-filter: blur(18px) saturate(135%);
+  backdrop-filter: blur(18px) saturate(135%);
+  box-shadow: 0 6px 20px var(--dockShadow), inset 0 1px 1px var(--dockHighlight, rgba(255, 255, 255, 0.85));
+  transform-origin: left center;
+  animation: dock-unfold 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.dock-key-row[hidden] { display: none; }
+
+@keyframes dock-unfold {
+  from { opacity: 0; transform: translateX(-8px) scale(0.96); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+.control-dock .dock-key {
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: center;
+  justify-content: center;
+  width: 70px;
+  height: 58px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radiusKey);
+  background: var(--dockKeyBg);
+  box-shadow: none;
+  cursor: pointer;
+  transition: background-color 140ms ease-out, opacity 140ms ease-out;
+}
+.control-dock .dock-key:active:not(:disabled) { transform: scale(0.94); box-shadow: none; }
+/* A disabled key must still be readable in both themes: the treatment is a
+   dimmed surface, not illegible text. */
+.control-dock .dock-key:disabled { opacity: 0.55; cursor: not-allowed; }
+/* No active scan: Stop reads as a light disabled treatment derived from the
+   engine's own availability flag, never from a second source of authority. */
+.control-dock .dock-key--stop:disabled {
+  opacity: 0.72;
+  background: color-mix(in srgb, var(--dockKeyBg) 45%, transparent);
+}
+.control-dock .dock-key:disabled .dock-key__label { color: var(--textSecondary); }
+.control-dock .dock-key:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.control-dock.dock-state--fault .dock-capsule { border-color: var(--danger); }
+.control-dock.dock-state--paused .dock-capsule { border-color: var(--warn); }
+.control-dock.dock-state--stopping .dock-capsule,
+.control-dock.dock-state--finishing .dock-capsule { border-color: color-mix(in srgb, var(--warn) 60%, var(--dockBorder)); }
+
+/* Screen-reader-only text. The console never carries meaning by colour alone,
+   so every state also exists as words. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* ---------- 12 watt controller ---------- */
 
 .xray-mode-banner {
@@ -636,6 +808,82 @@ i.tone-danger { background: var(--danger); }
 /* ---------- operation status ---------- */
 
 .operation-panel { height: 264px; min-height: 264px; }
+/* Eight-state read-only console feedback. The active state is emphasised and
+   always carries its meaning as text; the remaining seven stay as a reference
+   strip so the console names every state it can report. */
+.op-feedback { flex: 0 0 auto; margin: 8px 14px 0; display: flex; flex-direction: column; gap: 2px; }
+.op-feedback__row {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 8px;
+  min-height: 18px;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 7px;
+  background: var(--panelHeader);
+}
+.op-feedback__word {
+  flex: 0 0 auto;
+  font-family: var(--fontMono);
+  font-size: 11.5px;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.op-feedback__detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  line-height: 1.3;
+  color: var(--textSecondary);
+}
+.op-feedback__row.tone-ok { border-left-color: var(--ok); }
+.op-feedback__row.tone-accent { border-left-color: var(--accent); }
+.op-feedback__row.tone-warn { border-left-color: var(--warn); }
+.op-feedback__row.tone-danger { background: var(--dangerSoft); border-left-color: var(--danger); }
+.op-feedback__row.tone-muted { border-left-color: var(--textMuted); }
+.op-feedback__row.tone-danger .op-feedback__detail { color: var(--dangerText); }
+
+.op-feedback__states {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 3px;
+}
+.op-feedback__chip {
+  flex: 0 0 auto;
+  padding: 1px 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: var(--fontMono);
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1.3;
+  color: var(--textMuted);
+  background: transparent;
+}
+.op-feedback__chip.is-active { color: var(--textPrimary); background: var(--neutralSoft); border-color: var(--textSecondary); }
+.op-feedback__chip.is-idle { opacity: 0.72; }
+
+.op-feedback.is-hot .op-feedback__row { min-height: 24px; border-left-width: 4px; }
+.op-feedback.is-hot .op-feedback__word { font-size: 13px; }
+.op-feedback.is-hot .op-feedback__detail { font-size: 10.5px; }
+/* The eight-state read-out takes its budget from the spacing around it, not
+   from the panel height: the right status column keeps its published 264 px
+   operation panel with the Process Summary still fully visible. */
+.operation-panel .op-stats { padding-top: 4px; }
+.operation-panel .op-stats .op-stat strong { line-height: 1.05; }
+.operation-panel .op-progress { padding-top: 8px; }
+.operation-panel .op-summary { padding: 6px 14px 8px; gap: 8px; }
+
 .op-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 12px 14px 0; }
 .op-stat span { display: block; font-size: var(--fontSizeHint); font-weight: 600; letter-spacing: 0.05em; color: var(--textMuted); margin-bottom: 4px; }
 .op-stat strong { font-family: var(--fontMono); font-size: 15px; font-weight: 600; color: var(--textPrimary); white-space: nowrap; }
@@ -645,7 +893,9 @@ i.tone-danger { background: var(--danger); }
 .op-progress__head span { font-size: var(--fontSizeHint); font-weight: 600; letter-spacing: 0.05em; color: var(--textMuted); }
 .op-progress__head small { font-size: var(--fontSizeHint); font-family: var(--fontMono); color: var(--textMuted); }
 .op-progress__bar { height: 6px; border-radius: 3px; background: var(--preflightTrack); overflow: hidden; }
-.op-progress__bar span { display: block; height: 100%; border-radius: 3px; transition: width 320ms ease-out; }
+/* Local linear follow: a short, cheap transition that keeps the bar in step
+   with the committed projection instead of lagging 320 ms behind it. */
+.op-progress__bar span { display: block; height: 100%; border-radius: 3px; transition: width 120ms linear; }
 .op-progress__bar--accent span { background: var(--accent); }
 .op-progress__bar--warn span { background: var(--warn); }
 .op-progress__bar--danger span { background: var(--dangerSolid); }
@@ -865,3 +1115,39 @@ button.help-tip { display: inline-flex; align-items: center; justify-content: ce
 .xray-channel__label .help-tip { margin-left: auto; }
 .device-row__top { gap: 6px; }
 .status-bar .theme-toggle { flex-shrink: 0; }
+
+/* ============================================================
+   Reduced motion
+   tokens.css already shortens every transition and animation. This block goes
+   further and actually suppresses the motion of this interface: every entry,
+   unfold and follow transition is removed outright, so the console still shows
+   the same readings, the dock still expands into the same four keys and every
+   control stays operable, only without movement.
+   ============================================================ */
+@media (prefers-reduced-motion: reduce) {
+  .control-dock,
+  .control-dock *,
+  .op-feedback,
+  .op-feedback *,
+  .op-progress__bar span,
+  .preflight__fill,
+  .dock-ring__value,
+  .panel,
+  .panel__header,
+  .menu-bar,
+  .menu-dropdown,
+  .menu-dropdown__item,
+  .console,
+  .log-line,
+  .error-toast,
+  .dock-capsule,
+  .dock-capsule__chevron,
+  .dock-key-row,
+  .dock-key-row * {
+    transition: none !important;
+    animation: none !important;
+  }
+  /* The expanded dock appears in place instead of unfolding into it. */
+  .dock-key-row { transform: none !important; }
+  .dock-capsule__chevron { transition: none !important; }
+}

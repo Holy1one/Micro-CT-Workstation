@@ -367,7 +367,9 @@
    系统预检进度条（按钮说明：逐渐填充→绿；出问题→黄；确认故障→整条红）
    ============================================================ */
 .preflight { height: 6px; border-radius: 3px; background: var(--preflightTrack); overflow: hidden; }
-.preflight__fill { height: 100%; border-radius: 3px; transition: width 320ms ease-out; }
+/* Short local linear follow: the preflight bar tracks the engine's committed
+   check count instead of easing 320 ms behind it. */
+.preflight__fill { height: 100%; border-radius: 3px; transition: width 110ms linear; }
 .preflight--pass .preflight__fill { width: 100%; background: var(--preflightPass); }
 .preflight--warn .preflight__fill { width: 62%;  background: var(--preflightWarn); }
 .preflight--fail .preflight__fill { width: 100%; background: var(--preflightFail); }

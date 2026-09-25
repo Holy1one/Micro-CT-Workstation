@@ -4,83 +4,72 @@
  * the fallback hook without sending any device command.
  */
 
-import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
+import { OrbitControls, OrthographicCamera } from "@react-three/drei";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { useEffect, useRef } from "react";
-import { Box3, MathUtils, PerspectiveCamera as PerspectiveCameraImpl, Vector3, type Mesh, type Object3D } from "three";
+import { useEffect, useRef, useState } from "react";
+import { OrthographicCamera as OrthographicCameraImpl, PCFSoftShadowMap, Vector3 } from "three";
 import { EquipmentScene } from "./EquipmentScene";
 import { CAMERA_CONSTRAINTS, CAMERA_PRESETS } from "./scene-config";
+import { computeFitZoom, FRUSTUM_HEIGHT } from "./scene-fit";
 import { useSceneTheme } from "./theme-three";
 import type { SceneViewModel, ViewPreset } from "./types";
 
-/** Fraction of the viewport the optical bench is fitted into. */
-const FIT_MARGIN = 0.96;
-/** Camera framing: a 40 degree vertical field gives readable perspective on a
- *  bench this long without the wide-angle distortion of a 60 degree lens. */
-const FIT_FOV = 40;
-const PRESET_ZOOM: Record<ViewPreset, number> = { iso: 1.18, front: 1.18, top: 0.95 };
-const MIN_DISTANCE = 320;
-const MAX_DISTANCE = 3600;
-
-/** Bounding box of everything that must stay visible, ignoring fit-excluded helpers. */
-function sceneBounds(root: Object3D): Box3 {
-  const bounds = new Box3();
-  const scratch = new Box3();
-  root.traverse((object) => {
-    let ancestor: Object3D | null = object;
-    while (ancestor) {
-      if (ancestor.userData?.excludeFromFit) return;
-      ancestor = ancestor.parent;
-    }
-    if (!(object as Mesh).isMesh) return;
-    scratch.setFromObject(object);
-    if (!scratch.isEmpty()) bounds.union(scratch);
-  });
-  return bounds;
-}
-
-/** Distance from the orbit target at which the whole optical bench fits inside
- *  the current canvas. The camera only ever slides along its own view direction,
- *  so the corners keep their offsets in camera space and the distance each one
- *  needs follows from the frustum half angles - the nearest corner (in the sense
- *  of the one demanding the most room) decides. Null when there is nothing to
- *  frame yet, so the caller can retry instead of fitting to an empty box. */
-function computeFitDistance(
-  root: Object3D,
-  camera: PerspectiveCameraImpl,
-  target: Vector3,
-  viewWidth: number,
-  viewHeight: number,
-): number | null {
-  const bounds = sceneBounds(root);
-  if (bounds.isEmpty() || viewWidth <= 0 || viewHeight <= 0) return null;
-  const tanV = Math.tan(MathUtils.degToRad(camera.fov) / 2) * FIT_MARGIN;
-  const tanH = tanV * (viewWidth / viewHeight);
-  const corners: Vector3[] = [];
-  for (const x of [bounds.min.x, bounds.max.x]) {
-    for (const y of [bounds.min.y, bounds.max.y]) {
-      for (const z of [bounds.min.z, bounds.max.z]) corners.push(new Vector3(x, y, z));
-    }
-  }
-  // How much further back the camera has to sit so every corner clears the
-  // frustum; negative means the preset is already wide enough and can move in.
-  let extra = -Infinity;
-  for (const corner of corners) {
-    const local = corner.applyMatrix4(camera.matrixWorldInverse);
-    const depth = -local.z;
-    extra = Math.max(extra, Math.abs(local.x) / tanH - depth, Math.abs(local.y) / tanV - depth);
-  }
-  return camera.position.distanceTo(target) + extra;
-}
+/** Leave room at the top for the centered view dock and at the edges for the ring. */
+const VIEW_CENTER_SHIFT = 0.05;
 
 /** The subset of OrbitControls this rig touches, kept local so the store's
  *  untyped `controls` slot stays honest at the call sites. */
 type OrbitLike = {
   target?: { set: (x: number, y: number, z: number) => void };
+  minZoom?: number;
+  maxZoom?: number;
   update?: () => void;
   addEventListener?: (type: string, listener: () => void) => void;
   removeEventListener?: (type: string, listener: () => void) => void;
 };
+
+type SceneFeedback = {
+  state: string;
+  detail: string;
+};
+
+/** Keep the browser's reduced-motion preference in sync with Three.js. */
+function usePrefersReducedMotion(): boolean {
+  const [reducedMotion, setReducedMotion] = useState(() =>
+    typeof window !== "undefined"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+  );
+
+  useEffect(() => {
+    const preference = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = (): void => setReducedMotion(preference.matches);
+    update();
+    if (typeof preference.addEventListener === "function") {
+      preference.addEventListener("change", update);
+      return () => preference.removeEventListener("change", update);
+    }
+    preference.addListener(update);
+    return () => preference.removeListener(update);
+  }, []);
+
+  return reducedMotion;
+}
+
+/** Build a single static shadow map; the track and carriages do not move. */
+function SceneCanvasSettings({ reducedMotion }: { reducedMotion: boolean }) {
+  const { gl, invalidate } = useThree();
+  useEffect(() => {
+    gl.shadowMap.enabled = true;
+    gl.shadowMap.type = PCFSoftShadowMap;
+    gl.shadowMap.autoUpdate = false;
+    gl.shadowMap.needsUpdate = true;
+    gl.domElement.dataset.prefersReducedMotion = String(reducedMotion);
+    gl.domElement.dataset.orbitDamping = String(!reducedMotion);
+    gl.domElement.dataset.sceneShadowMap = String(gl.shadowMap.enabled);
+    invalidate();
+  }, [gl, invalidate, reducedMotion]);
+  return null;
+}
 
 function CameraRig({ preset, presetRevision }: { preset: ViewPreset; presetRevision: number }) {
   const { camera, controls, invalidate, scene, size, gl } = useThree();
@@ -117,24 +106,23 @@ function CameraRig({ preset, presetRevision }: { preset: ViewPreset; presetRevis
       return;
     }
 
-    const perspective = camera as PerspectiveCameraImpl;
+    const orthographic = camera as OrthographicCameraImpl;
     const target = new Vector3(...CAMERA_CONSTRAINTS.target);
-    if (preset === "top") target.z = -90;
     const eyeDirection = new Vector3(...CAMERA_PRESETS[preset]).sub(target);
-    const eyeUnit = eyeDirection.clone().normalize();
 
     let cancelled = false;
     let retried = false;
 
     const apply = () => {
       if (cancelled) return;
-      perspective.position.copy(target).add(eyeDirection);
-      perspective.lookAt(target);
-      // Camera.updateMatrixWorld also refreshes matrixWorldInverse, which the fit
-      // below reads to place the corners in camera space.
-      perspective.updateMatrixWorld();
+      const halfWidth = FRUSTUM_HEIGHT * size.width / Math.max(size.height, 1) / 2;
+      orthographic.left = -halfWidth;
+      orthographic.right = halfWidth;
+      orthographic.position.copy(target).add(eyeDirection);
+      orthographic.lookAt(target);
+      orthographic.updateMatrixWorld();
 
-      const fit = computeFitDistance(scene, perspective, target, size.width, size.height);
+      const fit = computeFitZoom(scene, orthographic, size.width, size.height);
       // The bench may not be attached to the scene graph on the first pass, and
       // framing an empty box would drop the camera onto the preset distance and
       // leave it there. Give it one more frame before trusting the result.
@@ -145,13 +133,19 @@ function CameraRig({ preset, presetRevision }: { preset: ViewPreset; presetRevis
       }
       if (fit === null) return;
 
-      const distance = MathUtils.clamp(fit / PRESET_ZOOM[preset], MIN_DISTANCE, MAX_DISTANCE);
-      perspective.position.copy(target).addScaledVector(eyeUnit, distance);
-      perspective.lookAt(target);
-      perspective.updateProjectionMatrix();
-      perspective.updateMatrixWorld();
+      orthographic.zoom = fit;
+      // Moving the camera and orbit target upward puts the equipment below the
+      // dock while retaining the same preset direction and orbit pivot.
+      const screenUp = new Vector3(0, 1, 0).applyQuaternion(orthographic.quaternion);
+      const offset = screenUp.multiplyScalar(FRUSTUM_HEIGHT * VIEW_CENTER_SHIFT / fit);
+      orthographic.position.add(offset);
+      target.add(offset);
+      orthographic.updateProjectionMatrix();
+      orthographic.updateMatrixWorld();
       const orbit = controls as OrbitLike | null;
       if (orbit?.target) {
+        orbit.minZoom = fit * CAMERA_CONSTRAINTS.minZoom;
+        orbit.maxZoom = fit * CAMERA_CONSTRAINTS.maxZoom;
         orbit.target.set(target.x, target.y, target.z);
         orbit.update?.();
       }
@@ -168,16 +162,19 @@ function CameraRig({ preset, presetRevision }: { preset: ViewPreset; presetRevis
 
 export function LiveSceneCanvas({
   view,
+  status,
   preset,
   presetRevision = 0,
   onContextLost,
 }: {
   view: SceneViewModel;
+  status: SceneFeedback;
   preset: ViewPreset;
   presetRevision?: number;
   onContextLost: () => void;
 }) {
   const sceneTheme = useSceneTheme();
+  const reducedMotion = usePrefersReducedMotion();
   return (
     <Canvas
       className="scene-canvas"
@@ -198,27 +195,31 @@ export function LiveSceneCanvas({
         invalidate();
       }}
     >
-      <PerspectiveCamera
+      <SceneCanvasSettings reducedMotion={reducedMotion} />
+      <OrthographicCamera
         makeDefault
-        fov={FIT_FOV}
-        near={20}
+        near={-9000}
         far={9000}
+        top={FRUSTUM_HEIGHT / 2}
+        bottom={-FRUSTUM_HEIGHT / 2}
+        left={-FRUSTUM_HEIGHT / 2}
+        right={FRUSTUM_HEIGHT / 2}
         position={CAMERA_PRESETS.iso}
       />
       <OrbitControls
         makeDefault
-        enableDamping
+        enableDamping={!reducedMotion}
         dampingFactor={0.08}
         enablePan={false}
         minPolarAngle={CAMERA_CONSTRAINTS.minPolarAngle}
         maxPolarAngle={CAMERA_CONSTRAINTS.maxPolarAngle}
-        minDistance={MIN_DISTANCE}
-        maxDistance={MAX_DISTANCE}
+        minZoom={0.1}
+        maxZoom={5}
         target={CAMERA_CONSTRAINTS.target}
       />
       {/* After the bench: the rig measures the scene, so it has to run once the
           geometry is in the graph. */}
-      <EquipmentScene view={view} theme={sceneTheme} />
+      <EquipmentScene view={view} status={status} reducedMotion={reducedMotion} theme={sceneTheme} />
       <CameraRig preset={preset} presetRevision={presetRevision} />
     </Canvas>
   );
