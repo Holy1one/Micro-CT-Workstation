@@ -36,42 +36,58 @@
 :root,
 [data-theme="light"] {
   /* ---- 底色 / 机箱层级 ---- */
-  --appBg:        #F2F4F7;   /* 应用最底画布 */
-  --chassis:      #FFFFFF;   /* 菜单栏 / 状态栏 */
-  --panel:        #FFFFFF;   /* 卡片面板 */
-  --panelHeader:  #FAFAFC;   /* 卡片内嵌标题条 / 视口工具条 / 统计小块底 */
-  --well:         #F2F4F7;   /* 凹陷区：输入框、进度槽、预检条底槽 */
-  --line:         #E3E7ED;   /* 卡片内发丝分隔线（1px） */
-  --lineStrong:   #E0E0E0;   /* 区块之间分隔线（菜单栏/控制台/状态栏上下） */
-  --lineField:    #D2D2D7;   /* 输入框描边 */
+  --appBg:        #E8EDF2;
+  --chassis:      #EFF3F7;
+  --panel:        #F8FAFC;
+  --panelHeader:  #F0F4F7;
+  --well:         #E9EEF3;
+  --line:         #D7E0E8;
+  --lineStrong:   #C3CFDA;
+  --lineField:    #BECBD7;
 
   /* ---- 最大化窗口的机箱留白（8:5 画布之外的区域 = 机箱框，不是空白） ---- */
-  --viewportGutter:      #E9EAEE;  /* 留白底：比画布深一档，读起来是机箱 */
-  --viewportGutterEdge:  #DCDEE3;  /* 留白两侧边缘渐隐 */
-  --canvasBorder:        #D6D8DD;  /* 画布外框 */
+  --viewportGutter:      #DDE4EA;
+  --viewportGutterEdge:  #D1DAE2;
+  --canvasBorder:        #C6D0DA;
   --canvasInset:         rgba(255, 255, 255, 0.90);
   --canvasShadow:        rgba(16, 18, 28, 0.16);
 
   /* ---- 文字层级 ---- */
-  --textPrimary:   #1D1D1F;  /* 标题、读数、值 */
-  --textSecondary: #536071;  /* 说明、字段名、次级信息 */
-  --textMuted:     #687485;  /* 最弱提示、日志时间戳、脚注 */
-  --textDisabled:  #AEAEB2;  /* 置灰控件文字 */
+  --textPrimary:   #192430;
+  --textSecondary: #455465;
+  --textMuted:     #596979;
+  --textDisabled:  #7E8A96;
   --onAccent:      #FFFFFF;
-  --glassText:     #172025;
-  --glassBg:       rgba(255, 255, 255, 0.72);
-  --glassBorder:   rgba(23, 32, 37, 0.14);
+  --glassText:     #192430;
+  --glassBg:       rgba(247, 250, 252, 0.82);
+  --glassBorder:   rgba(29, 43, 56, 0.14);
   --glassShadow:   rgba(0, 0, 0, 0.18);
 
+  /* Functional chrome: reserved for the title bar, island, and popovers. */
+  --functionalGlassBg:     rgba(247, 249, 252, 0.82);
+  --functionalGlassBorder: rgba(255, 255, 255, 0.72);
+  --functionalGlassText:   #202833;
+  --shadowFloat:           0 10px 26px rgba(25, 36, 48, 0.14);
+  --shadowIsland:          0 18px 40px rgba(25, 36, 48, 0.18);
+  --islandBg:              color-mix(in srgb, var(--panel) 92%, transparent);
+  --islandBorder:          color-mix(in srgb, var(--lineStrong) 72%, transparent);
+  --islandHighlight:       rgba(255, 255, 255, 0.88);
+  --islandKeyBg:           color-mix(in srgb, var(--neutralSoft) 84%, transparent);
+  --islandKeyHover:        color-mix(in srgb, var(--accentSoft) 88%, var(--neutralSoft));
+  --islandText:            var(--textPrimary);
+  --islandTextMuted:       var(--textSecondary);
+  --islandTrack:           color-mix(in srgb, var(--textMuted) 42%, transparent);
+  --islandRipple:          color-mix(in srgb, var(--accent) 28%, transparent);
+
   /* ---- 语义色（颜色即语义，不要换色表达同一动作） ---- */
-  --accent:        #0066CC;  /* 唯一强调色：选中态、链接、PASS 标签 */
+  --accent:        #176F89;
   --accentText:    #1A7F37;  /* 日志 INFO/OK 级别文字（绿） */
-  --ok:            #34C759;  /* 就绪点、预检通过、进度条绿色段 */
-  --warn:          #FFB340;  /* 预检告警（黄）、暂停按钮 */
-  --warnText:      #B26A00;  /* 日志 WARN 级别文字（琥珀） */
-  --danger:        #FF3B30;  /* 急停按钮（红） */
-  --dangerSolid:   #C71A1C;  /* Xray Disable / Timer On / 故障条等实心红 */
-  --dangerText:    #B3261E;  /* 日志 ERR 级别文字（红） */
+  --ok:            #228657;
+  --warn:          #E0A13A;
+  --warnText:      #9A5E10;
+  --danger:        #E84D49;
+  --dangerSolid:   #B93B37;
+  --dangerText:    #A83230;
   --violet:        #8B5CF6;  /* 读取上一次扫描进度（紫） */
   --btnHome:       #3B82F6;  /* 设备回零（深蓝，取自按钮 SVG） */
   --btnResume:     #0A84FF;  /* 从暂停开始 / 继续（浅蓝，取自按钮 SVG） */
@@ -82,12 +98,12 @@
   --okSoft:     #EBF7EF;
   --warnSoft:   #FEF2E4;
   --dangerSoft: #FCE6E5;
-  --accentSoft: #EEF4FF;
-  --neutralSoft:#E8E8ED;     /* 灰色按钮：Xray Enable / Timer Off / Retry */
+  --accentSoft: #E3F0F4;
+  --neutralSoft:#E6EBF0;
 
   /* ---- 中央 Live Scene 视口（跟随主题） ---- */
-  --sceneBg:     #FAFAFC;    /* 视口底（浅色 = 浅色取景器） */
-  --sceneLine:   #E0E0E0;    /* 视口描边 */
+  --sceneBg:     #EEF2F5;
+  --sceneLine:   #D7E0E8;
   /* 3D 舞台：桌面（布纹）与球壁（纸纹）的固有色，以及它们唯一能变白的手段
      ——自发光强度。靠着色的光照到不了白：球壁法线朝内拿到的是半球光的地色，
      方向光又被 three 除以 π，所以必须靠 emissive 提亮。 */
@@ -121,14 +137,14 @@
   --preflightFail:  #C71A1C;
 
   /* ---- 圆角 / 间距 ---- */
-  --radiusCard:    18px;   /* 卡片 */
-  --radiusCardCompact: 14px;
-  --radiusPanel:   16px;   /* 规范板 / 大面板 */
-  --radiusDock:    22px;   /* 控制坞（高 74 → 全圆角胶囊） */
-  --radiusKey:     14px;   /* 坞内键帽（54 直径） */
-  --radiusChip:    11px;   /* 芯片 / 徽章 / 统计小块 */
-  --radiusControl: 12px;   /* 按钮 / 开关 */
-  --radiusSmall:   8px;    /* 标签页 / 小控件 */
+  --radiusCard:    12px;
+  --radiusCardCompact: 10px;
+  --radiusPanel:   12px;
+  --radiusDock:    28px;
+  --radiusKey:     12px;
+  --radiusChip:    8px;
+  --radiusControl: 9px;
+  --radiusSmall:   6px;
   --space1: 4px;  --space2: 8px;  --space3: 12px;
   --space4: 16px; --space6: 24px; --space8: 32px;
 
@@ -155,40 +171,55 @@
    （画布 #12161D / 机箱条 #1A2029 / 卡片 #1E2530 / 日志体 #141922）
    ------------------------------------------------------------ */
 [data-theme="dark"] {
-  --appBg:        #12161D;
-  --chassis:      #1A2029;   /* 菜单栏 / 输出控制台 / 状态栏 */
-  --panel:        #1E2530;
-  --panelHeader:  #212834;
-  --well:         #141922;
-  --line:         #2A313C;
-  --lineStrong:   #2A313C;
-  --lineField:    #39424D;
+  --appBg:        #111821;
+  --chassis:      #161F29;
+  --panel:        #1C2631;
+  --panelHeader:  #222E3A;
+  --well:         #141D27;
+  --line:         #2E3A47;
+  --lineStrong:   #384654;
+  --lineField:    #40505F;
 
   /* ---- 最大化窗口的机箱留白（暗色：比画布更深的机身） ---- */
-  --viewportGutter:      #0B0E13;
-  --viewportGutterEdge:  #060910;
-  --canvasBorder:        #2A313C;
+  --viewportGutter:      #0B1118;
+  --viewportGutterEdge:  #080D13;
+  --canvasBorder:        #303D4A;
   --canvasInset:         rgba(255, 255, 255, 0.06);
   --canvasShadow:        rgba(0, 0, 0, 0.55);
 
-  --textPrimary:   #E8ECF2;
-  --textSecondary: #9AA4B2;
-  --textMuted:     #9BA6B6;
-  --textDisabled:  #5F6873;
+  --textPrimary:   #E7EDF2;
+  --textSecondary: #B2BDC8;
+  --textMuted:     #A1ADBA;
+  --textDisabled:  #778491;
   --onAccent:      #FFFFFF;
   --glassText:     #E8ECF2;
   --glassBg:       rgba(255, 255, 255, 0.12);
   --glassBorder:   rgba(255, 255, 255, 0.22);
   --glassShadow:   rgba(0, 0, 0, 0.30);
 
-  --accent:      #5AA9F5;   /* 暗底上提亮的 Action Blue（对比度达标） */
+  --functionalGlassBg:     rgba(24, 30, 39, 0.86);
+  --functionalGlassBorder: rgba(255, 255, 255, 0.16);
+  --functionalGlassText:   #E8ECF2;
+  --shadowFloat:           0 12px 28px rgba(0, 0, 0, 0.34);
+  --shadowIsland:          0 20px 44px rgba(0, 0, 0, 0.40);
+  --islandBg:              color-mix(in srgb, var(--panelHeader) 94%, transparent);
+  --islandBorder:          color-mix(in srgb, var(--lineField) 66%, transparent);
+  --islandHighlight:       rgba(255, 255, 255, 0.14);
+  --islandKeyBg:           rgba(255, 255, 255, 0.08);
+  --islandKeyHover:        color-mix(in srgb, var(--accentSoft) 90%, var(--panelHeader));
+  --islandText:            var(--textPrimary);
+  --islandTextMuted:       var(--textSecondary);
+  --islandTrack:           color-mix(in srgb, var(--textSecondary) 42%, transparent);
+  --islandRipple:          color-mix(in srgb, var(--accent) 34%, transparent);
+
+  --accent:      #69B4CF;
   --accentText:  #4ADE80;
-  --ok:          #4ADE80;
-  --warn:        #F5B940;
-  --warnText:    #F5B940;
-  --danger:      #FF6B61;
-  --dangerSolid: #D7261F;
-  --dangerText:  #FF8A80;
+  --ok:          #5BD09A;
+  --warn:        #F0B44E;
+  --warnText:    #F0B44E;
+  --danger:      #FF7770;
+  --dangerSolid: #D94C47;
+  --dangerText:  #FF9A93;
   --violet:      #BF5AF2;
   --btnHome:     #409CFF;
   --btnResume:   #64D2FF;
@@ -198,11 +229,11 @@
   --okSoft:     #12291D;
   --warnSoft:   #2C2410;
   --dangerSoft: #331A18;
-  --accentSoft: #16304F;
-  --neutralSoft:#2A323E;
+  --accentSoft: #193845;
+  --neutralSoft:#2A3744;
 
-  --sceneBg:     #12161D;   /* 暗态场景图为自带深底渲染，见 3D-scene-dark*.png */
-  --sceneLine:   #2A313C;
+  --sceneBg:     #111821;
+  --sceneLine:   #2E3A47;
   --stageTable:  #4F525A;   /* 桌面圆盘（暗态沿用同一套结构：比球壁亮一档） */
   --stageWall:   #3E424A;   /* 上半球球壁 */
   --stageGlow:   0.18;      /* 暗态自发光压低，否则桌面会脱离夜景 */

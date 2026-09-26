@@ -6,7 +6,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Folder } from "@phosphor-icons/react";
+import { isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
 import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } from "./scan-input";
 import { useEngine } from "./engine/useEngine";
@@ -43,20 +44,33 @@ const THEME_KEY = "micro-ct-workstation.theme";
 function useTheme(): [Theme, (theme: Theme) => void] {
   const [theme, setTheme] = useState<Theme>(() => {
     try {
-      return window.localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light";
-    } catch {
-      return "light";
-    }
+      const saved = window.localStorage.getItem(THEME_KEY);
+      if (saved === "light" || saved === "dark") return saved;
+    } catch { /* use the operating-system preference */ }
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    try {
-      window.localStorage.setItem(THEME_KEY, theme);
-    } catch {
-      /* storage unavailable */
-    }
+    const themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+    if (themeColor) themeColor.content = theme === "dark" ? "#111821" : "#E8EDF2";
   }, [theme]);
-  return [theme, setTheme];
+  useEffect(() => {
+    const preference = window.matchMedia("(prefers-color-scheme: dark)");
+    const syncFromOperatingSystem = (event: MediaQueryListEvent): void => {
+      try {
+        const saved = window.localStorage.getItem(THEME_KEY);
+        if (saved === "light" || saved === "dark") return;
+      } catch { /* a blocked store behaves as no manual override */ }
+      setTheme(event.matches ? "dark" : "light");
+    };
+    preference.addEventListener("change", syncFromOperatingSystem);
+    return () => preference.removeEventListener("change", syncFromOperatingSystem);
+  }, []);
+  const chooseTheme = useCallback((next: Theme): void => {
+    try { window.localStorage.setItem(THEME_KEY, next); } catch { /* the active session still follows the selection */ }
+    setTheme(next);
+  }, []);
+  return [theme, chooseTheme];
 }
 
 function logTime(timestamp: string): string {
@@ -106,7 +120,37 @@ function MenuBar({
   onAction: (id: MenuActionId) => void;
 }) {
   const [openMenu, setOpenMenu] = useState<TopMenu | null>(null);
+  const [windowMaximized, setWindowMaximized] = useState(true);
+  const [windowMaximizable, setWindowMaximizable] = useState(false);
   const barRef = useRef<HTMLElement | null>(null);
+  const desktopWindow = useMemo(() => isTauri() ? getCurrentWindow() : null, []);
+
+  useEffect(() => {
+    if (!desktopWindow) return;
+    let disposed = false;
+    let stopResize: (() => void) | undefined;
+    const syncWindowState = async (): Promise<void> => {
+      try {
+        const [maximized, maximizable] = await Promise.all([
+          desktopWindow.isMaximized(),
+          desktopWindow.isMaximizable(),
+        ]);
+        if (!disposed) {
+          setWindowMaximized(maximized);
+          setWindowMaximizable(maximizable);
+        }
+      } catch { /* the chrome remains visible if the host is shutting down */ }
+    };
+    void syncWindowState();
+    void desktopWindow.onResized(() => void syncWindowState()).then((stop) => {
+      if (disposed) stop();
+      else stopResize = stop;
+    });
+    return () => {
+      disposed = true;
+      stopResize?.();
+    };
+  }, [desktopWindow]);
 
   useEffect(() => {
     if (!openMenu) return;
@@ -125,7 +169,19 @@ function MenuBar({
   }, [openMenu]);
 
   return (
-    <header className="menu-bar" ref={barRef}>
+    <header
+      className="menu-bar"
+      ref={barRef}
+      onDoubleClick={(event) => {
+        if ((event.target as HTMLElement).closest("button, nav, .window-controls")) return;
+        if (desktopWindow && windowMaximizable) void desktopWindow.toggleMaximize().catch(() => undefined);
+      }}
+    >
+      <div className="workstation-brand" data-tauri-drag-region>
+        <img src="/assets/micro-ct-logo.png" alt="" draggable={false} />
+        <strong>Micro-CT Workstation</strong>
+        <span>v0.7.0</span>
+      </div>
       <nav className="sys-menu" aria-label="Application menu">
         {MENU_GROUPS.map((group) => {
           const open = openMenu === group.label;
@@ -171,6 +227,24 @@ function MenuBar({
           );
         })}
       </nav>
+      <span className="title-drag-space" data-tauri-drag-region aria-hidden="true" />
+      <div className="window-controls" aria-label="Window controls">
+        <button type="button" aria-label="Minimise window" title="Minimise" onClick={() => void desktopWindow?.minimize().catch(() => undefined)}>
+          <span className="window-glyph window-glyph--minimise" aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          aria-label={windowMaximized ? "Restore window" : "Maximise window"}
+          title={windowMaximizable ? (windowMaximized ? "Restore" : "Maximise") : "Window remains maximised at this display size"}
+          disabled={!windowMaximizable}
+          onClick={() => void desktopWindow?.toggleMaximize().catch(() => undefined)}
+        >
+          <span className={`window-glyph ${windowMaximized ? "window-glyph--restore" : "window-glyph--maximise"}`} aria-hidden="true" />
+        </button>
+        <button type="button" className="window-controls__close" aria-label="Close window" title="Close" onClick={() => void desktopWindow?.close().catch(() => undefined)}>
+          <span className="window-glyph window-glyph--close" aria-hidden="true" />
+        </button>
+      </div>
     </header>
   );
 }
@@ -434,7 +508,7 @@ function ScanParamsPanel({
               aria-label="Select image directory"
               onClick={() => void chooseDirectory()}
             >
-              <Folder size={18} weight="duotone" aria-hidden="true" />
+              <span className="folder-glyph" aria-hidden="true" />
             </button>
           </div>
           {pathError ? <small className="field-error">{pathError}</small> : null}
@@ -499,14 +573,138 @@ interface ConsoleFeedback {
 
 /**
  * Evidence checks that keep the console fail-closed. Every condition is read
- * from fields that already exist on EngineSnapshot / WorkstationView.
+ * from fields that already exist on EngineSnapshot / WorkstationView. Exported
+ * so the acceptance test can drive the real derivation instead of a copy of it.
  */
-interface FeedbackEvidence {
+export interface FeedbackEvidence {
   linkLost: boolean;
+  /** A device link was never established in this session, and nothing in the snapshot contradicts that. */
+  neverConnected: boolean;
   phaseFault: boolean;
   beamUnconfirmed: boolean;
   /** A scan is running or has run, so a cooldown could legitimately be in play. */
   scanAttempted: boolean;
+}
+
+/**
+ * Device phases that can only be reached once the engine actually engaged a
+ * device link. `idle` is deliberately absent: it is the phase a freshly started
+ * engine reports while it has never connected to anything. Any phase listed here
+ * is therefore snapshot-local evidence that a link existed, so a `disconnected`
+ * snapshot carrying one of them is a connection that was lost — red, not neutral
+ * — even if the in-session memory below is empty (for example after a window or
+ * React remount while the engine stayed alive).
+ */
+const POST_CONNECTION_PHASES: ReadonlySet<string> = new Set([
+  "ready_for_home",
+  "ready",
+  "running",
+  "paused",
+  "finishing",
+  "stopping",
+  "stopped",
+  "completed",
+  "fault",
+]);
+
+/**
+ * Presentation-only memory of whether a device link was EVER established while
+ * this console has been running. A first `disconnected` (fresh startup, nothing
+ * connected yet) is benign and must not be reported as a fault; a `disconnected`
+ * after a connection existed is still fail-closed red. This remembers an
+ * observed snapshot; it is never a second source of device truth and never an
+ * input to any gate.
+ */
+let linkEverEstablished = false;
+
+/** Reset the session memory. Test seam only; the app never calls this. */
+export function resetLinkMemoryForTest(): void {
+  linkEverEstablished = false;
+}
+
+/**
+ * True only for a connection that has never been established: the engine is
+ * disconnected, nothing in this snapshot proves a link once existed, and none
+ * has been observed yet. Everything else that is not `connected` stays
+ * fail-closed.
+ */
+function linkNeverEstablished(snapshot: EngineSnapshot, everConnected: boolean): boolean {
+  const connectionWasRecorded = Array.isArray(snapshot.logs) && snapshot.logs.some((entry) =>
+    /\bconnected\b/i.test(entry.message),
+  );
+  return (
+    snapshot.connectionState === "disconnected" &&
+    !everConnected &&
+    !connectionWasRecorded &&
+    snapshot.phase === "idle" &&
+    !snapshot.preflightPassed &&
+    !snapshot.homed &&
+    !POST_CONNECTION_PHASES.has(snapshot.phase)
+  );
+}
+
+/**
+ * One-line reading for the benign startup state. It states plainly that nothing
+ * is connected and that every device and output reading is unavailable, so the
+ * neutral banner can never be read as a claim that the machine is ready.
+ */
+function offlineFeedback(): ConsoleFeedback {
+  return {
+    state: "Stopped",
+    tone: "muted",
+    detail: "Not connected · no device link has been established yet · device and output states are unavailable and no scan has run",
+    active: false,
+  };
+}
+
+/**
+ * The only neutral disconnected snapshot is a positively identified fresh
+ * engine startup. Every signal that can disprove that initial state is checked
+ * here, then the caller sends all other disconnected snapshots directly to
+ * Fault. Parameter drafts are intentionally ignored: they are not device
+ * readbacks and do not mean a link or scan has existed.
+ */
+function isStrictlyInitialDisconnected(
+  snapshot: EngineSnapshot,
+  ws: WorkstationView,
+  stale: boolean,
+  neverConnected: boolean,
+): boolean {
+  return (
+    !stale &&
+    neverConnected &&
+    snapshot.connectionState === "disconnected" &&
+    snapshot.phase === "idle" &&
+    snapshot.preflightPassed === false &&
+    snapshot.homed === false &&
+    snapshot.lastError === null &&
+    Array.isArray(snapshot.logs) &&
+    !snapshot.logs.some((entry) => entry.level === "error") &&
+    Array.isArray(snapshot.devices) &&
+    snapshot.devices.every(
+      (device) => device.state === "offline" || (device.id === "xray" && device.state === "locked"),
+    ) &&
+    snapshot.imageCount === 0 &&
+    snapshot.progress.current === 0 &&
+    snapshot.progress.percent === 0 &&
+    ws.dataState === "ready" &&
+    ws.phaseTone === "accent" &&
+    Array.isArray(ws.consoleLogs) &&
+    !ws.consoleLogs.some((entry) => entry.level === "ERR") &&
+    ws.progress.captured === 0 &&
+    ws.progress.percent === 0 &&
+    ws.frames.length === 0 &&
+    ws.scene.angleKnown === false &&
+    ws.xray.connected === false &&
+    ws.xray.monKv === null &&
+    ws.xray.monUa === null &&
+    ws.xray.powerW === null &&
+    ws.xray.tempC === null &&
+    ws.xray.setpointConfirmed === false &&
+    ws.xray.latched === false &&
+    ws.xray.beamOn === false &&
+    (ws.xray.beamState === "off" || ws.xray.beamState === "unknown")
+  );
 }
 
 /**
@@ -523,17 +721,31 @@ const SCAN_ENGAGED_PHASES: ReadonlySet<string> = new Set([
   "completed",
 ]);
 
-function evaluateFeedbackEvidence(
+export function evaluateFeedbackEvidence(
   snapshot: EngineSnapshot,
   ws: WorkstationView,
   stale: boolean,
 ): FeedbackEvidence {
   const connection = snapshot.connectionState;
   const capturedFrames = Number.isFinite(ws.progress.captured) ? ws.progress.captured : 0;
+  // A link that was once established stays remembered for this session, so a
+  // later `disconnected` is a connection that was LOST and remains fail-closed.
+  // Only fresh snapshots are remembered: a stale one is already a fault and
+  // must not be able to seed this memory.
+  if (connection === "connected" && !stale) linkEverEstablished = true;
+  const neverConnected = linkNeverEstablished(snapshot, linkEverEstablished);
   return {
     // A lost link, a degraded link or a stale snapshot means every reading below
-    // is unknown, so the console must not present it as a normal state.
-    linkLost: stale || connection === "lost" || connection === "disconnected" || connection === "degraded",
+    // is unknown, so the console must not present it as a normal state. A
+    // `disconnected` link is part of that set unless it is the benign
+    // never-connected startup state, which is not a fault and must not be
+    // mislabelled as one — it relaxes no gate, it only stops the mislabelling.
+    linkLost:
+      stale ||
+      connection === "lost" ||
+      connection === "degraded" ||
+      (connection === "disconnected" && !neverConnected),
+    neverConnected,
     phaseFault: snapshot.phase === "fault" || ws.dataState === "fault",
     // Fail closed: a beam that is not a CONFIRMED off/on reading stays a warning.
     beamUnconfirmed: ws.xray.beamState === "unknown" || (!ws.xray.setpointConfirmed && ws.xray.beamOn),
@@ -567,13 +779,32 @@ function feedbackToneClass(tone: ConsoleStateTone): string {
  * a Stopping pose is frozen (the snapshot angle is repeated, never advanced);
  * and Cooling is only ever reported from real cooldown evidence — the snapshot
  * exposes none today, so it reports UNKNOWN instead of inventing a cooldown.
+ *
+ * A disconnected snapshot is partitioned in full: only a positively identified
+ * fresh idle startup is neutral; every other disconnected case is Fault. This
+ * keeps unknown device and output conditions out of the ordinary phase mapping.
  */
-function deriveConsoleFeedback(
+export function deriveConsoleFeedback(
   snapshot: EngineSnapshot,
   ws: WorkstationView,
   stale: boolean,
 ): ConsoleFeedback {
   const evidence = evaluateFeedbackEvidence(snapshot, ws, stale);
+
+  // Exhaustive partition: disconnected is neutral only for a fully verified
+  // initial snapshot. No disconnected combination can reach the phase switch or
+  // its final ordinary Stopped fallback.
+  if (snapshot.connectionState === "disconnected") {
+    if (isStrictlyInitialDisconnected(snapshot, ws, stale, evidence.neverConnected)) {
+      return offlineFeedback();
+    }
+    return {
+      state: "Fault",
+      tone: "danger",
+      detail: "Control service disconnected after device, output, progress, pose or error evidence · state is unknown",
+      active: false,
+    };
+  }
 
   if (evidence.linkLost) {
     return {
@@ -583,7 +814,7 @@ function deriveConsoleFeedback(
       active: false,
     };
   }
-  if (evidence.phaseFault) {
+  if (evidence.phaseFault || ws.xray.latched) {
     return {
       state: "Fault",
       tone: "danger",
@@ -593,11 +824,19 @@ function deriveConsoleFeedback(
       active: false,
     };
   }
-  if (evidence.beamUnconfirmed && (ws.phaseTone === "danger" || ws.xray.beamOn)) {
+  const outputContradictory =
+    (ws.xray.beamState === "on" && !ws.xray.beamOn) ||
+    (ws.xray.beamState === "off" && ws.xray.beamOn);
+  const outputActiveOutsideAcquisition = ws.xray.beamOn && snapshot.phase !== "running";
+  if (evidence.beamUnconfirmed || outputContradictory || outputActiveOutsideAcquisition) {
     return {
       state: "Fault",
       tone: "danger",
-      detail: "X-ray output state is not confirmed · treated as unsafe until the engine reports it",
+      detail: outputContradictory
+        ? "X-ray output readings contradict each other · treated as unsafe until the engine reports a consistent state"
+        : outputActiveOutsideAcquisition
+          ? "X-ray output is active outside acquisition · treated as unsafe until the engine confirms it is disabled"
+          : "X-ray output state is not confirmed · treated as unsafe until the engine reports it",
       active: false,
     };
   }
@@ -770,8 +1009,10 @@ function ControlDock({
   stale?: boolean;
   setupInvalid?: boolean;
 }) {
-  const [hoverOpen, setHoverOpen] = useState(false);
+  const [hoverOpen, setHoverOpen] = useState(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const [focusInside, setFocusInside] = useState(false);
+  const [approaching, setApproaching] = useState(false);
+  const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   // An explicit click pins the dock open and wins over hover, so hovering a
   // collapsed capsule can never leave the pointer sitting on a key it did not
   // aim at, and an explicit click can always close the dock again.
@@ -797,32 +1038,54 @@ function ControlDock({
 
   useEffect(() => clearExpandTimer, [clearExpandTimer]);
 
-  const openForHover = useCallback((): void => {
-    clearExpandTimer();
-    setHoverOpen(true);
+  useEffect(() => {
+    const preference = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const syncReducedMotion = (event: MediaQueryListEvent): void => {
+      setReducedMotion(event.matches);
+      setHoverOpen(event.matches);
+      if (event.matches) {
+        clearExpandTimer();
+        setApproaching(false);
+        setHoverOpen(true);
+      }
+    };
+    if (preference.matches) setHoverOpen(true);
+    preference.addEventListener("change", syncReducedMotion);
+    return () => preference.removeEventListener("change", syncReducedMotion);
   }, [clearExpandTimer]);
 
-  // Collapsing is delayed by less than the expand transition so the pointer can
-  // travel from the capsule onto the keys without the dock folding underneath it.
+  const openForHover = useCallback((): void => {
+    clearExpandTimer();
+    if (reducedMotion) {
+      setApproaching(false);
+      setHoverOpen(true);
+      return;
+    }
+    setApproaching(true);
+  }, [clearExpandTimer, reducedMotion]);
+
+  // Keep the approach ripple alive briefly as the pointer crosses the capsule.
   const scheduleHoverClose = useCallback((): void => {
     clearExpandTimer();
     expandTimer.current = window.setTimeout(() => {
       expandTimer.current = null;
-      setHoverOpen(false);
+      setApproaching(false);
     }, 260);
   }, [clearExpandTimer]);
 
   const collapse = useCallback((): void => {
     clearExpandTimer();
+    setApproaching(false);
     setHoverOpen(false);
     setFocusInside(false);
     setClickOpen(false);
   }, [clearExpandTimer]);
 
-  // Only an already-pinned dock closes on a click; otherwise the click pins the
-  // hover-expanded dock open instead of folding it away under the pointer.
+  // A click on the capsule first pins the panel open; only a later capsule click
+  // collapses it, so the pointer never lands on a newly revealed action key.
   const toggleOpen = useCallback((): void => {
     clearExpandTimer();
+    setApproaching(false);
     if (touchHandled.current) {
       // The tap already expanded the dock on pointerdown.
       touchHandled.current = false;
@@ -865,13 +1128,14 @@ function ControlDock({
 
   return (
     <div
-      className={`control-dock ${expanded ? "is-expanded" : "is-collapsed"} dock-state--${feedback.state.toLowerCase()}`}
+      className={`control-dock ${expanded ? "is-expanded" : "is-collapsed"} ${approaching ? "is-approaching" : ""} ${reducedMotion ? "is-reduced-motion" : ""} dock-state--${feedback.state.toLowerCase()}`}
       aria-label="Scan controls"
       aria-expanded={expanded}
       onMouseEnter={openForHover}
       onMouseLeave={scheduleHoverClose}
       onFocusCapture={() => {
         clearExpandTimer();
+        setApproaching(false);
         setFocusInside(true);
       }}
       onBlurCapture={(event) => {
@@ -880,36 +1144,37 @@ function ControlDock({
       // Touch has no hover: a tap on the collapsed capsule expands it, and the
       // four keys are only reachable once the capsule has visibly expanded.
       onPointerDown={(event) => {
-        if (event.pointerType !== "touch") return;
+        if (event.pointerType !== "touch" || !(event.target as HTMLElement).closest(".dock-capsule")) return;
         clearExpandTimer();
-        openForHover();
+        setApproaching(false);
+        setHoverOpen(true);
         setClickOpen(true);
         touchHandled.current = true;
       }}
     >
-      <button
-        type="button"
-        className="dock-capsule"
-        aria-expanded={expanded}
-        aria-controls="control-dock-keys"
-        aria-label={
-          expanded
-            ? `Collapse scan controls. ${feedback.state}. Progress ${progressReadout}.`
-            : `Expand scan controls. ${feedback.state}. Progress ${progressReadout}.`
-        }
-        title={`${feedback.state} · ${feedback.detail}`}
-        onClick={toggleOpen}
-      >
-        <span className="dock-capsule__lead">
-          <RingReadout percent={percent ?? 0} tone={feedback.tone} label="–" known={percentKnown} />
-          <span className="dock-capsule__text">
-            <span className="dock-capsule__state">{feedback.state}</span>
-            <span className="dock-capsule__progress">{progressReadout}</span>
+      <div className="dock-key-row" id="control-dock-keys">
+        <button
+          type="button"
+          className="dock-capsule"
+          aria-expanded={expanded}
+          aria-controls="control-dock-keys"
+          aria-label={
+            expanded
+              ? `Collapse scan controls. ${feedback.state}. Progress ${progressReadout}.`
+              : `Expand scan controls. ${feedback.state}. Progress ${progressReadout}.`
+          }
+          title={`${feedback.state} · ${feedback.detail}`}
+          onClick={toggleOpen}
+        >
+          <span className="dock-capsule__lead">
+            <RingReadout percent={percent ?? 0} tone={feedback.tone} label="–" known={percentKnown} />
+            <span className="dock-capsule__text">
+              <span className="dock-capsule__state">{feedback.state}</span>
+              <span className="dock-capsule__progress">{progressReadout}</span>
+            </span>
           </span>
-        </span>
-        <span className="dock-capsule__chevron" aria-hidden="true" />
-      </button>
-      <div className="dock-key-row" id="control-dock-keys" hidden={!expanded}>
+          <span className="dock-capsule__chevron" aria-hidden="true" />
+        </button>
         <DockKey
           variant="home"
           src="/assets/dock-home.svg"
@@ -1212,6 +1477,9 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
                 : "RELEASED · MANUAL"}
           </span>
         </div>
+        {stale || !ws.xray.usbAutoShutDownKnown ? (
+          <p className="safety-unknown" role="status">UNKNOWN · Select USB Auto Shut Down before deadman arming can be verified.</p>
+        ) : null}
         <label className="check-row check-row--inset">
           <input
             type="checkbox"
@@ -1431,7 +1699,7 @@ const DIALOG_TITLES: Record<DialogKind, string> = {
   diagnostics: "Device Diagnostics",
 };
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.7.0";
 
 function InfoDialog({
   kind,

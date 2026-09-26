@@ -11,6 +11,98 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 const read = async (path) => readFile(new URL(path, root), "utf8");
 
+/* ---------- shared layout facts read out of src/styles.css ---------- */
+
+/** The panel class the Operation Status section actually carries in App.tsx
+ *  (`<section className="panel operation-panel">`). There is no `.op-status`
+ *  rule, so any selector using it silently matches nothing. */
+export const OPERATION_PANEL_CLASS = "operation-panel";
+
+/** Bottom console row: 264 design px * 1.2 = 316.8, rounded to 317. The same
+ *  number is the Operation Status panel's own height; the two must never be
+ *  allowed to drift apart, so a change on either side has to update both. */
+export const BOTTOM_LOG_ROW_PX = 317;
+
+/** The right column's panel separator is the shared 1px hairline, not the
+ *  12px panel rhythm: a 12px gap pushes the Operation Status panel down and
+ *  pulls the X-ray panel above the line the other two columns end on. */
+export const RIGHT_COLUMN_SPACER_PX = 1;
+
+/** The first client-area row's design height, in design px. `.design-canvas`
+ *  spends row 1 on the custom title bar (`header.menu-bar`: compact menus,
+ *  brand, window controls) and the last row on the 30px status bar. This is a
+ *  specified design value, documented in src/AGENTS.md; the stylesheet is
+ *  graded against the spec, never the other way round. */
+export const TOP_CHROME_ROW_PX = 39;
+
+/** The design canvas grid: top chrome, hairline, content, hairline, status bar. */
+export const CHROME_ROW_TRACKS = /grid-template-rows: (\d+)px 1px minmax\(0, 1fr\) 1px (\d+)px/;
+
+const escapeForRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Every declaration body of one concrete class selector. Derived from the
+ * class name actually rendered by App.tsx, so renaming the panel in both places
+ * keeps working while a selector that matches nothing fails instead of skipping.
+ */
+export const classRuleBodies = (css, className) => [
+  ...css.matchAll(new RegExp(`\\.${escapeForRegExp(className)}\\s*\\{([^}]*)\\}`, "g")),
+].map((match) => match[1]);
+
+/**
+ * The bottom console row height declared by `.workspace-body`, or null when the
+ * rule is gone. Callers must treat null as a failure: the row is the anchor of
+ * the shared bottom edge, not something to fall back to a range for.
+ */
+export const bottomLogRowPx = (css) => {
+  const match = css.match(
+    /\.workspace-body\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+1px\s+(\d+)px/,
+  );
+  return match ? Number(match[1]) : null;
+};
+
+/** The `min-height` values the Operation Status panel declares, in source order. */
+export const operationPanelMinHeightsPx = (css, className = OPERATION_PANEL_CLASS) =>
+  classRuleBodies(css, className)
+    .flatMap((body) => [...body.matchAll(/min-height:\s*(\d+)px/g)])
+    .map((match) => Number(match[1]));
+
+/** The `height` values the Operation Status panel declares, in source order. */
+export const operationPanelHeightsPx = (css, className = OPERATION_PANEL_CLASS) =>
+  classRuleBodies(css, className)
+    .flatMap((body) => [...body.matchAll(/(?<!min-)height:\s*(\d+)px/g)])
+    .map((match) => Number(match[1]));
+
+/** The separator the right status column puts between its two panels, or null. */
+export const rightColumnSpacerPx = (css) => {
+  const bodies = classRuleBodies(css, "col--right");
+  for (const body of bodies) {
+    const match = body.match(/(?:^|;)\s*(?:row-)?gap\s*:\s*(\d+)px/);
+    if (match) return Number(match[1]);
+  }
+  return null;
+};
+
+/**
+ * Turns the stylesheet text into the number the bottom-log-row assertion is
+ * graded against: the Operation Status panel's published height. There is no
+ * fallback path on purpose - a stylesheet where the panel no longer publishes
+ * its height (wrong class, deleted rule, non-px value) throws here, and the
+ * test fails rather than quietly passing a looser check.
+ */
+export function readOperationPanelHeight(css, className = OPERATION_PANEL_CLASS) {
+  const bodies = classRuleBodies(css, className);
+  if (bodies.length === 0) {
+    throw new Error(`stylesheet has no .${className} rule to read the panel height from`);
+  }
+  const heights = operationPanelHeightsPx(css, className);
+  const minHeights = operationPanelMinHeightsPx(css, className);
+  if (heights.length === 0 && minHeights.length === 0) {
+    throw new Error(`.${className} publishes no height: / min-height: in px`);
+  }
+  return [...heights, ...minHeights][0];
+}
+
 test("desktop path resolver anchors Camera Roll to the configured Pictures folder", async () => {
   const source = await read("src-tauri/src/main.rs");
   assert.match(source, /fn resolve_default_image_directory/);
@@ -128,9 +220,91 @@ test("fixed design canvas scales as one unit and side columns never scroll", asy
   assert.match(styles, /\.menu-dropdown \{[\s\S]*position: absolute;/);
   assert.doesNotMatch(app, /Math\.min\(window\.innerWidth \/ 1600/);
   assert.doesNotMatch(styles, /\.design-canvas\s*\{[^}]*transform:/);
-  assert.match(styles, /grid-template-rows: 26px 1px minmax\(0, 1fr\) 1px 30px/);
+  // The first row is the single top chrome row (custom title bar: brand +
+  // menus + window controls) and the last is the status bar. The four-track
+  // structure and both pinned heights must not change.
+  const chromeRows = styles.match(CHROME_ROW_TRACKS);
+  assert.ok(chromeRows, "the design canvas must declare top-row / content / status-bar tracks");
+  const topRowPx = Number(chromeRows[1]);
+  const statusRowPx = Number(chromeRows[2]);
+  // Exactly 39, with the spec authority named so this is not self-referential:
+  // the height is a documented design value, not merely whatever the
+  // stylesheet happens to say. The previous check accepted anything in
+  // [26, 64] - a range 2.5x the width of the value, which silently tolerated
+  // the 13px drift between the 26px spec and the shipped 39px track while the
+  // status bar beside it was pinned to exactly 30. All 26..64 values, the
+  // stale 26 included, now fail.
+  assert.equal(
+    topRowPx,
+    TOP_CHROME_ROW_PX,
+    `the custom title-bar row must stay exactly ${TOP_CHROME_ROW_PX} design px, ` +
+      `the value specified in src/AGENTS.md (client-area first row design height); got ${topRowPx}px`,
+  );
+  // The range 26 <= topRowPx <= 64 was deliberately deleted here. It is not a
+  // regression gate: it accepted 26 through 64, so the drift it was meant to
+  // catch passed through it untouched. Do not reintroduce a tolerance band.
+  assert.equal(statusRowPx, 30, "the status bar row must stay 30px");
+  // Cross-check against the written spec so the pinned literal is anchored to a
+  // document rather than to this test. This is deliberately the inverse of the
+  // defect that created it: the range assertion let src/AGENTS.md keep saying
+  // 26px while src/styles.css shipped 39px. Whichever of the two drifts, one of
+  // the two assertions now fails.
+  const spec = await read("src/AGENTS.md");
+  assert.match(
+    spec,
+    new RegExp(`设计高度\\s*${TOP_CHROME_ROW_PX}px`),
+    `src/AGENTS.md must document the first client-area row's design height as ${TOP_CHROME_ROW_PX}px`,
+  );
+  assert.doesNotMatch(
+    spec,
+    /设计高度\s*26px/,
+    "src/AGENTS.md must not keep the stale 26px first-row design height",
+  );
   assert.match(styles, /grid-template-columns: 420px minmax\(0, 1fr\) 450px/);
-  assert.match(styles, /\.workspace-body \{[\s\S]*grid-template-rows: minmax\(0, 1fr\) 1px 270px;/);
+  // The bottom console row must match the Operation Status panel's height, so
+  // the two bottom areas line up instead of the log column looking cramped.
+  // Both numbers are read out of the stylesheet and must be EQUAL: the row
+  // height and the panel's own published height cannot drift apart. An earlier
+  // version of this check read a `.op-status` rule that does not exist, so the
+  // capture was always null and the equality was never asserted at all; the
+  // panel is `.operation-panel` in both App.tsx and styles.css. There is no
+  // fallback branch any more - if either number cannot be read, or the two
+  // disagree, this test fails.
+  const logRowPx = bottomLogRowPx(styles);
+  assert.ok(
+    logRowPx !== null,
+    "src/styles.css must declare the bottom console row in .workspace-body's grid-template-rows",
+  );
+  const operationPanelHeightPx = readOperationPanelHeight(styles);
+  assert.equal(
+    logRowPx,
+    operationPanelHeightPx,
+    "the bottom log row must equal the Operation Status panel height",
+  );
+  assert.equal(
+    logRowPx,
+    BOTTOM_LOG_ROW_PX,
+    `the bottom log row stays ${BOTTOM_LOG_ROW_PX} design px (264 * 1.2, rounded)`,
+  );
+  assert.equal(
+    operationPanelHeightPx,
+    BOTTOM_LOG_ROW_PX,
+    `the Operation Status panel stays ${BOTTOM_LOG_ROW_PX} design px so it shares the log row's edges`,
+  );
+  assert.deepEqual(
+    operationPanelMinHeightsPx(styles),
+    [BOTTOM_LOG_ROW_PX],
+    "every Operation Status min-height must equal the bottom log row",
+  );
+  assert.match(app, /className="panel operation-panel"/);
+  // The right status column's own separator has to be the shared 1px hairline,
+  // not the 12px panel rhythm: 12px would push the Operation Status panel 12px
+  // down and pull the X-ray panel above the line the other columns end on.
+  assert.equal(
+    rightColumnSpacerPx(styles),
+    RIGHT_COLUMN_SPACER_PX,
+    "the right column's panel separator must be the 1px hairline, not the 12px panel gap",
+  );
   // The bottom console stays full width over the left + centre columns only,
   // and the right status column runs through to the bottom of the workspace.
   assert.match(styles, /\.workspace-body > \.console \{[\s\S]*grid-column: 1 \/ 3;/);

@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { OrthographicCamera as OrthographicCameraImpl, PCFSoftShadowMap, Vector3 } from "three";
 import { EquipmentScene } from "./EquipmentScene";
 import { CAMERA_CONSTRAINTS, CAMERA_PRESETS } from "./scene-config";
-import { computeFitZoom, FRUSTUM_HEIGHT } from "./scene-fit";
+import { applyFrustumHeight, computeFitZoom, FRUSTUM_HEIGHT, measuredFrustumAspect } from "./scene-fit";
 import { useSceneTheme } from "./theme-three";
 import type { SceneViewModel, ViewPreset } from "./types";
 
@@ -73,11 +73,48 @@ function SceneCanvasSettings({ reducedMotion }: { reducedMotion: boolean }) {
 
 function CameraRig({ preset, presetRevision }: { preset: ViewPreset; presetRevision: number }) {
   const { camera, controls, invalidate, scene, size, gl } = useThree();
-  useFrame(() => { gl.domElement.dataset.cameraPosition = camera.position.toArray().join(","); });
+  const orthographic = camera as OrthographicCameraImpl;
+  /** Latest reported canvas box, for the per-frame projection guard below. */
+  const viewport = useRef({ width: size.width, height: size.height });
+  viewport.current = { width: size.width, height: size.height };
+
+  useFrame(() => {
+    // Mandatory, and deliberately independent of every other decision this rig
+    // makes: `@react-three/fiber`'s own resize handler rewrites an orthographic
+    // camera's bounds to `left/right = ±size.width/2` and `top/bottom =
+    // ±size.height/2` on every viewport change. Those two halves only share the
+    // canvas aspect ratio when the canvas happens to be square, so if that write
+    // lands after this rig's, the render is stretched until the rig runs again.
+    // Re-asserting the frustum here, immediately before the frame is drawn, keeps
+    // the projection coupled to the canvas no matter who else wrote it last.
+    // The size is first rounded to match the renderer's integer drawing buffer:
+    // the layout is CSS-zoomed, so unrounded fractional sizes would make the
+    // guard fire on every single frame for a sub-pixel reason.
+    const guardWidth = Math.round(viewport.current.width);
+    const guardHeight = Math.round(viewport.current.height);
+    const aspect = measuredFrustumAspect(orthographic);
+    if (aspect === null || Math.abs(aspect - guardWidth / guardHeight) > 1e-6) {
+      if (applyFrustumHeight(orthographic, guardWidth, guardHeight)) invalidate();
+    }
+
+    gl.domElement.dataset.cameraPosition = camera.position.toArray().join(",");
+    // Publish the live projection so a skew or stale frustum can be detected
+    // from outside without instrumenting the scene: for an orthographic camera
+    // (right-left)/(top-bottom) must stay equal to the canvas aspect ratio.
+    if (Number.isFinite(orthographic.left) && Number.isFinite(orthographic.right)) {
+      gl.domElement.dataset.cameraFrustum =
+        `${(orthographic.right - orthographic.left).toFixed(4)},${(orthographic.top - orthographic.bottom).toFixed(4)},${orthographic.zoom.toFixed(6)}`;
+      gl.domElement.dataset.cameraAspect =
+        (measuredFrustumAspect(orthographic) ?? 0).toFixed(6);
+    }
+  });
+
   /** Rounded viewport key. The live panel is a flex child whose neighbours keep
    *  changing height, and the whole layout is CSS-zoomed, so the ResizeObserver
    *  reports sub-pixel size changes constantly. Rounding collapses that jitter:
-   *  re-framing on every report yanked the camera back to the preset mid-orbit. */
+   *  re-framing on every report yanked the camera back to the preset mid-orbit.
+   *  This key only ever gates RE-FRAMING. The projection itself is corrected
+   *  unconditionally, by the per-frame guard above. */
   const fitKey = `${Math.round(size.width)}x${Math.round(size.height)}`;
   /** Once the user orbits, the camera is theirs until they pick a preset again. */
   const userOrbited = useRef(false);
@@ -102,11 +139,12 @@ function CameraRig({ preset, presetRevision }: { preset: ViewPreset; presetRevis
       // manual-orbit lock and re-enables auto-fit on later resizes.
       userOrbited.current = false;
     } else if (userOrbited.current) {
-      // Resize (or any size report) must not fight the user's current view.
+      // Resize (or any size report) must not fight the user's current view. This
+      // suppresses POSITION, TARGET and ZOOM only - the projection is corrected
+      // by the per-frame guard, so the picture stays undistorted.
       return;
     }
 
-    const orthographic = camera as OrthographicCameraImpl;
     const target = new Vector3(...CAMERA_CONSTRAINTS.target);
     const eyeDirection = new Vector3(...CAMERA_PRESETS[preset]).sub(target);
 
@@ -115,9 +153,7 @@ function CameraRig({ preset, presetRevision }: { preset: ViewPreset; presetRevis
 
     const apply = () => {
       if (cancelled) return;
-      const halfWidth = FRUSTUM_HEIGHT * size.width / Math.max(size.height, 1) / 2;
-      orthographic.left = -halfWidth;
-      orthographic.right = halfWidth;
+      applyFrustumHeight(orthographic, size.width, size.height);
       orthographic.position.copy(target).add(eyeDirection);
       orthographic.lookAt(target);
       orthographic.updateMatrixWorld();
@@ -156,7 +192,7 @@ function CameraRig({ preset, presetRevision }: { preset: ViewPreset; presetRevis
     return () => {
       cancelled = true;
     };
-  }, [camera, controls, invalidate, preset, presetRevision, scene, fitKey]);
+  }, [camera, controls, invalidate, orthographic, preset, presetRevision, scene, fitKey]);
   return null;
 }
 

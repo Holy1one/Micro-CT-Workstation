@@ -9,11 +9,14 @@
 /* ============================================================
    Micro-CT Workstation · Industrial Console
    Layout grid (design baseline 1920 x 1080, 16:9):
-     frame rows     26 / 1 / 1fr / 1 / 30
-     workspace rows 1fr / 1 / 270   (main console / divider / bottom console)
+     frame rows     39 / 1 / 1fr / 1 / 30
+      workspace rows 1fr / 1 / 317   (main console / divider / bottom console)
      columns        420 / 1fr / 450 (gap + padding 12)
    The right status column spans every workspace row, so the bottom console
-   covers the left and centre columns only.
+   covers the left and centre columns only. The bottom console row and the
+   Operation Status panel share one height (264 * 1.2 = 316.8 -> 317) so both
+   bottom areas keep a shared top and bottom edge. The divider is drawn at the
+   shared line; see .workspace-body for why it is not a sized grid track.
    All colors come from tokens.css variables only.
    ============================================================ */
 
@@ -60,7 +63,7 @@ button[aria-busy="true"] { cursor: progress; }
   width: 1920px;
   height: 1080px;
   display: grid;
-  grid-template-rows: 26px 1px minmax(0, 1fr) 1px 30px;
+  grid-template-rows: 39px 1px minmax(0, 1fr) 1px 30px;
   background: var(--appBg);
   color: var(--textPrimary);
   border: 0;
@@ -97,27 +100,53 @@ button[aria-busy="true"] { cursor: progress; }
   border: 1px solid var(--danger);
 }
 
-/* ---------- menu bar (32px) ---------- */
+/* ---------- custom menu and window bar (39px) ---------- */
 
 .menu-bar {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 0 14px;
-  background: var(--chassis);
-  transition: background-color 160ms ease-out;
+  gap: 10px;
+  padding: 0 8px;
+  background: var(--functionalGlassBg);
+  border-bottom: 1px solid var(--functionalGlassBorder);
+  color: var(--functionalGlassText);
+  -webkit-backdrop-filter: blur(14px) saturate(125%);
+  backdrop-filter: blur(14px) saturate(125%);
+  transition: background-color 180ms ease-out, color 180ms ease-out;
 }
 
-.sys-menu { display: flex; align-items: center; gap: 22px; }
+.workstation-brand { display: inline-flex; align-items: center; gap: 8px; min-width: max-content; white-space: nowrap; }
+.workstation-brand img { width: 22px; height: 22px; object-fit: contain; pointer-events: none; }
+.workstation-brand strong { font-size: 15px; font-weight: 650; letter-spacing: -0.01em; color: var(--textPrimary); }
+.workstation-brand > span { margin-left: -4px; padding-left: 0; border-left: 0; font-size: 15px; font-weight: 500; letter-spacing: 0; color: var(--textMuted); }
+
+.sys-menu { display: flex; align-items: center; gap: 2px; height: 100%; }
+.title-drag-space { align-self: stretch; flex: 1 1 auto; min-width: 24px; }
 .sys-menu button {
   border: 0;
   background: transparent;
-  padding: 0;
-  font-size: 11.5px;
+  padding: 0 12px;
+  height: 36px;
+  border-radius: 7px;
+  font-size: 14px;
   color: var(--textSecondary);
   cursor: pointer;
 }
 .sys-menu__item.is-open { color: var(--textPrimary); font-weight: 600; }
+.window-controls { align-self: stretch; display: inline-flex; align-items: stretch; gap: 2px; margin-left: auto; }
+.window-controls button { display: grid; place-items: center; width: 42px; height: 37px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--textSecondary); cursor: pointer; }
+.window-controls button:hover:not(:disabled) { background: color-mix(in srgb, var(--textPrimary) 9%, transparent); border-color: transparent; }
+.window-controls button:disabled { opacity: 0.42; }
+.window-controls .window-controls__close:hover:not(:disabled) { color: var(--onAccent); background: var(--dangerSolid); }
+.window-glyph { position: relative; display: block; width: 13px; height: 13px; }
+.window-glyph--minimise::after { position: absolute; right: 0; bottom: 1px; left: 0; height: 1px; background: currentColor; content: ""; }
+.window-glyph--maximise { border: 1px solid currentColor; border-radius: 1px; }
+.window-glyph--restore::before, .window-glyph--restore::after { position: absolute; width: 9px; height: 8px; border: 1px solid currentColor; border-radius: 1px; background: var(--functionalGlassBg); content: ""; }
+.window-glyph--restore::before { top: 0; right: 0; }
+.window-glyph--restore::after { bottom: 0; left: 0; }
+.window-glyph--close::before, .window-glyph--close::after { position: absolute; top: 6px; left: 0; width: 14px; height: 1px; background: currentColor; content: ""; }
+.window-glyph--close::before { transform: rotate(45deg); }
+.window-glyph--close::after { transform: rotate(-45deg); }
 
 /* ---------- floating drop-down submenu (overlay, layout unchanged) ---------- */
 
@@ -133,10 +162,12 @@ button[aria-busy="true"] { cursor: progress; }
   display: flex;
   flex-direction: column;
   gap: 2px;
-  background: var(--panel);
-  border: 1px solid var(--lineField);
-  border-radius: 10px;
-  box-shadow: 0 12px 30px var(--canvasShadow), 0 0 0 1px var(--canvasInset);
+  background: var(--functionalGlassBg);
+  border: 1px solid var(--functionalGlassBorder);
+  border-radius: var(--radiusCardCompact);
+  -webkit-backdrop-filter: blur(18px) saturate(130%);
+  backdrop-filter: blur(18px) saturate(130%);
+  box-shadow: var(--shadowFloat);
   z-index: 90;
 }
 .menu-dropdown__item {
@@ -200,14 +231,28 @@ button[aria-busy="true"] { cursor: progress; }
  * The main console row and the bottom console row live in one grid so the
  * right status column can run to the bottom of the workspace, while the
  * bottom console keeps its full width over the left and centre columns only.
+ *
+ * All three upper panels share one bottom edge. The left column and the centre
+ * scene take their natural height, and the row is sized by exactly that much,
+ * so every upper column ends on the same line; the right status column spans
+ * the whole workspace and its own 12px panel gap then reproduces that same
+ * rhythm (geometry in the .col--right comment below).
+ *
+ * The divider is taken out of the flow and drawn as a border at the shared
+ * line. A 1px grid track would be charged to the right column's span as well
+ * and would push the Operation Status panel 1px off the log console, so the
+ * track that positions the line stays declared while the line itself is an
+ * overlay. Nothing is drawn twice and no scrollbar is introduced.
  */
 .workspace-body {
   display: grid;
   grid-template-columns: 420px minmax(0, 1fr) 450px;
-  grid-template-rows: minmax(0, 1fr) 1px 270px;
+  /* Bottom console row: 264 * 1.2 = 316.8 -> 317 design px. */
+  grid-template-rows: minmax(0, 1fr) 1px 317px;
   column-gap: 12px;
   padding: 12px;
   min-height: 0;
+  position: relative;
 }
 
 .main-console {
@@ -218,23 +263,48 @@ button[aria-busy="true"] { cursor: progress; }
   min-height: 0;
 }
 
-.workspace-body > .app-divider { grid-column: 1 / 3; }
-.workspace-body > .console { grid-column: 1 / 3; }
+/* The share of the 12px panel rhythm that sits above the shared bottom line.
+   The right column keeps its gap and lands its stack on the same line as the
+   columns beside it. */
+.workspace-body > .app-divider {
+  position: absolute;
+  left: 12px;
+  right: 462px;
+  bottom: 329px;
+  height: 0;
+  border-top: 1px solid var(--lineStrong);
+  background: none;
+}
+
+/* The bottom console owns the 317px bottom track. It is placed explicitly
+   because the divider no longer occupies its own track, so auto-placement
+   would otherwise drop the console into the (empty) 1px divider track. */
+.workspace-body > .console { grid-column: 1 / 3; grid-row: 3 / 4; }
 
 .col { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 12px; min-height: 0; overflow: hidden; }
 
 /* Right status column: spans the main row and the log row. The X-ray panel
    takes the remaining height, the operation status keeps its own height, and
    neither panel ever scrolls: the industrial console shows every control in
-   full at the fixed canvas size. */
+   full at the fixed canvas size.
+   The column spans the upper row, the divider row and the bottom row. Its own
+   separator has to equal the divider row (a hairline), not the 12px panel
+   padding rhythm: a 12px gap here would push the Operation Status panel 12px
+   down and pull the X-ray panel (and only it) 11px above the line the columns
+   beside it end on. With the hairline separator the X-ray panel's flexible
+   track ends on that shared line and the Operation Status panel's own track
+   starts exactly on the log console's top edge. */
 .col--right {
   grid-column: 3;
   grid-row: 1 / 4;
   grid-template-rows: minmax(0, 1fr) auto;
+  row-gap: 1px;
 }
 
-/* ---------- panels ---------- */
+/* The right column's own bottom area height (317px) and the shared bottom row
+   height both live in the rules below; they must stay equal. */
 
+/* ---------- panels ---------- */
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -243,7 +313,8 @@ button[aria-busy="true"] { cursor: progress; }
   display: flex;
   flex-direction: column;
   min-height: 0;
-  transition: background-color 160ms ease-out, border-color 160ms ease-out;
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--textPrimary) 5%, transparent);
+  transition: background-color 180ms ease-out, border-color 180ms ease-out, box-shadow 180ms ease-out;
 }
 
 .panel__header {
@@ -343,6 +414,8 @@ i.tone-danger { background: var(--danger); }
 .path-control { display: grid; grid-template-columns: minmax(0, 1fr) 40px; align-items: stretch; border: 1px solid var(--lineField); border-radius: 9px; background: var(--well); }
 .path-control input { height: 38px; border: 0; background: transparent; border-radius: 9px 0 0 9px; }
 .folder-btn { width: 40px; min-height: 38px; display: grid; place-items: center; padding: 0; border-width: 0 0 0 1px !important; border-radius: 0 8px 8px 0; background: var(--panelHeader); color: var(--accent); cursor: pointer; }
+.folder-glyph { position: relative; display: block; width: 16px; height: 11px; border: 1.5px solid currentColor; border-radius: 2px; }
+.folder-glyph::before { position: absolute; top: -4px; left: -1.5px; width: 6px; height: 3px; border: 1.5px solid currentColor; border-bottom: 0; border-radius: 2px 2px 0 0; background: var(--panelHeader); content: ""; }
 .field-error { font-size: var(--fontSizeHint); line-height: 1.35; color: var(--dangerText); }
 .scan-input-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .numeric-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
@@ -442,7 +515,8 @@ i.tone-danger { background: var(--danger); }
 .live-scene .control-dock {
   position: absolute;
   left: 50%;
-  bottom: 16px;
+  top: 18px;
+  bottom: auto;
   transform: translateX(-50%);
   z-index: 5;
 }
@@ -460,47 +534,119 @@ i.tone-danger { background: var(--danger); }
    the theme/state overrides. */
 
 .control-dock {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
+  position: absolute;
+  display: grid;
+  place-items: center;
   gap: 0;
   padding: 0;
   min-height: 0;
-  background: transparent;
   border: 0;
   border-radius: 0;
+  background: transparent;
   box-shadow: none;
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
+  transition: none;
   pointer-events: none;
   touch-action: manipulation;
+  isolation: isolate;
 }
 .control-dock > * { pointer-events: auto; }
+.control-dock::before,
+.control-dock::after {
+  position: absolute;
+  z-index: 0;
+  inset: -10px;
+  border: 1px solid var(--islandRipple);
+  border-radius: 999px;
+  opacity: 0;
+  pointer-events: none;
+  content: "";
+}
+.control-dock.is-collapsed::before { opacity: 0.16; }
+.control-dock.is-collapsed::after { inset: -22px; opacity: 0.09; }
+.control-dock.is-expanded::before,
+.control-dock.is-expanded::after { opacity: 0; }
+.control-dock.is-approaching::before { animation: island-ripple 1.08s ease-out infinite; }
+.control-dock.is-approaching::after { animation: island-ripple 1.08s 0.36s ease-out infinite; }
+
+.control-dock .dock-key-row {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(5, 100px);
+  grid-template-rows: 88px;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--islandBorder);
+  border-radius: 999px;
+  background: var(--islandBg);
+  -webkit-backdrop-filter: blur(22px) saturate(145%);
+  backdrop-filter: blur(22px) saturate(145%);
+  box-shadow: var(--shadowIsland), inset 0 1px 0 var(--islandHighlight);
+  transform-origin: center center;
+  animation: island-unfold 340ms cubic-bezier(0.22, 0.72, 0.28, 1);
+}
+.control-dock.is-collapsed .dock-key-row {
+  display: flex;
+  width: max-content;
+  padding: 0;
+  border-color: transparent;
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: none;
+}
+.control-dock.is-collapsed .dock-key { display: none; }
 
 .control-dock .dock-capsule {
+  z-index: 2;
+  grid-column: 3;
   display: flex;
   flex-direction: row;
   align-items: center;
+  justify-content: center;
   gap: 10px;
-  height: 46px;
-  padding: 0 12px 0 9px;
-  border: 1px solid var(--dockBorder);
-  border-radius: 23px;
-  background: var(--dockBg);
-  -webkit-backdrop-filter: blur(18px) saturate(135%);
-  backdrop-filter: blur(18px) saturate(135%);
-  box-shadow: 0 6px 20px var(--dockShadow), inset 0 1px 1px var(--dockHighlight, rgba(255, 255, 255, 0.85));
-  color: var(--textPrimary);
+  width: 100px;
+  height: 88px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radiusKey);
+  background: transparent;
+  box-shadow: none;
+  color: var(--islandText);
   cursor: pointer;
-  transition: background-color 180ms ease-out, border-color 180ms ease-out, box-shadow 180ms ease-out;
+  transition: background-color 180ms ease-out, color 180ms ease-out, border-color 180ms ease-out, box-shadow 180ms ease-out, transform 180ms ease-out;
 }
-.control-dock .dock-capsule:hover { background: var(--dockKeyBgHover); }
-.control-dock .dock-capsule:active { transform: none; box-shadow: 0 6px 20px var(--dockShadow); }
+.control-dock.is-collapsed .dock-capsule {
+  width: auto;
+  min-width: 190px;
+  height: 58px;
+  padding: 0 18px 0 12px;
+  border: 1px solid var(--islandBorder);
+  border-radius: 999px;
+  background: var(--islandBg);
+  box-shadow: var(--shadowFloat), inset 0 1px 0 var(--islandHighlight);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  backdrop-filter: blur(18px) saturate(140%);
+}
+.control-dock .dock-capsule:hover { background-color: var(--islandKeyHover); }
+.control-dock.is-collapsed .dock-capsule:hover {
+  background-color: var(--islandKeyHover);
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--islandBorder));
+  box-shadow: var(--shadowFloat), inset 0 1px 0 var(--islandHighlight);
+  transform: translateY(-1px);
+}
+.control-dock .dock-capsule:active { transform: none; box-shadow: none; }
+.control-dock.is-collapsed .dock-capsule:active { box-shadow: var(--shadowFloat); }
 
-.dock-ring { position: relative; display: block; flex: 0 0 34px; width: 34px; height: 34px; }
-.dock-ring__svg { display: block; width: 34px; height: 34px; }
-.dock-ring__track { stroke: color-mix(in srgb, var(--textPrimary) 16%, transparent); }
-.dock-ring__value { stroke: currentColor; transition: stroke-dashoffset 120ms linear; }
+.dock-ring { position: relative; display: block; flex: 0 0 36px; width: 36px; height: 36px; color: var(--islandText); }
+.dock-ring__svg { display: block; width: 36px; height: 36px; }
+.dock-ring__track { stroke: var(--islandTrack); }
+.dock-ring__value { stroke: var(--danger); transition: stroke-dashoffset 150ms linear; }
 .dock-ring__text {
   position: absolute;
   inset: 0;
@@ -512,7 +658,7 @@ i.tone-danger { background: var(--danger); }
   font-weight: 700;
   line-height: 1;
   font-variant-numeric: tabular-nums;
-  color: currentColor;
+  color: var(--islandText);
 }
 .dock-ring--unknown .dock-ring__text { font-size: 13px; }
 
@@ -526,12 +672,12 @@ i.tone-danger { background: var(--danger); }
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--textPrimary);
+  color: var(--islandText);
   white-space: nowrap;
 }
 .dock-capsule__progress {
   font-family: var(--fontMono);
-  font-size: var(--fontSizeLabel);
+  display: none;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--textSecondary);
@@ -541,34 +687,32 @@ i.tone-danger { background: var(--danger); }
   flex: 0 0 auto;
   width: 7px;
   height: 7px;
-  border-right: 1.5px solid var(--textMuted);
-  border-bottom: 1.5px solid var(--textMuted);
+  border-right: 1.5px solid var(--islandTextMuted);
+  border-bottom: 1.5px solid var(--islandTextMuted);
   transform: rotate(-45deg);
   transition: transform 180ms ease-out;
 }
 .control-dock.is-expanded .dock-capsule__chevron { transform: rotate(45deg); }
 
-.dock-key-row {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
-  margin-left: 8px;
-  padding: 10px;
-  border: 1px solid var(--dockBorder);
-  border-radius: var(--radiusDock);
-  background: var(--dockBg);
-  -webkit-backdrop-filter: blur(18px) saturate(135%);
-  backdrop-filter: blur(18px) saturate(135%);
-  box-shadow: 0 6px 20px var(--dockShadow), inset 0 1px 1px var(--dockHighlight, rgba(255, 255, 255, 0.85));
-  transform-origin: left center;
-  animation: dock-unfold 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
-}
-.dock-key-row[hidden] { display: none; }
+.dock-key-row > .dock-key--home { grid-column: 1; grid-row: 1; }
+.dock-key-row > .dock-key--play { grid-column: 2; grid-row: 1; }
+.dock-key-row > .dock-capsule { grid-row: 1; }
+.dock-key-row > .dock-key--restore { grid-column: 4; grid-row: 1; }
+.dock-key-row > .dock-key--stop { grid-column: 5; grid-row: 1; }
+.control-dock.is-expanded .dock-capsule__text,
+.control-dock.is-expanded .dock-capsule__chevron { display: none; }
+.control-dock.is-expanded .dock-ring__text { opacity: 0; }
+.control-dock.is-expanded .dock-ring,
+.control-dock.is-expanded .dock-ring__svg { width: 48px; height: 48px; }
+.control-dock.is-expanded .dock-ring { flex-basis: 48px; width: 48px; height: 48px; }
 
-@keyframes dock-unfold {
-  from { opacity: 0; transform: translateX(-8px) scale(0.96); }
-  to { opacity: 1; transform: translateX(0) scale(1); }
+@keyframes island-unfold {
+  from { opacity: 0.72; transform: scaleX(0.58) scaleY(0.94); }
+  to { opacity: 1; transform: scaleX(1) scaleY(1); }
+}
+@keyframes island-ripple {
+  0% { opacity: 0.48; transform: scale(0.94); }
+  100% { opacity: 0; transform: scale(1.24); }
 }
 
 .control-dock .dock-key {
@@ -578,33 +722,42 @@ i.tone-danger { background: var(--danger); }
   gap: 5px;
   align-items: center;
   justify-content: center;
-  width: 70px;
-  height: 58px;
+  width: 100px;
+  height: 76px;
   padding: 0;
-  border: 0;
+  border: 1px solid color-mix(in srgb, var(--islandBorder) 78%, transparent);
   border-radius: var(--radiusKey);
-  background: var(--dockKeyBg);
+  background: var(--islandKeyBg);
   box-shadow: none;
   cursor: pointer;
-  transition: background-color 140ms ease-out, opacity 140ms ease-out;
+  transition: background-color 180ms ease-out, border-color 180ms ease-out, transform 180ms ease-out, box-shadow 180ms ease-out, opacity 140ms ease-out;
 }
-.control-dock .dock-key:active:not(:disabled) { transform: scale(0.94); box-shadow: none; }
-/* A disabled key must still be readable in both themes: the treatment is a
-   dimmed surface, not illegible text. */
-.control-dock .dock-key:disabled { opacity: 0.55; cursor: not-allowed; }
+.control-dock .dock-key:active:not(:disabled) { transform: scale(0.97); box-shadow: none; }
+.control-dock.is-expanded .dock-key:not(:disabled):hover {
+  background: var(--islandKeyHover);
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--islandBorder));
+  box-shadow: inset 0 1px 0 var(--islandHighlight);
+  transform: translateY(-1px);
+}
+.control-dock.is-expanded .dock-key:active:not(:disabled) { transform: scale(0.97); box-shadow: none; }
+.control-dock .dock-key .dock-icon { width: 30px; height: 30px; }
+/* Dim disabled key surfaces and icons while keeping their labels at the full
+   token contrast; applying opacity to the whole button also dims its text. */
+.control-dock .dock-key:disabled { opacity: 1; cursor: not-allowed; }
+.control-dock .dock-key:disabled .dock-icon { opacity: 0.58; filter: saturate(0.58); }
 /* No active scan: Stop reads as a light disabled treatment derived from the
    engine's own availability flag, never from a second source of authority. */
 .control-dock .dock-key--stop:disabled {
-  opacity: 0.72;
-  background: color-mix(in srgb, var(--dockKeyBg) 45%, transparent);
+  background: color-mix(in srgb, var(--islandKeyBg) 45%, var(--islandBg));
 }
-.control-dock .dock-key:disabled .dock-key__label { color: var(--textSecondary); }
+.control-dock .dock-key:disabled .dock-key__label { color: var(--islandTextMuted); }
+.control-dock .dock-key .dock-key__label { color: var(--islandText); font-size: 12px; }
 .control-dock .dock-key:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .control-dock.dock-state--fault .dock-capsule { border-color: var(--danger); }
 .control-dock.dock-state--paused .dock-capsule { border-color: var(--warn); }
 .control-dock.dock-state--stopping .dock-capsule,
-.control-dock.dock-state--finishing .dock-capsule { border-color: color-mix(in srgb, var(--warn) 60%, var(--dockBorder)); }
+.control-dock.dock-state--finishing .dock-capsule { border-color: color-mix(in srgb, var(--warn) 60%, var(--islandBorder)); }
 
 /* Screen-reader-only text. The console never carries meaning by colour alone,
    so every state also exists as words. */
@@ -765,6 +918,7 @@ i.tone-danger { background: var(--danger); }
   color: var(--textMuted);
 }
 .safety-block__head .chip { margin-left: auto; }
+.safety-unknown { margin: 8px 10px 0; padding: 7px 8px; border: 1px solid color-mix(in srgb, var(--danger) 34%, var(--line)); border-radius: var(--radiusSmall); background: var(--dangerSoft); color: var(--dangerText); font-size: var(--fontSizeHint); font-weight: 650; line-height: 1.4; }
 .check-row--inset { padding: 8px 10px 0; }
 .delay-row {
   display: grid;
@@ -807,7 +961,7 @@ i.tone-danger { background: var(--danger); }
 
 /* ---------- operation status ---------- */
 
-.operation-panel { height: 264px; min-height: 264px; }
+.operation-panel { height: 317px; min-height: 317px; }
 /* Eight-state read-only console feedback. The active state is emphasised and
    always carries its meaning as text; the remaining seven stay as a reference
    strip so the console names every state it can report. */
@@ -1096,8 +1250,7 @@ i.tone-danger { background: var(--danger); }
 .safety-block__head { gap: 6px; }
 .panel__footnote { line-height: 1.5; }
 .xray-panel > .panel__footnote { margin-top: auto; }
-.live-scene .control-dock { top: 16px; bottom: auto; }
-.dock-key--stop:disabled .dock-icon { filter: grayscale(1); opacity: 0.4; }
+.control-dock .dock-key--stop:disabled .dock-icon { filter: grayscale(1); opacity: 0.42; }
 .follow-toggle { padding: 3px 9px; border-radius: 6px; background: var(--panelHeader); color: var(--accent); font-size: var(--fontSizeHint); cursor: pointer; white-space: nowrap; }
 .console { border: 1px solid var(--line); border-radius: var(--radiusCardCompact); overflow: hidden; }
 .log-line { font-size: var(--fontSizeLabel); line-height: 1.5; }
@@ -1105,9 +1258,9 @@ i.tone-danger { background: var(--danger); }
 .log-line__msg { overflow-wrap: anywhere; }
 
 /* Compact engineering menu and contextual help; never letterbox the viewport. */
-.menu-bar { padding: 0 10px; }
+.menu-bar { padding: 0 12px; }
 .sys-menu { height: 100%; gap: 0; }
-.sys-menu > .menu-group > .sys-menu__item { padding: 0 12px; height: 25px; font-size: 12px; }
+.sys-menu > .menu-group > .sys-menu__item { padding: 0 12px; height: 36px; font-size: 14px; }
 .sys-menu__item:hover, .sys-menu__item.is-open { background: var(--neutralSoft); }
 button.help-tip { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 15px; width: 15px; height: 15px; padding: 0; border: 1px solid var(--textMuted); border-radius: 50%; background: transparent; box-shadow: none; color: var(--textSecondary); font-size: 10px; font-weight: 600; line-height: 1; cursor: help; }
 .numeric-field > span { display: flex; align-items: center; justify-content: space-between; gap: 3px; font-size: 11px; white-space: nowrap; }
@@ -1150,4 +1303,10 @@ button.help-tip { display: inline-flex; align-items: center; justify-content: ce
   /* The expanded dock appears in place instead of unfolding into it. */
   .dock-key-row { transform: none !important; }
   .dock-capsule__chevron { transition: none !important; }
+  .control-dock.is-collapsed::before,
+  .control-dock.is-collapsed::after,
+  .control-dock.is-approaching::before,
+  .control-dock.is-approaching::after,
+  .control-dock.is-reduced-motion::before,
+  .control-dock.is-reduced-motion::after { display: none !important; animation: none !important; }
 }

@@ -3,11 +3,66 @@ import {
   Vector3,
   type Camera,
   type Object3D,
+  type OrthographicCamera,
 } from "three";
 
 export const FRUSTUM_HEIGHT = 1200;
 export const FIT_WIDTH = 0.88;
 export const FIT_HEIGHT = 0.82;
+
+/** Keep the aspect comparison away from a divide-by-zero on a collapsed box. */
+const MIN_EXTENT = 1e-6;
+
+/**
+ * Rewrite an orthographic camera's frustum so that
+ * `(right - left) / (top - bottom)` equals `viewWidth / viewHeight` exactly,
+ * while the vertical extent stays pinned at FRUSTUM_HEIGHT.
+ *
+ * The vertical extent is the anchor, not the vertical extent *of the canvas*:
+ * the rig deliberately keeps a constant vertical world-height and widens only
+ * horizontally, so a wide canvas reveals more of the bench instead of shrinking
+ * it. Whatever the horizontal half-width comes out as, the pair must share the
+ * canvas aspect ratio or the image is stretched; that invariant is what this
+ * helper exists to restore.
+ *
+ * Returns true when it changed the frustum, so callers can avoid re-uploading
+ * an identical projection matrix.
+ */
+export function applyFrustumHeight(
+  camera: OrthographicCamera,
+  viewWidth: number,
+  viewHeight: number,
+): boolean {
+  // The renderer reports fractional CSS sizes, so a collapsed or nonsensical box
+  // must not be allowed to poison the projection with Infinity/NaN.
+  if (!(viewWidth > 0) || !(viewHeight > 0)) return false;
+
+  const halfHeight = FRUSTUM_HEIGHT / 2;
+  const halfWidth = FRUSTUM_HEIGHT * (viewWidth / viewHeight) / 2;
+  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) return false;
+
+  const unchanged = camera.left === -halfWidth
+    && camera.right === halfWidth
+    && camera.bottom === -halfHeight
+    && camera.top === halfHeight;
+  if (unchanged) return false;
+
+  camera.left = -halfWidth;
+  camera.right = halfWidth;
+  camera.bottom = -halfHeight;
+  camera.top = halfHeight;
+  camera.updateProjectionMatrix();
+  return true;
+}
+
+/** Aspect ratio of the live projection, or null when it cannot be measured. */
+export function measuredFrustumAspect(camera: OrthographicCamera): number | null {
+  const width = camera.right - camera.left;
+  const height = camera.top - camera.bottom;
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+  if (Math.abs(height) < MIN_EXTENT || Math.abs(width) < MIN_EXTENT) return null;
+  return width / height;
+}
 
 /** Collect visible mesh bounds, ignoring helpers excluded by this scene. */
 export function collectSceneBounds(root: Object3D): Box3 {

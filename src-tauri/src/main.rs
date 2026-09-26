@@ -241,8 +241,10 @@ fn apply_dynamic_min_size(window: &tauri::WebviewWindow) -> tauri::Result<()> {
             physical.width, physical.height, work_area.width, work_area.height,
         );
         let was_maximized = window.is_maximized().unwrap_or(false);
-        // Keep Windows' resizable frame so maximization respects the taskbar.
-        // Block user restore/size/move commands instead of removing that frame.
+        // The React title bar replaces native decorations, while the underlying
+        // resizable window style still supplies Windows' monitor-aware maximize
+        // geometry. The custom drag and restore actions remain subject to this
+        // policy so small/DPI-constrained displays stay maximized-only.
         #[cfg(windows)]
         unsafe {
             use windows_sys::Win32::UI::Shell::SetWindowSubclass;

@@ -10,7 +10,7 @@
     "frontendDist": "../dist/client"
   },
   "app": {
-    "windows": [{"title": "Micro-CT Workstation", "width": 1920, "height": 1080, "visible": false, "fullscreen": false, "decorations": true, "resizable": true, "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu-sandbox"}],
+    "windows": [{"title": "Micro-CT Workstation", "width": 1920, "height": 1080, "visible": false, "fullscreen": false, "decorations": false, "resizable": true, "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu-sandbox"}],
     "security": {"csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"}
   },
   "bundle": {
