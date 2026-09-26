@@ -505,9 +505,23 @@ interface FeedbackEvidence {
   linkLost: boolean;
   phaseFault: boolean;
   beamUnconfirmed: boolean;
-  /** A scan attempt exists, so a cooldown could be in play. */
+  /** A scan is running or has run, so a cooldown could legitimately be in play. */
   scanAttempted: boolean;
 }
+
+/**
+ * Phases that prove the engine actually engaged in a scan. A merely CONFIGURED
+ * projection count is not evidence of one: entering a count into the scan form
+ * must never make the console announce a cooldown.
+ */
+const SCAN_ENGAGED_PHASES: ReadonlySet<string> = new Set([
+  "running",
+  "paused",
+  "finishing",
+  "stopping",
+  "stopped",
+  "completed",
+]);
 
 function evaluateFeedbackEvidence(
   snapshot: EngineSnapshot,
@@ -515,6 +529,7 @@ function evaluateFeedbackEvidence(
   stale: boolean,
 ): FeedbackEvidence {
   const connection = snapshot.connectionState;
+  const capturedFrames = Number.isFinite(ws.progress.captured) ? ws.progress.captured : 0;
   return {
     // A lost link, a degraded link or a stale snapshot means every reading below
     // is unknown, so the console must not present it as a normal state.
@@ -522,7 +537,10 @@ function evaluateFeedbackEvidence(
     phaseFault: snapshot.phase === "fault" || ws.dataState === "fault",
     // Fail closed: a beam that is not a CONFIRMED off/on reading stays a warning.
     beamUnconfirmed: ws.xray.beamState === "unknown" || (!ws.xray.setpointConfirmed && ws.xray.beamOn),
-    scanAttempted: Number.isFinite(snapshot.parameters.projectionCount) && snapshot.parameters.projectionCount > 0,
+    // Evidence of a real scan only: the engine reached a phase that implies one
+    // engaged, or at least one projection was actually committed. A configured
+    // projection count alone deliberately does not qualify.
+    scanAttempted: SCAN_ENGAGED_PHASES.has(snapshot.phase) || capturedFrames > 0,
   };
 }
 
@@ -639,11 +657,13 @@ function deriveConsoleFeedback(
       break;
   }
 
-  // A scan attempt exists, so a cooldown could be in play. The snapshot does
-  // carry a temperature readback (ws.xray.tempC), but temperature alone cannot
-  // prove an active cooldown, and the engine's cooldown deadline is private and
-  // never projected. So the state is reported as UNKNOWN rather than assumed
-  // active or assumed absent — never as a confirmed "cooling" or "ready".
+  // The engine is in a phase that does not itself describe a scan, but a scan
+  // has genuinely engaged (see SCAN_ENGAGED_PHASES), so a cooldown could be in
+  // play. The snapshot does carry a temperature readback (ws.xray.tempC), but
+  // temperature alone cannot prove an active cooldown, and the engine's cooldown
+  // deadline is private and never projected. So the state is reported as UNKNOWN
+  // rather than assumed active or assumed absent — never as a confirmed
+  // "cooling" or "ready".
   if (evidence.scanAttempted) {
     return {
       state: "Cooling",
