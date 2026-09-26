@@ -4,6 +4,8 @@
  * scene-config.ts and safety state remains outside this module.
  */
 
+import { useEffect } from "react";
+import { useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import { RING_TRACK } from "./scene-config";
 import type { SceneTheme } from "./types";
@@ -128,6 +130,47 @@ const PAPER_MAP = createGrainMap((ctx, size) => {
   addGrain(ctx, size, 10);
 }, [10, 3]);
 
+/** A quiet high-to-low wash. Canvas values stay close to white so this map
+ *  modulates the token colour without tinting it or competing with the scene. */
+const BACKDROP_GRADIENT_MAP = createGrainMap((ctx, size) => {
+  const gradient = ctx.createLinearGradient(0, 0, 0, size);
+  gradient.addColorStop(0, "#d8d8d8");
+  // SphereGeometry's upper half uses texture V=1 at its pole and V=0.5 at the
+  // horizon. Finish the wash over that used half instead of wasting it below.
+  gradient.addColorStop(0.5, "#ffffff");
+  gradient.addColorStop(1, "#ffffff");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  addGrain(ctx, size, 1.5);
+}, [1, 1]);
+
+/** The oversized floor gets a broad centre lift and gentle edge falloff. It is
+ *  an emissive multiplier only: the existing fabric albedo and relief remain
+ *  responsible for the ground's material character. */
+function createGroundFalloffMap(edge: string): THREE.Texture {
+  const size = 512;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (ctx) {
+    const gradient = ctx.createRadialGradient(size / 2, size / 2, size * 0.02, size / 2, size / 2, size * 0.26);
+    gradient.addColorStop(0, "#ffffff");
+    gradient.addColorStop(0.38, "#fafafa");
+    gradient.addColorStop(1, edge);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, size, size);
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.anisotropy = 4;
+  return texture;
+}
+
+const GROUND_FALLOFF_LIGHT = createGroundFalloffMap("#e6e6e6");
+const GROUND_FALLOFF_DARK = createGroundFalloffMap("#ededed");
+
 /** The room the bench stands in: cloth table under a papered dome. Nothing here
  *  participates in the camera fit (see `sceneBounds`) - it is an order of
  *  magnitude wider than the bench, and fitting to it would frame the shell
@@ -148,6 +191,18 @@ const PAPER_MAP = createGrainMap((ctx, size) => {
  *  is carried by the colour it multiplies as well as by the relief. */
 export function StageSurroundings({ theme }: { theme: SceneTheme }) {
   const night = theme.stageGlow < 0.3;
+  const { scene, invalidate } = useThree();
+  useEffect(() => {
+    const previousFog = scene.fog;
+    const fog = new THREE.FogExp2(theme.stageWall, night ? 0.00003 : 0.00004);
+    scene.fog = fog;
+    invalidate();
+    return () => {
+      if (scene.fog === fog) scene.fog = previousFog;
+      invalidate();
+    };
+  }, [invalidate, night, scene, theme.stageWall]);
+
   return (
     <group>
       <mesh position={[0, TABLE_Y - 3, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow userData={{ excludeFromFit: true }}>
@@ -156,7 +211,7 @@ export function StageSurroundings({ theme }: { theme: SceneTheme }) {
           color={theme.stageTable}
           map={CLOTH_MAP}
           emissive={theme.stageTable}
-          emissiveMap={CLOTH_MAP}
+          emissiveMap={night ? GROUND_FALLOFF_DARK : GROUND_FALLOFF_LIGHT}
           emissiveIntensity={theme.stageGlow}
           roughness={0.95}
           metalness={0}
@@ -227,7 +282,9 @@ export function StageSurroundings({ theme }: { theme: SceneTheme }) {
         <sphereGeometry args={[STAGE_RADIUS, 96, 48, 0, Math.PI * 2, 0, Math.PI / 2]} />
         <meshStandardMaterial
           color={theme.stageWall}
+          map={BACKDROP_GRADIENT_MAP}
           emissive={theme.stageWall}
+          emissiveMap={BACKDROP_GRADIENT_MAP}
           emissiveIntensity={theme.stageGlow}
           roughness={1}
           metalness={0}

@@ -14,9 +14,8 @@
  * `deriveConsoleFeedback`; this test lifts that exact source region out of the
  * shipped file (between two stable top-level declarations), compiles it with the
  * repository's own esbuild transform, and drives the real function with synthetic
- * snapshots. Nothing in `App.tsx` was restructured for testability; the only
- * change made for this test was adding the `export` keyword to the two functions
- * and the evidence interface so a seam exists at all.
+ * snapshots. Tests pass session evidence through the exported function's input;
+ * missing evidence must fail closed, and no duplicate derivation is maintained.
  */
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -140,48 +139,90 @@ const { deriveConsoleFeedback, evaluateFeedbackEvidence } = derivation;
 const CONSOLE_FEEDBACK_STATES = derivation.CONSOLE_FEEDBACK_STATES;
 
 /* ------------------------------------------------------------------ *
- * Synthetic snapshots. Only fields the derivation actually reads are *
- * populated; the rest of EngineSnapshot is irrelevant to this contract. *
+ * Complete synthetic contract fixtures. Every EngineSnapshot and       *
+ * WorkstationView layer is present so shape coverage is exercised.      *
  * ------------------------------------------------------------------ */
 
 const STATE_NAMES = [...CONSOLE_FEEDBACK_STATES];
 const isRed = (feedback) => feedback.tone === "danger" && feedback.state === "Fault";
 const isNeutral = (feedback) => feedback.tone === "muted" && !isRed(feedback);
-/**
- * Every test below starts from a console that has never seen a connection, so
- * the row under test is the row being driven and not a leftover of the previous
- * one. Each test then drives the derivation synchronously, so no other test can
- * interleave with its session memory.
- */
-const freshSession = () => derivation.resetLinkMemoryForTest();
-
 function workstation(overrides = {}) {
-  const { xray = {}, progress = {}, scene = {}, ...rest } = overrides;
-  return {
+  const {
+    cameraExposure = {}, xray = {}, progress = {}, scene = {}, preflight = {}, safetyBar,
+    devices, floats, summary = {}, statusbar = {}, dock = {}, scanSetup = {}, consoleLogs = [],
+    frames = [], ...rest
+  } = overrides;
+  const beamState = xray.beamState ?? "off";
+  const outputText = beamState === "unknown" ? "OUTPUT UNKNOWN · READBACK REQUIRED" : "SAFETY · OUTPUT DISABLED";
+  const base = {
+    cameraExposure: { minMs: 0.125, maxMs: 30000, known: false },
     dataState: "ready",
-    phaseWord: "READY",
+    phaseWord: "IDLE",
     phaseTone: "accent",
+    devices: [
+      { id: "turntable", name: "Turntable-Nano", word: "OFFLINE", tone: "muted", spec: "DISCONNECTED" },
+      { id: "camera", name: "Camera", word: "OFFLINE", tone: "muted", spec: "D7100 · DISCONNECTED" },
+      { id: "xray", name: "X-Ray Source", word: beamState === "unknown" ? "OUTPUT UNKNOWN" : "OFF VERIFIED", tone: "muted", spec: "Moxtek · awaiting connection" },
+    ],
+    onlineSummary: "LOCKED · 0 REAL DEVICES",
+    preflight: { word: "WAITING", percent: 0, tone: "warn", subline: "0/8 checks · no real hardware" },
+    floats: [
+      { key: "X-RAY", text: beamState === "unknown" ? "OUTPUT UNKNOWN · READBACK REQUIRED" : "OUTPUT OFF", tone: "muted" },
+      { key: "CAMERA", text: "OFFLINE", tone: "muted" },
+      { key: "SAMPLE", text: "UNKNOWN", tone: "muted" },
+    ],
+    safetyBar: { text: outputText, tone: "muted" },
+    scene: { angleDeg: 0, rotated: false, angleKnown: false, rotationDirection: -1 },
     xray: {
       connected: false,
+      setKv: 4,
+      setUa: 10,
       monKv: null,
       monUa: null,
       powerW: null,
       tempC: null,
-      beamState: "off",
+      beamState,
       beamOn: false,
       latched: false,
+      onSec: 10,
+      offSec: 20,
+      timerOn: false,
+      usbAutoShutDown: true,
+      usbAutoShutDownKnown: false,
+      usbShutdownDelay: null,
+      manualControlsEnabled: false,
+      timerControlsEnabled: false,
+      setpointControlsEnabled: false,
+      voltageConfirmed: false,
+      currentConfirmed: false,
       setpointConfirmed: false,
       ...xray,
     },
-    progress: { captured: 0, total: 0, percent: 0, angleDeg: 0, ...progress },
-    scene: { angleDeg: 0, rotated: false, angleKnown: false, rotationDirection: -1, ...scene },
-    consoleLogs: [],
-    frames: [],
+    progress: {
+      captured: 0, total: 0, percent: 0, angleDeg: 0, etaText: "—", barTone: "accent", ...progress,
+      barLabel: progress.barLabel ?? `${progress.captured ?? 0} / ${progress.total ?? 0} · ${progress.percent ?? 0}%`,
+    },
+    summary: { savePath: "", acquisition: "Scan setup not configured", output: beamState === "unknown" ? "OUTPUT UNKNOWN · READBACK REQUIRED" : "OUTPUT OFF", ...summary },
+    statusbar: { left: "PRODUCTION LOCKED · SETUP REQUIRED", right: "ct-engine · JSONL v1 · LOCKED", dotTone: "muted", ...statusbar },
+    dock: { home: false, play: false, restore: false, stop: false, playMode: "start", homeReason: "Connect the Nano first", playReason: "Connect the Nano first", ...dock },
+    scanSetup: { savePath: "", taskId: "", projectionCount: 0, angleStepDeg: 0, exposureMs: 0, maxXraySec: 600, ...scanSetup },
+    consoleLogs,
+    frames,
+    checkpointAvailable: false,
+  };
+  return {
+    ...base,
     ...rest,
+    cameraExposure: { ...base.cameraExposure, ...cameraExposure },
+    devices: devices ?? base.devices,
+    preflight: { ...base.preflight, ...preflight },
+    safetyBar: safetyBar ?? base.safetyBar,
+    scene: { ...base.scene, ...scene },
   };
 }
 
 function snapshot(overrides = {}) {
+  const { safety = {}, ...rest } = overrides;
   return {
     mode: "production_locked",
     modeLabel: "PRODUCTION LOCKED · NANO DISCONNECTED",
@@ -193,7 +234,7 @@ function snapshot(overrides = {}) {
     homed: false,
     requiresPreflight: true,
     requiresHome: true,
-    safety: { xrayAvailable: false, xrayEnabled: false, interlockOk: false, lockReason: "" },
+    safety: { xrayAvailable: false, xrayEnabled: false, interlockOk: false, lockReason: "", ...safety },
     devices: [
       { id: "turntable", label: "Precision Turntable", state: "offline", detail: "disconnected" },
       { id: "camera", label: "Nikon D7100", state: "offline", detail: "disconnected" },
@@ -205,7 +246,7 @@ function snapshot(overrides = {}) {
     logs: [],
     lastError: null,
     updatedAt: "2026-09-26T00:00:00.000Z",
-    ...overrides,
+    ...rest,
   };
 }
 
@@ -230,8 +271,7 @@ const afterConnection = (connectionState) =>
  * ------------------------------------------------------------------ */
 
 test("a never-connected first `disconnected` renders neutral, not a red fault", () => {
-  freshSession();
-  const feedback = deriveConsoleFeedback(freshLaunch(), workstation(), false);
+  const feedback = deriveConsoleFeedback(freshLaunch(), workstation(), false, false);
   assert.equal(feedback.tone, "muted", `expected a neutral tone, got ${feedback.tone} (${feedback.state})`);
   assert.notEqual(feedback.state, "Fault");
   assert.match(feedback.detail, /not connected/i);
@@ -243,12 +283,30 @@ test("a never-connected first `disconnected` renders neutral, not a red fault", 
 });
 
 test("the neutral startup reading never claims a device or output state", () => {
-  freshSession();
-  const feedback = deriveConsoleFeedback(freshLaunch(), workstation(), false);
+  const feedback = deriveConsoleFeedback(freshLaunch(), workstation(), false, false);
   assert.doesNotMatch(feedback.detail, /\bON\b/);
   assert.doesNotMatch(feedback.detail, /\bOFF\b/);
   assert.doesNotMatch(feedback.detail, /safe|normal|ready\b/i);
   assert.doesNotMatch(feedback.detail, /\d+\s*(%|kV|µA|uA|°C)/);
+});
+
+test("contradictory safety enablement and output readback is red", () => {
+  const reading = deriveConsoleFeedback(
+    snapshot({ safety: { xrayAvailable: false, xrayEnabled: true, interlockOk: false, lockReason: "Stage 1 · X-ray locked" } }),
+    workstation({ xray: { beamOn: false, beamState: "off" } }),
+    false,
+    false,
+  );
+  assert.ok(isRed(reading), `contradictory safety output must be red, got ${reading.state}/${reading.tone}`);
+});
+
+test("complete first-start evidence allows an unknown beam only while no link exists", () => {
+  const startup = snapshot({
+    safety: { xrayAvailable: false, xrayEnabled: false, interlockOk: false, lockReason: "Stage 1 · X-ray locked" },
+  });
+  const unlinked = workstation({ xray: { beamState: "unknown" } });
+  assert.ok(isNeutral(deriveConsoleFeedback(startup, unlinked, false, false)));
+  assert.ok(isRed(deriveConsoleFeedback(startup, unlinked, false, true)), "post-session unknown output stays red");
 });
 
 /* ------------------------------------------------------------------ *
@@ -261,8 +319,7 @@ test("an initialising link with no connection evidence stays neutral and never c
   // phase is by definition post-connection. So the reachable "initialising"
   // reading is a disconnected engine still in `idle`, and it is the same neutral
   // reading as row 1 — never a red fault, and never a claim about a device.
-  freshSession();
-  const feedback = deriveConsoleFeedback(freshLaunch(), workstation(), false);
+  const feedback = deriveConsoleFeedback(freshLaunch(), workstation(), false, false);
   assert.ok(isNeutral(feedback), `initialising must stay neutral, got ${feedback.state}/${feedback.tone}`);
   assert.doesNotMatch(feedback.detail, /fault/i);
 });
@@ -272,11 +329,11 @@ test("a phase that can only be reached through a link is never reported as conne
   // link, so a `disconnected` snapshot carrying one of them is a connection that
   // was LOST, not an initialising one. Reporting these as neutral would be
   // fail-open, which is exactly what this change must not introduce.
-  freshSession();
   for (const phase of ["ready_for_home", "ready", "running", "paused", "finishing", "stopping", "stopped", "completed"]) {
     const feedback = deriveConsoleFeedback(
       snapshot({ phase, phaseLabel: phase, connectionState: "disconnected" }),
       workstation(),
+      false,
       false,
     );
     assert.ok(isRed(feedback), `${phase} proves a link existed and must stay red, got ${feedback.state}/${feedback.tone}`);
@@ -289,7 +346,6 @@ test("a phase that can only be reached through a link is never reported as conne
  * ------------------------------------------------------------------ */
 
 test("a fresh connected snapshot renders the real device feedback", () => {
-  freshSession();
   const connected = snapshot({
     connectionState: "connected",
     modeLabel: "PRODUCTION · NANO + D7100 + MOXTEK",
@@ -336,7 +392,6 @@ test("a fresh connected snapshot renders the real device feedback", () => {
  * ------------------------------------------------------------------ */
 
 test("non-vacuity: every genuinely uncertain state still fails closed to red", () => {
-  freshSession();
   const cases = [
     {
       label: "`lost`",
@@ -401,44 +456,47 @@ test("non-vacuity: every genuinely uncertain state still fails closed to red", (
 });
 
 test("a `disconnected` snapshot that proves a link existed is never neutral", () => {
-  // Snapshot-local evidence, independent of in-session memory: a phase that can
-  // only be reached through a device link, or a completed preflight / HOME.
-  freshSession();
+  // Phase, preflight, and HOME evidence must reject an explicit false result.
+  // A retained connection log is represented as unknown tracker evidence.
   const evidence = [
-    snapshot({ phase: "stopped", phaseLabel: "Stopped" }),
-    snapshot({ phase: "completed", phaseLabel: "Completed" }),
-    snapshot({ phase: "running", phaseLabel: "Running" }),
-    snapshot({ preflightPassed: true }),
-    snapshot({ homed: true }),
-    snapshot({ logs: [{ id: "i", timestamp: "now", level: "info", source: "系统", message: "Nano v1 connected · HOME not executed" }] }),
+    [snapshot({ phase: "stopped", phaseLabel: "Stopped" }), false],
+    [snapshot({ phase: "completed", phaseLabel: "Completed" }), false],
+    [snapshot({ phase: "running", phaseLabel: "Running" }), false],
+    [snapshot({ preflightPassed: true }), false],
+    [snapshot({ homed: true }), false],
+    [snapshot({ logs: [{ id: "i", timestamp: "now", level: "info", source: "系统", message: "Nano v1 connected · HOME not executed" }] }), "unknown"],
   ];
-  for (const [index, snap] of evidence.entries()) {
-    const feedback = deriveConsoleFeedback(snap, workstation(), false);
+  for (const [index, [snap, sessionEvidence]] of evidence.entries()) {
+    const feedback = deriveConsoleFeedback(snap, workstation(), false, sessionEvidence);
     assert.ok(isRed(feedback), `evidence case ${index} must stay red, got ${feedback.state}/${feedback.tone}`);
   }
 });
 
-test("in-session memory: a connection seen earlier keeps a later `disconnected` red", () => {
-  // Same shape as the live app: the console polls a NEW snapshot object every
-  // tick. Once a tick reported `connected`, a later tick that reports
-  // `disconnected` is a lost connection, not a fresh startup. The phase here
-  // stays pre-connection, so only the session memory can carry that evidence.
-  const { resetLinkMemoryForTest } = derivation;
-  assert.equal(typeof resetLinkMemoryForTest, "function", "the memory seam is missing from src/App.tsx");
+test("explicit session evidence distinguishes a fresh launch from a post-session disconnect", () => {
+  const connected = deriveConsoleFeedback(
+    snapshot({ connectionState: "connected", phase: "idle" }),
+    workstation(),
+    false,
+    true,
+  );
+  assert.equal(connected.state, "Stopped");
 
-  resetLinkMemoryForTest();
-  const connected = snapshot({ connectionState: "connected", phase: "idle" });
-  const first = deriveConsoleFeedback(connected, workstation(), false);
-  assert.equal(first.state, "Stopped", "a connected idle engine is the plain queue-idle reading");
+  const disconnected = deriveConsoleFeedback(
+    snapshot({ connectionState: "disconnected", phase: "idle" }),
+    workstation(),
+    false,
+    true,
+  );
+  assert.ok(isRed(disconnected));
 
-  const disconnected = snapshot({ connectionState: "disconnected", phase: "idle" });
-  const second = deriveConsoleFeedback(disconnected, workstation(), false);
-  assert.ok(isRed(second), `post-connection disconnect must stay red, got ${second.state}/${second.tone}`);
-
-  // And the same tick, on a fresh session, is the benign neutral startup state.
-  resetLinkMemoryForTest();
-  const freshAgain = deriveConsoleFeedback(snapshot({ connectionState: "disconnected", phase: "idle" }), workstation(), false);
-  assert.ok(isNeutral(freshAgain), `a fresh session must be neutral again, got ${freshAgain.state}/${freshAgain.tone}`);
+  const freshAgain = deriveConsoleFeedback(
+    snapshot({ connectionState: "disconnected", phase: "idle" }),
+    workstation(),
+    false,
+    false,
+  );
+  assert.ok(isNeutral(freshAgain));
+  assert.ok(isRed(deriveConsoleFeedback(snapshot(), workstation(), false)), "missing evidence must fail closed");
 });
 
 /* ------------------------------------------------------------------ *
@@ -470,33 +528,30 @@ test("the derivation only ever reports one of the eight console states", () => {
 test("the neutral startup branch relaxes no gate and stays local to `disconnected`+`idle`", () => {
   // The evidence evaluator itself keeps `linkLost` true for every other link
   // state, and the neutral branch is reachable only for the two offline cases.
-  derivation.resetLinkMemoryForTest();
-  const evidence = evaluateFeedbackEvidence(freshLaunch(), workstation(), false);
+  const evidence = evaluateFeedbackEvidence(freshLaunch(), workstation(), false, false);
   assert.equal(evidence.linkLost, false);
-  assert.equal(evidence.neverConnected, true);
   assert.equal(evidence.phaseFault, false);
 
   for (const connectionState of ["lost", "degraded"]) {
-    const staleEvidence = evaluateFeedbackEvidence(afterConnection(connectionState), workstation(), false);
+    const staleEvidence = evaluateFeedbackEvidence(afterConnection(connectionState), workstation(), false, false);
     assert.equal(staleEvidence.linkLost, true, `${connectionState} must remain linkLost`);
-    assert.equal(staleEvidence.neverConnected, false, `${connectionState} must never be treated as never-connected`);
   }
-  derivation.resetLinkMemoryForTest();
-  const staleEvidence = evaluateFeedbackEvidence(freshLaunch(), workstation(), true);
+  const staleEvidence = evaluateFeedbackEvidence(freshLaunch(), workstation(), true, false);
   assert.equal(staleEvidence.linkLost, true, "a stale snapshot must remain linkLost");
-  assert.ok(isRed(deriveConsoleFeedback(freshLaunch(), workstation(), true)), "a stale snapshot must stay red");
+  assert.ok(isRed(deriveConsoleFeedback(freshLaunch(), workstation(), true, false)), "a stale snapshot must stay red");
 
   // The neutral reading carries no gate decision: `active` is false and the state
   // is one of the existing eight, so every panel rendering it keeps its own
   // preflight/HOME/parameter gating unchanged.
-  const neutral = deriveConsoleFeedback(freshLaunch(), workstation(), false);
+  const neutral = deriveConsoleFeedback(freshLaunch(), workstation(), false, false);
   assert.equal(neutral.active, false);
 
   // The change is confined to the console feedback derivation: no gate-relevant
   // helper (progress, tone mapping) was touched.
-  assert.ok(!derived.includes("requiresPreflight"), "the derivation must not read the preflight gate");
-  assert.ok(!derived.includes("requiresHome"), "the derivation must not read the HOME gate");
-  assert.ok(!derived.includes("safety"), "the derivation must not read or rewrite the safety state");
+  assert.ok(derived.includes("requiresPreflight"), "the derivation must reconcile the preflight gate state");
+  assert.ok(derived.includes("requiresHome"), "the derivation must reconcile the HOME gate state");
+  assert.ok(derived.includes("snapshot.safety"), "the derivation must inspect safety evidence");
+  assert.doesNotMatch(derived, /snapshot\.safety\.[A-Za-z_$][\w$]*\s*=(?!=)/, "the derivation must not rewrite safety state");
   assert.ok(!derived.includes("dispatch"), "the derivation must not send or enable a command");
   assert.ok(!source.includes("dock.home = true") && !source.includes("dock.play = true"), "dock gates untouched");
 });

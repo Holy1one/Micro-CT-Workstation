@@ -10,7 +10,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
 import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } from "./scan-input";
-import { useEngine } from "./engine/useEngine";
+import { hasDeviceSessionEverEstablished, useEngine } from "./engine/useEngine";
 import {
   chooseImageDirectory,
   exportSessionLog,
@@ -572,75 +572,16 @@ interface ConsoleFeedback {
 }
 
 /**
- * Evidence checks that keep the console fail-closed. Every condition is read
- * from fields that already exist on EngineSnapshot / WorkstationView. Exported
- * so the acceptance test can drive the real derivation instead of a copy of it.
+ * Evidence checks combine snapshot/workstation fields with the device-session
+ * result supplied by useEngine. Exported so acceptance tests can drive the real
+ * derivation instead of a copy of it.
  */
 export interface FeedbackEvidence {
   linkLost: boolean;
-  /** A device link was never established in this session, and nothing in the snapshot contradicts that. */
-  neverConnected: boolean;
   phaseFault: boolean;
   beamUnconfirmed: boolean;
   /** A scan is running or has run, so a cooldown could legitimately be in play. */
   scanAttempted: boolean;
-}
-
-/**
- * Device phases that can only be reached once the engine actually engaged a
- * device link. `idle` is deliberately absent: it is the phase a freshly started
- * engine reports while it has never connected to anything. Any phase listed here
- * is therefore snapshot-local evidence that a link existed, so a `disconnected`
- * snapshot carrying one of them is a connection that was lost — red, not neutral
- * — even if the in-session memory below is empty (for example after a window or
- * React remount while the engine stayed alive).
- */
-const POST_CONNECTION_PHASES: ReadonlySet<string> = new Set([
-  "ready_for_home",
-  "ready",
-  "running",
-  "paused",
-  "finishing",
-  "stopping",
-  "stopped",
-  "completed",
-  "fault",
-]);
-
-/**
- * Presentation-only memory of whether a device link was EVER established while
- * this console has been running. A first `disconnected` (fresh startup, nothing
- * connected yet) is benign and must not be reported as a fault; a `disconnected`
- * after a connection existed is still fail-closed red. This remembers an
- * observed snapshot; it is never a second source of device truth and never an
- * input to any gate.
- */
-let linkEverEstablished = false;
-
-/** Reset the session memory. Test seam only; the app never calls this. */
-export function resetLinkMemoryForTest(): void {
-  linkEverEstablished = false;
-}
-
-/**
- * True only for a connection that has never been established: the engine is
- * disconnected, nothing in this snapshot proves a link once existed, and none
- * has been observed yet. Everything else that is not `connected` stays
- * fail-closed.
- */
-function linkNeverEstablished(snapshot: EngineSnapshot, everConnected: boolean): boolean {
-  const connectionWasRecorded = Array.isArray(snapshot.logs) && snapshot.logs.some((entry) =>
-    /\bconnected\b/i.test(entry.message),
-  );
-  return (
-    snapshot.connectionState === "disconnected" &&
-    !everConnected &&
-    !connectionWasRecorded &&
-    snapshot.phase === "idle" &&
-    !snapshot.preflightPassed &&
-    !snapshot.homed &&
-    !POST_CONNECTION_PHASES.has(snapshot.phase)
-  );
 }
 
 /**
@@ -658,52 +599,279 @@ function offlineFeedback(): ConsoleFeedback {
 }
 
 /**
+ * These key sets mirror every object layer in EngineSnapshot and WorkstationView.
+ * Requiring exact own-key coverage means a new contract field starts closed
+ * until this first-start projection classifies it. Existing fields are checked
+ * below by their value, type, or relationship to the other projection.
+ */
+const FIRST_START_SNAPSHOT_KEYS = [
+  "mode", "modeLabel", "connectionState", "adapterLabel", "phase", "phaseLabel",
+  "preflightPassed", "homed", "requiresPreflight", "requiresHome", "safety", "devices",
+  "parameters", "progress", "imageCount", "logs", "lastError", "updatedAt",
+];
+const FIRST_START_SAFETY_KEYS = ["xrayAvailable", "xrayEnabled", "interlockOk", "lockReason"];
+const FIRST_START_DEVICE_KEYS = ["id", "label", "state", "detail"];
+const FIRST_START_PARAMETER_KEYS = ["taskId", "savePath", "projectionCount", "angleStepDeg", "exposureMs"];
+const FIRST_START_PROGRESS_KEYS = ["current", "total", "percent", "angleDeg", "etaSeconds"];
+const FIRST_START_LOG_KEYS = ["id", "timestamp", "level", "source", "message"];
+const FIRST_START_WORKSTATION_KEYS = [
+  "cameraExposure", "dataState", "phaseWord", "phaseTone", "devices", "onlineSummary", "preflight",
+  "floats", "safetyBar", "scene", "xray", "progress", "summary", "statusbar", "dock", "scanSetup",
+  "consoleLogs", "frames", "checkpointAvailable",
+];
+const FIRST_START_CONSOLE_DEVICE_KEYS = ["id", "name", "word", "tone", "spec"];
+const FIRST_START_FLOAT_KEYS = ["key", "text", "tone"];
+const FIRST_START_XRAY_KEYS = [
+  "connected", "setKv", "setUa", "monKv", "monUa", "powerW", "tempC", "beamState", "beamOn", "latched",
+  "onSec", "offSec", "timerOn", "usbAutoShutDown", "usbAutoShutDownKnown", "usbShutdownDelay",
+  "manualControlsEnabled", "timerControlsEnabled", "setpointControlsEnabled", "voltageConfirmed",
+  "currentConfirmed", "setpointConfirmed",
+];
+const FIRST_START_CONSOLE_PROGRESS_KEYS = ["captured", "total", "percent", "angleDeg", "etaText", "barTone", "barLabel"];
+const FIRST_START_FRAME_KEYS = ["index", "angleDeg", "exposureMs", "fileName"];
+const FIRST_START_DEVICE_IDS = ["turntable", "camera", "xray"] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactOwnKeys(value: unknown, expectedKeys: readonly string[]): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const actualKeys = Reflect.ownKeys(value);
+  return actualKeys.length === expectedKeys.length && actualKeys.every((key) =>
+    typeof key === "string" && expectedKeys.includes(key),
+  );
+}
+
+function hasExactArrayEntries(value: unknown): value is unknown[] {
+  if (!Array.isArray(value)) return false;
+  const ownKeys = Reflect.ownKeys(value).filter((key) => key !== "length");
+  return ownKeys.length === value.length && ownKeys.every((key, index) =>
+    typeof key === "string" && key === String(index),
+  );
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function hasDeviceIds(devices: unknown, expectedIds: readonly string[]): devices is Record<string, unknown>[] {
+  if (!hasExactArrayEntries(devices) || devices.length !== expectedIds.length) return false;
+  const ids = devices.map((device) => isRecord(device) ? device.id : undefined);
+  return expectedIds.every((id) => ids.filter((candidate) => candidate === id).length === 1);
+}
+
+function sameStructuredValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) &&
+      hasExactArrayEntries(left) && hasExactArrayEntries(right) &&
+      left.length === right.length && left.every((value, index) => sameStructuredValue(value, right[index]));
+  }
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const leftKeys = Reflect.ownKeys(left);
+  const rightKeys = Reflect.ownKeys(right);
+  return leftKeys.length === rightKeys.length && leftKeys.every((key) =>
+    rightKeys.includes(key) && typeof key === "string" && sameStructuredValue(left[key], right[key]),
+  );
+}
+
+function hasCompleteFirstStartLogs(logs: unknown): boolean {
+  if (!hasExactArrayEntries(logs)) return false;
+  return logs.every((entry) =>
+    hasExactOwnKeys(entry, FIRST_START_LOG_KEYS) &&
+    isString(entry.id) && entry.id.length > 0 &&
+    isString(entry.timestamp) &&
+    ["INFO", "WARN"].includes(String(entry.level)) &&
+    ["system", "xray", "nano", "camera", "preflight", "operator"].includes(String(entry.source)) &&
+    isString(entry.message),
+  );
+}
+
+function hasCompleteFirstStartConsoleLogs(logs: unknown): boolean {
+  // Rust projects the same production log records into both snapshot logs and
+  // workstation console logs. Keep one format contract so they cannot drift.
+  return hasCompleteFirstStartLogs(logs);
+}
+
+function hasCompleteFirstStartSnapshot(snapshot: EngineSnapshot): boolean {
+  const hasWorkstation = Object.prototype.hasOwnProperty.call(snapshot, "workstation");
+  const rootKeys = hasWorkstation ? [...FIRST_START_SNAPSHOT_KEYS, "workstation"] : FIRST_START_SNAPSHOT_KEYS;
+  if (!hasExactOwnKeys(snapshot, rootKeys)) return false;
+  if (!hasExactOwnKeys(snapshot.safety, FIRST_START_SAFETY_KEYS)) return false;
+  if (![snapshot.safety.xrayAvailable, snapshot.safety.xrayEnabled, snapshot.safety.interlockOk].every((value) => typeof value === "boolean") ||
+    !isString(snapshot.safety.lockReason)) return false;
+  if (!hasExactOwnKeys(snapshot.parameters, FIRST_START_PARAMETER_KEYS)) return false;
+  if (!hasExactOwnKeys(snapshot.progress, FIRST_START_PROGRESS_KEYS)) return false;
+  if (!hasExactArrayEntries(snapshot.devices) || !hasDeviceIds(snapshot.devices, FIRST_START_DEVICE_IDS)) return false;
+  if (!snapshot.devices.every((device) =>
+    hasExactOwnKeys(device, FIRST_START_DEVICE_KEYS) &&
+    isString(device.label) && isString(device.state) && isString(device.detail),
+  )) return false;
+  if (!hasCompleteFirstStartLogs(snapshot.logs)) return false;
+  if (!isString(snapshot.modeLabel) || !isString(snapshot.adapterLabel) || !isString(snapshot.phaseLabel) || !isString(snapshot.updatedAt)) return false;
+  if (!isString(snapshot.parameters.taskId) || !isString(snapshot.parameters.savePath)) return false;
+  if (![snapshot.parameters.projectionCount, snapshot.parameters.angleStepDeg, snapshot.parameters.exposureMs].every(isFiniteNumber)) return false;
+  if (![snapshot.progress.current, snapshot.progress.total, snapshot.progress.percent, snapshot.progress.angleDeg].every(isFiniteNumber)) return false;
+  if (snapshot.progress.etaSeconds !== null && !isFiniteNumber(snapshot.progress.etaSeconds)) return false;
+  if (!isFiniteNumber(snapshot.imageCount) || !Number.isInteger(snapshot.imageCount)) return false;
+  if (snapshot.lastError !== null && !isString(snapshot.lastError)) return false;
+  if (hasWorkstation && (snapshot.workstation === undefined || !hasCompleteFirstStartWorkstation(snapshot.workstation))) return false;
+  return true;
+}
+
+function hasCompleteFirstStartWorkstation(ws: WorkstationView): boolean {
+  if (!hasExactOwnKeys(ws, FIRST_START_WORKSTATION_KEYS)) return false;
+  if (!hasExactOwnKeys(ws.cameraExposure, ["minMs", "maxMs", "known"])) return false;
+  if (!hasDeviceIds(ws.devices, FIRST_START_DEVICE_IDS)) return false;
+  if (!ws.devices.every((device) =>
+    hasExactOwnKeys(device, FIRST_START_CONSOLE_DEVICE_KEYS) &&
+    isString(device.name) && isString(device.word) && isString(device.tone) && isString(device.spec),
+  )) return false;
+  if (!hasExactOwnKeys(ws.preflight, ["word", "percent", "tone", "subline"])) return false;
+  if (!isString(ws.preflight.word) || !isFiniteNumber(ws.preflight.percent) || !isString(ws.preflight.tone) || !isString(ws.preflight.subline)) return false;
+  if (!hasExactArrayEntries(ws.floats) || ws.floats.length !== 3) return false;
+  if (!ws.floats.every((item) =>
+    hasExactOwnKeys(item, FIRST_START_FLOAT_KEYS) && isString(item.key) && isString(item.text) && isString(item.tone),
+  )) return false;
+  if (!hasExactOwnKeys(ws.safetyBar, ["text", "tone"]) || !isString(ws.safetyBar.text) || !isString(ws.safetyBar.tone)) return false;
+  if (!hasExactOwnKeys(ws.scene, ["angleDeg", "rotated", "angleKnown", "rotationDirection"])) return false;
+  if (!hasExactOwnKeys(ws.xray, FIRST_START_XRAY_KEYS)) return false;
+  if (![ws.xray.setKv, ws.xray.setUa, ws.xray.onSec, ws.xray.offSec].every(isFiniteNumber)) return false;
+  if (![ws.xray.connected, ws.xray.beamOn, ws.xray.latched, ws.xray.timerOn, ws.xray.usbAutoShutDown,
+    ws.xray.usbAutoShutDownKnown, ws.xray.manualControlsEnabled, ws.xray.timerControlsEnabled,
+    ws.xray.setpointControlsEnabled, ws.xray.voltageConfirmed, ws.xray.currentConfirmed,
+    ws.xray.setpointConfirmed].every((value) => typeof value === "boolean")) return false;
+  if (![ws.xray.monKv, ws.xray.monUa, ws.xray.powerW, ws.xray.tempC, ws.xray.usbShutdownDelay].every((value) => value === null || isFiniteNumber(value))) return false;
+  if (!hasExactOwnKeys(ws.progress, FIRST_START_CONSOLE_PROGRESS_KEYS)) return false;
+  if (![ws.progress.captured, ws.progress.total, ws.progress.percent, ws.progress.angleDeg].every(isFiniteNumber)) return false;
+  if (!isString(ws.progress.etaText) || !isString(ws.progress.barTone) || !isString(ws.progress.barLabel)) return false;
+  if (!hasExactOwnKeys(ws.summary, ["savePath", "acquisition", "output"]) ||
+    ![ws.summary.savePath, ws.summary.acquisition, ws.summary.output].every(isString)) return false;
+  if (!hasExactOwnKeys(ws.statusbar, ["left", "right", "dotTone"]) ||
+    ![ws.statusbar.left, ws.statusbar.right, ws.statusbar.dotTone].every(isString)) return false;
+  if (!hasExactOwnKeys(ws.dock, ["home", "play", "restore", "stop", "playMode", "homeReason", "playReason"])) return false;
+  if (![ws.dock.home, ws.dock.play, ws.dock.restore, ws.dock.stop].every((value) => typeof value === "boolean")) return false;
+  if (!isString(ws.dock.playMode) || !isString(ws.dock.homeReason) || !isString(ws.dock.playReason)) return false;
+  if (!hasExactOwnKeys(ws.scanSetup, ["savePath", "taskId", "projectionCount", "angleStepDeg", "exposureMs", "maxXraySec"])) return false;
+  if (![ws.scanSetup.savePath, ws.scanSetup.taskId].every(isString) ||
+    ![ws.scanSetup.projectionCount, ws.scanSetup.angleStepDeg, ws.scanSetup.exposureMs, ws.scanSetup.maxXraySec].every(isFiniteNumber)) return false;
+  if (!hasCompleteFirstStartConsoleLogs(ws.consoleLogs)) return false;
+  if (!hasExactArrayEntries(ws.frames) || !ws.frames.every((frame) =>
+    hasExactOwnKeys(frame, FIRST_START_FRAME_KEYS) &&
+    [frame.index, frame.angleDeg, frame.exposureMs].every(isFiniteNumber) && isString(frame.fileName),
+  )) return false;
+  if (typeof ws.cameraExposure.known !== "boolean" || !isFiniteNumber(ws.cameraExposure.minMs) || !isFiniteNumber(ws.cameraExposure.maxMs)) return false;
+  if (!isString(ws.dataState) || !isString(ws.phaseWord) || !isString(ws.phaseTone) || !isString(ws.onlineSummary)) return false;
+  if (typeof ws.scene.rotated !== "boolean" || typeof ws.scene.angleKnown !== "boolean" ||
+    !isFiniteNumber(ws.scene.angleDeg) || ![-1, 1].includes(ws.scene.rotationDirection)) return false;
+  return typeof ws.checkpointAvailable === "boolean";
+}
+
+function hasConsistentFirstStartProjection(snapshot: EngineSnapshot, ws: WorkstationView): boolean {
+  if (!hasCompleteFirstStartSnapshot(snapshot) || !hasCompleteFirstStartWorkstation(ws)) return false;
+  if (snapshot.workstation !== undefined && !sameStructuredValue(snapshot.workstation, ws)) return false;
+
+  if (snapshot.mode !== "production_locked" || snapshot.connectionState !== "disconnected" || snapshot.phase !== "idle") return false;
+  if (!/locked|disconnected/i.test(snapshot.modeLabel) || !/idle/i.test(snapshot.phaseLabel)) return false;
+  if (snapshot.preflightPassed !== false || snapshot.homed !== false ||
+    snapshot.requiresPreflight !== true || snapshot.requiresHome !== true) return false;
+  if (snapshot.safety.xrayAvailable !== false || snapshot.safety.xrayEnabled !== false || snapshot.safety.interlockOk !== false) return false;
+  if (snapshot.lastError !== null || !hasCompleteFirstStartLogs(snapshot.logs)) return false;
+  if (snapshot.devices.some((device) =>
+    device.id === "xray"
+      ? device.state !== "offline" && device.state !== "locked"
+      : device.state !== "offline",
+  )) return false;
+
+  const snapshotDevices = new Map(snapshot.devices.map((device) => [device.id, device]));
+  const viewDevices = new Map(ws.devices.map((device) => [device.id, device]));
+  if (ws.xray.connected !== false || ws.xray.latched !== false || ws.xray.beamOn !== false) return false;
+  if (ws.xray.beamState !== "off" && ws.xray.beamState !== "unknown") return false;
+  if (snapshot.safety.xrayEnabled !== ws.xray.beamOn) return false;
+  if (ws.xray.beamOn) return false;
+  if (ws.xray.setpointConfirmed || ws.xray.voltageConfirmed || ws.xray.currentConfirmed) return false;
+  if (ws.xray.monKv !== null || ws.xray.monUa !== null || ws.xray.powerW !== null || ws.xray.tempC !== null) return false;
+  if (ws.xray.usbAutoShutDownKnown || ws.xray.usbShutdownDelay !== null || ws.xray.timerOn ||
+    ws.xray.manualControlsEnabled || ws.xray.timerControlsEnabled || ws.xray.setpointControlsEnabled) return false;
+  for (const id of FIRST_START_DEVICE_IDS) {
+    const snapshotDevice = snapshotDevices.get(id);
+    const viewDevice = viewDevices.get(id);
+    if (!snapshotDevice || !viewDevice || viewDevice.tone !== "muted") return false;
+    if (/\b(?:online|connected|ready|moving|emitting|fault|failed|busy|scanning|running)\b/i.test(viewDevice.word)) return false;
+    if (/\b(?:online|connected|ready|moving|emitting|fault|failed|busy|scanning|running)\b|\bbeam on\b/i.test(viewDevice.spec)) return false;
+    if (id !== "xray" && !/offline|disconnected/i.test(viewDevice.word)) return false;
+    if (id === "xray") {
+      const expectedWords = ws.xray.beamState === "unknown" ? /unknown|offline/i : /off|offline/i;
+      if (!expectedWords.test(viewDevice.word)) return false;
+    }
+  }
+
+  if (ws.dataState !== "ready" || ws.phaseTone !== "accent" || !/^(idle|ready)$/i.test(ws.phaseWord)) return false;
+  if (ws.preflight.tone !== "warn" || ws.preflight.percent !== 0 || !/^waiting$/i.test(ws.preflight.word)) return false;
+  if (/passed|complete|fault|running/i.test(ws.preflight.subline)) return false;
+  if (ws.dock.home || ws.dock.play || ws.dock.restore || ws.dock.stop || ws.dock.playMode !== "start") return false;
+  if (!/\b0 real devices\b/i.test(ws.onlineSummary) || !/locked|disconnected/i.test(ws.statusbar.right)) return false;
+  if (ws.statusbar.dotTone !== "muted" || /fault|scanning|running|paused|finishing|stopping/i.test(ws.statusbar.left)) return false;
+  if (/fault|scanning|running|paused|finishing|stopping|capturing|captured/i.test(ws.summary.acquisition)) return false;
+
+  const xrayFloat = ws.floats.find((item) => item.key === "X-RAY");
+  const cameraFloat = ws.floats.find((item) => item.key === "CAMERA");
+  const sampleFloat = ws.floats.find((item) => item.key === "SAMPLE");
+  if (!xrayFloat || !cameraFloat || !sampleFloat) return false;
+  if (new Set(ws.floats.map((item) => item.key)).size !== 3) return false;
+  if (xrayFloat.tone !== "muted" || cameraFloat.tone !== "muted" || sampleFloat.tone !== "muted") return false;
+  if (ws.xray.beamState === "unknown" ? !/unknown|readback|offline/i.test(xrayFloat.text) : !/off|disabled|offline/i.test(xrayFloat.text)) return false;
+  if (!/offline|disconnected|standby|no real camera/i.test(cameraFloat.text) || !/unknown/i.test(sampleFloat.text)) return false;
+
+  if (ws.safetyBar.tone !== "muted" || /\b(on|enabled|active|fault|latched|trip)\b/i.test(ws.safetyBar.text)) return false;
+  if (ws.xray.beamState === "unknown" ? !/unknown|readback|unavailable/i.test(ws.safetyBar.text) : !/off|disabled|unavailable/i.test(ws.safetyBar.text)) return false;
+  if (ws.summary.output.length === 0 || /\b(on|enabled|active|fault|latched|trip)\b/i.test(ws.summary.output)) return false;
+  if (ws.xray.beamState === "unknown" ? !/unknown|readback|unavailable|offline/i.test(ws.summary.output) : !/off|disabled|unavailable|offline/i.test(ws.summary.output)) return false;
+
+  const parameterKeys = ["taskId", "savePath", "projectionCount", "angleStepDeg", "exposureMs"];
+  if (parameterKeys.some((key) => snapshot.parameters[key as keyof typeof snapshot.parameters] !== ws.scanSetup[key as keyof typeof ws.scanSetup])) return false;
+  if (ws.summary.savePath !== ws.scanSetup.savePath) return false;
+  if (!Number.isFinite(snapshot.progress.total) || snapshot.progress.total < 0) return false;
+  if (snapshot.progress.current !== 0 || snapshot.progress.percent !== 0 || snapshot.progress.angleDeg !== 0) return false;
+  if (snapshot.progress.etaSeconds !== null) return false;
+  if (snapshot.progress.total !== snapshot.parameters.projectionCount ||
+    ws.progress.total !== snapshot.progress.total || ws.progress.captured !== snapshot.progress.current ||
+    ws.progress.percent !== snapshot.progress.percent || ws.progress.angleDeg !== snapshot.progress.angleDeg) return false;
+  if (snapshot.imageCount !== snapshot.progress.current || snapshot.imageCount !== 0 ||
+    ws.frames.length !== snapshot.imageCount || ws.checkpointAvailable !== false) return false;
+  if (ws.progress.barTone !== "accent" || ws.scene.angleDeg !== snapshot.progress.angleDeg ||
+    ws.scene.angleKnown !== false || ws.scene.rotated !== false) return false;
+  if (ws.scene.angleDeg !== 0 || ws.progress.captured !== 0 || ws.progress.percent !== 0) return false;
+  if (ws.progress.barLabel.trim() !== `${ws.progress.captured} / ${ws.progress.total} · ${ws.progress.percent}%` ||
+    /\d/.test(ws.progress.etaText)) return false;
+  if (ws.cameraExposure.known !== false) return false;
+  return true;
+}
+
+/**
  * The only neutral disconnected snapshot is a positively identified fresh
  * engine startup. Every signal that can disprove that initial state is checked
  * here, then the caller sends all other disconnected snapshots directly to
- * Fault. Parameter drafts are intentionally ignored: they are not device
- * readbacks and do not mean a link or scan has existed.
+ * Fault. Parameter drafts do not count as device readbacks or scan activity,
+ * but their duplicated snapshot and workstation values must still agree.
  */
 function isStrictlyInitialDisconnected(
   snapshot: EngineSnapshot,
   ws: WorkstationView,
   stale: boolean,
-  neverConnected: boolean,
+  sessionEverEstablished: unknown,
 ): boolean {
   return (
+    sessionEverEstablished === false &&
     !stale &&
-    neverConnected &&
     snapshot.connectionState === "disconnected" &&
     snapshot.phase === "idle" &&
-    snapshot.preflightPassed === false &&
-    snapshot.homed === false &&
-    snapshot.lastError === null &&
-    Array.isArray(snapshot.logs) &&
-    !snapshot.logs.some((entry) => entry.level === "error") &&
-    Array.isArray(snapshot.devices) &&
-    snapshot.devices.every(
-      (device) => device.state === "offline" || (device.id === "xray" && device.state === "locked"),
-    ) &&
-    snapshot.imageCount === 0 &&
-    snapshot.progress.current === 0 &&
-    snapshot.progress.percent === 0 &&
-    ws.dataState === "ready" &&
-    ws.phaseTone === "accent" &&
-    Array.isArray(ws.consoleLogs) &&
-    !ws.consoleLogs.some((entry) => entry.level === "ERR") &&
-    ws.progress.captured === 0 &&
-    ws.progress.percent === 0 &&
-    ws.frames.length === 0 &&
-    ws.scene.angleKnown === false &&
-    ws.xray.connected === false &&
-    ws.xray.monKv === null &&
-    ws.xray.monUa === null &&
-    ws.xray.powerW === null &&
-    ws.xray.tempC === null &&
-    ws.xray.setpointConfirmed === false &&
-    ws.xray.latched === false &&
-    ws.xray.beamOn === false &&
-    (ws.xray.beamState === "off" || ws.xray.beamState === "unknown")
+    hasConsistentFirstStartProjection(snapshot, ws)
   );
 }
 
@@ -725,15 +893,10 @@ export function evaluateFeedbackEvidence(
   snapshot: EngineSnapshot,
   ws: WorkstationView,
   stale: boolean,
+  sessionEverEstablished: unknown = "unknown",
 ): FeedbackEvidence {
   const connection = snapshot.connectionState;
   const capturedFrames = Number.isFinite(ws.progress.captured) ? ws.progress.captured : 0;
-  // A link that was once established stays remembered for this session, so a
-  // later `disconnected` is a connection that was LOST and remains fail-closed.
-  // Only fresh snapshots are remembered: a stale one is already a fault and
-  // must not be able to seed this memory.
-  if (connection === "connected" && !stale) linkEverEstablished = true;
-  const neverConnected = linkNeverEstablished(snapshot, linkEverEstablished);
   return {
     // A lost link, a degraded link or a stale snapshot means every reading below
     // is unknown, so the console must not present it as a normal state. A
@@ -744,8 +907,7 @@ export function evaluateFeedbackEvidence(
       stale ||
       connection === "lost" ||
       connection === "degraded" ||
-      (connection === "disconnected" && !neverConnected),
-    neverConnected,
+      (connection === "disconnected" && sessionEverEstablished !== false),
     phaseFault: snapshot.phase === "fault" || ws.dataState === "fault",
     // Fail closed: a beam that is not a CONFIRMED off/on reading stays a warning.
     beamUnconfirmed: ws.xray.beamState === "unknown" || (!ws.xray.setpointConfirmed && ws.xray.beamOn),
@@ -788,24 +950,24 @@ export function deriveConsoleFeedback(
   snapshot: EngineSnapshot,
   ws: WorkstationView,
   stale: boolean,
+  sessionEverEstablished: unknown = "unknown",
 ): ConsoleFeedback {
-  const evidence = evaluateFeedbackEvidence(snapshot, ws, stale);
-
   // Exhaustive partition: disconnected is neutral only for a fully verified
   // initial snapshot. No disconnected combination can reach the phase switch or
   // its final ordinary Stopped fallback.
   if (snapshot.connectionState === "disconnected") {
-    if (isStrictlyInitialDisconnected(snapshot, ws, stale, evidence.neverConnected)) {
+    if (isStrictlyInitialDisconnected(snapshot, ws, stale, sessionEverEstablished)) {
       return offlineFeedback();
     }
     return {
       state: "Fault",
       tone: "danger",
-      detail: "Control service disconnected after device, output, progress, pose or error evidence · state is unknown",
+      detail: "Device session evidence does not confirm a never-connected startup · state is unknown",
       active: false,
     };
   }
 
+  const evidence = evaluateFeedbackEvidence(snapshot, ws, stale, sessionEverEstablished);
   if (evidence.linkLost) {
     return {
       state: "Fault",
@@ -1021,7 +1183,7 @@ function ControlDock({
   // the same tap generates must not immediately fold it away again.
   const touchHandled = useRef(false);
   const expandTimer = useRef<number | null>(null);
-  const feedback = deriveConsoleFeedback(snapshot, ws, stale);
+  const feedback = deriveConsoleFeedback(snapshot, ws, stale, hasDeviceSessionEverEstablished());
   const dock = ws.dock;
 
   const expanded = hoverOpen || focusInside || clickOpen;
@@ -1251,7 +1413,7 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
   const [viewPreset, setViewPreset] = useState<ViewPreset>("iso");
   const [presetRevision, setPresetRevision] = useState(0);
   const fallback = useSceneFallback();
-  const feedback = deriveConsoleFeedback(snapshot, ws, stale);
+  const feedback = deriveConsoleFeedback(snapshot, ws, stale, hasDeviceSessionEverEstablished());
   const sceneView = {
     dataState: ws.dataState,
     angleDeg: ws.scene.angleDeg,
@@ -1518,7 +1680,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
 }
 
 function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws: WorkstationView; stale: boolean }) {
-  const feedback = deriveConsoleFeedback(snapshot, ws, stale);
+  const feedback = deriveConsoleFeedback(snapshot, ws, stale, hasDeviceSessionEverEstablished());
   return (
     <section className="panel operation-panel">
       <div className="panel__header">
