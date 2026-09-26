@@ -1,16 +1,49 @@
-# Dependency, compiler, and packaging output
+# ===========================================================================
+# Micro-CT Workstation repository hygiene
+#
+# Only durable inputs are versioned: source, configuration, lock files, tests
+# and curated documentation. Compilers, bundlers, packagers and test runs
+# recreate everything else from those inputs, so no compiled binary, build
+# result folder, cache, log or packaged installer is committed.
+#
+# Regeneration entry points live in README.md and AGENTS.md; the canonical
+# generated locations are node_modules/, dist/, target/, src-tauri/binaries/,
+# portable-release/ and tmp/. Adding a new generated location requires the
+# AGENTS.md directory process first.
+# ===========================================================================
+
+# --- Node / frontend toolchain --------------------------------------------
 node_modules/
 dist/
-target/
-release/
-portable-release/build-info.json
-src-tauri/binaries/
 .vite/
-# Approved local artifact hierarchy. AGENTS.md defines the required
+*.tsbuildinfo
+
+# --- Rust / Cargo / Tauri compiler output ---------------------------------
+# `target/` matches the workspace root cache and any nested crate cache.
+target/
+*.pdb
+*.rlib
+*.rmeta
+
+# --- Prepared sidecars and packaged desktop deliverables -------------------
+src-tauri/binaries/
+# Release-candidate intermediate products; the portable package is built here.
+release/
+# The portable EXE and build-info.json are local build products: distribute
+# them from the build machine instead of committing them. Only the adjacent
+# README explains the folder and keeps its module ownership resolvable.
+portable-release/*
+!portable-release/README.md
+# Packaged Windows installers/binaries are never source.
+*.exe
+*.msi
+
+# --- Approved local artifact hierarchy ------------------------------------
+# AGENTS.md defines the required
 # tmp/{cache,tests,debug,sessions,screenshots}/<module>/<run-id> layout.
 tmp/
 
-# Logs and runtime crash output
+# --- Logs, traces and crash output ----------------------------------------
 *.log
 *.stackdump
 *.dmp
@@ -19,13 +52,13 @@ tmp/
 *.profraw
 *.profdata
 
-# Operating-system metadata
+# --- Operating-system metadata --------------------------------------------
 .DS_Store
 Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# Editor and IDE-local state
+# --- Editor and IDE-local state -------------------------------------------
 .vs/
 .history/
 *.swp
@@ -36,23 +69,23 @@ $RECYCLE.BIN/
 *.userosscache
 *.sln.docstates
 
-# Language/tool caches
+# --- Language/tool caches -------------------------------------------------
 **/__pycache__/
 *.py[cod]
-*.tsbuildinfo
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 coverage/
 
-# Local environment and secrets
+# --- Local environment and secrets ----------------------------------------
 .env
 .env.*
 !.env.example
 *.local
 
-# Local QA / agent scratch output - never part of the shipped source.
+# --- Local QA / agent scratch output --------------------------------------
+# Never part of the shipped source.
 .ai-memory/
 .cleanup-backup/
 .qa-*.txt
