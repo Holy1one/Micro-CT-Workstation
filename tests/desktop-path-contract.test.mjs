@@ -18,15 +18,11 @@ const read = async (path) => readFile(new URL(path, root), "utf8");
  *  rule, so any selector using it silently matches nothing. */
 export const OPERATION_PANEL_CLASS = "operation-panel";
 
-/** Bottom console row: 264 design px * 1.2 = 316.8, rounded to 317. The same
- *  number is the Operation Status panel's own height; the two must never be
- *  allowed to drift apart, so a change on either side has to update both. */
-export const BOTTOM_LOG_ROW_PX = 317;
+/** Log and Operation Status remain equal at the published design height. */
+export const BOTTOM_LOG_ROW_PX = 306;
 
-/** The right column's panel separator is the shared 1px hairline, not the
- *  12px panel rhythm: a 12px gap pushes the Operation Status panel down and
- *  pulls the X-ray panel above the line the other two columns end on. */
-export const RIGHT_COLUMN_SPACER_PX = 1;
+/** The right column uses the same panel spacing as the workspace columns. */
+export const RIGHT_COLUMN_SPACER_PX = 12;
 
 /** The first client-area row's design height, in design px. `.design-canvas`
  *  spends row 1 on the custom title bar (`header.menu-bar`: compact menus,
@@ -56,7 +52,7 @@ export const classRuleBodies = (css, className) => [
  */
 export const bottomLogRowPx = (css) => {
   const match = css.match(
-    /\.workspace-body\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+1px\s+(\d+)px/,
+    /\.workspace-body\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+12px\s+(\d+)px/,
   );
   return match ? Number(match[1]) : null;
 };
@@ -84,11 +80,8 @@ export const rightColumnSpacerPx = (css) => {
 };
 
 /**
- * Turns the stylesheet text into the number the bottom-log-row assertion is
- * graded against: the Operation Status panel's published height. There is no
- * fallback path on purpose - a stylesheet where the panel no longer publishes
- * its height (wrong class, deleted rule, non-px value) throws here, and the
- * test fails rather than quietly passing a looser check.
+ * Returns the Operation Status panel's published height. The log must equal
+ * that value; missing or conflicting declarations fail rather than fallback.
  */
 export function readOperationPanelHeight(css, className = OPERATION_PANEL_CLASS) {
   const bodies = classRuleBodies(css, className);
@@ -261,55 +254,21 @@ test("fixed design canvas scales as one unit and side columns never scroll", asy
     "src/AGENTS.md must not keep the stale 26px first-row design height",
   );
   assert.match(styles, /grid-template-columns: 420px minmax\(0, 1fr\) 450px/);
-  // The bottom console row must match the Operation Status panel's height, so
-  // the two bottom areas line up instead of the log column looking cramped.
-  // Both numbers are read out of the stylesheet and must be EQUAL: the row
-  // height and the panel's own published height cannot drift apart. An earlier
-  // version of this check read a `.op-status` rule that does not exist, so the
-  // capture was always null and the equality was never asserted at all; the
-  // panel is `.operation-panel` in both App.tsx and styles.css. There is no
-  // fallback branch any more - if either number cannot be read, or the two
-  // disagree, this test fails.
+  // The log alone is shortened and moved down; Operation Status does not move.
   const logRowPx = bottomLogRowPx(styles);
-  assert.ok(
-    logRowPx !== null,
-    "src/styles.css must declare the bottom console row in .workspace-body's grid-template-rows",
-  );
+  assert.equal(logRowPx, BOTTOM_LOG_ROW_PX);
   const operationPanelHeightPx = readOperationPanelHeight(styles);
-  assert.equal(
-    logRowPx,
-    operationPanelHeightPx,
-    "the bottom log row must equal the Operation Status panel height",
-  );
-  assert.equal(
-    logRowPx,
-    BOTTOM_LOG_ROW_PX,
-    `the bottom log row stays ${BOTTOM_LOG_ROW_PX} design px (264 * 1.2, rounded)`,
-  );
-  assert.equal(
-    operationPanelHeightPx,
-    BOTTOM_LOG_ROW_PX,
-    `the Operation Status panel stays ${BOTTOM_LOG_ROW_PX} design px so it shares the log row's edges`,
-  );
-  assert.deepEqual(
-    operationPanelMinHeightsPx(styles),
-    [BOTTOM_LOG_ROW_PX],
-    "every Operation Status min-height must equal the bottom log row",
-  );
+  assert.equal(operationPanelHeightPx, logRowPx);
+  assert.deepEqual(operationPanelMinHeightsPx(styles), [operationPanelHeightPx]);
   assert.match(app, /className="panel operation-panel"/);
-  // The right status column's own separator has to be the shared 1px hairline,
-  // not the 12px panel rhythm: 12px would push the Operation Status panel 12px
-  // down and pull the X-ray panel above the line the other columns end on.
-  assert.equal(
-    rightColumnSpacerPx(styles),
-    RIGHT_COLUMN_SPACER_PX,
-    "the right column's panel separator must be the 1px hairline, not the 12px panel gap",
-  );
+  assert.equal(rightColumnSpacerPx(styles), RIGHT_COLUMN_SPACER_PX);
+  assert.match(styles, /grid-template-rows: minmax\(0, 1fr\) 12px 306px;/);
+  assert.match(styles, /\.col--right \{[^}]*grid-template-rows: minmax\(0, 1fr\) 306px;/);
   // The bottom console stays full width over the left + centre columns only,
   // and the right status column runs through to the bottom of the workspace.
   assert.match(styles, /\.workspace-body > \.console \{[\s\S]*grid-column: 1 \/ 3;/);
   assert.match(styles, /\.col--right \{[\s\S]*grid-row: 1 \/ 4;/);
-  assert.match(styles, /\.col--right \{[\s\S]*grid-template-rows: minmax\(0, 1fr\) auto;/);
+  assert.match(styles, /\.col--right \{[^}]*grid-template-rows: minmax\(0, 1fr\) 306px;/);
   assert.match(styles, /\.viewport-shell \{[^}]*var\(--appBg\)/);
   assert.match(app, /width: `\$\{canvasLayout\.designWidth\}px`/);
   assert.ok((tokens.match(/--viewportGutter:/g) ?? []).length >= 2);

@@ -1639,9 +1639,8 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
                 : "RELEASED · MANUAL"}
           </span>
         </div>
-        {stale || !ws.xray.usbAutoShutDownKnown ? (
-          <p className="safety-unknown" role="status">UNKNOWN · Select USB Auto Shut Down before deadman arming can be verified.</p>
-        ) : null}
+        {/* Unknown readback is already indicated by NOT VERIFIED and the indeterminate
+            control. Never claim the hardware timer is armed until confirmed. */}
         <label className="check-row check-row--inset">
           <input
             type="checkbox"
@@ -2293,7 +2292,6 @@ export function App() {
             </aside>
             <LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} />
           </section>
-          <div className="app-divider" />
           <BottomConsole ws={ws} />
           <aside className="col col--right">
             <XrayPanel ws={ws} busy={busy || Boolean(transportError)} dispatch={dispatch} stale={Boolean(transportError)} />

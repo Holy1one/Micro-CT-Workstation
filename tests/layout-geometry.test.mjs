@@ -1,9 +1,10 @@
 /**
  * Alignment regression gate for the fixed industrial console.
  *
- * The three upper columns must end on one line, and the bottom log console and
- * the Operation Status panel must share both a top and a bottom edge. Those
- * facts are derived from `src/styles.css` by `layout-geometry.mjs` and asserted
+ * The three upper columns end on one line. The Log and Operation Status
+ * panels both start 12px below that line and share the same bottom edge.
+ * Neither upper panel nor Operation Status moves.
+ * These facts are derived from `src/styles.css` by `layout-geometry.mjs` and asserted
  * here, so the gate fails as soon as the numbers drift apart again — it does
  * not pin fresh literals where a derivation is possible.
  *
@@ -16,8 +17,6 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   BOTTOM_ROW_PX,
-  BOTTOM_ROW_BASE_PX,
-  BOTTOM_ROW_SCALE,
   DESIGN_HEIGHT,
   DESIGN_WIDTH,
   assertAlignmentInvariants,
@@ -28,9 +27,8 @@ import {
 const STYLESHEET = new URL("../src/styles.css", import.meta.url);
 const stylesheet = readFileSync(STYLESHEET, "utf8");
 
-test("the bottom row grows from the published bottom-area height", () => {
-  assert.equal(BOTTOM_ROW_PX, Math.round(BOTTOM_ROW_BASE_PX * BOTTOM_ROW_SCALE));
-  assert.equal(BOTTOM_ROW_PX, 317, "264 * 1.2 = 316.8 rounds to 317 design px");
+test("the bottom panels use the published 306px design height", () => {
+  assert.equal(BOTTOM_ROW_PX, 306);
 });
 
 test("the stylesheet numbers satisfy every alignment invariant", () => {
@@ -38,25 +36,23 @@ test("the stylesheet numbers satisfy every alignment invariant", () => {
   assertAlignmentInvariants(assert, geometry);
 });
 
-test("the operation status panel and the log console share one height and one row", () => {
-  const { workspace, operationPanel } = readGeometry(stylesheet);
-  assert.equal(operationPanel.height, workspace.bottom);
-  assert.equal(operationPanel.minHeight, workspace.bottom);
-  // A mismatch here is exactly the regression that made the bottom-right area
-  // look cramped: the panel was clamped to a row it was taller than.
-  assert.equal(operationPanel.height, BOTTOM_ROW_PX);
+test("the log alone moves down to align with Operation Status", () => {
+  const geometry = readGeometry(stylesheet);
+  const facts = deriveAlignment(geometry);
+  assert.equal(geometry.operationPanel.height, geometry.workspace.bottom);
+  assert.equal(geometry.operationPanel.minHeight, geometry.workspace.bottom);
+  assert.equal(facts.rightUpperTrack, facts.upperBottomLine);
+  assert.equal(facts.operationTop, facts.logTop);
+  assert.equal(facts.operationBottom, facts.logBottom);
+  assert.equal(facts.operationTop - facts.upperBottomLine, geometry.workspace.columnGap);
 });
 
-test("the right column's separator matches the shared divider row", () => {
-  const { workspace, rightColumn } = readGeometry(stylesheet);
-  assert.equal(
-    rightColumn.spacer,
-    workspace.divider,
-    "a wider separator would leave only the X-ray panel short of the shared bottom line",
-  );
-  // The contract also pins the decoupled right column stack; the separator must
-  // therefore come from the row-gap, not from a fixed middle track.
-  assert.match(rightColumn.tracks, /^minmax\(0, 1fr\) auto$/);
+test("the right panel gap matches the shared 12px panel rhythm", () => {
+  const { workspace, rightColumn, operationPanel } = readGeometry(stylesheet);
+  assert.equal(rightColumn.spacer, workspace.columnGap);
+  assert.equal(workspace.divider, workspace.columnGap);
+  assert.equal(rightColumn.bottomTrack, operationPanel.height);
+  assert.match(rightColumn.tracks, /^minmax\(0, 1fr\) \d+px$/);
 });
 
 test("the three upper columns and the bottom console stay inside the canvas", () => {
@@ -74,6 +70,23 @@ test("the three upper columns and the bottom console stay inside the canvas", ()
     facts.workspaceContentBox,
   );
   assert.equal(geometry.canvas.width, DESIGN_WIDTH);
+});
+
+test("upper panels and log are separated by empty space, not an overlay line", () => {
+  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const workspace = app.slice(app.indexOf('<section className="workspace-body">'), app.indexOf('<BottomConsole ws={ws} />'));
+  assert.ok(workspace.length > 0);
+  assert.doesNotMatch(workspace, /<div className="app-divider"\s*\/>/);
+  assert.doesNotMatch(stylesheet, /\.workspace-body\s*>\s*\.app-divider\s*\{/);
+});
+
+test("the 3D viewport joins the toolbar and follows the outer bottom curve", () => {
+  const tokens = readFileSync(new URL("../src/tokens.css", import.meta.url), "utf8");
+  const scene = tokens.match(/\.live-scene\s*\{([^}]*)\}/)?.[1];
+  assert.ok(scene, "the viewport must declare its clipping geometry");
+  assert.match(scene, /border-radius:\s*0 0 calc\(var\(--radiusCardCompact\) - 1px\) calc\(var\(--radiusCardCompact\) - 1px\)/);
+  assert.match(scene, /overflow:\s*hidden/);
+  assert.match(stylesheet, /\.panel\s*\{[^}]*border:\s*1px solid var\(--line\);[^}]*border-radius:\s*var\(--radiusCardCompact\)/);
 });
 
 test("no column or panel gained an in-column scrollbar", () => {

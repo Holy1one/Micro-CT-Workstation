@@ -69,8 +69,8 @@
   --functionalGlassText:   #202833;
   --shadowFloat:           0 10px 26px rgba(25, 36, 48, 0.14);
   --shadowIsland:          0 18px 40px rgba(25, 36, 48, 0.18);
-  --islandBg:              color-mix(in srgb, var(--panel) 92%, transparent);
-  --islandBorder:          color-mix(in srgb, var(--lineStrong) 72%, transparent);
+  --islandBg:              rgba(247, 250, 252, 0.72);
+  --islandBorder:          rgba(165, 186, 203, 0.62);
   --islandHighlight:       rgba(255, 255, 255, 0.88);
   --islandKeyBg:           color-mix(in srgb, var(--neutralSoft) 84%, transparent);
   --islandKeyHover:        color-mix(in srgb, var(--accentSoft) 88%, var(--neutralSoft));
@@ -202,8 +202,8 @@
   --functionalGlassText:   #E8ECF2;
   --shadowFloat:           0 12px 28px rgba(0, 0, 0, 0.34);
   --shadowIsland:          0 20px 44px rgba(0, 0, 0, 0.40);
-  --islandBg:              color-mix(in srgb, var(--panelHeader) 94%, transparent);
-  --islandBorder:          color-mix(in srgb, var(--lineField) 66%, transparent);
+  --islandBg:              rgba(30, 42, 54, 0.76);
+  --islandBorder:          rgba(159, 182, 200, 0.34);
   --islandHighlight:       rgba(255, 255, 255, 0.14);
   --islandKeyBg:           rgba(255, 255, 255, 0.08);
   --islandKeyHover:        color-mix(in srgb, var(--accentSoft) 90%, var(--panelHeader));
@@ -303,7 +303,8 @@
    ============================================================ */
 .live-scene {
   position: relative;
-  border-radius: 14px;
+  /* Square at the toolbar; inset the lower curve by the panel's 1px border. */
+  border-radius: 0 0 calc(var(--radiusCardCompact) - 1px) calc(var(--radiusCardCompact) - 1px);
   overflow: hidden;
   background: var(--sceneBg);
 }

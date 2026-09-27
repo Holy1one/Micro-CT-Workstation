@@ -7,18 +7,15 @@
  * never grade a different formula than the one the stylesheet actually uses.
  *
  * Everything here is derived from the stylesheet text: no geometry literal is
- * duplicated, and the only pinned numbers are the design baseline and the 1.2x
- * growth factor the brief states for the bottom row.
+ * duplicated; the 306px bottom panel height is the published design spec.
  */
 
 /** The console's design baseline, shared with canvas-layout.ts. */
 export const DESIGN_WIDTH = 1920;
 export const DESIGN_HEIGHT = 1080;
 
-/** Bottom-row growth factor: 264 * 1.2 = 316.8, rounded to 317. */
-export const BOTTOM_ROW_SCALE = 1.2;
-export const BOTTOM_ROW_BASE_PX = 264;
-export const BOTTOM_ROW_PX = Math.round(BOTTOM_ROW_BASE_PX * BOTTOM_ROW_SCALE);
+/** Both bottom panels have the same published 306px design height. */
+export const BOTTOM_ROW_PX = 306;
 
 const ruleBody = (css, selector) => {
   const pattern = new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`);
@@ -96,8 +93,8 @@ export function readGeometry(css) {
   const canvasTracks = trackShape(trackList(canvasBody, ".design-canvas"));
   const workspaceTracks = trackList(workspaceBody, ".workspace-body");
   const workspaceShape = trackShape(workspaceTracks);
-  // The upper row is the flexible track (the main console area); the divider and
-  // the bottom console row are the fixed tracks around it.
+  // The upper row is flexible; the separator and bottom console row are fixed.
+  // This separator is a full panel gap, not a hairline.
   const workspaceFixed = workspaceShape.px.filter((px) => px !== null);
   const rightShape = trackShape(trackList(rightBody, ".col--right"));
   const rightFixed = rightShape.px.filter((px) => px !== null);
@@ -141,14 +138,10 @@ export function readGeometry(css) {
       trackCount: rightShape.count,
       flexibleTracks: rightShape.flexible,
       upperIsFlexible: rightShape.px[0] === null,
-      // The right column's upper panel is the flexible track; its bottom panel
-      // is an auto track sized by the Operation Status panel's own height.
-      bottomIsAuto: rightShape.px[rightShape.count - 1] === null,
-      // The separator between the two right-column panels is the column's own
-      // row-gap. It has to equal the shared divider row (a hairline), not the
-      // 12px padding rhythm: a 12px gap would push the Operation Status panel
-      // 12px down and pull the X-ray panel (and only it) 11px above the shared
-      // line the left and centre columns end on.
+      // The right column's lower track is a fixed height, just like the panel.
+      bottomIsFixed: rightShape.px[rightShape.count - 1] !== null,
+      bottomTrack: rightShape.px[rightShape.count - 1],
+      // A 12px inter-panel gap matches the workspace's horizontal rhythm.
       spacer: rowGapPx(css, ".col--right"),
       tracks: trackList(rightBody, ".col--right").trim(),
     },
@@ -192,12 +185,9 @@ export function deriveAlignment(geometry) {
   // Every upper column ends on this line, measured from the workspace content
   // box's top: the upper row's height.
   const upperBottomLine = upperRow;
-  // The right column spans the upper row, the divider row and the bottom row,
-  // so its flexible first track is that span minus its own separator (the
-  // column's row-gap) and minus its auto track, which the Operation Status
-  // panel fills with its own published height.
+  // The bottom track and the actual panel are fixed to the same height.
   const rightSpan = upperRow + workspace.divider + workspace.bottom;
-  const rightBottomTrack = operationPanel.height;
+  const rightBottomTrack = rightColumn.bottomTrack;
   const rightUpperTrack = rightSpan - rightSpacer - rightBottomTrack;
 
   return {
@@ -211,13 +201,14 @@ export function deriveAlignment(geometry) {
     rightBottomTrack,
     rightUpperTrack,
     rightColumnTrackSum: rightUpperTrack + rightSpacer + rightBottomTrack,
-    requiredRightSpacer: workspace.divider,
-    // Both bottom areas are one grid track tall and the Operation Status panel
-    // carries that same height, so the panel needs no min-height that differs
-    // from the console row height.
+    requiredRightSpacer: columnGap,
     bottomRow: workspace.bottom,
     operationHeight: operationPanel.height,
     operationMinHeight: operationPanel.minHeight,
+    operationTop: rightUpperTrack + rightSpacer,
+    operationBottom: rightUpperTrack + rightSpacer + rightBottomTrack,
+    logTop: upperRow + workspace.divider,
+    logBottom: workspaceContentBox,
     columnGap,
     padding,
   };
@@ -231,53 +222,32 @@ export function assertAlignmentInvariants(assert, geometry) {
   assert.equal(canvas.width, DESIGN_WIDTH, "the console keeps its 1920px design width");
   assert.equal(canvas.height, DESIGN_HEIGHT, "the console keeps its 1080px design height");
 
-  // 1. The bottom row is the published bottom-row height, not a fresh literal.
-  assert.equal(
-    workspace.bottom,
-    BOTTOM_ROW_PX,
-    `the bottom console row must be ${BOTTOM_ROW_BASE_PX} * ${BOTTOM_ROW_SCALE} = ${BOTTOM_ROW_PX}px`,
-  );
+  assert.equal(workspace.bottom, BOTTOM_ROW_PX, "the bottom console keeps its 306px design height");
+  assert.equal(workspace.divider, workspace.columnGap, "the gap above the log matches the 12px panel rhythm");
+  assert.equal(operationPanel.height, workspace.bottom, "the bottom panels share one height");
+  assert.equal(operationPanel.minHeight, workspace.bottom, "Operation Status has no taller minimum height");
+  assert.ok(rightColumn.bottomIsFixed, "the right column keeps a fixed lower panel track");
+  assert.equal(rightColumn.bottomTrack, operationPanel.height, "the fixed lower track matches the panel");
+  assert.equal(rightColumn.spacer, facts.requiredRightSpacer, "the right panel gap matches the other panel gaps");
 
-  // 2. The Operation Status panel adopts the bottom row height exactly, so the
-  //    log console and the Operation Status panel share a top and a bottom edge.
-  assert.equal(operationPanel.height, BOTTOM_ROW_PX, "the Operation Status panel height must equal the bottom console row");
-  assert.equal(operationPanel.minHeight, BOTTOM_ROW_PX, "the Operation Status panel min-height must equal the bottom console row");
-  assert.ok(rightColumn.bottomIsAuto, "the right column's Operation Status track stays auto, sized by the panel's own height");
-
-  // 3. The right column's separator must be the row the columns beside it use
-  //    for the same visual break, not the 12px padding rhythm: a wider gap
-  //    pushes the Operation Status panel down and pulls the X-ray panel (and
-  //    only it) above the line the left and centre columns end on.
-  assert.equal(
-    rightColumn.spacer,
-    facts.requiredRightSpacer,
-    "the right column's panel separator must equal the shared divider row so all three upper columns end on one line",
-  );
-
-  // 4. Structure: the upper row is flexible, so the columns beside it decide
-  //    the shared line instead of a literal; the divider stays a hairline.
-  assert.equal(workspace.trackCount, 3, "the workspace grid keeps its upper / divider / bottom structure");
-  assert.ok(workspace.upperIsFlexible, "the upper row must stay the flexible track so it sizes to the upper columns");
-  assert.ok(workspace.flexibleTracks === 1, "exactly one workspace track may be flexible");
+  // The flexible upper row must remain at the previously verified height:
+  // the earlier 1px divider + 317px log occupied the same 318px in total.
+  assert.equal(workspace.divider + workspace.bottom, 318, "the upper panels keep their prior height");
+  assert.equal(workspace.trackCount, 3, "the workspace grid keeps upper / gap / bottom tracks");
+  assert.ok(workspace.upperIsFlexible, "the upper row stays flexible");
+  assert.equal(workspace.flexibleTracks, 1, "exactly one workspace row may be flexible");
   assert.ok(facts.upperRow > workspace.bottom, "the upper row stays the larger area");
-  assert.ok(workspace.divider >= 0 && workspace.divider <= 2, "the divider row stays a hairline track");
 
-  // 5. The right column's stack reproduces the shared line inside its own span:
-  //    the right column covers the same box the workspace grid gives the upper
-  //    columns (upper row + divider row + bottom row), its own separator equals
-  //    the divider row and its auto track equals the bottom row. Therefore the
-  //    X-ray panel's flexible track ends exactly where the left and centre
-  //    columns end, and the Operation Status panel starts on the console's top.
+  // Neither X-ray nor Operation Status moves. The log now starts at the
+  // same 12px lower line and still ends at the same workspace bottom.
   assert.equal(
     facts.rightColumnTrackSum,
     facts.workspaceContentBox,
-    "the right column's tracks must cover the same box the upper columns cover",
+    "the right column's tracks must cover the entire workspace content box",
   );
-  assert.equal(
-    facts.rightUpperTrack + rightColumn.spacer,
-    facts.upperBottomLine + workspace.divider,
-    "the X-ray panel must end on the same line as the left and centre columns",
-  );
+  assert.equal(facts.rightUpperTrack, facts.upperBottomLine, "the X-ray panel keeps its previous bottom edge");
+  assert.equal(facts.operationTop, facts.logTop, "the two bottom panels start on the same line");
+  assert.equal(facts.operationBottom, facts.logBottom, "the two bottom panels finish on the same line");
 
   // 6. No scrollbar may be added anywhere. The only surfaces allowed to scroll
   //    are the log list, the image strip and the overlay dialog; the tab rail is

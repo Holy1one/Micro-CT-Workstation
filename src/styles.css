@@ -10,14 +10,11 @@
    Micro-CT Workstation · Industrial Console
    Layout grid (design baseline 1920 x 1080, 16:9):
      frame rows     39 / 1 / 1fr / 1 / 30
-      workspace rows 1fr / 1 / 317   (main console / divider / bottom console)
+      workspace rows 1fr / 12 / 306 (main console / gap / bottom console)
      columns        420 / 1fr / 450 (gap + padding 12)
-   The right status column spans every workspace row, so the bottom console
-   covers the left and centre columns only. The bottom console row and the
-   Operation Status panel share one height (264 * 1.2 = 316.8 -> 317) so both
-   bottom areas keep a shared top and bottom edge. The divider is drawn at the
-   shared line; see .workspace-body for why it is not a sized grid track.
-   All colors come from tokens.css variables only.
+   The right status column spans every workspace row. The log and Operation
+   Status both occupy the bottom 306px, with a matching 12px gap above them.
+   The upper panels and both bottom edges keep their previous positions.
    ============================================================ */
 
 * { box-sizing: border-box; }
@@ -133,18 +130,19 @@ button[aria-busy="true"] { cursor: progress; }
   cursor: pointer;
 }
 .sys-menu__item.is-open { color: var(--textPrimary); font-weight: 600; }
-.window-controls { align-self: stretch; display: inline-flex; align-items: stretch; gap: 2px; margin-left: auto; }
-.window-controls button { display: grid; place-items: center; width: 42px; height: 37px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--textSecondary); cursor: pointer; }
+.window-controls { align-self: stretch; display: inline-flex; align-items: center; gap: 2px; margin-left: auto; }
+.window-controls button { display: grid; place-items: center; width: 40px; height: 38px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--textSecondary); cursor: pointer; }
 .window-controls button:hover:not(:disabled) { background: color-mix(in srgb, var(--textPrimary) 9%, transparent); border-color: transparent; }
-.window-controls button:disabled { opacity: 0.42; }
+.window-controls button:active:not(:disabled) { transform: none; box-shadow: none; }
+.window-controls button:disabled { opacity: 0.48; }
 .window-controls .window-controls__close:hover:not(:disabled) { color: var(--onAccent); background: var(--dangerSolid); }
-.window-glyph { position: relative; display: block; width: 13px; height: 13px; }
-.window-glyph--minimise::after { position: absolute; right: 0; bottom: 1px; left: 0; height: 1px; background: currentColor; content: ""; }
-.window-glyph--maximise { border: 1px solid currentColor; border-radius: 1px; }
-.window-glyph--restore::before, .window-glyph--restore::after { position: absolute; width: 9px; height: 8px; border: 1px solid currentColor; border-radius: 1px; background: var(--functionalGlassBg); content: ""; }
-.window-glyph--restore::before { top: 0; right: 0; }
-.window-glyph--restore::after { bottom: 0; left: 0; }
-.window-glyph--close::before, .window-glyph--close::after { position: absolute; top: 6px; left: 0; width: 14px; height: 1px; background: currentColor; content: ""; }
+.window-glyph { position: relative; display: block; width: 14px; height: 14px; flex: 0 0 14px; }
+.window-glyph--minimise::after { position: absolute; top: 7px; right: 1px; left: 1px; height: 1.5px; border-radius: 1px; background: currentColor; content: ""; }
+.window-glyph--maximise::after { position: absolute; inset: 2px 1px 2px; border: 1.5px solid currentColor; border-radius: 1px; content: ""; }
+.window-glyph--restore::before, .window-glyph--restore::after { position: absolute; width: 9px; height: 8px; border: 1.5px solid currentColor; border-radius: 1px; content: ""; }
+.window-glyph--restore::before { top: 1px; right: 1px; }
+.window-glyph--restore::after { bottom: 1px; left: 1px; background: var(--functionalGlassBg); }
+.window-glyph--close::before, .window-glyph--close::after { position: absolute; top: 6.25px; left: 1px; width: 12px; height: 1.5px; border-radius: 1px; background: currentColor; content: ""; }
 .window-glyph--close::before { transform: rotate(45deg); }
 .window-glyph--close::after { transform: rotate(-45deg); }
 
@@ -232,23 +230,14 @@ button[aria-busy="true"] { cursor: progress; }
  * right status column can run to the bottom of the workspace, while the
  * bottom console keeps its full width over the left and centre columns only.
  *
- * All three upper panels share one bottom edge. The left column and the centre
- * scene take their natural height, and the row is sized by exactly that much,
- * so every upper column ends on the same line; the right status column spans
- * the whole workspace and its own 12px panel gap then reproduces that same
- * rhythm (geometry in the .col--right comment below).
- *
- * The divider is taken out of the flow and drawn as a border at the shared
- * line. A 1px grid track would be charged to the right column's span as well
- * and would push the Operation Status panel 1px off the log console, so the
- * track that positions the line stays declared while the line itself is an
- * overlay. Nothing is drawn twice and no scrollbar is introduced.
+ * Left, centre and X-ray panels keep their shared bottom line. Both bottom
+ * panels begin 12px below that line and stay bottom-aligned. The intervening
+ * grid row remains empty, avoiding an extra line across the card gutters.
  */
 .workspace-body {
   display: grid;
   grid-template-columns: 420px minmax(0, 1fr) 450px;
-  /* Bottom console row: 264 * 1.2 = 316.8 -> 317 design px. */
-  grid-template-rows: minmax(0, 1fr) 1px 317px;
+  grid-template-rows: minmax(0, 1fr) 12px 306px;
   column-gap: 12px;
   padding: 12px;
   min-height: 0;
@@ -263,46 +252,22 @@ button[aria-busy="true"] { cursor: progress; }
   min-height: 0;
 }
 
-/* The share of the 12px panel rhythm that sits above the shared bottom line.
-   The right column keeps its gap and lands its stack on the same line as the
-   columns beside it. */
-.workspace-body > .app-divider {
-  position: absolute;
-  left: 12px;
-  right: 462px;
-  bottom: 329px;
-  height: 0;
-  border-top: 1px solid var(--lineStrong);
-  background: none;
-}
+/* The empty middle grid track supplies the 12px gap without drawing a line. */
 
-/* The bottom console owns the 317px bottom track. It is placed explicitly
-   because the divider no longer occupies its own track, so auto-placement
-   would otherwise drop the console into the (empty) 1px divider track. */
+/* The bottom log and Operation Status each occupy a 306px track. The log is
+   placed explicitly so the middle 12px gap remains empty. */
 .workspace-body > .console { grid-column: 1 / 3; grid-row: 3 / 4; }
 
 .col { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 12px; min-height: 0; overflow: hidden; }
 
-/* Right status column: spans the main row and the log row. The X-ray panel
-   takes the remaining height, the operation status keeps its own height, and
-   neither panel ever scrolls: the industrial console shows every control in
-   full at the fixed canvas size.
-   The column spans the upper row, the divider row and the bottom row. Its own
-   separator has to equal the divider row (a hairline), not the 12px panel
-   padding rhythm: a 12px gap here would push the Operation Status panel 12px
-   down and pull the X-ray panel (and only it) 11px above the line the columns
-   beside it end on. With the hairline separator the X-ray panel's flexible
-   track ends on that shared line and the Operation Status panel's own track
-   starts exactly on the log console's top edge. */
+/* Unchanged right-hand geometry: the X-ray panel ends at the shared upper
+   line and Operation Status starts 12px below it at a fixed 306px height. */
 .col--right {
   grid-column: 3;
   grid-row: 1 / 4;
-  grid-template-rows: minmax(0, 1fr) auto;
-  row-gap: 1px;
+  grid-template-rows: minmax(0, 1fr) 306px;
+  row-gap: 12px;
 }
-
-/* The right column's own bottom area height (317px) and the shared bottom row
-   height both live in the rules below; they must stay equal. */
 
 /* ---------- panels ---------- */
 .panel {
@@ -327,7 +292,7 @@ button[aria-busy="true"] { cursor: progress; }
   background: var(--panelHeader);
   border-bottom: 1px solid var(--line);
 }
-.panel__header h2 { margin: 0; font-size: var(--fontSizeTitle); font-weight: 600; color: var(--textPrimary); white-space: nowrap; }
+.panel__header h2, .scene-toolbar h2 { margin: 0; font-family: var(--fontUi); font-size: var(--fontSizeTitle); font-weight: 600; letter-spacing: 0; line-height: 1.25; color: var(--textPrimary); white-space: nowrap; }
 
 .panel__divider { height: 1px; background: var(--line); margin: 10px 14px 0; }
 .panel__footnote { margin: 0; padding: 8px 14px 10px; font-size: var(--fontSizeHint); color: var(--textMuted); }
@@ -437,7 +402,7 @@ i.tone-danger { background: var(--danger); }
   border-bottom: 1px solid var(--line);
 }
 .scene-toolbar .chip { margin-left: 0; }
-.scene-toolbar h2 { margin: 0; font-size: 13px; font-weight: 600; }
+.scene-toolbar h2 { flex: 0 0 auto; }
 
 .scene-view-btn {
   min-width: 38px;
@@ -523,15 +488,9 @@ i.tone-danger { background: var(--danger); }
 .dock-icon { width: 34px; height: 34px; flex-shrink: 0; object-fit: contain; display: block; pointer-events: none; }
 
 /* ---------- Dynamic-Island control dock ----------
-   Collapsed, the dock is a small frosted capsule carrying a ring progress
-   indicator and a readable numeric read-out. It expands into the four frosted
-   keys through hover, keyboard focus, an explicit click and touch. The capsule
-   keeps the same footprint while the dock expands, so the pointer never lands
-   on a different control than the one it aimed at.
-
-   The key geometry is declared here (styles.css) so the single dock component
-   rule set owns the shipped size; tokens.css keeps only the colour tokens and
-   the theme/state overrides. */
+   A compact readout when closed; on expansion a single glass surface groups
+   four unframed actions around the progress ring. The readout remains the
+   stable central target, so expanding cannot redirect the initial click. */
 
 .control-dock {
   position: absolute;
@@ -574,19 +533,19 @@ i.tone-danger { background: var(--danger); }
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: repeat(5, 100px);
-  grid-template-rows: 88px;
+  grid-template-columns: repeat(5, 72px);
+  grid-template-rows: 66px;
   align-items: center;
-  gap: 8px;
-  padding: 12px;
+  gap: 6px;
+  padding: 7px 9px;
   border: 1px solid var(--islandBorder);
-  border-radius: 999px;
+  border-radius: 22px;
   background: var(--islandBg);
-  -webkit-backdrop-filter: blur(22px) saturate(145%);
-  backdrop-filter: blur(22px) saturate(145%);
-  box-shadow: var(--shadowIsland), inset 0 1px 0 var(--islandHighlight);
+  -webkit-backdrop-filter: blur(18px) saturate(135%);
+  backdrop-filter: blur(18px) saturate(135%);
+  box-shadow: var(--shadowFloat), inset 0 1px 0 var(--islandHighlight);
   transform-origin: center center;
-  animation: island-unfold 340ms cubic-bezier(0.22, 0.72, 0.28, 1);
+  animation: island-unfold 300ms cubic-bezier(0.22, 0.72, 0.28, 1);
 }
 .control-dock.is-collapsed .dock-key-row {
   display: flex;
@@ -609,9 +568,9 @@ i.tone-danger { background: var(--danger); }
   flex-direction: row;
   align-items: center;
   justify-content: center;
-  gap: 10px;
-  width: 100px;
-  height: 88px;
+  gap: 8px;
+  width: 72px;
+  height: 66px;
   padding: 0;
   border: 0;
   border-radius: var(--radiusKey);
@@ -622,10 +581,10 @@ i.tone-danger { background: var(--danger); }
   transition: background-color 180ms ease-out, color 180ms ease-out, border-color 180ms ease-out, box-shadow 180ms ease-out, transform 180ms ease-out;
 }
 .control-dock.is-collapsed .dock-capsule {
-  width: auto;
-  min-width: 190px;
-  height: 58px;
-  padding: 0 18px 0 12px;
+  width: max-content;
+  min-width: 0;
+  height: 48px;
+  padding: 0 12px 0 9px;
   border: 1px solid var(--islandBorder);
   border-radius: 999px;
   background: var(--islandBg);
@@ -664,7 +623,9 @@ i.tone-danger { background: var(--danger); }
 
 /* The read-out is per-line text, not a roll: the ring may saturate at 100 %
    while Finishing, but only the engine can make the console read Completed. */
-.dock-capsule__lead { display: flex; flex-direction: row; align-items: center; gap: 10px; min-width: 0; }
+.dock-capsule__lead { display: flex; flex-direction: row; align-items: center; gap: 8px; min-width: 0; }
+.control-dock.is-collapsed .dock-ring { flex-basis: 32px; width: 32px; height: 32px; }
+.control-dock.is-collapsed .dock-ring__svg { width: 32px; height: 32px; }
 .dock-capsule__text { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
 .dock-capsule__state {
   font-family: var(--fontMono);
@@ -703,8 +664,8 @@ i.tone-danger { background: var(--danger); }
 .control-dock.is-expanded .dock-capsule__chevron { display: none; }
 .control-dock.is-expanded .dock-ring__text { opacity: 0; }
 .control-dock.is-expanded .dock-ring,
-.control-dock.is-expanded .dock-ring__svg { width: 48px; height: 48px; }
-.control-dock.is-expanded .dock-ring { flex-basis: 48px; width: 48px; height: 48px; }
+.control-dock.is-expanded .dock-ring__svg { width: 38px; height: 38px; }
+.control-dock.is-expanded .dock-ring { flex-basis: 38px; }
 
 @keyframes island-unfold {
   from { opacity: 0.72; transform: scaleX(0.58) scaleY(0.94); }
@@ -719,40 +680,32 @@ i.tone-danger { background: var(--danger); }
   position: relative;
   display: inline-flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 3px;
   align-items: center;
   justify-content: center;
-  width: 100px;
-  height: 76px;
+  width: 72px;
+  height: 64px;
   padding: 0;
-  border: 1px solid color-mix(in srgb, var(--islandBorder) 78%, transparent);
-  border-radius: var(--radiusKey);
-  background: var(--islandKeyBg);
+  border: 0;
+  border-radius: 14px;
+  background: transparent;
   box-shadow: none;
   cursor: pointer;
-  transition: background-color 180ms ease-out, border-color 180ms ease-out, transform 180ms ease-out, box-shadow 180ms ease-out, opacity 140ms ease-out;
+  transition: background-color 160ms ease-out, transform 160ms ease-out, opacity 140ms ease-out;
 }
 .control-dock .dock-key:active:not(:disabled) { transform: scale(0.97); box-shadow: none; }
 .control-dock.is-expanded .dock-key:not(:disabled):hover {
   background: var(--islandKeyHover);
-  border-color: color-mix(in srgb, var(--accent) 48%, var(--islandBorder));
-  box-shadow: inset 0 1px 0 var(--islandHighlight);
   transform: translateY(-1px);
 }
 .control-dock.is-expanded .dock-key:active:not(:disabled) { transform: scale(0.97); box-shadow: none; }
-.control-dock .dock-key .dock-icon { width: 30px; height: 30px; }
-/* Dim disabled key surfaces and icons while keeping their labels at the full
-   token contrast; applying opacity to the whole button also dims its text. */
+.control-dock .dock-key .dock-icon { width: 28px; height: 28px; }
+/* State availability only dims the glyph, never hides the label. */
 .control-dock .dock-key:disabled { opacity: 1; cursor: not-allowed; }
 .control-dock .dock-key:disabled .dock-icon { opacity: 0.58; filter: saturate(0.58); }
-/* No active scan: Stop reads as a light disabled treatment derived from the
-   engine's own availability flag, never from a second source of authority. */
-.control-dock .dock-key--stop:disabled {
-  background: color-mix(in srgb, var(--islandKeyBg) 45%, var(--islandBg));
-}
 .control-dock .dock-key:disabled .dock-key__label { color: var(--islandTextMuted); }
-.control-dock .dock-key .dock-key__label { color: var(--islandText); font-size: 12px; }
-.control-dock .dock-key:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.control-dock .dock-key .dock-key__label { color: var(--islandText); font-size: 11px; line-height: 1.2; }
+.control-dock .dock-key:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 .control-dock.dock-state--fault .dock-capsule { border-color: var(--danger); }
 .control-dock.dock-state--paused .dock-capsule { border-color: var(--warn); }
@@ -961,18 +914,18 @@ i.tone-danger { background: var(--danger); }
 
 /* ---------- operation status ---------- */
 
-.operation-panel { height: 317px; min-height: 317px; }
+.operation-panel { height: 306px; min-height: 306px; }
 /* Eight-state read-only console feedback. The active state is emphasised and
    always carries its meaning as text; the remaining seven stay as a reference
    strip so the console names every state it can report. */
-.op-feedback { flex: 0 0 auto; margin: 8px 14px 0; display: flex; flex-direction: column; gap: 2px; }
+.op-feedback { flex: 0 0 auto; margin: 10px 14px 0; display: flex; flex-direction: column; gap: 5px; }
 .op-feedback__row {
   display: flex;
   flex-direction: row;
-  align-items: baseline;
-  gap: 8px;
-  min-height: 18px;
-  padding: 1px 8px;
+  align-items: center;
+  gap: 9px;
+  min-height: 24px;
+  padding: 3px 8px;
   border: 1px solid var(--line);
   border-left-width: 3px;
   border-radius: 7px;
@@ -993,8 +946,8 @@ i.tone-danger { background: var(--danger); }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 10px;
-  line-height: 1.3;
+  font-size: 11px;
+  line-height: 1.4;
   color: var(--textSecondary);
 }
 .op-feedback__row.tone-ok { border-left-color: var(--ok); }
@@ -1013,30 +966,28 @@ i.tone-danger { background: var(--danger); }
 }
 .op-feedback__chip {
   flex: 0 0 auto;
-  padding: 1px 4px;
+  padding: 2px 4px;
   border: 1px solid var(--line);
   border-radius: 6px;
   font-family: var(--fontMono);
-  font-size: 8.5px;
+  font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.01em;
-  line-height: 1.3;
+  line-height: 1.35;
   color: var(--textMuted);
   background: transparent;
 }
 .op-feedback__chip.is-active { color: var(--textPrimary); background: var(--neutralSoft); border-color: var(--textSecondary); }
 .op-feedback__chip.is-idle { opacity: 0.72; }
 
-.op-feedback.is-hot .op-feedback__row { min-height: 24px; border-left-width: 4px; }
-.op-feedback.is-hot .op-feedback__word { font-size: 13px; }
-.op-feedback.is-hot .op-feedback__detail { font-size: 10.5px; }
-/* The eight-state read-out takes its budget from the spacing around it, not
-   from the panel height: the right status column keeps its published 264 px
-   operation panel with the Process Summary still fully visible. */
-.operation-panel .op-stats { padding-top: 4px; }
-.operation-panel .op-stats .op-stat strong { line-height: 1.05; }
-.operation-panel .op-progress { padding-top: 8px; }
-.operation-panel .op-summary { padding: 6px 14px 8px; gap: 8px; }
+.op-feedback.is-hot .op-feedback__row { min-height: 26px; border-left-width: 4px; }
+.op-feedback.is-hot .op-feedback__word { font-size: 12px; }
+.op-feedback.is-hot .op-feedback__detail { font-size: 11px; }
+/* Leave room for the full summary within the shortened, bottom-aligned panel. */
+.operation-panel .op-stats { padding-top: 9px; }
+.operation-panel .op-stats .op-stat strong { line-height: 1.15; }
+.operation-panel .op-progress { padding-top: 10px; }
+.operation-panel .op-summary { padding: 10px 14px 9px; gap: 9px; }
 
 .op-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 12px 14px 0; }
 .op-stat span { display: block; font-size: var(--fontSizeHint); font-weight: 600; letter-spacing: 0.05em; color: var(--textMuted); margin-bottom: 4px; }
@@ -1154,7 +1105,7 @@ i.tone-danger { background: var(--danger); }
 .scan-panel .param-stack { flex: 1 1 auto; gap: 12px; }
 .operation-panel .op-stats { flex: 0 0 auto; }
 .operation-panel .op-progress { flex: 0 0 auto; }
-.operation-panel .op-summary { flex: 1 1 auto; gap: 10px; }
+.operation-panel .op-summary { flex: 1 1 auto; }
 .xray-channels { flex: 0 0 auto; }
 .device-list { flex: 0 0 auto; }
 
