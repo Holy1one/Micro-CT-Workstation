@@ -11,12 +11,12 @@ pub mod devices;
 mod scan;
 
 use devices::camera::{CameraHealth, DigiCamControlAdapter, valid_exposure_ms, EXPOSURE_MIN_MS, EXPOSURE_MAX_MS};
-use devices::turntable::{NanoAdapter, NanoConnectionState, NanoHealth};
+use devices::turntable::{NanoAdapter, NanoConnectionState, NanoHealth, NanoStatus};
 use devices::xray::{
     MoxtekAdapter, XrayHealth, MAX_CURRENT_UA, MAX_SETPOINT_POWER_W, MAX_VOLTAGE_KV,
     MIN_VOLTAGE_KV,
 };
-use scan::{RealScanConfig, RealScanHandle, ScanCompletion};
+use scan::{RealFrame, RealScanConfig, RealScanHandle, ScanCompletion};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -44,6 +44,18 @@ fn confirmed_nano_angle(health: &NanoHealth) -> Option<f64> {
         return None;
     }
     Some(status.position_pulses as f64 * 360.0 / f64::from(status.pulses_per_rev))
+}
+
+/// A live, idle Nano STATUS can retain the Hall reference established earlier
+/// in the same controller session. Cached engine flags alone never qualify.
+fn nano_reference_ready(status: &NanoStatus) -> bool {
+    status.state == "IDLE" && status.capture_id == 0
+        && status.reference_valid && status.homed && status.rearmed
+        && status.pulses_per_rev > 0 && status.target_pulses == status.position_pulses
+}
+
+fn may_reuse_home(calibrated_this_process: bool, status: &NanoStatus) -> bool {
+    calibrated_this_process && nano_reference_ready(status)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -241,6 +253,8 @@ pub struct Engine {
     real_scan_message_count: usize,
     scan_angle_deg: Option<f64>,
     real_frames: Vec<Value>,
+    restored_frames: Vec<RealFrame>,
+    home_performed_this_process: bool,
     cached_camera_health: Option<CameraHealth>,
     cached_xray_health: Option<XrayHealth>,
     last_xray_poll: Instant,
@@ -280,6 +294,8 @@ impl Engine {
             real_scan_message_count: 0,
             scan_angle_deg: None,
             real_frames: Vec::new(),
+            restored_frames: Vec::new(),
+            home_performed_this_process: false,
             cached_camera_health: None,
             cached_xray_health: None,
             last_xray_poll: Instant::now() - Duration::from_secs(10),
@@ -435,12 +451,14 @@ impl Engine {
         self.preflight = false;
         self.homed = false;
         self.phase = phase;
+        self.restored_frames.clear();
     }
 
     fn nano_error(&mut self, context: &str, error: impl std::fmt::Display) -> &'static str {
         let message = format!("{context}: {error}");
         self.last_error = Some(message.clone());
         self.connected = false;
+        self.home_performed_this_process = false;
         self.fault_latched = true;
         self.invalidate(Phase::Fault);
         self.log("ERR", "nano", &format!("{message} · STOP/OFF recovery required"));
@@ -583,6 +601,7 @@ impl Engine {
                 .unwrap_or_else(|| format!("Nano state {:?}", health.state));
             self.last_error = Some(detail.clone());
             self.connected = false;
+            self.home_performed_this_process = false;
             self.fault_latched = true;
             self.invalidate(Phase::Fault);
         }
@@ -640,6 +659,7 @@ impl Engine {
             self.usb_auto_shut_down = true;
             self.usb_auto_shut_down_confirmed = false;
             self.connected = false;
+            self.home_performed_this_process = false;
             self.invalidate(if xray_off.is_ok() { Phase::Idle } else { Phase::Fault });
             self.log("WARN", "system", "Engine disconnected · Moxtek OFF, warning OFF and Nano STOP attempted · safety conditions invalidated");
             return xray_off;
@@ -667,6 +687,7 @@ impl Engine {
                             .map_err(|error| self.nano_error("Nano initial STATUS failed", error))?;
                         self.nano = Some(Arc::new(nano));
                         self.connected = true;
+                        self.home_performed_this_process = false;
                         self.invalidate(Phase::Idle);
                         self.fault_latched = false;
                         self.last_error = None;
@@ -674,8 +695,10 @@ impl Engine {
                             "INFO",
                             "nano",
                             &format!(
-                                "{} v{} build {} connected · state={} · HOME not executed",
-                                identity.device, identity.version, identity.build, status.state
+                                "{} v{} build {} connected · state={} · {}",
+                                identity.device, identity.version, identity.build, status.state,
+                                if nano_reference_ready(&status) { "live reference available for Preflight" }
+                                else { "HOME required if reference remains invalid" }
                             ),
                         );
                     }
@@ -846,25 +869,30 @@ impl Engine {
                     let nano_status = nano
                         .status()
                         .map_err(|error| self.nano_error("Nano preflight STATUS failed", error))?;
+                    let reusable_reference = may_reuse_home(self.home_performed_this_process, &nano_status);
                     if nano_status.state == "FAULT" {
                         nano.clear_fault()
                             .map_err(|error| self.nano_error("Nano CLEAR_FAULT failed", error))?;
                         self.log("WARN", "nano", "Previous Nano fault cleared · reference remains invalid until HOME");
                     }
-                    let status = nano
-                        .rearm()
-                        .map_err(|error| self.nano_error("Nano REARM failed", error))?;
+                    let status = if reusable_reference {
+                        nano_status
+                    } else {
+                        nano.rearm()
+                            .map_err(|error| self.nano_error("Nano REARM failed", error))?
+                    };
                     self.fault_latched = false;
                     self.preflight = true;
-                    self.homed = false;
-                    self.phase = Phase::ReadyForHome;
+                    self.homed = reusable_reference;
+                    self.phase = if reusable_reference { Phase::Ready } else { Phase::ReadyForHome };
                     self.last_error = None;
                     self.log(
                         "PASS",
                         "preflight",
                         &format!(
-                            "8/8 real checks passed · Nano={} · D7100 host-only · Moxtek OFF/unlocked {:.1} kV / {:.1} µA · {:.1} C",
+                            "8/8 real checks passed · Nano={} · reference={} · D7100 host-only · Moxtek OFF/unlocked {:.1} kV / {:.1} µA · {:.1} C",
                             status.state,
+                            if reusable_reference { "live STATUS confirmed; HOME reused" } else { "HOME required" },
                             self.set_kv,
                             self.set_ua,
                             xray_health.temperature_c.unwrap_or_default()
@@ -900,7 +928,10 @@ impl Engine {
                         .home()
                         .map_err(|error| self.nano_error("Nano HOME failed", error))?;
                     self.homed = true;
+                    self.home_performed_this_process = true;
                     self.current = 0;
+                    self.real_frames.clear();
+                    self.restored_frames.clear();
                     self.phase = Phase::Ready;
                     self.last_error = None;
                     self.log(
@@ -933,11 +964,16 @@ impl Engine {
                     if self.fault_latched {
                         return Err("FAULT_RECOVERY_REQUIRED");
                     }
+                    self.verify_current_nano_reference()?;
                     if !self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down {
                         return Err("USB_AUTO_SHUTDOWN_RELEASE_REQUIRED");
                     }
                     self.parameters.validate()?;
                     self.validate_setpoint(self.set_kv, self.set_ua)?;
+                    let starting_new_scan = self.restored_frames.is_empty();
+                    if starting_new_scan && scan::manifest_file_exists(&self.parameters) {
+                        return Err("SCAN_OUTPUT_EXISTS_USE_RESTORE");
+                    }
                     let nano = self.nano.as_ref().ok_or("NANO_NOT_CONNECTED")?.clone();
                     let camera = self.camera.take().ok_or("CAMERA_NOT_CONNECTED")?;
                     let xray = match self.xray.take() {
@@ -949,9 +985,9 @@ impl Engine {
                     };
                     self.cached_camera_health = Some(camera.health());
                     self.cached_xray_health = Some(xray.health());
-                    self.current = 0;
+                    self.current = self.restored_frames.len() as u32;
                     self.scan_angle_deg = Some(0.0);
-                    self.real_frames.clear();
+                    if self.restored_frames.is_empty() { self.real_frames.clear(); }
                     self.real_scan_revision = 0;
                     self.real_scan_message_count = 0;
                     self.phase = Phase::Running;
@@ -966,9 +1002,13 @@ impl Engine {
                             max_xray_sec: self.max_xray_sec,
                             voltage_kv: self.set_kv,
                             current_ua: self.set_ua,
+                            resume_frames: std::mem::take(&mut self.restored_frames),
                         },
                     ));
-                    self.log("ACTION", "operator", "Real scan worker started · output remains OFF until first READY_TO_CAPTURE");
+                    self.log("ACTION", "operator", &format!(
+                        "Real scan worker started at view {} · output remains OFF until READY_TO_CAPTURE",
+                        self.current + 1
+                    ));
                     return Ok(());
                 }
                 self.require_connected()?;
@@ -1025,7 +1065,6 @@ impl Engine {
                 self.log("INFO", "system", "Preview resumed");
             }
             "restore_previous" => {
-                if !self.preview { return Err("RESTORE_UNAVAILABLE"); }
                 self.require_connected()?;
                 if self.fault_latched || self.phase == Phase::Fault {
                     return Err("FAULT_RECOVERY_REQUIRED");
@@ -1041,6 +1080,30 @@ impl Engine {
                 }
                 if !self.homed {
                     return Err("HOME_REQUIRED");
+                }
+                if !self.preview {
+                    self.verify_current_nano_reference()?;
+                    let frames = match scan::load_resume_frames(&self.parameters, self.set_kv, self.set_ua) {
+                        Ok(frames) => frames,
+                        Err(error) => {
+                            self.last_error = Some(error.clone());
+                            self.log("ERR", "system", &format!("Scan Restore rejected: {error}"));
+                            return Err("RESTORE_VALIDATION_FAILED");
+                        }
+                    };
+                    self.current = frames.len() as u32;
+                    self.real_frames = frames.iter()
+                        .map(|frame| serde_json::to_value(frame).unwrap_or_else(|_| json!({})))
+                        .collect();
+                    self.restored_frames = frames;
+                    self.scan_angle_deg = Some(0.0);
+                    self.phase = Phase::Ready;
+                    self.last_error = None;
+                    self.log("PASS", "system", &format!(
+                        "Restore verified {} committed NEFs · live Nano reference confirmed · Start continues at view {}",
+                        self.current, self.current + 1
+                    ));
+                    return Ok(());
                 }
                 self.current = (self.parameters.projection_count / 3).max(1);
                 self.phase = Phase::Paused;
@@ -1517,6 +1580,20 @@ impl Engine {
         if self.connected { Ok(()) } else { Err("NOT_CONNECTED") }
     }
 
+    fn verify_current_nano_reference(&mut self) -> Result<(), &'static str> {
+        let nano = self.nano.as_ref().ok_or("NANO_NOT_CONNECTED")?.clone();
+        let status = nano.status()
+            .map_err(|error| self.nano_error("Nano reference STATUS failed", error))?;
+        if !nano_reference_ready(&status) {
+            self.homed = false;
+            self.phase = Phase::ReadyForHome;
+            self.last_error = Some("Nano reference is no longer valid; HOME required".into());
+            self.log("WARN", "nano", "Nano reference invalid or position unsettled · HOME required before exposure");
+            return Err("HOME_REQUIRED");
+        }
+        Ok(())
+    }
+
     fn log(&mut self, level: &str, source: &str, message: &str) {
         self.logs.insert(0, json!({
             "id": format!("{}-{}", self.sequence, timestamp()),
@@ -1610,6 +1687,9 @@ impl Engine {
         let data_state = self.data_state();
         let configured = self.parameters.validate().is_ok()
             && (1..=600).contains(&self.max_xray_sec);
+        let checkpoint_available = if self.preview { self.current > 0 || self.logs.iter().any(|entry| entry["message"].as_str().is_some_and(|message| message.contains("Preview scan ended"))) }
+            else { configured && self.phase != Phase::Completed && scan::resume_manifest_exists(&self.parameters) };
+        let pending_restore = !self.preview && checkpoint_available && self.restored_frames.is_empty();
         let is_preview = self.preview;
         let nano_health = self.nano.as_ref().map(|nano| nano.health());
         let angle_known = self.phase != Phase::Stopping && (self.preview || nano_health.as_ref().and_then(confirmed_nano_angle).is_some());
@@ -1675,7 +1755,7 @@ impl Engine {
         } else {
             "PRODUCTION LOCKED · NANO DISCONNECTED".to_owned()
         };
-        let device_tone = if self.phase == Phase::Fault || nano_faulted { "danger" } else if self.connected { "accent" } else { "muted" };
+        let device_tone = if nano_faulted { "danger" } else if nano_connected || self.preview { "accent" } else { "muted" };
         let xray_text = match beam_state {
             "on" => if self.preview { "PREVIEW BEAM" } else { "EMITTING" },
             "off" => if self.preview { "PREVIEW OFF" } else { "OFF CONFIRMED" },
@@ -1781,18 +1861,19 @@ impl Engine {
             },
             "dock":{
                 "home":self.connected && self.preflight && !self.busy() && !self.fault_latched,
-                "play":self.connected && !self.fault_latched && ((self.phase == Phase::Running || self.phase == Phase::Paused) || (!self.busy() && self.preflight && self.homed && (self.preview || (self.usb_auto_shut_down_confirmed && !self.usb_auto_shut_down)))),
-                "restore":self.preview && self.connected && !self.busy() && self.preflight && self.homed && !self.fault_latched && !matches!(self.phase, Phase::Fault | Phase::Stopped),
+                "play":self.connected && !self.fault_latched && !pending_restore && ((self.phase == Phase::Running || self.phase == Phase::Paused) || (!self.busy() && self.preflight && self.homed && (self.preview || (self.usb_auto_shut_down_confirmed && !self.usb_auto_shut_down)))),
+                "restore":checkpoint_available && self.connected && !self.busy() && self.preflight && self.homed && !self.fault_latched && !matches!(self.phase, Phase::Fault | Phase::Stopped),
                 "stop":matches!(self.phase, Phase::Running | Phase::Paused | Phase::Finishing),
                 "playMode":if self.phase == Phase::Running {"pause"} else if self.phase == Phase::Paused {"resume"} else if matches!(self.phase, Phase::Fault | Phase::Finishing | Phase::Stopping) {"disabled"} else {"start"},
                 "homeReason":if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to revalidate device safety"} else if !self.preflight {"Complete scan setup and run Preflight first"} else if self.busy() {"HOME is unavailable while a scan is active"} else {""},
-                "playReason":if self.phase == Phase::Running {"Pause after the active transaction closes"} else if self.phase == Phase::Paused {"Resume the paused scan"} else if matches!(self.phase, Phase::Finishing | Phase::Stopping) {"Wait for scan cleanup"} else if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to recover"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if !self.preview && (!self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down) {"Disable USB Auto Shut Down manually in the X-ray panel"} else {""}
+                "restoreReason":if !configured {"Complete valid scan parameters first"} else if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to recover from the device fault"} else if self.busy() {"Restore is unavailable while a scan is active"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if !checkpoint_available {"No unfinished scan checkpoint was found"} else if !self.restored_frames.is_empty() {"Checkpoint already verified; Start continues at the next view"} else {""},
+                "playReason":if self.phase == Phase::Running {"Pause after the active transaction closes"} else if self.phase == Phase::Paused {"Resume the paused scan"} else if matches!(self.phase, Phase::Finishing | Phase::Stopping) {"Wait for scan cleanup"} else if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to recover"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if pending_restore {"Run Restore to verify the saved frames before Start"} else if !self.preview && (!self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down) {"Disable USB Auto Shut Down manually in the X-ray panel"} else {""}
             },
             "scanSetup":{
                 "savePath":self.parameters.save_path,"taskId":self.parameters.task_id,"projectionCount":total,
                 "angleStepDeg":self.parameters.angle_step_deg,"exposureMs":self.parameters.exposure_ms,"maxXraySec":self.max_xray_sec
             },
-            "consoleLogs":console_logs,"frames":frames,"checkpointAvailable":self.current > 0
+            "consoleLogs":console_logs,"frames":frames,"checkpointAvailable":checkpoint_available
         })
     }
 
@@ -1973,6 +2054,32 @@ mod tests {
         health.status.as_mut().unwrap().reference_valid = true;
         health.status.as_mut().unwrap().pulses_per_rev = 0;
         assert_eq!(confirmed_nano_angle(&health), None);
+    }
+
+    #[test]
+    fn a_second_scan_may_reuse_only_a_live_idle_nano_reference() {
+        let mut status = NanoStatus {
+            state: "IDLE".into(), position_pulses: -73_067, target_pulses: -73_067,
+            microsteps: 8, pulses_per_rev: 96_000, reference_valid: true,
+            homed: true, rearmed: true, hall_active: false, capture_id: 0,
+        };
+        assert!(nano_reference_ready(&status));
+        assert!(!may_reuse_home(false, &status), "a new app process must perform its first HOME");
+        assert!(may_reuse_home(true, &status), "later scans may reuse a live valid reference");
+        status.reference_valid = false;
+        assert!(!nano_reference_ready(&status));
+        status.reference_valid = true;
+        status.rearmed = false;
+        assert!(!nano_reference_ready(&status));
+        status.rearmed = true;
+        status.state = "FAULT".into();
+        assert!(!nano_reference_ready(&status));
+        status.state = "IDLE".into();
+        status.target_pulses -= 1;
+        assert!(!nano_reference_ready(&status));
+        status.target_pulses = status.position_pulses;
+        status.capture_id = 1;
+        assert!(!nano_reference_ready(&status));
     }
 
     #[test]

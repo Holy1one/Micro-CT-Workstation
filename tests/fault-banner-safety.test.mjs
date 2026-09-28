@@ -204,7 +204,7 @@ function workstation(overrides = {}) {
     },
     summary: { savePath: "", acquisition: "Scan setup not configured", output: beamState === "unknown" ? "OUTPUT UNKNOWN · READBACK REQUIRED" : "OUTPUT OFF", ...summary },
     statusbar: { left: "PRODUCTION LOCKED · SETUP REQUIRED", right: "ct-engine · JSONL v1 · LOCKED", dotTone: "muted", ...statusbar },
-    dock: { home: false, play: false, restore: false, stop: false, playMode: "start", homeReason: "Connect the Nano first", playReason: "Connect the Nano first", ...dock },
+    dock: { home: false, play: false, restore: false, stop: false, playMode: "start", homeReason: "Connect the Nano first", restoreReason: "Connect the Nano first", playReason: "Connect the Nano first", ...dock },
     scanSetup: { savePath: "", taskId: "", projectionCount: 0, angleStepDeg: 0, exposureMs: 0, maxXraySec: 600, ...scanSetup },
     consoleLogs,
     frames,

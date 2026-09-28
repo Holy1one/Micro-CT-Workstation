@@ -19,7 +19,7 @@ import {
   TURNTABLE,
   trackContactPose,
 } from "./scene-config";
-import { StageSurroundings } from "./stage-surroundings";
+import { StageSurroundings, STAGE_SHADOW_Y } from "./stage-surroundings";
 import type { SceneTheme, SceneViewModel } from "./types";
 
 // Optical axis: light grey, and deliberately kept out of the theme tokens so it
@@ -1350,7 +1350,7 @@ export function EquipmentScene({ view, status, reducedMotion, theme }: {
         transparent
         opacity={0.9}
       />
-      <mesh position={[0, RING_TRACK.bottomY + 0.1, 0]} rotation={[-Math.PI / 2, 0, 0]} userData={{ excludeFromFit: true }}>
+      <mesh position={[0, STAGE_SHADOW_Y, 0]} rotation={[-Math.PI / 2, 0, 0]} userData={{ excludeFromFit: true }}>
         <planeGeometry args={[1000, 1000]} />
         <shadowMaterial color={theme.sceneLine} transparent opacity={0.18} />
       </mesh>

@@ -332,6 +332,7 @@ export class WorkstationAdapter implements EngineAdapter {
       stop: phase === "scanning" || phase === "paused" || phase === "finishing",
       playMode: phase === "scanning" ? "pause" : phase === "paused" ? "resume" : phase === "fault" || phase === "finishing" || phase === "stopping" ? "disabled" : "start",
       homeReason: phase === "fault" ? "Run Preflight to recover from the device fault" : !wf.preflightPassed ? "Run Preflight first" : "",
+      restoreReason: !wf.checkpointAvailable ? "No unfinished scan checkpoint was found" : !wf.preflightPassed ? "Run Preflight first" : !wf.homed ? "Run HOME first" : "",
       playReason: phase === "fault" ? "Run Preflight and HOME to recover from the device fault" : !wf.preflightPassed ? "Run Preflight first" : !wf.homed ? "Run HOME first" : "",
     };
 

@@ -161,6 +161,7 @@ impl EngineClient {
             .map_err(|error| error.to_string())?;
         let timeout = match command {
             "home" => Duration::from_secs(310),
+            "restore_previous" => Duration::from_secs(300),
             "connect" => Duration::from_secs(30),
             "camera_test_capture" => Duration::from_secs(75),
             "preflight" | "retry_device" => Duration::from_secs(20),

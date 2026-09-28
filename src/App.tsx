@@ -5,7 +5,7 @@
  * decisions; those remain authoritative in ct-engine.
  */
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -86,17 +86,25 @@ function logTime(timestamp: string): string {
 function HelpTip({ text, align = "start", side = "down" }: { text: string; align?: "start" | "end"; side?: "down" | "up" }) {
   const id = useId();
   const button = useRef<HTMLButtonElement>(null);
+  const bubble = useRef<HTMLSpanElement>(null);
   const [visible, setVisible] = useState(false);
   const [position, setPosition] = useState({ top: 0, left: 0 });
-  const show = useCallback(() => {
+  const show = useCallback(() => setVisible(true), []);
+  useLayoutEffect(() => {
+    if (!visible) return;
     const rect = button.current?.getBoundingClientRect();
-    if (!rect) return;
+    const tip = bubble.current;
+    if (!rect || !tip) return;
+    const margin = 8;
+    const width = tip.offsetWidth;
+    const height = tip.offsetHeight;
+    const preferredLeft = align === "end" ? rect.right + margin - width : rect.left - margin;
+    const preferredTop = side === "up" ? rect.top - margin - height : rect.bottom + margin;
     setPosition({
-      top: side === "up" ? rect.top - 7 : rect.bottom + 7,
-      left: align === "end" ? rect.right + 8 : rect.left - 8,
+      top: Math.max(margin, Math.min(preferredTop, window.innerHeight - height - margin)),
+      left: Math.max(margin, Math.min(preferredLeft, window.innerWidth - width - margin)),
     });
-    setVisible(true);
-  }, [align, side]);
+  }, [visible, align, side, text]);
   return (
     <>
       <button
@@ -114,10 +122,11 @@ function HelpTip({ text, align = "start", side = "down" }: { text: string; align
       </button>
       {visible && createPortal(
         <span
+          ref={bubble}
           id={id}
           className="help-tip__bubble"
           role="tooltip"
-          style={{ top: position.top, left: position.left, transform: `translate(${align === "end" ? "-100%" : "0"}, ${side === "up" ? "-100%" : "0"})` }}
+          style={{ top: position.top, left: position.left }}
         >{text}</span>,
         document.body,
       )}
@@ -221,7 +230,7 @@ function MenuBar({
       <div className="workstation-brand" data-tauri-drag-region>
         <img src="/assets/micro-ct-logo.png" alt="" draggable={false} />
         <strong>Micro-CT Workstation</strong>
-        <span>v0.7.0</span>
+        <span>v0.7.8</span>
       </div>
       <nav className="sys-menu" aria-label="Application menu">
         {MENU_GROUPS.map((group) => {
@@ -827,9 +836,9 @@ function hasCompleteFirstStartWorkstation(ws: WorkstationView): boolean {
     ![ws.summary.savePath, ws.summary.acquisition, ws.summary.output].every(isString)) return false;
   if (!hasExactOwnKeys(ws.statusbar, ["left", "right", "dotTone"]) ||
     ![ws.statusbar.left, ws.statusbar.right, ws.statusbar.dotTone].every(isString)) return false;
-  if (!hasExactOwnKeys(ws.dock, ["home", "play", "restore", "stop", "playMode", "homeReason", "playReason"])) return false;
+  if (!hasExactOwnKeys(ws.dock, ["home", "play", "restore", "stop", "playMode", "homeReason", "restoreReason", "playReason"])) return false;
   if (![ws.dock.home, ws.dock.play, ws.dock.restore, ws.dock.stop].every((value) => typeof value === "boolean")) return false;
-  if (!isString(ws.dock.playMode) || !isString(ws.dock.homeReason) || !isString(ws.dock.playReason)) return false;
+  if (!isString(ws.dock.playMode) || !isString(ws.dock.homeReason) || !isString(ws.dock.restoreReason) || !isString(ws.dock.playReason)) return false;
   if (!hasExactOwnKeys(ws.scanSetup, ["savePath", "taskId", "projectionCount", "angleStepDeg", "exposureMs", "maxXraySec"])) return false;
   if (![ws.scanSetup.savePath, ws.scanSetup.taskId].every(isString) ||
     ![ws.scanSetup.projectionCount, ws.scanSetup.angleStepDeg, ws.scanSetup.exposureMs, ws.scanSetup.maxXraySec].every(isFiniteNumber)) return false;
@@ -1053,9 +1062,9 @@ export function deriveConsoleFeedback(
     return {
       state: "Fault",
       tone: "danger",
-      detail: ws.xray.latched
-        ? "Device fault latched · X-ray output disabled · preflight then HOME to recover"
-        : "Device fault · output and motion commands fail closed",
+      detail: snapshot.lastError
+        ? `Device fault latched · ${snapshot.lastError} · inspect the log and recover with Preflight then HOME`
+        : "Device fault latched · inspect the log and recover with Preflight then HOME",
       active: false,
     };
   }
@@ -1098,12 +1107,14 @@ export function deriveConsoleFeedback(
         active: true,
       };
     case "finishing":
-      // Projection progress may already read 100%, but return-to-start
-      // orientation, manifest commit and cleanup are still outstanding.
+      // Projection progress may read 100% while final position and manifest
+      // confirmation are still outstanding.
       return {
         state: "Finishing",
         tone: "warn",
-        detail: `All ${total} projections committed · returning to the start orientation, committing the manifest and cleaning up · not complete yet`,
+        detail: snapshot.mode === "developer_preview"
+          ? `All ${total} projections committed · simulated return and cleanup in progress`
+          : `All ${total} projections committed · verifying the final ${angleText} position, output OFF and manifest · not complete yet`,
         active: true,
       };
     case "stopping":
@@ -1117,7 +1128,9 @@ export function deriveConsoleFeedback(
       return {
         state: "Completed",
         tone: "ok",
-        detail: `Return to start orientation, manifest commit and cleanup confirmed · ${total} of ${total} projections stored`,
+        detail: snapshot.mode === "developer_preview"
+          ? `Simulated return and cleanup confirmed · ${total} of ${total} projections stored`
+          : `Final position ${angleText} and output OFF confirmed · manifest complete · ${total} of ${total} projections stored`,
         active: false,
       };
     case "stopped":
@@ -1400,7 +1413,7 @@ function ControlDock({
           variant="restore"
           icon="history"
           label="Restore"
-          title={setupInvalid ? "Complete valid scan parameters first" : "Restore the previous scan progress from the on-disk checkpoint"}
+          title={setupInvalid ? "Complete valid scan parameters first" : dock.restoreReason || "After Preflight and a valid Nano reference, verify saved frames; Start continues at the next view"}
           disabled={setupBlocked || !dock.restore}
           onClick={() => void dispatch({ type: "restore_previous" })}
         />
@@ -1501,15 +1514,6 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
           <i aria-hidden="true" />
           GEOMETRY VIEW · {stale ? "STATUS UNAVAILABLE" : "OPTICAL AXIS"}
         </span>
-        <div className="status-floats">
-          {ws.floats.map((float) => (
-            <span className="status-float" key={float.key}>
-              <i className={`status-float__dot ${toneClass(stale ? "muted" : float.tone)}`} aria-hidden="true" />
-              {float.key}
-              <b>{stale ? "UNKNOWN" : float.text}</b>
-            </span>
-          ))}
-        </div>
         <div className="scene-readout-block">
           <span className="scene-label">TURNTABLE ANGLE <HelpTip side="up" text="Latest confirmed turntable angle. The model follows confirmed feedback without predicting a position; reduced motion jumps directly between samples." /></span>
           <strong className="scene-readout">{stale || !ws.scene.angleKnown ? "—" : ws.scene.angleDeg.toFixed(2)}°</strong>
@@ -1552,10 +1556,13 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
     ws.xray.currentConfirmed && Number(uaDraft).toFixed(1) === ws.xray.setUa.toFixed(1);
   const pairConfirmed = voltageDraftConfirmed && currentDraftConfirmed;
   const scanLocked = ws.dataState === "scanning";
+  const faultLocked = ws.dataState === "fault" || ws.xray.latched;
   const beamState = stale ? "unknown" : ws.xray.beamState;
   const outputText = beamState === "on" ? "ON" : beamState === "off" ? "OFF · VERIFIED" : "UNKNOWN";
   const connected = !stale && ws.xray.connected;
-  const sourceHelp = scanLocked
+  const sourceHelp = faultLocked
+          ? "Device fault latched · manual beam enable is locked until device checks, Preflight and HOME complete"
+          : scanLocked
           ? "CT scan owns beam commands only · USB AUTO SHUT DOWN remains operator-controlled"
           : !ws.xray.connected
             ? "Connect the Moxtek before changing setpoints or device safety settings"
@@ -1577,8 +1584,9 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           {beamState === "on" ? "EMITTING" : connected ? "CONNECTED" : "NOT CONNECTED"}
         </span>
       </div>
-      <div className={`xray-mode-banner ${scanLocked ? "xray-mode-banner--locked" : "xray-mode-banner--manual"}`}>
-        <span>{scanLocked ? "Scan control · manual locked" : "Manual source control"}</span>
+      <div className="xray-panel__body">
+      <div className={`xray-mode-banner ${scanLocked || faultLocked ? "xray-mode-banner--locked" : "xray-mode-banner--manual"}`}>
+        <span>{faultLocked ? "Device fault · manual locked" : scanLocked ? "Scan control · manual locked" : "Manual source control"}</span>
         <strong className={beamState === "on" ? "tone-danger" : beamState === "off" ? "tone-ok" : "tone-muted"}>{outputText}</strong>
       </div>
       <button
@@ -1651,6 +1659,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
         type="button"
         className={`switch-btn switch-btn--block ${ws.xray.beamOn ? "switch-btn--on" : "switch-btn--idle"}`}
         disabled={busy || ws.dataState === "fault" || !ws.xray.manualControlsEnabled}
+        title={faultLocked ? "Device fault latched · inspect the log, then repeat Preflight and HOME" : scanLocked ? "The scan owns X-ray output" : !ws.xray.connected ? "Connect the X-ray source first" : busy ? "Wait for the current command" : "Manual X-ray output control"}
         onClick={() => void dispatch({ type: "xray_toggle" })}
       >
         {ws.xray.beamOn ? "Xray Disable" : "Xray Enable"}
@@ -1684,6 +1693,8 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
               ? "TIMER ARMED"
               : scanLocked
                 ? "RELEASED · SCAN OWNED"
+                : faultLocked
+                  ? "RELEASED · FAULT LOCKED"
                 : "RELEASED · MANUAL"}
           </span>
         </div>
@@ -1720,6 +1731,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           </button>
           <span className="delay-row__device">Device {stale ? "—" : ws.xray.usbShutdownDelay ?? "—"}</span>
         </div>
+      </div>
       </div>
 
     </section>
@@ -1763,10 +1775,6 @@ function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws:
       </div>
       <div className="op-summary">
         <span className="op-summary__title">PROCESS SUMMARY</span>
-        <div>
-          <span>Save Path</span>
-          <strong title={ws.summary.savePath}>{ws.summary.savePath || "Not selected"}</strong>
-        </div>
         <div>
           <span>Acquisition</span>
           <strong>{ws.summary.acquisition}</strong>
@@ -1851,7 +1859,9 @@ function FrameThumbnail({ frame, production }: { frame: ConsoleFrame; production
     return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [frame.index, frame.sha256, production, visible]);
   return <div className="image-tile image-tile--captured" ref={element} title={failure || frame.fileName}>
-    {url ? <img src={url} alt={`Camera projection ${frame.index}`} /> : <span>{failure ? "Preview unavailable" : production ? "Loading image…" : "Offline preview"}</span>}
+    <div className="image-tile__image">
+      {url ? <img src={url} alt={`Camera projection ${frame.index}`} /> : <span>{failure ? "Preview unavailable" : production ? "Loading image…" : "Offline preview"}</span>}
+    </div>
     <div className="image-tile__caption"><strong>VIEW {String(frame.index).padStart(2, "0")}</strong><span>{frame.angleDeg.toFixed(2)}° · {frame.exposureMs} ms</span></div>
   </div>;
 }
@@ -1860,6 +1870,7 @@ function BottomConsole({ ws, production }: { ws: WorkstationView; production: bo
   const [tab, setTab] = useState<BottomTab>("aggregate");
   const [follow, setFollow] = useState(true);
   const logs = ws.consoleLogs;
+  const frames = useMemo(() => [...ws.frames].sort((a, b) => a.index - b.index), [ws.frames]);
   const filtered = useMemo(() => {
     if (tab === "aggregate" || tab === "images") return logs;
     return logs.filter((entry) => entry.source === tab);
@@ -1907,13 +1918,10 @@ function BottomConsole({ ws, production }: { ws: WorkstationView; production: bo
         )}</div>
         {tab === "images" ? (
           <div className="image-strip">
-            {ws.progress.total === 0 && <div className="log-empty">No projections yet. Configure a scan task to view its image sequence.</div>}
-            {Array.from({ length: ws.progress.total }, (_, index) => {
-              const frame = ws.frames.find((item) => item.index === index + 1);
-              return frame ?
-                <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} /> :
-                <div className="image-tile" key={index}><strong>VIEW {String(index + 1).padStart(2, "0")}</strong><span>queued</span></div>;
-            })}
+            {frames.length === 0 && <div className="image-strip__empty">No projections yet. Configure a scan task to view its image sequence.</div>}
+            {frames.map((frame) => (
+              <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} />
+            ))}
           </div>
         ) : (
           <LogLines logs={filtered} follow={follow} onFollow={setFollow} />
@@ -1945,7 +1953,7 @@ const DIALOG_ICONS: Record<DialogKind, LineIconName> = {
   diagnostics: "pulse",
 };
 
-const APP_VERSION = "0.7.0";
+const APP_VERSION = "0.7.8";
 
 function InfoDialog({
   kind,
@@ -1977,8 +1985,8 @@ function InfoDialog({
           rejects exposure until they pass.
         </li>
         <li>
-          <strong>Home all axes</strong> (Tools → Home All Axes, or the dock). HOME is required before any
-          exposure and is invalidated whenever a parameter changes.
+          <strong>Establish a turntable reference.</strong> Run HOME once. Later scans in the same valid Nano
+          session may reuse it after live STATUS and Preflight confirm the controller is idle and referenced.
         </li>
         <li>
           <strong>Start the scan.</strong> Pause takes effect after a safe projection boundary, Resume continues,
@@ -1986,6 +1994,12 @@ function InfoDialog({
         </li>
         <li>
           <strong>After Stop</strong> run Preflight and HOME again before starting a new scan.
+        </li>
+        <li>
+          <strong>Continue an unfinished scan.</strong> Keep the same task ID, save path, projection count,
+          exposure and X-ray setpoints. Run Preflight; HOME is needed if Nano reports an invalid reference.
+          Restore verifies the manifest and each saved image. Start continues at the next missing
+          view without replacing previously committed images.
         </li>
       </ol>
     );
@@ -1997,12 +2011,12 @@ function InfoDialog({
           then invalidates Preflight and HOME. A physical emergency stop remains part of the hardware safety system.
         </li>
         <li>
-          <strong>Preflight before HOME, HOME before exposure.</strong> The engine rejects HOME without
-          preflight and rejects exposure without HOME.
+          <strong>Preflight before exposure.</strong> The engine requires a live, valid Nano reference.
+          HOME establishes it when the controller reports none; STOP or a lost reference requires HOME again.
         </li>
         <li>
           <strong>Any parameter change invalidates the safety chain.</strong> Editing Task ID, Save Path,
-          projections, exposure or Max X-ray resets preflight and HOME.
+          projections, exposure or Max X-ray resets preflight; a still valid Nano reference is checked again.
         </li>
         <li>
           <strong>{snapshot.mode === "developer_preview" ? "This build drives no hardware." : "Stage 1 controls the Nano turntable only."}</strong>{" "}
@@ -2207,9 +2221,9 @@ export function App() {
         : snapshot?.preflightPassed
           ? ok
           : blocked("preflight required"),
-      "tools.restorePrevious": ws?.checkpointAvailable
+      "tools.restorePrevious": ws?.dock.restore
         ? ok
-        : blocked("no checkpoint"),
+        : blocked(ws?.dock.restoreReason || "no checkpoint"),
       "tools.deviceDiagnostics": ok,
       "help.userGuide": ok,
       "help.safetyNotes": ok,

@@ -788,7 +788,7 @@ fn transact_transport(
     let mut response = vec![0; expected_length];
     transport
         .read_exact_bytes(&mut response)
-        .map_err(|error| XrayError::Transport(format!("read failed: {error}")))?;
+        .map_err(|error| XrayError::Transport(format!("read failed for command 0x{command:02X}: {error}")))?;
     if response.len() < 3
         || response[0] != PACKET_HEADER
         || response[1] != command
@@ -1259,6 +1259,7 @@ mod tests {
         assert!(health.beam_on && !health.beam_off_confirmed);
         assert!(health.telemetry_warning.as_deref().is_some_and(|message| {
             message.contains("ON acknowledgement timed out")
+                && message.contains("command 0x42")
                 && message.contains("independent 0x43/0x80 verification")
         }));
         assert!(state.lock().unwrap().enabled);

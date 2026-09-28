@@ -225,6 +225,7 @@ export interface WorkstationView {
     stop: boolean;
     playMode: "start" | "pause" | "resume" | "disabled";
     homeReason: string;
+    restoreReason: string;
     playReason: string;
   };
   scanSetup: ScanSetup;

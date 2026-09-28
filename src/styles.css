@@ -272,6 +272,7 @@ button[aria-busy="true"] { cursor: progress; }
 .workspace-body > .console { grid-column: 1 / 3; grid-row: 3 / 4; }
 
 .col { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 12px; min-height: 0; overflow: hidden; }
+.main-console > .col { grid-template-rows: 310px minmax(0, 1fr); }
 
 /* Unchanged right-hand geometry: the X-ray panel ends at the shared upper
    line and Operation Status starts 12px below it at a fixed 306px height. */
@@ -344,9 +345,10 @@ i.tone-danger { background: var(--danger); }
 
 /* ---------- device connection panel ---------- */
 
-.device-list { display: flex; flex-direction: column; }
+.device-list { display: flex; flex: 0 0 168px; flex-direction: column; min-height: 0; }
 
-.device-row { padding: 7px 14px; border-bottom: 1px solid var(--line); }
+.device-row { display: flex; flex: 1 1 0; align-items: center; min-height: 0; padding: 7px 14px; border-bottom: 1px solid var(--line); }
+.device-row__top { width: 100%; }
 .device-row__top { display: flex; align-items: center; gap: 8px; }
 .device-row__icon { flex: 0 0 auto; color: var(--textMuted); }
 .device-row__top strong { font-size: var(--fontSizeBody); font-weight: 600; color: var(--textPrimary); }
@@ -367,12 +369,12 @@ i.tone-danger { background: var(--danger); }
 .retry-btn { margin-left: 2px; }
 .preflight-btn { color: var(--onAccent); background: var(--accent); border-color: var(--accent); }
 
-.preflight-block { padding: 8px 14px 6px; }
+.preflight-block { display: flex; flex: 1 1 auto; flex-direction: column; justify-content: center; padding: 8px 14px; }
 .preflight-block__top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .preflight-block__top strong { font-size: 11px; font-weight: 700; letter-spacing: 0.03em; }
 .preflight-block .preflight { margin: 6px 0 4px; height: 8px; border-radius: 4px; }
 .preflight-block__sub { font-size: var(--fontSizeHint); color: var(--textMuted); }
-.device-online-summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 14px; border-top: 1px solid var(--line); background: var(--panelHeader); }
+.device-online-summary { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 14px; border-top: 1px solid var(--line); background: var(--panelHeader); }
 .device-online-summary span { font-size: var(--fontSizeHint); font-weight: 700; letter-spacing: 0.06em; color: var(--textMuted); }
 .device-online-summary strong { font-family: var(--fontMono); font-size: var(--fontSizeHint); color: var(--textSecondary); white-space: nowrap; }
 
@@ -452,7 +454,7 @@ i.tone-danger { background: var(--danger); }
   font-size: var(--fontSizeHint);
   letter-spacing: 0.04em;
 }
-.live-indicator, .status-floats, .scene-readout-block { z-index: 3; pointer-events: none; }
+.live-indicator, .scene-readout-block { z-index: 3; pointer-events: none; }
 
 .live-indicator {
   position: absolute;
@@ -467,19 +469,6 @@ i.tone-danger { background: var(--danger); }
   color: var(--textPrimary);
 }
 .live-indicator i { width: 6px; height: 6px; border-radius: 3px; background: var(--ok); }
-
-.status-floats {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 8px;
-}
-.status-float { position: static; display: inline-flex; flex-direction: row; flex-wrap: nowrap; align-items: center; white-space: nowrap; }
-.status-float b { font-weight: 700; }
-.status-float__dot { display: inline-block; }
 
 .scene-readout-block {
   position: absolute;
@@ -764,6 +753,23 @@ i.tone-danger { background: var(--danger); }
 
 /* ---------- 12 watt controller ---------- */
 
+.xray-panel__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px;
+}
+.xray-panel__body > .xray-mode-banner,
+.xray-panel__body > .safety-block { margin: 0; }
+.xray-panel__body > .switch-btn--block { width: 100%; margin: 0; }
+.xray-panel__body > .xray-channels,
+.xray-panel__body > .xray-meters,
+.xray-panel__body > .timer-row { padding: 0; }
+.xray-panel__body > .panel__divider { margin: 0; }
+
 .xray-mode-banner {
   display: flex;
   align-items: center;
@@ -786,7 +792,7 @@ i.tone-danger { background: var(--danger); }
 
 .xray-channels { display: flex; flex-direction: column; gap: 8px; padding: 8px 14px 0; }
 .xray-channel__label { display: block; font-size: var(--fontSizeHint); font-weight: 600; letter-spacing: 0.04em; color: var(--textMuted); margin-bottom: 5px; }
-.xray-channel__row { display: grid; grid-template-columns: minmax(0, 1fr) 76px; align-items: stretch; gap: 10px; }
+.xray-channel__row { display: grid; grid-template-columns: minmax(0, 1fr) 82px; align-items: stretch; gap: 8px; }
 .xray-channel__control { display: grid; grid-template-columns: 28px minmax(0, 1fr) 110px; align-items: center; gap: 8px; height: 44px; padding: 0 10px; border-radius: 9px; border: 1px solid var(--lineStrong); background: var(--well); }
 .xray-channel__key { font-size: var(--fontSizeHint); font-weight: 700; letter-spacing: 0.06em; color: var(--textSecondary); }
 .xray-channel__well {
@@ -805,7 +811,7 @@ i.tone-danger { background: var(--danger); }
 
 .send-btn {
   height: 40px;
-  padding: 0 12px;
+  padding: 0 6px;
   border: 0;
   border-radius: 8px;
   background: var(--accent);
@@ -813,6 +819,7 @@ i.tone-danger { background: var(--danger); }
   font-size: var(--fontSizeLabel);
   font-weight: 700;
   letter-spacing: 0.03em;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -995,14 +1002,14 @@ i.tone-danger { background: var(--danger); }
 .op-feedback__row.tone-danger .op-feedback__detail { color: var(--dangerText); }
 
 .op-feedback__states {
-  display: flex;
-  flex-direction: row;
-  flex-wrap: nowrap;
-  align-items: center;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 3px;
 }
 .op-feedback__chip {
-  flex: 0 0 auto;
+  min-width: 0;
+  text-align: center;
+  white-space: nowrap;
   padding: 2px 4px;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -1052,13 +1059,16 @@ i.tone-danger { background: var(--danger); }
 
 .console {
   display: grid;
-  grid-template-columns: 178px minmax(0, 1fr);
+  grid-template-columns: 214px minmax(0, 1fr);
   min-height: 0;
   background: var(--consoleBg);
   transition: background-color var(--durSlow) var(--easeOut);
 }
 
 .console__tabs { min-height: 0; overflow: hidden; }
+.console__tab { min-width: 0; white-space: nowrap; }
+.console__tab em { min-width: 0; }
+.console__tab span { flex: 0 0 auto; }
 .console__tab span { font-size: var(--fontSizeHint); font-family: var(--fontMono); color: var(--textMuted); }
 .console__tab[aria-selected="true"] span { color: var(--textPrimary); }
 
@@ -1093,16 +1103,29 @@ i.tone-danger { background: var(--danger); }
 
 .image-strip {
   flex: 1 1 auto;
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  overflow-x: auto;
-  padding: 4px 14px 14px;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-auto-rows: max-content;
+  align-content: start;
+  column-gap: 6px;
+  row-gap: 8px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+.image-strip__empty {
+  grid-column: 1 / -1;
+  padding: 12px 4px;
+  color: var(--textMuted);
+  font-size: 14px;
+  line-height: 1.4;
 }
 .image-tile {
-  flex: 0 0 216px;
-  height: 128px;
-  border-radius: 12px;
+  min-width: 0;
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  border-radius: 6px;
   background: var(--well);
   border: 1px solid var(--line);
   display: flex;
@@ -1115,10 +1138,12 @@ i.tone-danger { background: var(--danger); }
 .image-tile--captured:hover { transform: translateY(-2px); box-shadow: var(--shadowFloat); }
 .image-tile strong { font-size: 11px; font-weight: 600; letter-spacing: 0.05em; color: var(--textMuted); }
 .image-tile span { font-size: var(--fontSizeHint); font-family: var(--fontMono); color: var(--textMuted); }
-.image-tile--captured { position: relative; overflow: hidden; background: var(--well); }
-.image-tile--captured img { width: 100%; height: 100%; object-fit: contain; }
-.image-tile__caption { position: absolute; bottom: 0; left: 0; right: 0; display: flex; justify-content: space-between; gap: 4px; padding: 5px 8px; background: var(--panel); }
+.image-tile--captured { aspect-ratio: auto; overflow: hidden; gap: 0; justify-content: flex-start; background: var(--well); content-visibility: auto; contain-intrinsic-size: auto 150px; }
+.image-tile__image { width: 100%; aspect-ratio: 3 / 2; display: grid; place-items: center; overflow: hidden; }
+.image-tile__image img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.image-tile__caption { width: 100%; display: flex; justify-content: space-between; gap: 4px; padding: 4px 6px; background: var(--panel); white-space: nowrap; }
 .image-tile__caption strong { color: var(--textPrimary); }
+.image-tile__caption span { overflow: hidden; text-overflow: ellipsis; }
 
 /* ---------- status bar (30px) ---------- */
 
@@ -1147,7 +1172,6 @@ i.tone-danger { background: var(--danger); }
 .operation-panel .op-progress { flex: 0 0 auto; }
 .operation-panel .op-summary { flex: 1 1 auto; }
 .xray-channels { flex: 0 0 auto; }
-.device-list { flex: 0 0 auto; }
 
 /* Larger, obvious numeric entry wells: they now absorb the column space that
    previously stayed empty under the fields. */
@@ -1272,8 +1296,11 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
   position: fixed;
   z-index: 1000;
   width: max-content;
-  max-width: 250px;
+  max-width: min(250px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   white-space: normal;
+  overflow-wrap: anywhere;
   text-align: left;
   padding: 7px 10px;
   border-radius: 8px;
@@ -1291,7 +1318,7 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
   pointer-events: none;
 }
 /* 视口覆盖层默认不接收指针，唯独问号需要可悬停 */
-.scene-readout-block .help-tip, .status-floats .help-tip { pointer-events: auto; }
+.scene-readout-block .help-tip { pointer-events: auto; }
 .numeric-field > span { display: flex; align-items: center; justify-content: space-between; gap: 3px; font-size: 11.5px; white-space: nowrap; }
 .scan-input-error { padding: 8px 10px; color: var(--dangerText); background: var(--dangerSoft); border-radius: 6px; font-size: 12px; line-height: 1.45; }
 .xray-channel__label .help-tip { margin-left: auto; }

@@ -18,6 +18,25 @@ import type { SceneTheme } from "./types";
 const STAGE_RADIUS = 4000;
 const GARDEN_RADIUS = 560;
 const TABLE_Y = RING_TRACK.bottomY;
+const POND_RADIUS = 310;
+const POND_Y = TABLE_Y - 27;
+const PLINTH_BOTTOM_Y = TABLE_Y - 136;
+export const STAGE_SHADOW_Y = PLINTH_BOTTOM_Y - 11;
+const DRAIN_ANGLES = [0.36, 1.13] as const;
+const DRAIN_HALF_ANGLE = 0.055;
+const WALL_ARCS = [
+  [0, DRAIN_ANGLES[0] - DRAIN_HALF_ANGLE],
+  [DRAIN_ANGLES[0] + DRAIN_HALF_ANGLE, DRAIN_ANGLES[1] - DRAIN_HALF_ANGLE],
+  [DRAIN_ANGLES[1] + DRAIN_HALF_ANGLE, Math.PI * 2],
+] as const;
+// RingGeometry starts at +X; CylinderGeometry starts at +Z. Both arc sets
+// therefore describe the same two radial openings in world coordinates.
+const DECK_DRAIN_ANGLES = DRAIN_ANGLES.map((angle) => (angle - Math.PI / 2 + Math.PI * 2) % (Math.PI * 2)).sort((a, b) => a - b);
+const DECK_ARCS = [
+  [0, DECK_DRAIN_ANGLES[0] - DRAIN_HALF_ANGLE],
+  [DECK_DRAIN_ANGLES[0] + DRAIN_HALF_ANGLE, DECK_DRAIN_ANGLES[1] - DRAIN_HALF_ANGLE],
+  [DECK_DRAIN_ANGLES[1] + DRAIN_HALF_ANGLE, Math.PI * 2],
+] as const;
 
 const SHRUB_POSITIONS: readonly [number, number, number][] = [
   [-480, -180, 18], [-500, 20, 21], [-430, 285, 16],
@@ -56,6 +75,51 @@ function MiniatureTree({ x, z, night }: { x: number; z: number; night: boolean }
       <mesh position={[0, 68, 0]}>
         <coneGeometry args={[15, 39, 7]} />
         <meshStandardMaterial color={night ? "#507070" : "#91bd90"} flatShading roughness={1} />
+      </mesh>
+    </group>
+  );
+}
+
+/** A fixed mesh cascade: the open wall and pale vertical ribs suggest motion
+ * without a texture upload or a continuously running render loop. */
+function Cascade({ angle, night }: { angle: number; night: boolean }) {
+  const radius = GARDEN_RADIUS;
+  const x = Math.sin(angle);
+  const z = Math.cos(angle);
+  const water = night ? "#528b9b" : "#73bac5";
+  const glint = night ? "#a4cbd0" : "#e0f8ee";
+  const fallHeight = POND_Y - PLINTH_BOTTOM_Y;
+  return (
+    <group>
+      <group position={[x * 435, POND_Y - 1, z * 435]} rotation={[0, angle, 0]}>
+        <mesh>
+          <boxGeometry args={[42, 2.5, 254]} />
+          <meshStandardMaterial color={water} roughness={0.25} metalness={0.12} />
+        </mesh>
+        <mesh position={[-12, 1.6, 0]}>
+          <boxGeometry args={[4, 0.8, 248]} />
+          <meshBasicMaterial color={glint} transparent opacity={0.7} />
+        </mesh>
+      </group>
+      <group position={[x * (radius + 2), (POND_Y + PLINTH_BOTTOM_Y) / 2, z * (radius + 2)]} rotation={[0, angle, 0]}>
+        <mesh>
+          <planeGeometry args={[53, fallHeight]} />
+          <meshStandardMaterial color={water} side={THREE.DoubleSide} roughness={0.18} metalness={0.12} />
+        </mesh>
+        {[-17, -3, 13].map((offset, index) => (
+          <mesh key={offset} position={[offset, 0, 0.8]}>
+            <planeGeometry args={[index === 1 ? 3 : 5, fallHeight - 5]} />
+            <meshBasicMaterial color={glint} side={THREE.DoubleSide} transparent opacity={index === 1 ? 0.78 : 0.45} depthWrite={false} />
+          </mesh>
+        ))}
+      </group>
+      <mesh position={[x * (radius + 27), PLINTH_BOTTOM_Y + 4, z * (radius + 27)]} rotation={[-Math.PI / 2, 0, 0]}>
+        <circleGeometry args={[31, 16]} />
+        <meshStandardMaterial color={water} roughness={0.3} metalness={0.08} />
+      </mesh>
+      <mesh position={[x * (radius + 27), PLINTH_BOTTOM_Y + 5, z * (radius + 27)]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[21, 25, 20]} />
+        <meshBasicMaterial color={glint} transparent opacity={0.65} depthWrite={false} />
       </mesh>
     </group>
   );
@@ -205,7 +269,7 @@ export function StageSurroundings({ theme }: { theme: SceneTheme }) {
 
   return (
     <group>
-      <mesh position={[0, TABLE_Y - 3, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow userData={{ excludeFromFit: true }}>
+      <mesh position={[0, STAGE_SHADOW_Y - 1, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow userData={{ excludeFromFit: true }}>
         <circleGeometry args={[STAGE_RADIUS, 96]} />
         <meshStandardMaterial
           color={theme.stageTable}
@@ -220,21 +284,56 @@ export function StageSurroundings({ theme }: { theme: SceneTheme }) {
           bumpScale={1.5}
         />
       </mesh>
-      {/* The finite tray participates in camera fit; only the room shell is
-          excluded. The rail's 432-unit outer edge remains clear. */}
+      {/* The raised miniature landscape participates in camera fit. The rail
+          and optical equipment keep their original coordinates above it. */}
       <group>
-        <mesh position={[0, TABLE_Y - 6, 0]}>
-          <cylinderGeometry args={[GARDEN_RADIUS + 10, GARDEN_RADIUS + 4, 12, 64]} />
-          <meshStandardMaterial color={night ? "#394e57" : "#eee4d1"} roughness={0.95} />
+        <mesh position={[0, PLINTH_BOTTOM_Y - 5, 0]}>
+          <cylinderGeometry args={[GARDEN_RADIUS + 38, GARDEN_RADIUS + 41, 10, 48]} />
+          <meshStandardMaterial color={night ? "#303f47" : "#b4aa93"} roughness={1} flatShading />
+        </mesh>
+        {WALL_ARCS.map(([start, end]) => (
+          <mesh key={start} position={[0, (TABLE_Y + PLINTH_BOTTOM_Y) / 2, 0]} receiveShadow>
+            <cylinderGeometry args={[GARDEN_RADIUS, GARDEN_RADIUS + 8, TABLE_Y - PLINTH_BOTTOM_Y, 48, 1, true, start, end - start]} />
+            <meshStandardMaterial color={night ? "#526063" : "#c7baa3"} roughness={1} flatShading side={THREE.DoubleSide} />
+          </mesh>
+        ))}
+        {DECK_ARCS.map(([start, end]) => (
+          <group key={start}>
+            <mesh position={[0, TABLE_Y + 0.3, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+              <ringGeometry args={[POND_RADIUS, GARDEN_RADIUS, 64, 1, start, end - start]} />
+              <meshStandardMaterial color={night ? "#586966" : "#c6cbb0"} roughness={1} flatShading />
+            </mesh>
+            <mesh position={[0, TABLE_Y + 0.8, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+              <ringGeometry args={[455, GARDEN_RADIUS - 12, 64, 1, start, end - start]} />
+              <meshStandardMaterial color={night ? "#617a6c" : "#97ae7e"} roughness={1} flatShading />
+            </mesh>
+          </group>
+        ))}
+        {WALL_ARCS.map(([start, end]) => (
+          <mesh key={start} position={[0, (TABLE_Y + POND_Y) / 2, 0]}>
+            <cylinderGeometry args={[POND_RADIUS, POND_RADIUS - 12, TABLE_Y - POND_Y, 48, 1, true, start, end - start]} />
+            <meshStandardMaterial color={night ? "#66736f" : "#adac91"} roughness={1} flatShading side={THREE.DoubleSide} />
+          </mesh>
+        ))}
+        <mesh position={[0, POND_Y, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+          <circleGeometry args={[POND_RADIUS - 3, 64]} />
+          <meshStandardMaterial color={night ? "#376b76" : "#669ea8"} roughness={0.25} metalness={0.12} />
+        </mesh>
+        {[90, 156, 230].map((radius) => (
+          <mesh key={radius} position={[0, POND_Y + 0.8, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+            <ringGeometry args={[radius, radius + 1.8, 48]} />
+            <meshBasicMaterial color={night ? "#81b6bd" : "#d4eddd"} transparent opacity={0.42} depthWrite={false} />
+          </mesh>
+        ))}
+        <mesh position={[0, (TABLE_Y + POND_Y) / 2, 0]}>
+          <cylinderGeometry args={[55, 67, TABLE_Y - POND_Y, 16]} />
+          <meshStandardMaterial color={night ? "#6a746b" : "#c5bea3"} roughness={1} flatShading />
         </mesh>
         <mesh position={[0, TABLE_Y + 0.5, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-          <ringGeometry args={[465, GARDEN_RADIUS, 64]} />
-          <meshStandardMaterial color={night ? "#485b61" : "#b7c69c"} roughness={1} />
+          <circleGeometry args={[55, 16]} />
+          <meshStandardMaterial color={night ? "#7d8474" : "#d4ceb5"} roughness={1} />
         </mesh>
-        <mesh position={[0, TABLE_Y + 1, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-          <ringGeometry args={[GARDEN_RADIUS - 23, GARDEN_RADIUS + 10, 64]} />
-          <meshStandardMaterial color={night ? "#82919a" : "#efe5cf"} roughness={0.9} />
-        </mesh>
+        {DRAIN_ANGLES.map((angle) => <Cascade key={angle} angle={angle} night={night} />)}
         {SHRUB_POSITIONS.map(([x, z, size]) => (
           <Shrub key={`${x}:${z}`} x={x} z={z} size={size} night={night} />
         ))}

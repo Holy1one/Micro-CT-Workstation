@@ -357,7 +357,6 @@
                              宽 100% 等比（1536×972）、垂直居中，上下留面板底色
        .scene-object         待测物独立层（可选，默认已合成进场景图）：
                              透明底 PNG 叠在转台顶面，换形象只换这一层
-       .status-float         右上角半透明状态浮窗 ×3（磨砂，基础设备状态）
    场景图按主题 × 转台角度切换：Ready=0°，Scanning/Paused/Fault=144°。
    三维结构与光路口径（源→物→板→镜头四点共线直线）见 重构交接说明.md 5.6。
    ============================================================ */
@@ -372,13 +371,6 @@
   transform: translateY(-50%); width: 100%; aspect-ratio: 1536 / 972;
   object-fit: contain; pointer-events: none; }
 .scene-object { position: absolute; pointer-events: none; }
-.status-float { position: absolute; right: 12px; display: inline-flex;
-  align-items: center; gap: 6px; padding: 5px 10px; border-radius: 10px;
-  font-family: var(--fontMono); font-size: var(--fontSizeHint);
-  color: var(--glassText); background: var(--glassBg); border: 1px solid var(--glassBorder);
-  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
-  box-shadow: 0 4px 12px var(--glassShadow); }
-.status-float__dot { width: 6px; height: 6px; border-radius: 3px; }
 /* 分层 / 实时 3D 方案保留：射线层与呼吸动画走 --ray* / --beamGlow 令牌 */
 .scene-ray { position: absolute; opacity: 0; pointer-events: none;
   mix-blend-mode: screen; transition: opacity 180ms ease-out; }

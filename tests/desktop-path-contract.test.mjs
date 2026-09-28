@@ -282,7 +282,13 @@ test("fixed design canvas scales as one unit and side columns never scroll", asy
   assert.doesNotMatch(styles, /\.xray-panel[^{]*\{[^}]*overflow(-y)?: auto/);
   assert.match(styles, /\.console__tabs \{[^}]*overflow: hidden;/);
   assert.match(styles, /\.log-lines\s*\{[^}]*overflow-y: auto;/);
-  assert.match(styles, /\.image-strip\s*\{[^}]*overflow-x: auto;/);
+  assert.match(styles, /\.image-strip\s*\{[^}]*overflow-y: auto;/);
+  const imageGrid = styles.match(/\.image-strip\s*\{([^}]*)\}/)?.[1] ?? "";
+  assert.match(imageGrid, /grid-template-columns:\s*repeat\(5, minmax\(0, 1fr\)\)/);
+  assert.match(imageGrid, /align-content:\s*start/);
+  const columnGap = Number(imageGrid.match(/column-gap:\s*(\d+)px/)?.[1]);
+  const rowGap = Number(imageGrid.match(/row-gap:\s*(\d+)px/)?.[1]);
+  assert.ok(columnGap > 0 && rowGap <= columnGap * 1.5);
 });
 
 test("engineering menus and numeric scan fields stay compact and free of branding", async () => {
