@@ -294,6 +294,12 @@ test("engineering menus and numeric scan fields stay compact and free of brandin
   assert.doesNotMatch(scan, /<small>1[–-]/);
   assert.match(scan, /minutesToSeconds\(maxXray\)/);
   assert.match(scan, /secondsToMinutes\(setup\.maxXraySec \|\| 600\)/);
-  assert.match(app, /className="help-tip" title=\{text\}/);
+  // HelpTip renders the linear question icon with a self-drawn glass bubble;
+  // the native title attribute was dropped because WebView2 pops it unreliably.
+  assert.match(app, /className="help-tip"/);
+  assert.match(app, /createPortal\(/);
+  assert.match(app, /className="help-tip__bubble"/);
+  assert.match(app, /onPointerEnter=\{show\}/);
+  assert.doesNotMatch(app, /className="help-tip" title=/);
   assert.match(styles, /button\.help-tip[^}]*border-radius: 50%/);
 });

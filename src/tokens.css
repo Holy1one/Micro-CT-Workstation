@@ -31,6 +31,26 @@
    ============================================================ */
 
 /* ------------------------------------------------------------
+   自托管字体（OFL，离线便携可用，不依赖网络与系统安装）
+   Inter：专为屏幕 UI 设计，高 x-height + 开放字腔，小字号辨识度高；
+   JetBrains Mono：工程读数/日志，替代 Consolas 回退的陈旧观感。
+   ------------------------------------------------------------ */
+@font-face {
+  font-family: "Inter";
+  src: url("/assets/inter-var.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/assets/jetbrains-mono-var.woff2") format("woff2");
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ------------------------------------------------------------
    默认主题 · Light
    ------------------------------------------------------------ */
 :root,
@@ -38,12 +58,26 @@
   /* ---- 底色 / 机箱层级 ---- */
   --appBg:        #E8EDF2;
   --chassis:      #EFF3F7;
-  --panel:        #F8FAFC;
-  --panelHeader:  #F0F4F7;
-  --well:         #E9EEF3;
-  --line:         #D7E0E8;
-  --lineStrong:   #C3CFDA;
-  --lineField:    #BECBD7;
+  --panel:        #FBFCFD;
+  --panelHeader:  #F0F4F8;
+  --well:         #E7EDF2;
+  /* 发丝线：看得见但不刻意——只承担分区职责，不抢内容 */
+  --line:         rgba(15, 23, 42, 0.09);
+  --lineStrong:   rgba(15, 23, 42, 0.13);
+  --lineField:    rgba(15, 23, 42, 0.18);
+
+  /* ---- Apple 质感画布：极浅的多层渐变，衬托实心面板的边缘 ---- */
+  --appGradient:
+    radial-gradient(1200px 640px at 12% -12%, rgba(255, 255, 255, 0.85) 0%, rgba(255, 255, 255, 0) 55%),
+    radial-gradient(1100px 720px at 108% 112%, rgba(171, 198, 227, 0.40) 0%, rgba(171, 198, 227, 0) 60%),
+    linear-gradient(160deg, #ECF0F5 0%, #E2E8F0 100%);
+
+  /* ---- 面板：实心卡片（清晰骨架）；玻璃只留给浮层（菜单/下拉/控制坞/对话框） ---- */
+  --panelGlass:        rgba(255, 255, 255, 0.88);
+  --panelHeaderGlass:  rgba(250, 251, 253, 0.55);
+  --panelBlur:         blur(24px) saturate(150%);
+  --shadowCard:        0 1px 2px rgba(16, 24, 40, 0.05), 0 6px 16px rgba(16, 24, 40, 0.06);
+  --consoleGlass:      rgba(255, 255, 255, 0.88);
 
   /* ---- 最大化窗口的机箱留白（8:5 画布之外的区域 = 机箱框，不是空白） ---- */
   --viewportGutter:      #DDE4EA;
@@ -60,17 +94,19 @@
   --onAccent:      #FFFFFF;
   --glassText:     #192430;
   --glassBg:       rgba(247, 250, 252, 0.82);
-  --glassBorder:   rgba(29, 43, 56, 0.14);
+  --glassBorder:   rgba(29, 43, 56, 0.10);
   --glassShadow:   rgba(0, 0, 0, 0.18);
 
   /* Functional chrome: reserved for the title bar, island, and popovers. */
-  --functionalGlassBg:     rgba(247, 249, 252, 0.82);
+  --functionalGlassBg:     rgba(247, 249, 252, 0.78);
   --functionalGlassBorder: rgba(255, 255, 255, 0.72);
   --functionalGlassText:   #202833;
+  /* 顶栏：半透薄纱，直接让画布渐变透上来（不做毛玻璃）；磨砂玻璃只留给灵动岛与浮层 */
+  --menuBarBg:             rgba(241, 245, 249, 0.50);
   --shadowFloat:           0 10px 26px rgba(25, 36, 48, 0.14);
   --shadowIsland:          0 18px 40px rgba(25, 36, 48, 0.18);
-  --islandBg:              rgba(247, 250, 252, 0.72);
-  --islandBorder:          rgba(165, 186, 203, 0.62);
+  --islandBg:              rgba(247, 250, 252, 0.62);
+  --islandBorder:          rgba(165, 186, 203, 0.46);
   --islandHighlight:       rgba(255, 255, 255, 0.88);
   --islandKeyBg:           color-mix(in srgb, var(--neutralSoft) 84%, transparent);
   --islandKeyHover:        color-mix(in srgb, var(--accentSoft) 88%, var(--neutralSoft));
@@ -80,7 +116,7 @@
   --islandRipple:          color-mix(in srgb, var(--accent) 28%, transparent);
 
   /* ---- 语义色（颜色即语义，不要换色表达同一动作） ---- */
-  --accent:        #176F89;
+  --accent:        #0E7490;  /* 深青：与 3D 场景光路色系一致的唯一强调色 */
   --accentText:    #1A7F37;  /* 日志 INFO/OK 级别文字（绿） */
   --ok:            #228657;
   --warn:          #E0A13A;
@@ -89,8 +125,8 @@
   --dangerSolid:   #B93B37;
   --dangerText:    #A83230;
   --violet:        #8B5CF6;  /* 读取上一次扫描进度（紫） */
-  --btnHome:       #3B82F6;  /* 设备回零（深蓝，取自按钮 SVG） */
-  --btnResume:     #0A84FF;  /* 从暂停开始 / 继续（浅蓝，取自按钮 SVG） */
+  --btnHome:       #3B82F6;  /* 设备回零（深蓝） */
+  --btnResume:     #0A84FF;  /* 从暂停开始 / 继续（浅蓝） */
   --beamGlow:      #F5A623;  /* X 射线束暖色（视口内唯一暖色高亮） */
   --optics:        #1F7A8C;  /* 光路/光学路径描边 */
 
@@ -98,15 +134,13 @@
   --okSoft:     #EBF7EF;
   --warnSoft:   #FEF2E4;
   --dangerSoft: #FCE6E5;
-  --accentSoft: #E3F0F4;
+  --accentSoft: rgba(14, 116, 144, 0.10);
   --neutralSoft:#E6EBF0;
 
   /* ---- 中央 Live Scene 视口（跟随主题） ---- */
   --sceneBg:     #EEF2F5;
   --sceneLine:   #D7E0E8;
-  /* 3D 舞台：桌面（布纹）与球壁（纸纹）的固有色，以及它们唯一能变白的手段
-     ——自发光强度。靠着色的光照到不了白：球壁法线朝内拿到的是半球光的地色，
-     方向光又被 three 除以 π，所以必须靠 emissive 提亮。 */
+  /* 3D 舞台保留原有程序化布纹桌面和纸纹球壁。 */
   --stageTable:  #E8E6E2;    /* 桌面圆盘（比球壁暗一档，地平线才有交代） */
   --stageWall:   #F4F4F6;    /* 上半球球壁 */
   --stageGlow:   0.55;       /* 桌面/球壁的 emissiveIntensity */
@@ -137,9 +171,9 @@
   --preflightFail:  #C71A1C;
 
   /* ---- 圆角 / 间距 ---- */
-  --radiusCard:    12px;
-  --radiusCardCompact: 10px;
-  --radiusPanel:   12px;
+  --radiusCard:    14px;
+  --radiusCardCompact: 12px;
+  --radiusPanel:   14px;
   --radiusDock:    28px;
   --radiusKey:     12px;
   --radiusChip:    8px;
@@ -148,15 +182,26 @@
   --space1: 4px;  --space2: 8px;  --space3: 12px;
   --space4: 16px; --space6: 24px; --space8: 32px;
 
-  --fontSizeHint: 11px;
-  --fontSizeLabel: 12px;
-  --fontSizeBody: 13px;
-  --fontSizeTitle: 14px;
+  /* 字阶：整体上调半档，控制台密度保持不变（固定画布，无栏内滚动） */
+  --fontSizeHint: 12px;
+  --fontSizeLabel: 13px;
+  --fontSizeBody: 14px;
+  --fontSizeTitle: 16px;
 
-  /* ---- 字体 ---- */
-  --fontUi:   "IBM Plex Sans", "Source Sans 3", "Segoe UI", "Microsoft YaHei UI", sans-serif;
-  --fontMono: "IBM Plex Mono", "JetBrains Mono", Consolas, monospace;
+  /* ---- 字体（自托管 Inter / JetBrains Mono 优先，系统栈回退） ---- */
+  --fontUi:   "Inter", -apple-system, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  --fontMono: "JetBrains Mono", "SF Mono", "Cascadia Mono", Consolas, monospace;
   --fontCjk:  "Microsoft YaHei UI", "Segoe UI", sans-serif;
+
+  /* ---- 动效令牌：时长与缓动（Apple 式先快后稳 + 轻微回弹） ---- */
+  --durInstant: 80ms;
+  --durFast:    140ms;
+  --durBase:    200ms;
+  --durSlow:    320ms;
+  --easeOut:    cubic-bezier(0.22, 1, 0.36, 1);
+  --easeInOut:  cubic-bezier(0.65, 0, 0.35, 1);
+  --easeSpring: cubic-bezier(0.34, 1.45, 0.64, 1);
+  --easeSpringGentle: cubic-bezier(0.3, 1.3, 0.5, 1);
 
   /* ---- 顶栏主题切换段控 ---- */
   --segTrack:    #E8E8ED;
@@ -173,12 +218,24 @@
 [data-theme="dark"] {
   --appBg:        #111821;
   --chassis:      #161F29;
-  --panel:        #1C2631;
-  --panelHeader:  #222E3A;
+  --panel:        #1D2733;
+  --panelHeader:  #242F3C;
   --well:         #141D27;
-  --line:         #2E3A47;
-  --lineStrong:   #384654;
-  --lineField:    #40505F;
+  --line:         rgba(255, 255, 255, 0.085);
+  --lineStrong:   rgba(255, 255, 255, 0.125);
+  --lineField:    rgba(255, 255, 255, 0.18);
+
+  /* 深色画布：深海蓝渐变 + 微光晕 */
+  --appGradient:
+    radial-gradient(1200px 640px at 12% -12%, rgba(64, 96, 130, 0.26) 0%, rgba(64, 96, 130, 0) 55%),
+    radial-gradient(1100px 720px at 108% 112%, rgba(23, 74, 104, 0.32) 0%, rgba(23, 74, 104, 0) 60%),
+    linear-gradient(160deg, #131B25 0%, #0E141D 100%);
+
+  --panelGlass:        rgba(29, 39, 51, 0.92);
+  --panelHeaderGlass:  rgba(38, 48, 62, 0.45);
+  --panelBlur:         blur(24px) saturate(140%);
+  --shadowCard:        0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 22px rgba(0, 0, 0, 0.30);
+  --consoleGlass:      rgba(22, 29, 39, 0.92);
 
   /* ---- 最大化窗口的机箱留白（暗色：比画布更深的机身） ---- */
   --viewportGutter:      #0B1118;
@@ -194,16 +251,18 @@
   --onAccent:      #FFFFFF;
   --glassText:     #E8ECF2;
   --glassBg:       rgba(255, 255, 255, 0.12);
-  --glassBorder:   rgba(255, 255, 255, 0.22);
+  --glassBorder:   rgba(255, 255, 255, 0.16);
   --glassShadow:   rgba(0, 0, 0, 0.30);
 
-  --functionalGlassBg:     rgba(24, 30, 39, 0.86);
+  --functionalGlassBg:     rgba(24, 30, 39, 0.82);
   --functionalGlassBorder: rgba(255, 255, 255, 0.16);
   --functionalGlassText:   #E8ECF2;
+  /* 顶栏：半透薄纱，直接让画布渐变透上来（不做毛玻璃）；磨砂玻璃只留给灵动岛与浮层 */
+  --menuBarBg:             rgba(18, 25, 34, 0.48);
   --shadowFloat:           0 12px 28px rgba(0, 0, 0, 0.34);
   --shadowIsland:          0 20px 44px rgba(0, 0, 0, 0.40);
-  --islandBg:              rgba(30, 42, 54, 0.76);
-  --islandBorder:          rgba(159, 182, 200, 0.34);
+  --islandBg:              rgba(30, 42, 54, 0.64);
+  --islandBorder:          rgba(159, 182, 200, 0.26);
   --islandHighlight:       rgba(255, 255, 255, 0.14);
   --islandKeyBg:           rgba(255, 255, 255, 0.08);
   --islandKeyHover:        color-mix(in srgb, var(--accentSoft) 90%, var(--panelHeader));
@@ -212,7 +271,7 @@
   --islandTrack:           color-mix(in srgb, var(--textSecondary) 42%, transparent);
   --islandRipple:          color-mix(in srgb, var(--accent) 34%, transparent);
 
-  --accent:      #69B4CF;
+  --accent:      #45B6CC;
   --accentText:  #4ADE80;
   --ok:          #5BD09A;
   --warn:        #F0B44E;
@@ -229,7 +288,7 @@
   --okSoft:     #12291D;
   --warnSoft:   #2C2410;
   --dangerSoft: #331A18;
-  --accentSoft: #193845;
+  --accentSoft: rgba(69, 182, 204, 0.16);
   --neutralSoft:#2A3744;
 
   --sceneBg:     #111821;
@@ -274,9 +333,10 @@
    ============================================================ */
 .theme-toggle { display: inline-flex; gap: 2px; padding: 2px;
   background: var(--segTrack); border-radius: 12px; }
-.theme-toggle__seg { height: 20px; padding: 0 9px; display: inline-flex;
+.theme-toggle__seg { height: 20px; padding: 0 9px; display: inline-flex; gap: 4px;
   align-items: center; border-radius: 10px; font-size: var(--fontSizeLabel); font-weight: 400;
-  color: var(--segIdleFg); background: transparent; border: 0; cursor: pointer; }
+  color: var(--segIdleFg); background: transparent; border: 0; cursor: pointer;
+  transition: background-color var(--durFast) var(--easeOut), color var(--durFast) var(--easeOut); }
 .theme-toggle__seg[aria-pressed="true"] { background: var(--segActiveBg);
   color: var(--segActiveFg); font-weight: 600; }
 
@@ -349,16 +409,17 @@
 .control-dock {
   display: inline-flex; gap: 8px; padding: 10px;
   background: var(--dockBg);
-  -webkit-backdrop-filter: blur(18px) saturate(135%);
-  backdrop-filter: blur(18px) saturate(135%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
   border: 1px solid var(--dockBorder);
   border-radius: var(--radiusDock);
   box-shadow: 0 6px 20px var(--dockShadow), inset 0 1px 1px var(--dockHighlight, rgba(255,255,255,.85));
+  transition: background-color var(--durBase) var(--easeOut), border-color var(--durBase) var(--easeOut), box-shadow var(--durBase) var(--easeOut);
 }
 .dock-key { position: relative; width: 70px; height: 58px; border-radius: var(--radiusKey);
   display: inline-flex; flex-direction: column; gap: 5px; align-items: center; justify-content: center;
   background: var(--dockKeyBg); border: 0; cursor: pointer;
-  transition: background 140ms ease-out, transform 140ms ease-out; }
+  transition: background var(--durFast) var(--easeOut), transform var(--durFast) var(--easeSpring), opacity var(--durFast) var(--easeOut); }
 .control-dock:hover .dock-key { background: var(--dockKeyBgHover); }
 .dock-key:active { transform: scale(0.94); }
 .dock-key[disabled], .dock-key[aria-disabled="true"] { opacity: 0.55; cursor: not-allowed; }
@@ -366,13 +427,15 @@
 /* Persistent action labels remain legible without hover. */
 .dock-key__label { font-size: 11px; font-weight: 600; color: var(--textPrimary); white-space: nowrap; pointer-events: none; }
 
-/* 第二槽位按状态循环：开始（绿）→ 暂停（黄）→ 继续（浅蓝）
-   色值取自用户提供的按钮 SVG，直接内联在 <svg> 里，不要用滤镜改色 */
-[data-state="scanning"] .dock-key--play  .dock-icon--play   { display: none; }
-[data-state="scanning"] .dock-key--play  .dock-icon--pause  { display: block; }
-[data-state="paused"]   .dock-key--play  .dock-icon--play   { display: none; }
-[data-state="paused"]   .dock-key--play  .dock-icon--resume { display: block; }
-[data-state="paused"]   .dock-key--play  { background: var(--accentSoft); }
+/* 操作键语义色：线性图标用 currentColor 继承，四键一色一义。
+   开始（绿）→ 暂停（黄）→ 继续（浅蓝）随 [data-state] 切换。
+   键帽的语义浅底在 styles.css 的灵动岛键规则之后声明（级联要求）。 */
+.dock-key--home    { color: var(--btnHome); }
+.dock-key--play    { color: var(--ok); }
+.dock-key--restore { color: var(--violet); }
+.dock-key--stop    { color: var(--danger); }
+[data-state="scanning"] .dock-key--play  { color: var(--warn); }
+[data-state="paused"]   .dock-key--play  { color: var(--btnResume); }
 [data-state="fault"]    .dock-key--play  { opacity: 0.45; pointer-events: none; }
 /* 扫描中：回零与读取置灰 */
 [data-state="scanning"] .dock-key--home,
@@ -380,15 +443,20 @@
 [data-state="paused"]   .dock-key--restore { opacity: 0.45; pointer-events: none; }
 [data-state="fault"]    .dock-key--home { opacity: 0.35; pointer-events: none; }
 [data-state="fault"]    .dock-key--restore { opacity: 1; }
+/* 置灰的键不再显示语义色，只保留 muted 线性稿 */
+.dock-key:disabled { color: var(--textMuted); }
 
 /* ============================================================
    射线 / 时间开关（按钮说明「射线开启关闭切换效果」「按时间开关」）
    灰 = 关闭态；红 = 已使能（射线可出束 / 定时器生效）
    ============================================================ */
 .switch-btn { height: 48px; border-radius: var(--radiusControl); border: 0;
-  font-size: 12.5px; cursor: pointer; transition: background 140ms ease-out; }
+  font-size: 12.5px; cursor: pointer;
+  transition: background var(--durFast) var(--easeOut), color var(--durFast) var(--easeOut),
+    box-shadow var(--durBase) var(--easeOut), transform var(--durFast) var(--easeSpring); }
 .switch-btn--idle { background: var(--neutralSoft); color: var(--textPrimary); }
-.switch-btn--on   { background: var(--dangerSolid); color: #fff; font-weight: 600; }
+.switch-btn--on   { background: var(--dangerSolid); color: #fff; font-weight: 600;
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--dangerSolid) 36%, transparent); }
 .switch-field { height: 40px; padding: 0 10px; border-radius: 10px;
   background: var(--well); display: inline-flex; align-items: center;
   justify-content: space-between; gap: 8px; }
@@ -413,14 +481,19 @@
    底部控制台（日志 / 图像预览）
    前 4 个标签是日志，最后一个是本轮已拍图像；聚合日志汇总全部设备与串口
    ============================================================ */
-.console { background: var(--consoleBg); border-top: 1px solid var(--lineStrong); }
-.console__tabs { background: var(--consoleTabBg); border-right: 1px solid var(--lineStrong);
+.console { background: var(--consoleBg); border-top: 1px solid var(--line); }
+.console__tabs { background: var(--consoleTabBg); border-right: 1px solid var(--line);
   padding: 8px; display: flex; flex-direction: column; gap: 2px; }
 .console__tab { height: 30px; padding: 0 10px; border-radius: var(--radiusSmall);
-  display: flex; align-items: center; justify-content: space-between;
-  font-size: var(--fontSizeLabel); color: var(--textMuted); background: transparent; border: 0; cursor: pointer; }
+  display: flex; align-items: center; justify-content: space-between; gap: 7px;
+  font-size: var(--fontSizeLabel); color: var(--textMuted); background: transparent; border: 0; cursor: pointer;
+  transition: background-color var(--durFast) var(--easeOut), color var(--durFast) var(--easeOut); }
+.console__tab em { font-style: normal; flex: 1 1 auto; text-align: left; }
+.console__tab-icon { color: var(--textMuted); flex: 0 0 auto;
+  transition: color var(--durFast) var(--easeOut); }
 .console__tab[aria-selected="true"] { background: var(--consoleTabActive);
   color: var(--textPrimary); font-weight: 600; }
+.console__tab[aria-selected="true"] .console__tab-icon { color: var(--accent); }
 .log-line { display: flex; gap: 10px; font-size: 11.5px; line-height: 1.45; }
 .log-line__time { flex: 0 0 110px; font-family: var(--fontMono); color: var(--textMuted); }
 .log-line__tag  { flex: 0 0 106px; font-family: var(--fontMono); font-weight: 600; }
@@ -432,7 +505,7 @@
 
 /* 状态栏 */
 .statusbar { height: 30px; padding: 0 14px; background: var(--chassis);
-  border-top: 1px solid var(--lineStrong);
+  border-top: 1px solid var(--line);
   display: flex; align-items: center; justify-content: space-between;
   font-size: var(--fontSizeHint); color: var(--textSecondary); }
 .statusbar__state { color: var(--textPrimary); font-weight: 600; }

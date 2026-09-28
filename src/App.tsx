@@ -5,10 +5,12 @@
  * decisions; those remain authoritative in ct-engine.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
+import { LineIcon, type LineIconName } from "./icons";
 import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } from "./scan-input";
 import { hasDeviceSessionEverEstablished, useEngine } from "./engine/useEngine";
 import {
@@ -80,8 +82,46 @@ function logTime(timestamp: string): string {
   return `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}.${p(date.getMilliseconds(), 3)}`;
 }
 
-function HelpTip({ text }: { text: string }) {
-  return <button type="button" className="help-tip" title={text} aria-label={text}>?</button>;
+function HelpTip({ text, align = "start", side = "down" }: { text: string; align?: "start" | "end"; side?: "down" | "up" }) {
+  const id = useId();
+  const button = useRef<HTMLButtonElement>(null);
+  const [visible, setVisible] = useState(false);
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+  const show = useCallback(() => {
+    const rect = button.current?.getBoundingClientRect();
+    if (!rect) return;
+    setPosition({
+      top: side === "up" ? rect.top - 7 : rect.bottom + 7,
+      left: align === "end" ? rect.right + 8 : rect.left - 8,
+    });
+    setVisible(true);
+  }, [align, side]);
+  return (
+    <>
+      <button
+        ref={button}
+        type="button"
+        className="help-tip"
+        aria-label={text}
+        aria-describedby={visible ? id : undefined}
+        onPointerEnter={show}
+        onPointerLeave={() => setVisible(false)}
+        onFocus={show}
+        onBlur={() => setVisible(false)}
+      >
+        <LineIcon name="question" size={12} />
+      </button>
+      {visible && createPortal(
+        <span
+          id={id}
+          className="help-tip__bubble"
+          role="tooltip"
+          style={{ top: position.top, left: position.left, transform: `translate(${align === "end" ? "-100%" : "0"}, ${side === "up" ? "-100%" : "0"})` }}
+        >{text}</span>,
+        document.body,
+      )}
+    </>
+  );
 }
 
 const toneClass = (tone: string) => `tone-${tone}`;
@@ -217,7 +257,8 @@ function MenuBar({
                           onAction(entry.id);
                         }}
                       >
-                        {entry.label}
+                        <LineIcon name={entry.icon} size={13} className="menu-dropdown__icon" />
+                        <span>{entry.label}</span>
                       </button>
                     );
                   })}
@@ -300,15 +341,19 @@ function DevicePanel({
   return (
     <section className="panel device-panel">
       <div className="panel__header">
+        <LineIcon name="link" size={15} className="panel__icon" />
         <h2>Device Connection Status</h2>
         <HelpTip text={`Preflight: ${ws.preflight.subline}`} />
       </div>
       <div className="device-list">
         {ws.devices.map((device) => {
           const retrying = pendingDevice === device.id;
+          const deviceIcon: LineIconName =
+            device.id === "xray" ? "radiation" : device.id === "camera" ? "camera" : "rotate";
           return (
             <div className="device-row" key={device.id}>
               <div className="device-row__top">
+                <LineIcon name={deviceIcon} size={15} className="device-row__icon" />
                 <strong>{device.name}</strong>
                 <HelpTip text={stale ? "Device status unavailable" : device.spec} />
                 <span className={`device-row__word ${toneClass(stale ? "muted" : device.tone)}`}>{stale ? "UNKNOWN" : device.word}</span>
@@ -468,6 +513,7 @@ function ScanParamsPanel({
   return (
     <section className="panel scan-panel">
       <div className="panel__header">
+        <LineIcon name="sliders" size={15} className="panel__icon" />
         <h2>Scan Parameters</h2>
         <span className="chip chip--accent">
           {setup.projectionCount > 0 ? `${setup.projectionCount} PROJECTIONS` : "NOT CONFIGURED"}
@@ -508,22 +554,22 @@ function ScanParamsPanel({
               aria-label="Select image directory"
               onClick={() => void chooseDirectory()}
             >
-              <span className="folder-glyph" aria-hidden="true" />
+              <LineIcon name="folder" size={15} />
             </button>
           </div>
           {pathError ? <small className="field-error">{pathError}</small> : null}
         </label>
         <div className="scan-input-grid">
           <label className={`numeric-field ${viewsInvalid ? "is-invalid" : ""}`}>
-            <span>Total projections <HelpTip text="Any positive integer up to 3600. The engine calculates the angular step." /></span>
+            <span>Total projections <HelpTip align="end" text="Any positive integer up to 3600. The engine calculates the angular step." /></span>
             <input value={views} disabled={locked} inputMode="numeric" aria-label="Total projections" aria-invalid={viewsInvalid} onChange={(event) => setViews(event.target.value)} onBlur={() => commitNumber("projectionCount", views)} />
           </label>
           <label className={`numeric-field ${exposureInvalid ? "is-invalid" : ""}`}>
-            <span>Exposure · ms <HelpTip text={`${ws.cameraExposure.known ? "Connected camera" : "Nikon D7100 timed shutter"}: ${ws.cameraExposure.minMs}–${ws.cameraExposure.maxMs} ms. The value must match a supported camera shutter setting; unsupported values are rejected.`} /></span>
+            <span>Exposure · ms <HelpTip align="end" text={`${ws.cameraExposure.known ? "Connected camera" : "Nikon D7100 timed shutter"}: ${ws.cameraExposure.minMs}–${ws.cameraExposure.maxMs} ms. The value must match a supported camera shutter setting; unsupported values are rejected.`} /></span>
             <input value={exposure} disabled={locked} inputMode="decimal" aria-label="Exposure in milliseconds" aria-invalid={exposureInvalid} onChange={(event) => setExposure(event.target.value)} onBlur={() => commitNumber("exposureMs", exposure)} />
           </label>
           <label className={`numeric-field ${durationInvalid ? "is-invalid" : ""}`}>
-            <span>Max X-ray · min <HelpTip text="Default 10 min. Maximum continuous output is limited to 10 min, followed by 5 min cooldown. Fractional minutes such as 0.5 are allowed." /></span>
+            <span>Max X-ray · min <HelpTip align="end" text="Default 10 min. Maximum continuous output is limited to 10 min, followed by 5 min cooldown. Fractional minutes such as 0.5 are allowed." /></span>
             <input value={maxXray} disabled={locked} inputMode="decimal" aria-label="Maximum X-ray time in minutes" aria-invalid={durationInvalid} onChange={(event) => setMaxXray(event.target.value)} onBlur={commitDuration} />
           </label>
         </div>
@@ -536,8 +582,34 @@ function ScanParamsPanel({
 /* Center: live scene                                                  */
 /* ------------------------------------------------------------------ */
 
-function DockIcon({ src, alt }: { src: string; alt: string }) {
-  return <img className="dock-icon" src={src} alt={alt} draggable={false} />;
+function DockKey({
+  variant,
+  icon,
+  label,
+  title,
+  disabled,
+  onClick,
+}: {
+  variant: string;
+  icon: LineIconName;
+  label: string;
+  title: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`dock-key dock-key--${variant}`}
+      aria-label={label}
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <LineIcon name={icon} size={28} className="dock-icon" />
+      <span className="dock-key__label">{label}</span>
+    </button>
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -1118,36 +1190,6 @@ function RingReadout({
   );
 }
 
-function DockKey({
-  variant,
-  src,
-  label,
-  title,
-  disabled,
-  onClick,
-}: {
-  variant: string;
-  src: string;
-  label: string;
-  title: string;
-  disabled: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={`dock-key dock-key--${variant}`}
-      aria-label={label}
-      title={title}
-      disabled={disabled}
-      onClick={onClick}
-    >
-      <DockIcon src={src} alt="" />
-      <span className="dock-key__label">{label}</span>
-    </button>
-  );
-}
-
 /**
  * Dynamic-Island control dock.
  *
@@ -1274,10 +1316,10 @@ function ControlDock({
 
   const play =
     dock.playMode === "pause"
-      ? { src: "/assets/dock-pause.svg", label: "Pause", command: { type: "pause" } as EngineCommand }
+      ? { icon: "pause" as LineIconName, label: "Pause", command: { type: "pause" } as EngineCommand }
       : dock.playMode === "resume"
-        ? { src: "/assets/dock-resume.svg", label: "Resume", command: { type: "resume" } as EngineCommand }
-        : { src: "/assets/dock-play.svg", label: "Start", command: { type: "start_scan" } as EngineCommand };
+        ? { icon: "play" as LineIconName, label: "Resume", command: { type: "resume" } as EngineCommand }
+        : { icon: "play" as LineIconName, label: "Start", command: { type: "start_scan" } as EngineCommand };
 
   // Availability comes from the engine's own `ws.dock` flags, plus the stale
   // (control-service-lost) override. On top of that, a locally invalid setup
@@ -1339,7 +1381,7 @@ function ControlDock({
         </button>
         <DockKey
           variant="home"
-          src="/assets/dock-home.svg"
+          icon="crosshair"
           label="Home"
           title={setupInvalid ? "Complete valid scan parameters first" : dock.homeReason || "Home turntable"}
           disabled={setupBlocked || !dock.home}
@@ -1347,7 +1389,7 @@ function ControlDock({
         />
         <DockKey
           variant="play"
-          src={play.src}
+          icon={play.icon}
           label={play.label}
           title={setupInvalid ? "Complete valid scan parameters first" : dock.playReason || play.label}
           disabled={setupBlocked || !dock.play}
@@ -1355,7 +1397,7 @@ function ControlDock({
         />
         <DockKey
           variant="restore"
-          src="/assets/dock-restore.svg"
+          icon="history"
           label="Restore"
           title={setupInvalid ? "Complete valid scan parameters first" : "Restore the previous scan progress from the on-disk checkpoint"}
           disabled={setupBlocked || !dock.restore}
@@ -1363,7 +1405,7 @@ function ControlDock({
         />
         <DockKey
           variant="stop"
-          src="/assets/dock-stop.svg"
+          icon="stop"
           label="Stop"
           title={dock.stop ? "End the active scan; already saved projections are retained" : "No active scan to end"}
           disabled={keysDisabled || !dock.stop}
@@ -1383,17 +1425,20 @@ function ControlDock({
  */
 function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: boolean }) {
   const active = stale ? "Fault" : feedback.state;
+  // The strip is one glance, not a paragraph: only the leading segment of the
+  // detail stays on the row; the full sentence lives in the help bubble.
+  const detailLead = feedback.detail.split(" · ")[0];
   return (
     <div className={`op-feedback ${feedback.active ? "is-hot" : ""}`}>
       <div
         className={`op-feedback__row ${feedbackToneClass(feedback.tone)}`}
         role="status"
         aria-live="polite"
-        aria-label={`Console feedback state: ${active}`}
-        title={feedback.detail}
+        aria-label={`Console feedback state: ${active}. ${feedback.detail}`}
       >
         <span className="op-feedback__word">{active}</span>
-        <span className="op-feedback__detail">{feedback.detail}</span>
+        <span className="op-feedback__detail">{detailLead}</span>
+        <HelpTip text={feedback.detail} align="end" />
       </div>
       <div className="op-feedback__states">
         {CONSOLE_FEEDBACK_STATES.map((state) => (
@@ -1429,6 +1474,7 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
     <section className="panel live-panel">
       <div className="scene-toolbar">
         <span className="chip chip--accent">3D RENDER</span>
+        <LineIcon name="cube" size={15} className="panel__icon" />
         <h2>Equipment View</h2>
         <HelpTip text={`Read-only geometry view. ${setupInvalid ? "Complete valid scan parameters first." : ws.dock.playReason || "Ready for the next operation."}`} />
         <span className="menu-spacer" />
@@ -1464,7 +1510,7 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
           ))}
         </div>
         <div className="scene-readout-block">
-          <span className="scene-label">TURNTABLE ANGLE <HelpTip text="Latest confirmed turntable angle. The model follows confirmed feedback without predicting a position; reduced motion jumps directly between samples." /></span>
+          <span className="scene-label">TURNTABLE ANGLE <HelpTip side="up" text="Latest confirmed turntable angle. The model follows confirmed feedback without predicting a position; reduced motion jumps directly between samples." /></span>
           <strong className="scene-readout">{stale || !ws.scene.angleKnown ? "—" : ws.scene.angleDeg.toFixed(2)}°</strong>
           <span className={`scene-safety ${ws.safetyBar.tone !== "muted" ? "scene-safety--danger" : ""} ${ws.safetyBar.tone === "dangerBold" ? "scene-safety--bold" : ""}`}>
             {stale ? "Control service unavailable · readings are unknown" : ws.safetyBar.text}
@@ -1523,6 +1569,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
   return (
     <section className="panel xray-panel">
       <div className="panel__header">
+        <LineIcon name="radiation" size={15} className="panel__icon" />
         <h2>12 Watt Controller</h2>
         <HelpTip text={sourceHelp} />
         <span className={`chip chip--${beamState === "on" ? "danger" : connected ? "accent" : "muted"}`}>
@@ -1543,7 +1590,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
       </button>
       <div className="xray-channels">
         <div className="xray-channel">
-          <span className="xray-channel__label">Voltage · kV <HelpTip text="SET is the requested voltage. Measured is device readback; a dash means unknown." /></span>
+          <span className="xray-channel__label">Voltage · kV <HelpTip align="end" text="SET is the requested voltage. Measured is device readback; a dash means unknown." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
               <span className="xray-channel__key">SET</span>
@@ -1563,7 +1610,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           </div>
         </div>
         <div className="xray-channel">
-          <span className="xray-channel__label">Current · µA <HelpTip text="SET is the requested current. Measured is device readback; a dash means unknown." /></span>
+          <span className="xray-channel__label">Current · µA <HelpTip align="end" text="SET is the requested current. Measured is device readback; a dash means unknown." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
               <span className="xray-channel__key">SET</span>
@@ -1683,6 +1730,7 @@ function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws:
   return (
     <section className="panel operation-panel">
       <div className="panel__header">
+        <LineIcon name="gauge" size={15} className="panel__icon" />
         <h2>Operation Status</h2>
         <span className={`chip chip--${stale ? "muted" : ws.phaseTone}`}>{stale ? "UNKNOWN" : ws.phaseWord}</span>
       </div>
@@ -1735,12 +1783,12 @@ function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws:
 /* Bottom console                                                      */
 /* ------------------------------------------------------------------ */
 
-const bottomTabs: Array<{ id: BottomTab; label: string }> = [
-  { id: "aggregate", label: "Log Aggregation" },
-  { id: "xray", label: "X-ray Log" },
-  { id: "nano", label: "Turntable Log" },
-  { id: "camera", label: "Camera Log" },
-  { id: "images", label: "Image Preview" },
+const bottomTabs: Array<{ id: BottomTab; label: string; icon: LineIconName }> = [
+  { id: "aggregate", label: "Log Aggregation", icon: "terminal" },
+  { id: "xray", label: "X-ray Log", icon: "radiation" },
+  { id: "nano", label: "Turntable Log", icon: "rotate" },
+  { id: "camera", label: "Camera Log", icon: "camera" },
+  { id: "images", label: "Image Preview", icon: "image" },
 ];
 
 const logLevelClass: Record<ConsoleLogLine["level"], string> = {
@@ -1814,7 +1862,8 @@ function BottomConsole({ ws }: { ws: WorkstationView }) {
             className="console__tab"
             onClick={() => setTab(item.id)}
           >
-            {item.label}
+            <LineIcon name={item.icon} size={13} className="console__tab-icon" />
+            <em>{item.label}</em>
             <span>{counts[item.id]}</span>
           </button>
         ))}
@@ -1858,6 +1907,14 @@ const DIALOG_TITLES: Record<DialogKind, string> = {
   about: "About Micro-CT Workstation",
   preferences: "Preferences",
   diagnostics: "Device Diagnostics",
+};
+
+const DIALOG_ICONS: Record<DialogKind, LineIconName> = {
+  guide: "book",
+  safety: "warning",
+  about: "info",
+  preferences: "sliders",
+  diagnostics: "pulse",
 };
 
 const APP_VERSION = "0.7.0";
@@ -2027,6 +2084,7 @@ function InfoDialog({
         onClick={(event) => event.stopPropagation()}
       >
         <header className="modal-card__head">
+          <LineIcon name={DIALOG_ICONS[kind]} size={15} className="panel__icon" />
           <h2 id="menu-dialog-title">{DIALOG_TITLES[kind]}</h2>
           <button type="button" className="modal-card__close" onClick={onClose} aria-label="Close dialog">
             ×
@@ -2263,6 +2321,7 @@ export function App() {
         <div className="app-divider" />
         {error || actionError || setupDraftError ? (
           <div className="error-toast" role="alert">
+            <LineIcon name="warning" size={13} />
             {setupDraftError ?? actionError ?? error}
           </div>
         ) : null}
@@ -2313,6 +2372,7 @@ export function App() {
             <div className="theme-toggle" role="group" aria-label="Theme">
               {(["light", "dark"] as const).map(value => (
                 <button type="button" key={value} className="theme-toggle__seg" aria-pressed={theme === value} onClick={() => setTheme(value)}>
+                  <LineIcon name={value === "light" ? "sun" : "moon"} size={11} />
                   {value === "light" ? "Light" : "Dark"}
                 </button>
               ))}
