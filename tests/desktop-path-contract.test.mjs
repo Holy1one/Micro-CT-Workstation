@@ -11,6 +11,91 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 const read = async (path) => readFile(new URL(path, root), "utf8");
 
+/* ---------- shared layout facts read out of src/styles.css ---------- */
+
+/** The panel class the Operation Status section actually carries in App.tsx
+ *  (`<section className="panel operation-panel">`). There is no `.op-status`
+ *  rule, so any selector using it silently matches nothing. */
+export const OPERATION_PANEL_CLASS = "operation-panel";
+
+/** Log and Operation Status remain equal at the published design height. */
+export const BOTTOM_LOG_ROW_PX = 306;
+
+/** The right column uses the same panel spacing as the workspace columns. */
+export const RIGHT_COLUMN_SPACER_PX = 12;
+
+/** The first client-area row's design height, in design px. `.design-canvas`
+ *  spends row 1 on the custom title bar (`header.menu-bar`: compact menus,
+ *  brand, window controls) and the last row on the 30px status bar. This is a
+ *  specified design value, documented in src/AGENTS.md; the stylesheet is
+ *  graded against the spec, never the other way round. */
+export const TOP_CHROME_ROW_PX = 39;
+
+/** The design canvas grid: top chrome, hairline, content, hairline, status bar. */
+export const CHROME_ROW_TRACKS = /grid-template-rows: (\d+)px 1px minmax\(0, 1fr\) 1px (\d+)px/;
+
+const escapeForRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Every declaration body of one concrete class selector. Derived from the
+ * class name actually rendered by App.tsx, so renaming the panel in both places
+ * keeps working while a selector that matches nothing fails instead of skipping.
+ */
+export const classRuleBodies = (css, className) => [
+  ...css.matchAll(new RegExp(`\\.${escapeForRegExp(className)}\\s*\\{([^}]*)\\}`, "g")),
+].map((match) => match[1]);
+
+/**
+ * The bottom console row height declared by `.workspace-body`, or null when the
+ * rule is gone. Callers must treat null as a failure: the row is the anchor of
+ * the shared bottom edge, not something to fall back to a range for.
+ */
+export const bottomLogRowPx = (css) => {
+  const match = css.match(
+    /\.workspace-body\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+12px\s+(\d+)px/,
+  );
+  return match ? Number(match[1]) : null;
+};
+
+/** The `min-height` values the Operation Status panel declares, in source order. */
+export const operationPanelMinHeightsPx = (css, className = OPERATION_PANEL_CLASS) =>
+  classRuleBodies(css, className)
+    .flatMap((body) => [...body.matchAll(/min-height:\s*(\d+)px/g)])
+    .map((match) => Number(match[1]));
+
+/** The `height` values the Operation Status panel declares, in source order. */
+export const operationPanelHeightsPx = (css, className = OPERATION_PANEL_CLASS) =>
+  classRuleBodies(css, className)
+    .flatMap((body) => [...body.matchAll(/(?<!min-)height:\s*(\d+)px/g)])
+    .map((match) => Number(match[1]));
+
+/** The separator the right status column puts between its two panels, or null. */
+export const rightColumnSpacerPx = (css) => {
+  const bodies = classRuleBodies(css, "col--right");
+  for (const body of bodies) {
+    const match = body.match(/(?:^|;)\s*(?:row-)?gap\s*:\s*(\d+)px/);
+    if (match) return Number(match[1]);
+  }
+  return null;
+};
+
+/**
+ * Returns the Operation Status panel's published height. The log must equal
+ * that value; missing or conflicting declarations fail rather than fallback.
+ */
+export function readOperationPanelHeight(css, className = OPERATION_PANEL_CLASS) {
+  const bodies = classRuleBodies(css, className);
+  if (bodies.length === 0) {
+    throw new Error(`stylesheet has no .${className} rule to read the panel height from`);
+  }
+  const heights = operationPanelHeightsPx(css, className);
+  const minHeights = operationPanelMinHeightsPx(css, className);
+  if (heights.length === 0 && minHeights.length === 0) {
+    throw new Error(`.${className} publishes no height: / min-height: in px`);
+  }
+  return [...heights, ...minHeights][0];
+}
+
 test("desktop path resolver anchors Camera Roll to the configured Pictures folder", async () => {
   const source = await read("src-tauri/src/main.rs");
   assert.match(source, /fn resolve_default_image_directory/);
@@ -128,14 +213,62 @@ test("fixed design canvas scales as one unit and side columns never scroll", asy
   assert.match(styles, /\.menu-dropdown \{[\s\S]*position: absolute;/);
   assert.doesNotMatch(app, /Math\.min\(window\.innerWidth \/ 1600/);
   assert.doesNotMatch(styles, /\.design-canvas\s*\{[^}]*transform:/);
-  assert.match(styles, /grid-template-rows: 26px 1px minmax\(0, 1fr\) 1px 30px/);
+  // The first row is the single top chrome row (custom title bar: brand +
+  // menus + window controls) and the last is the status bar. The four-track
+  // structure and both pinned heights must not change.
+  const chromeRows = styles.match(CHROME_ROW_TRACKS);
+  assert.ok(chromeRows, "the design canvas must declare top-row / content / status-bar tracks");
+  const topRowPx = Number(chromeRows[1]);
+  const statusRowPx = Number(chromeRows[2]);
+  // Exactly 39, with the spec authority named so this is not self-referential:
+  // the height is a documented design value, not merely whatever the
+  // stylesheet happens to say. The previous check accepted anything in
+  // [26, 64] - a range 2.5x the width of the value, which silently tolerated
+  // the 13px drift between the 26px spec and the shipped 39px track while the
+  // status bar beside it was pinned to exactly 30. All 26..64 values, the
+  // stale 26 included, now fail.
+  assert.equal(
+    topRowPx,
+    TOP_CHROME_ROW_PX,
+    `the custom title-bar row must stay exactly ${TOP_CHROME_ROW_PX} design px, ` +
+      `the value specified in src/AGENTS.md (client-area first row design height); got ${topRowPx}px`,
+  );
+  // The range 26 <= topRowPx <= 64 was deliberately deleted here. It is not a
+  // regression gate: it accepted 26 through 64, so the drift it was meant to
+  // catch passed through it untouched. Do not reintroduce a tolerance band.
+  assert.equal(statusRowPx, 30, "the status bar row must stay 30px");
+  // Cross-check against the written spec so the pinned literal is anchored to a
+  // document rather than to this test. This is deliberately the inverse of the
+  // defect that created it: the range assertion let src/AGENTS.md keep saying
+  // 26px while src/styles.css shipped 39px. Whichever of the two drifts, one of
+  // the two assertions now fails.
+  const spec = await read("src/AGENTS.md");
+  assert.match(
+    spec,
+    new RegExp(`设计高度\\s*${TOP_CHROME_ROW_PX}px`),
+    `src/AGENTS.md must document the first client-area row's design height as ${TOP_CHROME_ROW_PX}px`,
+  );
+  assert.doesNotMatch(
+    spec,
+    /设计高度\s*26px/,
+    "src/AGENTS.md must not keep the stale 26px first-row design height",
+  );
   assert.match(styles, /grid-template-columns: 420px minmax\(0, 1fr\) 450px/);
-  assert.match(styles, /\.workspace-body \{[\s\S]*grid-template-rows: minmax\(0, 1fr\) 1px 270px;/);
+  // The log alone is shortened and moved down; Operation Status does not move.
+  const logRowPx = bottomLogRowPx(styles);
+  assert.equal(logRowPx, BOTTOM_LOG_ROW_PX);
+  const operationPanelHeightPx = readOperationPanelHeight(styles);
+  assert.equal(operationPanelHeightPx, logRowPx);
+  assert.deepEqual(operationPanelMinHeightsPx(styles), [operationPanelHeightPx]);
+  assert.match(app, /className="panel operation-panel"/);
+  assert.equal(rightColumnSpacerPx(styles), RIGHT_COLUMN_SPACER_PX);
+  assert.match(styles, /grid-template-rows: minmax\(0, 1fr\) 12px 306px;/);
+  assert.match(styles, /\.col--right \{[^}]*grid-template-rows: minmax\(0, 1fr\) 306px;/);
   // The bottom console stays full width over the left + centre columns only,
   // and the right status column runs through to the bottom of the workspace.
   assert.match(styles, /\.workspace-body > \.console \{[\s\S]*grid-column: 1 \/ 3;/);
   assert.match(styles, /\.col--right \{[\s\S]*grid-row: 1 \/ 4;/);
-  assert.match(styles, /\.col--right \{[\s\S]*grid-template-rows: minmax\(0, 1fr\) auto;/);
+  assert.match(styles, /\.col--right \{[^}]*grid-template-rows: minmax\(0, 1fr\) 306px;/);
   assert.match(styles, /\.viewport-shell \{[^}]*var\(--appBg\)/);
   assert.match(app, /width: `\$\{canvasLayout\.designWidth\}px`/);
   assert.ok((tokens.match(/--viewportGutter:/g) ?? []).length >= 2);
@@ -161,6 +294,12 @@ test("engineering menus and numeric scan fields stay compact and free of brandin
   assert.doesNotMatch(scan, /<small>1[–-]/);
   assert.match(scan, /minutesToSeconds\(maxXray\)/);
   assert.match(scan, /secondsToMinutes\(setup\.maxXraySec \|\| 600\)/);
-  assert.match(app, /className="help-tip" title=\{text\}/);
+  // HelpTip renders the linear question icon with a self-drawn glass bubble;
+  // the native title attribute was dropped because WebView2 pops it unreliably.
+  assert.match(app, /className="help-tip"/);
+  assert.match(app, /createPortal\(/);
+  assert.match(app, /className="help-tip__bubble"/);
+  assert.match(app, /onPointerEnter=\{show\}/);
+  assert.doesNotMatch(app, /className="help-tip" title=/);
   assert.match(styles, /button\.help-tip[^}]*border-radius: 50%/);
 });

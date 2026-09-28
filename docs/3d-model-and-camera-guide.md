@@ -9,7 +9,7 @@
 三维渲染链路如下：
 
 1. `src/App.tsx` 根据 `useSceneFallback()` 的结果，在实时 Canvas 和静态降级图之间选择。
-2. `src/scene/LiveSceneCanvas.tsx` 创建 React Three Fiber `Canvas`、透视相机和轨道控制器，并按包围盒自动取景。
+2. `src/scene/LiveSceneCanvas.tsx` 创建 React Three Fiber `Canvas`、正交相机和轨道控制器，并按投影包围盒自动取景（取景数学在 `src/scene/scene-fit.ts`）。
 3. `src/scene/EquipmentScene.tsx` 是设备几何的主入口，负责光源、转台与样品、相机、光束和光轴线；`src/scene/stage-surroundings.tsx` 负责上半球球壁与桌面圆盘（当前半径 4000，桌面高度取 `RING_TRACK.bottomY`，即 y=-112）。
 4. `src/scene/scene-config.ts` 集中保存光轴坐标、设备尺寸、转台参数、相机约束和视角预设。
 5. `src/scene/StaticSceneFallback.tsx` 在 WebGL 不可用或 WebGL 上下文丢失时展示静态图片。
@@ -85,49 +85,59 @@ React Three Fiber 中的变换与 Three.js 一致：
 
 ## 4. 相机视角和 OrbitControls
 
-### 4.1 PerspectiveCamera
+### 4.1 OrthographicCamera 与自动取景
 
-`LiveSceneCanvas.tsx` 使用 `PerspectiveCamera`（当前 `fov = 40`、`near = 20`、`far = 9000`）：
+`LiveSceneCanvas.tsx` 使用 `OrthographicCamera`（`near = -9000`、`far = 9000`），垂直视锥高度为常量 `FRUSTUM_HEIGHT = 1200`（即 `top = FRUSTUM_HEIGHT / 2`、`bottom = -FRUSTUM_HEIGHT / 2`，左右再按视口宽高比推出半宽）：
 
 ```tsx
-<PerspectiveCamera
+<OrthographicCamera
   makeDefault
-  fov={FIT_FOV}
-  near={20}
+  near={-9000}
   far={9000}
+  top={FRUSTUM_HEIGHT / 2}
+  bottom={-FRUSTUM_HEIGHT / 2}
+  left={-FRUSTUM_HEIGHT / 2}
+  right={FRUSTUM_HEIGHT / 2}
   position={CAMERA_PRESETS.iso}
 />
 ```
 
-透视相机按**距离**取景，不再用正交 zoom。切换预设时，`CameraRig` 会：
+正交相机按 `zoom` 取景，因此预设只决定视线方向，实际取景由投影包围盒算出。切换预设时，`CameraRig` 会：
 
-1. 从 `CAMERA_PRESETS[preset]` 读取相机位置，只取其方向（单位向量）；
-2. 用 `Box3` 量出整机包围盒，结合视口宽高比算出刚好装下它的距离；
-3. 按 `PRESET_ZOOM[preset]` 缩放该距离，并夹在 `MIN_DISTANCE`（320）与 `MAX_DISTANCE`（3600）之间；背景半球半径为 4000，调整最大距离时须保持相机位于半球内；
-4. 把控制器 target 重设为 `CAMERA_CONSTRAINTS.target`；
-5. 调用 `invalidate()` 触发按需渲染。
+1. 从 `CAMERA_PRESETS[preset]` 读取相机位置，与 `CAMERA_CONSTRAINTS.target` 相减得到视线方向；
+2. 用 `Box3` 量出需要保持在画面内的网格包围盒，把 8 个角点变换到相机空间，取投影后的水平与垂直跨度；
+3. 取 `min(FRUSTUM_HEIGHT × aspect × FIT_WIDTH / 水平跨度, FRUSTUM_HEIGHT × FIT_HEIGHT / 垂直跨度)` 作为 `orthographic.zoom`，其中 `FIT_WIDTH = 0.88`、`FIT_HEIGHT = 0.82`，即预留 12% / 18% 边距；
+4. 把相机与 orbit target 沿屏幕上方平移 `FRUSTUM_HEIGHT × VIEW_CENTER_SHIFT / zoom`（`VIEW_CENTER_SHIFT = 0.05`），让设备整体落在顶部视角按钮坞下方；
+5. 把 `OrbitControls` 的 `minZoom` / `maxZoom` 设为 `zoom × CAMERA_CONSTRAINTS.minZoom`（0.6）与 `zoom × CAMERA_CONSTRAINTS.maxZoom`（2.2），再把 target 重设为 `CAMERA_CONSTRAINTS.target`；
+6. 调用 `invalidate()` 触发按需渲染。
 
-当前预设（位置只决定视线方向，实际距离由包围盒与视口比例算出）：
+取景包围盒由 `src/scene/scene-fit.ts` 的 `collectSceneBounds` 收集。它遍历场景图，跳过不可见对象；祖先带 `userData.excludeFromFit` 的网格默认排除（背景半球与桌面圆盘就属于这一类，它们本应铺满画面而不参与取景），但若该网格自身标记 `userData.includeInFit`，仍会重新纳入取景，避免可见的装饰带被漏掉而出现欠覆盖。
 
-| 预设 | 相机位置（视线方向） | zoom |
-|---|---|---:|
-| `iso` | `[760, 430, 760]` | `1` |
-| `front` | `[780, 95, 0]` | `1.05` |
-| `top` | `[0, 1050, 0.001]` | `0.84` |
+计算被抽到 `src/scene/scene-fit.ts` 以便单元测试。`tests/scene-framing.test.mjs` 用合成轨道与装饰带包围盒、按三个预设的相机朝向断言投影跨度不越界且不超过 `FIT_WIDTH` / `FIT_HEIGHT` 留边。
 
-`top` 的 Z 使用 `0.001` 而不是完全为 0，可避免相机朝向计算处于退化方向。新增预设时，应同时更新 `ViewPreset` 类型、`CAMERA_PRESETS` 和对应 UI 入口。
+当前预设（位置只决定视线方向）：
+
+| 预设 | 相机位置（视线方向） |
+|---|---|
+| `iso` | `[760, 430, 760]` |
+| `front` | `[780, 95, 0]` |
+| `top` | `[0, 1050, 0.001]` |
+
+`top` 的 Z 使用 `0.001` 而不是完全为 0，可避免相机朝向计算处于退化方向。`OrbitControls` 的 `minZoom` / `maxZoom` 属性上写的是 0.1 与 5，但 `CameraRig` 在每次取景后会把它覆盖为上面第 5 步的以 fit 为基准的范围。新增预设时，应同时更新 `ViewPreset` 类型、`CAMERA_PRESETS` 和对应 UI 入口。用户手动轨道后，`CameraRig` 通过 `userOrbited` 停止在 resize 时重新取景，直到再次点击某个预设才会复位。
 
 ### 4.2 OrbitControls
 
 当前 `OrbitControls` 配置为：
 
-- 启用阻尼，`dampingFactor = 0.08`；
+- 启用阻尼，`dampingFactor = 0.08`；`enableDamping` 绑定 `!reducedMotion`，因此 `prefers-reduced-motion: reduce` 生效时会关闭阻尼；
 - 禁止平移，避免用户把设备移出视野；
-- 垂直旋转角限制为 12° 到 78°；
-- 轨道距离限制为 `MIN_DISTANCE`（320）到 `MAX_DISTANCE`（3600），并与背景半球半径配合；
+- 垂直旋转角限制为 12° 到 78°（`CAMERA_CONSTRAINTS.minPolarAngle` / `maxPolarAngle`）；
+- 轨道缩放范围在每次取景后被改写为「本次 fit 的 zoom × 0.6」到「× 2.2」（`CAMERA_CONSTRAINTS.minZoom` / `maxZoom`）；
 - 观察目标为 `[0, 20, 0]`。
 
-如果模型整体尺寸发生改变，优先统一调整 `CAMERA_PRESETS`、`CAMERA_CONSTRAINTS.target` 或取景倍率，不要通过破坏设备各组件的相对比例来迁就视野。本轮集成目标还包括把视角控制坞放到场景顶部、重复点击 ISO 时复位视角，以及拉近预设构图；具体参数和验收结果以集成后的源码与截图为准。
+`LiveSceneCanvas.tsx` 用 `usePrefersReducedMotion()` 监听 `window.matchMedia("(prefers-reduced-motion: reduce)")`，并在用户运行期改变该偏好时同步更新；同一个标志既驱动上面的 `enableDamping`，也传给 `EquipmentScene`，让转台角度直接跳到确认值而不做插值。为了可观测，`SceneCanvasSettings` 会把 `data-prefers-reduced-motion` 与 `data-orbit-damping` 写到 WebGL canvas 的 `dataset` 上。这些只影响展示，不改变任何实测读数。
+
+如果模型整体尺寸发生改变，优先统一调整 `CAMERA_PRESETS`、`CAMERA_CONSTRAINTS.target` 或 `FIT_WIDTH` / `FIT_HEIGHT`，不要通过破坏设备各组件的相对比例来迁就视野。
 
 ## 5. 外部 GLB/GLTF 模型的目录建议
 
@@ -278,6 +288,10 @@ Box3 只解决“整体尺寸”问题，不会自动知道：
 
 ## 9. 材质和贴图
 
+### 当前程序化设备造型
+
+设备采用克制的日系卡通配色：射线源与相机主体为暖米白，盖板和剪叉支架为低饱和青绿，握把为柔和珊瑚色，圆轨保留可辨认的刻度与双轨接触面。金属件使用较高粗糙度和适度金属度，使轮组、丝杆、镜头和黄铜出束口在柔和灯光下仍有清晰层次。造型调整只涉及表面材质及剪叉臂圆角；光轴基准、源和相机比例、轨道半径、轮轨接触位置及反馈旋转组保持不变。
+
 当前程序化几何使用 `meshStandardMaterial`、`meshPhysicalMaterial` 和 `meshBasicMaterial`，灯光由半球光和两盏方向光提供。外部模型建议优先使用 glTF 的金属度/粗糙度 PBR 工作流：
 
 - Base Color：sRGB 色彩空间；
@@ -345,7 +359,9 @@ connect-src ipc: http://ipc.localhost
 
 - `src/scene/EquipmentScene.tsx:21-173`：光束、设备组件、转台旋转、光轴线和灯光实现。
 - `src/scene/scene-config.ts:3-69`：光轴常量、设备尺寸、相机约束、视角预设和启动断言。
-- `src/scene/LiveSceneCanvas.tsx`：透视相机（fov 40）、包围盒自动取景、距离限制 `MIN_DISTANCE`/`MAX_DISTANCE`、OrbitControls 和 WebGL 上下文丢失处理。
+- `src/scene/LiveSceneCanvas.tsx`：正交相机（`FRUSTUM_HEIGHT = 1200`，`near`/`far` 为 ±9000）、按投影包围盒自动取景、以 fit 为基准的 OrbitControls 缩放范围、`prefers-reduced-motion` 对阻尼的取消，以及 WebGL 上下文丢失处理。
+- `src/scene/scene-fit.ts`：`collectSceneBounds`（含 `excludeFromFit` / `includeInFit` 规则）与 `computeFitZoom`、`FRUSTUM_HEIGHT`、`FIT_WIDTH`、`FIT_HEIGHT`。
+- `tests/scene-framing.test.mjs`：三个预设下取景不越界的数值回归测试。
 - `src/scene/StaticSceneFallback.tsx:3-29`：静态降级原因和图片路径规则。
 - `src/App.tsx:343-373`：实时场景与静态 fallback 的选择入口。
 - `vite.config.mjs:4-7`：前端构建输出目录 `dist/client`。

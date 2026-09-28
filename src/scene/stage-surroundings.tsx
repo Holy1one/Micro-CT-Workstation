@@ -4,6 +4,8 @@
  * scene-config.ts and safety state remains outside this module.
  */
 
+import { useEffect } from "react";
+import { useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import { RING_TRACK } from "./scene-config";
 import type { SceneTheme } from "./types";
@@ -14,7 +16,50 @@ import type { SceneTheme } from "./types";
 // looking at the inside of the same shell.
 //
 const STAGE_RADIUS = 4000;
+const GARDEN_RADIUS = 560;
 const TABLE_Y = RING_TRACK.bottomY;
+
+const SHRUB_POSITIONS: readonly [number, number, number][] = [
+  [-480, -180, 18], [-500, 20, 21], [-430, 285, 16],
+  [430, -285, 20], [500, -20, 19], [480, 180, 17],
+  [-230, 470, 15], [230, 470, 18], [-230, -470, 16], [230, -470, 17],
+];
+const PEBBLE_ANGLES = [-168, -125, -80, -36, 12, 54, 103, 147] as const;
+const TREE_POSITIONS: readonly [number, number][] = [[-360, -370], [370, -360], [430, 295]];
+
+function Shrub({ x, z, size, night }: { x: number; z: number; size: number; night: boolean }) {
+  return (
+    <group position={[x, TABLE_Y, z]}>
+      <mesh position={[0, size * 0.42, 0]} castShadow={false}>
+        <icosahedronGeometry args={[size, 0]} />
+        <meshStandardMaterial color={night ? "#647c77" : "#80a775"} flatShading roughness={1} />
+      </mesh>
+      <mesh position={[size * 0.62, size * 0.29, size * 0.2]}>
+        <icosahedronGeometry args={[size * 0.67, 0]} />
+        <meshStandardMaterial color={night ? "#4e6967" : "#6d956c"} flatShading roughness={1} />
+      </mesh>
+    </group>
+  );
+}
+
+function MiniatureTree({ x, z, night }: { x: number; z: number; night: boolean }) {
+  return (
+    <group position={[x, TABLE_Y, z]}>
+      <mesh position={[0, 20, 0]}>
+        <cylinderGeometry args={[4, 5, 40, 6]} />
+        <meshStandardMaterial color={night ? "#594e49" : "#98785d"} roughness={1} />
+      </mesh>
+      <mesh position={[0, 49, 0]}>
+        <coneGeometry args={[22, 51, 7]} />
+        <meshStandardMaterial color={night ? "#405f5e" : "#78aa80"} flatShading roughness={1} />
+      </mesh>
+      <mesh position={[0, 68, 0]}>
+        <coneGeometry args={[15, 39, 7]} />
+        <meshStandardMaterial color={night ? "#507070" : "#91bd90"} flatShading roughness={1} />
+      </mesh>
+    </group>
+  );
+}
 
 /** Builds a tiling greyscale grain map. Grey-only on purpose: the surface takes
  *  its colour from `material.color`, so the same map survives a theme switch and
@@ -85,6 +130,47 @@ const PAPER_MAP = createGrainMap((ctx, size) => {
   addGrain(ctx, size, 10);
 }, [10, 3]);
 
+/** A quiet high-to-low wash. Canvas values stay close to white so this map
+ *  modulates the token colour without tinting it or competing with the scene. */
+const BACKDROP_GRADIENT_MAP = createGrainMap((ctx, size) => {
+  const gradient = ctx.createLinearGradient(0, 0, 0, size);
+  gradient.addColorStop(0, "#d8d8d8");
+  // SphereGeometry's upper half uses texture V=1 at its pole and V=0.5 at the
+  // horizon. Finish the wash over that used half instead of wasting it below.
+  gradient.addColorStop(0.5, "#ffffff");
+  gradient.addColorStop(1, "#ffffff");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  addGrain(ctx, size, 1.5);
+}, [1, 1]);
+
+/** The oversized floor gets a broad centre lift and gentle edge falloff. It is
+ *  an emissive multiplier only: the existing fabric albedo and relief remain
+ *  responsible for the ground's material character. */
+function createGroundFalloffMap(edge: string): THREE.Texture {
+  const size = 512;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (ctx) {
+    const gradient = ctx.createRadialGradient(size / 2, size / 2, size * 0.02, size / 2, size / 2, size * 0.26);
+    gradient.addColorStop(0, "#ffffff");
+    gradient.addColorStop(0.38, "#fafafa");
+    gradient.addColorStop(1, edge);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, size, size);
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.anisotropy = 4;
+  return texture;
+}
+
+const GROUND_FALLOFF_LIGHT = createGroundFalloffMap("#e6e6e6");
+const GROUND_FALLOFF_DARK = createGroundFalloffMap("#ededed");
+
 /** The room the bench stands in: cloth table under a papered dome. Nothing here
  *  participates in the camera fit (see `sceneBounds`) - it is an order of
  *  magnitude wider than the bench, and fitting to it would frame the shell
@@ -104,15 +190,28 @@ const PAPER_MAP = createGrainMap((ctx, size) => {
  *  the cloth and the paper still read once the surface is this bright: the weave
  *  is carried by the colour it multiplies as well as by the relief. */
 export function StageSurroundings({ theme }: { theme: SceneTheme }) {
+  const night = theme.stageGlow < 0.3;
+  const { scene, invalidate } = useThree();
+  useEffect(() => {
+    const previousFog = scene.fog;
+    const fog = new THREE.FogExp2(theme.stageWall, night ? 0.00003 : 0.00004);
+    scene.fog = fog;
+    invalidate();
+    return () => {
+      if (scene.fog === fog) scene.fog = previousFog;
+      invalidate();
+    };
+  }, [invalidate, night, scene, theme.stageWall]);
+
   return (
     <group>
-      <mesh position={[0, TABLE_Y, 0]} rotation={[-Math.PI / 2, 0, 0]} userData={{ excludeFromFit: true }}>
+      <mesh position={[0, TABLE_Y - 3, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow userData={{ excludeFromFit: true }}>
         <circleGeometry args={[STAGE_RADIUS, 96]} />
         <meshStandardMaterial
           color={theme.stageTable}
           map={CLOTH_MAP}
           emissive={theme.stageTable}
-          emissiveMap={CLOTH_MAP}
+          emissiveMap={night ? GROUND_FALLOFF_DARK : GROUND_FALLOFF_LIGHT}
           emissiveIntensity={theme.stageGlow}
           roughness={0.95}
           metalness={0}
@@ -121,13 +220,71 @@ export function StageSurroundings({ theme }: { theme: SceneTheme }) {
           bumpScale={1.5}
         />
       </mesh>
+      {/* The finite tray participates in camera fit; only the room shell is
+          excluded. The rail's 432-unit outer edge remains clear. */}
+      <group>
+        <mesh position={[0, TABLE_Y - 6, 0]}>
+          <cylinderGeometry args={[GARDEN_RADIUS + 10, GARDEN_RADIUS + 4, 12, 64]} />
+          <meshStandardMaterial color={night ? "#394e57" : "#eee4d1"} roughness={0.95} />
+        </mesh>
+        <mesh position={[0, TABLE_Y + 0.5, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+          <ringGeometry args={[465, GARDEN_RADIUS, 64]} />
+          <meshStandardMaterial color={night ? "#485b61" : "#b7c69c"} roughness={1} />
+        </mesh>
+        <mesh position={[0, TABLE_Y + 1, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+          <ringGeometry args={[GARDEN_RADIUS - 23, GARDEN_RADIUS + 10, 64]} />
+          <meshStandardMaterial color={night ? "#82919a" : "#efe5cf"} roughness={0.9} />
+        </mesh>
+        {SHRUB_POSITIONS.map(([x, z, size]) => (
+          <Shrub key={`${x}:${z}`} x={x} z={z} size={size} night={night} />
+        ))}
+        {TREE_POSITIONS.map(([x, z]) => (
+          <MiniatureTree key={`${x}:${z}`} x={x} z={z} night={night} />
+        ))}
+        {PEBBLE_ANGLES.map((degrees) => {
+          const radians = degrees * Math.PI / 180;
+          return (
+            <mesh key={degrees} position={[Math.sin(radians) * 514, TABLE_Y + 1.1, Math.cos(radians) * 514]}>
+              <cylinderGeometry args={[8, 10, 2, 6]} />
+              <meshStandardMaterial color={night ? "#89928e" : "#f8efe0"} roughness={1} />
+            </mesh>
+          );
+        })}
+        {/* The lamp is outside the rail and illuminates only a small garden
+            patch; it never stands in the source/sample/detector corridor. */}
+        <group position={[-510, TABLE_Y, -140]}>
+          <mesh position={[0, 73, 0]}>
+            <cylinderGeometry args={[3, 5, 146, 8]} />
+            <meshStandardMaterial color={night ? "#59636d" : "#66717a"} roughness={0.75} />
+          </mesh>
+          <mesh position={[0, 148, 0]}>
+            <cylinderGeometry args={[15, 10, 8, 8]} />
+            <meshStandardMaterial color={night ? "#a98564" : "#8b8274"} roughness={0.8} />
+          </mesh>
+          <mesh position={[0, 140, 0]}>
+            <sphereGeometry args={[9, 8, 6]} />
+            <meshStandardMaterial color={night ? "#ffdda1" : "#f6e2b9"} emissive={night ? "#ffc879" : "#000000"} emissiveIntensity={night ? 0.75 : 0} />
+          </mesh>
+          {night && (
+            <>
+              <mesh position={[0, 1.6, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <circleGeometry args={[82, 24]} />
+                <meshBasicMaterial color="#e9b87c" transparent opacity={0.11} depthWrite={false} />
+              </mesh>
+              <pointLight position={[0, 136, 0]} color="#ffc58a" intensity={1.9} distance={270} decay={2} />
+            </>
+          )}
+        </group>
+      </group>
       {/* Upper half only: theta sweep of PI/2 from the pole down to the rim,
           which lands the rim exactly on the table edge. */}
       <mesh position={[0, TABLE_Y, 0]} userData={{ excludeFromFit: true }}>
         <sphereGeometry args={[STAGE_RADIUS, 96, 48, 0, Math.PI * 2, 0, Math.PI / 2]} />
         <meshStandardMaterial
           color={theme.stageWall}
+          map={BACKDROP_GRADIENT_MAP}
           emissive={theme.stageWall}
+          emissiveMap={BACKDROP_GRADIENT_MAP}
           emissiveIntensity={theme.stageGlow}
           roughness={1}
           metalness={0}

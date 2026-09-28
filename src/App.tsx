@@ -5,12 +5,14 @@
  * decisions; those remain authoritative in ct-engine.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Folder } from "@phosphor-icons/react";
-import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
+import { LineIcon, type LineIconName } from "./icons";
 import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } from "./scan-input";
-import { useEngine } from "./engine/useEngine";
+import { hasDeviceSessionEverEstablished, useEngine } from "./engine/useEngine";
 import {
   chooseImageDirectory,
   exportSessionLog,
@@ -45,20 +47,33 @@ const THEME_KEY = "micro-ct-workstation.theme";
 function useTheme(): [Theme, (theme: Theme) => void] {
   const [theme, setTheme] = useState<Theme>(() => {
     try {
-      return window.localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light";
-    } catch {
-      return "light";
-    }
+      const saved = window.localStorage.getItem(THEME_KEY);
+      if (saved === "light" || saved === "dark") return saved;
+    } catch { /* use the operating-system preference */ }
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    try {
-      window.localStorage.setItem(THEME_KEY, theme);
-    } catch {
-      /* storage unavailable */
-    }
+    const themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+    if (themeColor) themeColor.content = theme === "dark" ? "#111821" : "#E8EDF2";
   }, [theme]);
-  return [theme, setTheme];
+  useEffect(() => {
+    const preference = window.matchMedia("(prefers-color-scheme: dark)");
+    const syncFromOperatingSystem = (event: MediaQueryListEvent): void => {
+      try {
+        const saved = window.localStorage.getItem(THEME_KEY);
+        if (saved === "light" || saved === "dark") return;
+      } catch { /* a blocked store behaves as no manual override */ }
+      setTheme(event.matches ? "dark" : "light");
+    };
+    preference.addEventListener("change", syncFromOperatingSystem);
+    return () => preference.removeEventListener("change", syncFromOperatingSystem);
+  }, []);
+  const chooseTheme = useCallback((next: Theme): void => {
+    try { window.localStorage.setItem(THEME_KEY, next); } catch { /* the active session still follows the selection */ }
+    setTheme(next);
+  }, []);
+  return [theme, chooseTheme];
 }
 
 function logTime(timestamp: string): string {
@@ -68,8 +83,46 @@ function logTime(timestamp: string): string {
   return `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}.${p(date.getMilliseconds(), 3)}`;
 }
 
-function HelpTip({ text }: { text: string }) {
-  return <button type="button" className="help-tip" title={text} aria-label={text}>?</button>;
+function HelpTip({ text, align = "start", side = "down" }: { text: string; align?: "start" | "end"; side?: "down" | "up" }) {
+  const id = useId();
+  const button = useRef<HTMLButtonElement>(null);
+  const [visible, setVisible] = useState(false);
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+  const show = useCallback(() => {
+    const rect = button.current?.getBoundingClientRect();
+    if (!rect) return;
+    setPosition({
+      top: side === "up" ? rect.top - 7 : rect.bottom + 7,
+      left: align === "end" ? rect.right + 8 : rect.left - 8,
+    });
+    setVisible(true);
+  }, [align, side]);
+  return (
+    <>
+      <button
+        ref={button}
+        type="button"
+        className="help-tip"
+        aria-label={text}
+        aria-describedby={visible ? id : undefined}
+        onPointerEnter={show}
+        onPointerLeave={() => setVisible(false)}
+        onFocus={show}
+        onBlur={() => setVisible(false)}
+      >
+        <LineIcon name="question" size={12} />
+      </button>
+      {visible && createPortal(
+        <span
+          id={id}
+          className="help-tip__bubble"
+          role="tooltip"
+          style={{ top: position.top, left: position.left, transform: `translate(${align === "end" ? "-100%" : "0"}, ${side === "up" ? "-100%" : "0"})` }}
+        >{text}</span>,
+        document.body,
+      )}
+    </>
+  );
 }
 
 const toneClass = (tone: string) => `tone-${tone}`;
@@ -108,7 +161,37 @@ function MenuBar({
   onAction: (id: MenuActionId) => void;
 }) {
   const [openMenu, setOpenMenu] = useState<TopMenu | null>(null);
+  const [windowMaximized, setWindowMaximized] = useState(true);
+  const [windowMaximizable, setWindowMaximizable] = useState(false);
   const barRef = useRef<HTMLElement | null>(null);
+  const desktopWindow = useMemo(() => isTauri() ? getCurrentWindow() : null, []);
+
+  useEffect(() => {
+    if (!desktopWindow) return;
+    let disposed = false;
+    let stopResize: (() => void) | undefined;
+    const syncWindowState = async (): Promise<void> => {
+      try {
+        const [maximized, maximizable] = await Promise.all([
+          desktopWindow.isMaximized(),
+          desktopWindow.isMaximizable(),
+        ]);
+        if (!disposed) {
+          setWindowMaximized(maximized);
+          setWindowMaximizable(maximizable);
+        }
+      } catch { /* the chrome remains visible if the host is shutting down */ }
+    };
+    void syncWindowState();
+    void desktopWindow.onResized(() => void syncWindowState()).then((stop) => {
+      if (disposed) stop();
+      else stopResize = stop;
+    });
+    return () => {
+      disposed = true;
+      stopResize?.();
+    };
+  }, [desktopWindow]);
 
   useEffect(() => {
     if (!openMenu) return;
@@ -127,7 +210,19 @@ function MenuBar({
   }, [openMenu]);
 
   return (
-    <header className="menu-bar" ref={barRef}>
+    <header
+      className="menu-bar"
+      ref={barRef}
+      onDoubleClick={(event) => {
+        if ((event.target as HTMLElement).closest("button, nav, .window-controls")) return;
+        if (desktopWindow && windowMaximizable) void desktopWindow.toggleMaximize().catch(() => undefined);
+      }}
+    >
+      <div className="workstation-brand" data-tauri-drag-region>
+        <img src="/assets/micro-ct-logo.png" alt="" draggable={false} />
+        <strong>Micro-CT Workstation</strong>
+        <span>v0.7.0</span>
+      </div>
       <nav className="sys-menu" aria-label="Application menu">
         {MENU_GROUPS.map((group) => {
           const open = openMenu === group.label;
@@ -163,7 +258,8 @@ function MenuBar({
                           onAction(entry.id);
                         }}
                       >
-                        {entry.label}
+                        <LineIcon name={entry.icon} size={13} className="menu-dropdown__icon" />
+                        <span>{entry.label}</span>
                       </button>
                     );
                   })}
@@ -173,6 +269,24 @@ function MenuBar({
           );
         })}
       </nav>
+      <span className="title-drag-space" data-tauri-drag-region aria-hidden="true" />
+      <div className="window-controls" aria-label="Window controls">
+        <button type="button" aria-label="Minimise window" title="Minimise" onClick={() => void desktopWindow?.minimize().catch(() => undefined)}>
+          <span className="window-glyph window-glyph--minimise" aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          aria-label={windowMaximized ? "Restore window" : "Maximise window"}
+          title={windowMaximizable ? (windowMaximized ? "Restore" : "Maximise") : "Window remains maximised at this display size"}
+          disabled={!windowMaximizable}
+          onClick={() => void desktopWindow?.toggleMaximize().catch(() => undefined)}
+        >
+          <span className={`window-glyph ${windowMaximized ? "window-glyph--restore" : "window-glyph--maximise"}`} aria-hidden="true" />
+        </button>
+        <button type="button" className="window-controls__close" aria-label="Close window" title="Close" onClick={() => void desktopWindow?.close().catch(() => undefined)}>
+          <span className="window-glyph window-glyph--close" aria-hidden="true" />
+        </button>
+      </div>
     </header>
   );
 }
@@ -228,15 +342,19 @@ function DevicePanel({
   return (
     <section className="panel device-panel">
       <div className="panel__header">
+        <LineIcon name="link" size={15} className="panel__icon" />
         <h2>Device Connection Status</h2>
         <HelpTip text={`Preflight: ${ws.preflight.subline}`} />
       </div>
       <div className="device-list">
         {ws.devices.map((device) => {
           const retrying = pendingDevice === device.id;
+          const deviceIcon: LineIconName =
+            device.id === "xray" ? "radiation" : device.id === "camera" ? "camera" : "rotate";
           return (
             <div className="device-row" key={device.id}>
               <div className="device-row__top">
+                <LineIcon name={deviceIcon} size={15} className="device-row__icon" />
                 <strong>{device.name}</strong>
                 <HelpTip text={stale ? "Device status unavailable" : device.spec} />
                 <span className={`device-row__word ${toneClass(stale ? "muted" : device.tone)}`}>{stale ? "UNKNOWN" : device.word}</span>
@@ -396,6 +514,7 @@ function ScanParamsPanel({
   return (
     <section className="panel scan-panel">
       <div className="panel__header">
+        <LineIcon name="sliders" size={15} className="panel__icon" />
         <h2>Scan Parameters</h2>
         <span className="chip chip--accent">
           {setup.projectionCount > 0 ? `${setup.projectionCount} PROJECTIONS` : "NOT CONFIGURED"}
@@ -436,22 +555,22 @@ function ScanParamsPanel({
               aria-label="Select image directory"
               onClick={() => void chooseDirectory()}
             >
-              <Folder size={18} weight="duotone" aria-hidden="true" />
+              <LineIcon name="folder" size={15} />
             </button>
           </div>
           {pathError ? <small className="field-error">{pathError}</small> : null}
         </label>
         <div className="scan-input-grid">
           <label className={`numeric-field ${viewsInvalid ? "is-invalid" : ""}`}>
-            <span>Total projections <HelpTip text="Any positive integer up to 3600. The engine calculates the angular step." /></span>
+            <span>Total projections <HelpTip align="end" text="Any positive integer up to 3600. The engine calculates the angular step." /></span>
             <input value={views} disabled={locked} inputMode="numeric" aria-label="Total projections" aria-invalid={viewsInvalid} onChange={(event) => setViews(event.target.value)} onBlur={() => commitNumber("projectionCount", views)} />
           </label>
           <label className={`numeric-field ${exposureInvalid ? "is-invalid" : ""}`}>
-            <span>Exposure · ms <HelpTip text={`${ws.cameraExposure.known ? "Connected camera" : "Nikon D7100 timed shutter"}: ${ws.cameraExposure.minMs}–${ws.cameraExposure.maxMs} ms. The value must match a supported camera shutter setting; unsupported values are rejected.`} /></span>
+            <span>Exposure · ms <HelpTip align="end" text={`${ws.cameraExposure.known ? "Connected camera" : "Nikon D7100 timed shutter"}: ${ws.cameraExposure.minMs}–${ws.cameraExposure.maxMs} ms. The value must match a supported camera shutter setting; unsupported values are rejected.`} /></span>
             <input value={exposure} disabled={locked} inputMode="decimal" aria-label="Exposure in milliseconds" aria-invalid={exposureInvalid} onChange={(event) => setExposure(event.target.value)} onBlur={() => commitNumber("exposureMs", exposure)} />
           </label>
           <label className={`numeric-field ${durationInvalid ? "is-invalid" : ""}`}>
-            <span>Max X-ray · min <HelpTip text="Default 10 min. Maximum continuous output is limited to 10 min, followed by 5 min cooldown. Fractional minutes such as 0.5 are allowed." /></span>
+            <span>Max X-ray · min <HelpTip align="end" text="Default 10 min. Maximum continuous output is limited to 10 min, followed by 5 min cooldown. Fractional minutes such as 0.5 are allowed." /></span>
             <input value={maxXray} disabled={locked} inputMode="decimal" aria-label="Maximum X-ray time in minutes" aria-invalid={durationInvalid} onChange={(event) => setMaxXray(event.target.value)} onBlur={commitDuration} />
           </label>
         </div>
@@ -464,72 +583,883 @@ function ScanParamsPanel({
 /* Center: live scene                                                  */
 /* ------------------------------------------------------------------ */
 
-function DockIcon({ src, alt }: { src: string; alt: string }) {
-  return <img className="dock-icon" src={src} alt={alt} draggable={false} />;
+function DockKey({
+  variant,
+  icon,
+  label,
+  title,
+  disabled,
+  onClick,
+}: {
+  variant: string;
+  icon: LineIconName;
+  label: string;
+  title: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`dock-key dock-key--${variant}`}
+      aria-label={label}
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <LineIcon name={icon} size={28} className="dock-icon" />
+      <span className="dock-key__label">{label}</span>
+    </button>
+  );
 }
 
-function ControlDock({ ws, dispatch, stale = false }: { ws: WorkstationView; dispatch: (c: EngineCommand) => void; stale?: boolean }) {
+/* ------------------------------------------------------------------ */
+/* Console feedback: the eight states the operator must be able to     */
+/* read off the console. Every field is derived in React from the       */
+/* existing EngineSnapshot; no IPC field, DTO or device command is      */
+/* added, and the engine stays the only source of production truth.     */
+/* ------------------------------------------------------------------ */
+
+/** The eight console feedback states. Each one renders its own name. */
+const CONSOLE_FEEDBACK_STATES = [
+  "Running",
+  "Paused",
+  "Cooling",
+  "Finishing",
+  "Stopping",
+  "Stopped",
+  "Completed",
+  "Fault",
+] as const;
+
+type ConsoleStateName = (typeof CONSOLE_FEEDBACK_STATES)[number];
+type ConsoleStateTone = "accent" | "warn" | "danger" | "muted" | "ok";
+
+interface ConsoleFeedback {
+  state: ConsoleStateName;
+  tone: ConsoleStateTone;
+  /** One-line reading. Never claims more than the snapshot proves. */
+  detail: string;
+  /** True while the scan itself is still in flight. */
+  active: boolean;
+}
+
+/**
+ * Evidence checks combine snapshot/workstation fields with the device-session
+ * result supplied by useEngine. Exported so acceptance tests can drive the real
+ * derivation instead of a copy of it.
+ */
+export interface FeedbackEvidence {
+  linkLost: boolean;
+  phaseFault: boolean;
+  beamUnconfirmed: boolean;
+  /** A scan is running or has run, so a cooldown could legitimately be in play. */
+  scanAttempted: boolean;
+}
+
+/**
+ * One-line reading for the benign startup state. It states plainly that nothing
+ * is connected and that every device and output reading is unavailable, so the
+ * neutral banner can never be read as a claim that the machine is ready.
+ */
+function offlineFeedback(): ConsoleFeedback {
+  return {
+    state: "Stopped",
+    tone: "muted",
+    detail: "Not connected · no device link has been established yet · device and output states are unavailable and no scan has run",
+    active: false,
+  };
+}
+
+/**
+ * These key sets mirror every object layer in EngineSnapshot and WorkstationView.
+ * Requiring exact own-key coverage means a new contract field starts closed
+ * until this first-start projection classifies it. Existing fields are checked
+ * below by their value, type, or relationship to the other projection.
+ */
+const FIRST_START_SNAPSHOT_KEYS = [
+  "mode", "modeLabel", "connectionState", "adapterLabel", "phase", "phaseLabel",
+  "preflightPassed", "homed", "requiresPreflight", "requiresHome", "safety", "devices",
+  "parameters", "progress", "imageCount", "logs", "lastError", "updatedAt",
+];
+const FIRST_START_SAFETY_KEYS = ["xrayAvailable", "xrayEnabled", "interlockOk", "lockReason"];
+const FIRST_START_DEVICE_KEYS = ["id", "label", "state", "detail"];
+const FIRST_START_PARAMETER_KEYS = ["taskId", "savePath", "projectionCount", "angleStepDeg", "exposureMs"];
+const FIRST_START_PROGRESS_KEYS = ["current", "total", "percent", "angleDeg", "etaSeconds"];
+const FIRST_START_LOG_KEYS = ["id", "timestamp", "level", "source", "message"];
+const FIRST_START_WORKSTATION_KEYS = [
+  "cameraExposure", "dataState", "phaseWord", "phaseTone", "devices", "onlineSummary", "preflight",
+  "floats", "safetyBar", "scene", "xray", "progress", "summary", "statusbar", "dock", "scanSetup",
+  "consoleLogs", "frames", "checkpointAvailable",
+];
+const FIRST_START_CONSOLE_DEVICE_KEYS = ["id", "name", "word", "tone", "spec"];
+const FIRST_START_FLOAT_KEYS = ["key", "text", "tone"];
+const FIRST_START_XRAY_KEYS = [
+  "connected", "setKv", "setUa", "monKv", "monUa", "powerW", "tempC", "beamState", "beamOn", "latched",
+  "onSec", "offSec", "timerOn", "usbAutoShutDown", "usbAutoShutDownKnown", "usbShutdownDelay",
+  "manualControlsEnabled", "timerControlsEnabled", "setpointControlsEnabled", "voltageConfirmed",
+  "currentConfirmed", "setpointConfirmed",
+];
+const FIRST_START_CONSOLE_PROGRESS_KEYS = ["captured", "total", "percent", "angleDeg", "etaText", "barTone", "barLabel"];
+const FIRST_START_FRAME_KEYS = ["index", "angleDeg", "exposureMs", "fileName"];
+const FIRST_START_DEVICE_IDS = ["turntable", "camera", "xray"] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactOwnKeys(value: unknown, expectedKeys: readonly string[]): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const actualKeys = Reflect.ownKeys(value);
+  return actualKeys.length === expectedKeys.length && actualKeys.every((key) =>
+    typeof key === "string" && expectedKeys.includes(key),
+  );
+}
+
+function hasExactArrayEntries(value: unknown): value is unknown[] {
+  if (!Array.isArray(value)) return false;
+  const ownKeys = Reflect.ownKeys(value).filter((key) => key !== "length");
+  return ownKeys.length === value.length && ownKeys.every((key, index) =>
+    typeof key === "string" && key === String(index),
+  );
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function hasDeviceIds(devices: unknown, expectedIds: readonly string[]): devices is Record<string, unknown>[] {
+  if (!hasExactArrayEntries(devices) || devices.length !== expectedIds.length) return false;
+  const ids = devices.map((device) => isRecord(device) ? device.id : undefined);
+  return expectedIds.every((id) => ids.filter((candidate) => candidate === id).length === 1);
+}
+
+function sameStructuredValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) &&
+      hasExactArrayEntries(left) && hasExactArrayEntries(right) &&
+      left.length === right.length && left.every((value, index) => sameStructuredValue(value, right[index]));
+  }
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const leftKeys = Reflect.ownKeys(left);
+  const rightKeys = Reflect.ownKeys(right);
+  return leftKeys.length === rightKeys.length && leftKeys.every((key) =>
+    rightKeys.includes(key) && typeof key === "string" && sameStructuredValue(left[key], right[key]),
+  );
+}
+
+function hasCompleteFirstStartLogs(logs: unknown): boolean {
+  if (!hasExactArrayEntries(logs)) return false;
+  return logs.every((entry) =>
+    hasExactOwnKeys(entry, FIRST_START_LOG_KEYS) &&
+    isString(entry.id) && entry.id.length > 0 &&
+    isString(entry.timestamp) &&
+    ["INFO", "WARN"].includes(String(entry.level)) &&
+    ["system", "xray", "nano", "camera", "preflight", "operator"].includes(String(entry.source)) &&
+    isString(entry.message),
+  );
+}
+
+function hasCompleteFirstStartConsoleLogs(logs: unknown): boolean {
+  // Rust projects the same production log records into both snapshot logs and
+  // workstation console logs. Keep one format contract so they cannot drift.
+  return hasCompleteFirstStartLogs(logs);
+}
+
+function hasCompleteFirstStartSnapshot(snapshot: EngineSnapshot): boolean {
+  const hasWorkstation = Object.prototype.hasOwnProperty.call(snapshot, "workstation");
+  const rootKeys = hasWorkstation ? [...FIRST_START_SNAPSHOT_KEYS, "workstation"] : FIRST_START_SNAPSHOT_KEYS;
+  if (!hasExactOwnKeys(snapshot, rootKeys)) return false;
+  if (!hasExactOwnKeys(snapshot.safety, FIRST_START_SAFETY_KEYS)) return false;
+  if (![snapshot.safety.xrayAvailable, snapshot.safety.xrayEnabled, snapshot.safety.interlockOk].every((value) => typeof value === "boolean") ||
+    !isString(snapshot.safety.lockReason)) return false;
+  if (!hasExactOwnKeys(snapshot.parameters, FIRST_START_PARAMETER_KEYS)) return false;
+  if (!hasExactOwnKeys(snapshot.progress, FIRST_START_PROGRESS_KEYS)) return false;
+  if (!hasExactArrayEntries(snapshot.devices) || !hasDeviceIds(snapshot.devices, FIRST_START_DEVICE_IDS)) return false;
+  if (!snapshot.devices.every((device) =>
+    hasExactOwnKeys(device, FIRST_START_DEVICE_KEYS) &&
+    isString(device.label) && isString(device.state) && isString(device.detail),
+  )) return false;
+  if (!hasCompleteFirstStartLogs(snapshot.logs)) return false;
+  if (!isString(snapshot.modeLabel) || !isString(snapshot.adapterLabel) || !isString(snapshot.phaseLabel) || !isString(snapshot.updatedAt)) return false;
+  if (!isString(snapshot.parameters.taskId) || !isString(snapshot.parameters.savePath)) return false;
+  if (![snapshot.parameters.projectionCount, snapshot.parameters.angleStepDeg, snapshot.parameters.exposureMs].every(isFiniteNumber)) return false;
+  if (![snapshot.progress.current, snapshot.progress.total, snapshot.progress.percent, snapshot.progress.angleDeg].every(isFiniteNumber)) return false;
+  if (snapshot.progress.etaSeconds !== null && !isFiniteNumber(snapshot.progress.etaSeconds)) return false;
+  if (!isFiniteNumber(snapshot.imageCount) || !Number.isInteger(snapshot.imageCount)) return false;
+  if (snapshot.lastError !== null && !isString(snapshot.lastError)) return false;
+  if (hasWorkstation && (snapshot.workstation === undefined || !hasCompleteFirstStartWorkstation(snapshot.workstation))) return false;
+  return true;
+}
+
+function hasCompleteFirstStartWorkstation(ws: WorkstationView): boolean {
+  if (!hasExactOwnKeys(ws, FIRST_START_WORKSTATION_KEYS)) return false;
+  if (!hasExactOwnKeys(ws.cameraExposure, ["minMs", "maxMs", "known"])) return false;
+  if (!hasDeviceIds(ws.devices, FIRST_START_DEVICE_IDS)) return false;
+  if (!ws.devices.every((device) =>
+    hasExactOwnKeys(device, FIRST_START_CONSOLE_DEVICE_KEYS) &&
+    isString(device.name) && isString(device.word) && isString(device.tone) && isString(device.spec),
+  )) return false;
+  if (!hasExactOwnKeys(ws.preflight, ["word", "percent", "tone", "subline"])) return false;
+  if (!isString(ws.preflight.word) || !isFiniteNumber(ws.preflight.percent) || !isString(ws.preflight.tone) || !isString(ws.preflight.subline)) return false;
+  if (!hasExactArrayEntries(ws.floats) || ws.floats.length !== 3) return false;
+  if (!ws.floats.every((item) =>
+    hasExactOwnKeys(item, FIRST_START_FLOAT_KEYS) && isString(item.key) && isString(item.text) && isString(item.tone),
+  )) return false;
+  if (!hasExactOwnKeys(ws.safetyBar, ["text", "tone"]) || !isString(ws.safetyBar.text) || !isString(ws.safetyBar.tone)) return false;
+  if (!hasExactOwnKeys(ws.scene, ["angleDeg", "rotated", "angleKnown", "rotationDirection"])) return false;
+  if (!hasExactOwnKeys(ws.xray, FIRST_START_XRAY_KEYS)) return false;
+  if (![ws.xray.setKv, ws.xray.setUa, ws.xray.onSec, ws.xray.offSec].every(isFiniteNumber)) return false;
+  if (![ws.xray.connected, ws.xray.beamOn, ws.xray.latched, ws.xray.timerOn, ws.xray.usbAutoShutDown,
+    ws.xray.usbAutoShutDownKnown, ws.xray.manualControlsEnabled, ws.xray.timerControlsEnabled,
+    ws.xray.setpointControlsEnabled, ws.xray.voltageConfirmed, ws.xray.currentConfirmed,
+    ws.xray.setpointConfirmed].every((value) => typeof value === "boolean")) return false;
+  if (![ws.xray.monKv, ws.xray.monUa, ws.xray.powerW, ws.xray.tempC, ws.xray.usbShutdownDelay].every((value) => value === null || isFiniteNumber(value))) return false;
+  if (!hasExactOwnKeys(ws.progress, FIRST_START_CONSOLE_PROGRESS_KEYS)) return false;
+  if (![ws.progress.captured, ws.progress.total, ws.progress.percent, ws.progress.angleDeg].every(isFiniteNumber)) return false;
+  if (!isString(ws.progress.etaText) || !isString(ws.progress.barTone) || !isString(ws.progress.barLabel)) return false;
+  if (!hasExactOwnKeys(ws.summary, ["savePath", "acquisition", "output"]) ||
+    ![ws.summary.savePath, ws.summary.acquisition, ws.summary.output].every(isString)) return false;
+  if (!hasExactOwnKeys(ws.statusbar, ["left", "right", "dotTone"]) ||
+    ![ws.statusbar.left, ws.statusbar.right, ws.statusbar.dotTone].every(isString)) return false;
+  if (!hasExactOwnKeys(ws.dock, ["home", "play", "restore", "stop", "playMode", "homeReason", "playReason"])) return false;
+  if (![ws.dock.home, ws.dock.play, ws.dock.restore, ws.dock.stop].every((value) => typeof value === "boolean")) return false;
+  if (!isString(ws.dock.playMode) || !isString(ws.dock.homeReason) || !isString(ws.dock.playReason)) return false;
+  if (!hasExactOwnKeys(ws.scanSetup, ["savePath", "taskId", "projectionCount", "angleStepDeg", "exposureMs", "maxXraySec"])) return false;
+  if (![ws.scanSetup.savePath, ws.scanSetup.taskId].every(isString) ||
+    ![ws.scanSetup.projectionCount, ws.scanSetup.angleStepDeg, ws.scanSetup.exposureMs, ws.scanSetup.maxXraySec].every(isFiniteNumber)) return false;
+  if (!hasCompleteFirstStartConsoleLogs(ws.consoleLogs)) return false;
+  if (!hasExactArrayEntries(ws.frames) || !ws.frames.every((frame) =>
+    hasExactOwnKeys(frame, FIRST_START_FRAME_KEYS) &&
+    [frame.index, frame.angleDeg, frame.exposureMs].every(isFiniteNumber) && isString(frame.fileName),
+  )) return false;
+  if (typeof ws.cameraExposure.known !== "boolean" || !isFiniteNumber(ws.cameraExposure.minMs) || !isFiniteNumber(ws.cameraExposure.maxMs)) return false;
+  if (!isString(ws.dataState) || !isString(ws.phaseWord) || !isString(ws.phaseTone) || !isString(ws.onlineSummary)) return false;
+  if (typeof ws.scene.rotated !== "boolean" || typeof ws.scene.angleKnown !== "boolean" ||
+    !isFiniteNumber(ws.scene.angleDeg) || ![-1, 1].includes(ws.scene.rotationDirection)) return false;
+  return typeof ws.checkpointAvailable === "boolean";
+}
+
+function hasConsistentFirstStartProjection(snapshot: EngineSnapshot, ws: WorkstationView): boolean {
+  if (!hasCompleteFirstStartSnapshot(snapshot) || !hasCompleteFirstStartWorkstation(ws)) return false;
+  if (snapshot.workstation !== undefined && !sameStructuredValue(snapshot.workstation, ws)) return false;
+
+  if (snapshot.mode !== "production_locked" || snapshot.connectionState !== "disconnected" || snapshot.phase !== "idle") return false;
+  if (!/locked|disconnected/i.test(snapshot.modeLabel) || !/idle/i.test(snapshot.phaseLabel)) return false;
+  if (snapshot.preflightPassed !== false || snapshot.homed !== false ||
+    snapshot.requiresPreflight !== true || snapshot.requiresHome !== true) return false;
+  if (snapshot.safety.xrayAvailable !== false || snapshot.safety.xrayEnabled !== false || snapshot.safety.interlockOk !== false) return false;
+  if (snapshot.lastError !== null || !hasCompleteFirstStartLogs(snapshot.logs)) return false;
+  if (snapshot.devices.some((device) =>
+    device.id === "xray"
+      ? device.state !== "offline" && device.state !== "locked"
+      : device.state !== "offline",
+  )) return false;
+
+  const snapshotDevices = new Map(snapshot.devices.map((device) => [device.id, device]));
+  const viewDevices = new Map(ws.devices.map((device) => [device.id, device]));
+  if (ws.xray.connected !== false || ws.xray.latched !== false || ws.xray.beamOn !== false) return false;
+  if (ws.xray.beamState !== "off" && ws.xray.beamState !== "unknown") return false;
+  if (snapshot.safety.xrayEnabled !== ws.xray.beamOn) return false;
+  if (ws.xray.beamOn) return false;
+  if (ws.xray.setpointConfirmed || ws.xray.voltageConfirmed || ws.xray.currentConfirmed) return false;
+  if (ws.xray.monKv !== null || ws.xray.monUa !== null || ws.xray.powerW !== null || ws.xray.tempC !== null) return false;
+  if (ws.xray.usbAutoShutDownKnown || ws.xray.usbShutdownDelay !== null || ws.xray.timerOn ||
+    ws.xray.manualControlsEnabled || ws.xray.timerControlsEnabled || ws.xray.setpointControlsEnabled) return false;
+  for (const id of FIRST_START_DEVICE_IDS) {
+    const snapshotDevice = snapshotDevices.get(id);
+    const viewDevice = viewDevices.get(id);
+    if (!snapshotDevice || !viewDevice || viewDevice.tone !== "muted") return false;
+    if (/\b(?:online|connected|ready|moving|emitting|fault|failed|busy|scanning|running)\b/i.test(viewDevice.word)) return false;
+    if (/\b(?:online|connected|ready|moving|emitting|fault|failed|busy|scanning|running)\b|\bbeam on\b/i.test(viewDevice.spec)) return false;
+    if (id !== "xray" && !/offline|disconnected/i.test(viewDevice.word)) return false;
+    if (id === "xray") {
+      const expectedWords = ws.xray.beamState === "unknown" ? /unknown|offline/i : /off|offline/i;
+      if (!expectedWords.test(viewDevice.word)) return false;
+    }
+  }
+
+  if (ws.dataState !== "ready" || ws.phaseTone !== "accent" || !/^(idle|ready)$/i.test(ws.phaseWord)) return false;
+  if (ws.preflight.tone !== "warn" || ws.preflight.percent !== 0 || !/^waiting$/i.test(ws.preflight.word)) return false;
+  if (/passed|complete|fault|running/i.test(ws.preflight.subline)) return false;
+  if (ws.dock.home || ws.dock.play || ws.dock.restore || ws.dock.stop || ws.dock.playMode !== "start") return false;
+  if (!/\b0 real devices\b/i.test(ws.onlineSummary) || !/locked|disconnected/i.test(ws.statusbar.right)) return false;
+  if (ws.statusbar.dotTone !== "muted" || /fault|scanning|running|paused|finishing|stopping/i.test(ws.statusbar.left)) return false;
+  if (/fault|scanning|running|paused|finishing|stopping|capturing|captured/i.test(ws.summary.acquisition)) return false;
+
+  const xrayFloat = ws.floats.find((item) => item.key === "X-RAY");
+  const cameraFloat = ws.floats.find((item) => item.key === "CAMERA");
+  const sampleFloat = ws.floats.find((item) => item.key === "SAMPLE");
+  if (!xrayFloat || !cameraFloat || !sampleFloat) return false;
+  if (new Set(ws.floats.map((item) => item.key)).size !== 3) return false;
+  if (xrayFloat.tone !== "muted" || cameraFloat.tone !== "muted" || sampleFloat.tone !== "muted") return false;
+  if (ws.xray.beamState === "unknown" ? !/unknown|readback|offline/i.test(xrayFloat.text) : !/off|disabled|offline/i.test(xrayFloat.text)) return false;
+  if (!/offline|disconnected|standby|no real camera/i.test(cameraFloat.text) || !/unknown/i.test(sampleFloat.text)) return false;
+
+  if (ws.safetyBar.tone !== "muted" || /\b(on|enabled|active|fault|latched|trip)\b/i.test(ws.safetyBar.text)) return false;
+  if (ws.xray.beamState === "unknown" ? !/unknown|readback|unavailable/i.test(ws.safetyBar.text) : !/off|disabled|unavailable/i.test(ws.safetyBar.text)) return false;
+  if (ws.summary.output.length === 0 || /\b(on|enabled|active|fault|latched|trip)\b/i.test(ws.summary.output)) return false;
+  if (ws.xray.beamState === "unknown" ? !/unknown|readback|unavailable|offline/i.test(ws.summary.output) : !/off|disabled|unavailable|offline/i.test(ws.summary.output)) return false;
+
+  const parameterKeys = ["taskId", "savePath", "projectionCount", "angleStepDeg", "exposureMs"];
+  if (parameterKeys.some((key) => snapshot.parameters[key as keyof typeof snapshot.parameters] !== ws.scanSetup[key as keyof typeof ws.scanSetup])) return false;
+  if (ws.summary.savePath !== ws.scanSetup.savePath) return false;
+  if (!Number.isFinite(snapshot.progress.total) || snapshot.progress.total < 0) return false;
+  if (snapshot.progress.current !== 0 || snapshot.progress.percent !== 0 || snapshot.progress.angleDeg !== 0) return false;
+  if (snapshot.progress.etaSeconds !== null) return false;
+  if (snapshot.progress.total !== snapshot.parameters.projectionCount ||
+    ws.progress.total !== snapshot.progress.total || ws.progress.captured !== snapshot.progress.current ||
+    ws.progress.percent !== snapshot.progress.percent || ws.progress.angleDeg !== snapshot.progress.angleDeg) return false;
+  if (snapshot.imageCount !== snapshot.progress.current || snapshot.imageCount !== 0 ||
+    ws.frames.length !== snapshot.imageCount || ws.checkpointAvailable !== false) return false;
+  if (ws.progress.barTone !== "accent" || ws.scene.angleDeg !== snapshot.progress.angleDeg ||
+    ws.scene.angleKnown !== false || ws.scene.rotated !== false) return false;
+  if (ws.scene.angleDeg !== 0 || ws.progress.captured !== 0 || ws.progress.percent !== 0) return false;
+  if (ws.progress.barLabel.trim() !== `${ws.progress.captured} / ${ws.progress.total} · ${ws.progress.percent}%` ||
+    /\d/.test(ws.progress.etaText)) return false;
+  if (ws.cameraExposure.known !== false) return false;
+  return true;
+}
+
+/**
+ * The only neutral disconnected snapshot is a positively identified fresh
+ * engine startup. Every signal that can disprove that initial state is checked
+ * here, then the caller sends all other disconnected snapshots directly to
+ * Fault. Parameter drafts do not count as device readbacks or scan activity,
+ * but their duplicated snapshot and workstation values must still agree.
+ */
+function isStrictlyInitialDisconnected(
+  snapshot: EngineSnapshot,
+  ws: WorkstationView,
+  stale: boolean,
+  sessionEverEstablished: unknown,
+): boolean {
+  return (
+    sessionEverEstablished === false &&
+    !stale &&
+    snapshot.connectionState === "disconnected" &&
+    snapshot.phase === "idle" &&
+    hasConsistentFirstStartProjection(snapshot, ws)
+  );
+}
+
+/**
+ * Phases that prove the engine actually engaged in a scan. A merely CONFIGURED
+ * projection count is not evidence of one: entering a count into the scan form
+ * must never make the console announce a cooldown.
+ */
+const SCAN_ENGAGED_PHASES: ReadonlySet<string> = new Set([
+  "running",
+  "paused",
+  "finishing",
+  "stopping",
+  "stopped",
+  "completed",
+]);
+
+export function evaluateFeedbackEvidence(
+  snapshot: EngineSnapshot,
+  ws: WorkstationView,
+  stale: boolean,
+  sessionEverEstablished: unknown = "unknown",
+): FeedbackEvidence {
+  const connection = snapshot.connectionState;
+  const capturedFrames = Number.isFinite(ws.progress.captured) ? ws.progress.captured : 0;
+  return {
+    // A lost link, a degraded link or a stale snapshot means every reading below
+    // is unknown, so the console must not present it as a normal state. A
+    // `disconnected` link is part of that set unless it is the benign
+    // never-connected startup state, which is not a fault and must not be
+    // mislabelled as one — it relaxes no gate, it only stops the mislabelling.
+    linkLost:
+      stale ||
+      connection === "lost" ||
+      connection === "degraded" ||
+      (connection === "disconnected" && sessionEverEstablished !== false),
+    phaseFault: snapshot.phase === "fault" || ws.dataState === "fault",
+    // Fail closed: a beam that is not a CONFIRMED off/on reading stays a warning.
+    beamUnconfirmed: ws.xray.beamState === "unknown" || (!ws.xray.setpointConfirmed && ws.xray.beamOn),
+    // Evidence of a real scan only: the engine reached a phase that implies one
+    // engaged, or at least one projection was actually committed. A configured
+    // projection count alone deliberately does not qualify.
+    scanAttempted: SCAN_ENGAGED_PHASES.has(snapshot.phase) || capturedFrames > 0,
+  };
+}
+
+/** Projection progress is only "known" when the engine reported a target count. */
+function progressPercent(snapshot: EngineSnapshot, ws: WorkstationView, stale: boolean): number | null {
+  if (stale) return null;
+  if (!Number.isFinite(ws.progress.total) || ws.progress.total <= 0) return null;
+  const percent = Number.isFinite(ws.progress.percent) ? ws.progress.percent : snapshot.progress.percent;
+  if (!Number.isFinite(percent)) return null;
+  return Math.max(0, Math.min(100, Math.round(percent)));
+}
+
+const feedbackPercentText = (percent: number | null): string => (percent === null ? "UNKNOWN" : `${percent}%`);
+
+function feedbackToneClass(tone: ConsoleStateTone): string {
+  return tone === "ok" ? "tone-accent" : `tone-${tone}`;
+}
+
+/**
+ * Derive the single console feedback state from a complete snapshot.
+ *
+ * Ordering is deliberate. A fail-closed condition always wins; 100% projection
+ * progress still reads as Finishing until the engine itself reports `completed`;
+ * a Stopping pose is frozen (the snapshot angle is repeated, never advanced);
+ * and Cooling is only ever reported from real cooldown evidence — the snapshot
+ * exposes none today, so it reports UNKNOWN instead of inventing a cooldown.
+ *
+ * A disconnected snapshot is partitioned in full: only a positively identified
+ * fresh idle startup is neutral; every other disconnected case is Fault. This
+ * keeps unknown device and output conditions out of the ordinary phase mapping.
+ */
+export function deriveConsoleFeedback(
+  snapshot: EngineSnapshot,
+  ws: WorkstationView,
+  stale: boolean,
+  sessionEverEstablished: unknown = "unknown",
+): ConsoleFeedback {
+  // Exhaustive partition: disconnected is neutral only for a fully verified
+  // initial snapshot. No disconnected combination can reach the phase switch or
+  // its final ordinary Stopped fallback.
+  if (snapshot.connectionState === "disconnected") {
+    if (isStrictlyInitialDisconnected(snapshot, ws, stale, sessionEverEstablished)) {
+      return offlineFeedback();
+    }
+    return {
+      state: "Fault",
+      tone: "danger",
+      detail: "Device session evidence does not confirm a never-connected startup · state is unknown",
+      active: false,
+    };
+  }
+
+  const evidence = evaluateFeedbackEvidence(snapshot, ws, stale, sessionEverEstablished);
+  if (evidence.linkLost) {
+    return {
+      state: "Fault",
+      tone: "danger",
+      detail: "Control service unavailable · device states and progress are unknown",
+      active: false,
+    };
+  }
+  if (evidence.phaseFault || ws.xray.latched) {
+    return {
+      state: "Fault",
+      tone: "danger",
+      detail: ws.xray.latched
+        ? "Device fault latched · X-ray output disabled · preflight then HOME to recover"
+        : "Device fault · output and motion commands fail closed",
+      active: false,
+    };
+  }
+  const outputContradictory =
+    (ws.xray.beamState === "on" && !ws.xray.beamOn) ||
+    (ws.xray.beamState === "off" && ws.xray.beamOn);
+  const outputActiveOutsideAcquisition = ws.xray.beamOn && snapshot.phase !== "running";
+  if (evidence.beamUnconfirmed || outputContradictory || outputActiveOutsideAcquisition) {
+    return {
+      state: "Fault",
+      tone: "danger",
+      detail: outputContradictory
+        ? "X-ray output readings contradict each other · treated as unsafe until the engine reports a consistent state"
+        : outputActiveOutsideAcquisition
+          ? "X-ray output is active outside acquisition · treated as unsafe until the engine confirms it is disabled"
+          : "X-ray output state is not confirmed · treated as unsafe until the engine reports it",
+      active: false,
+    };
+  }
+
+  const percent = progressPercent(snapshot, ws, stale);
+  const percentText = feedbackPercentText(percent);
+  const captured = ws.progress.captured;
+  const total = ws.progress.total;
+  const angleText = ws.scene.angleKnown ? `${ws.scene.angleDeg.toFixed(2)}°` : "unknown pose";
+
+  switch (snapshot.phase) {
+    case "running":
+      return {
+        state: "Running",
+        tone: "accent",
+        detail: `Acquiring view ${Math.min(captured + 1, Math.max(total, 1))} of ${total} · ${percentText} committed · ${angleText}`,
+        active: true,
+      };
+    case "paused":
+      return {
+        state: "Paused",
+        tone: "warn",
+        detail: `Held after a committed projection · ${captured} of ${total} retained · ${percentText} · ${angleText}`,
+        active: true,
+      };
+    case "finishing":
+      // Projection progress may already read 100%, but return-to-start
+      // orientation, manifest commit and cleanup are still outstanding.
+      return {
+        state: "Finishing",
+        tone: "warn",
+        detail: `All ${total} projections committed · returning to the start orientation, committing the manifest and cleaning up · not complete yet`,
+        active: true,
+      };
+    case "stopping":
+      return {
+        state: "Stopping",
+        tone: "warn",
+        detail: `Ending the active scan · output disabled · pose frozen at ${ws.scene.angleKnown ? angleText : "an unknown reading"} · awaiting beam-off and task exit`,
+        active: true,
+      };
+    case "completed":
+      return {
+        state: "Completed",
+        tone: "ok",
+        detail: `Return to start orientation, manifest commit and cleanup confirmed · ${total} of ${total} projections stored`,
+        active: false,
+      };
+    case "stopped":
+      return {
+        state: "Stopped",
+        tone: "muted",
+        detail: `Scan ended by the operator · ${captured} of ${total} committed · preflight and HOME are required before another scan`,
+        active: false,
+      };
+    default:
+      break;
+  }
+
+  // The engine is in a phase that does not itself describe a scan, but a scan
+  // has genuinely engaged (see SCAN_ENGAGED_PHASES), so a cooldown could be in
+  // play. The snapshot does carry a temperature readback (ws.xray.tempC), but
+  // temperature alone cannot prove an active cooldown, and the engine's cooldown
+  // deadline is private and never projected. So the state is reported as UNKNOWN
+  // rather than assumed active or assumed absent — never as a confirmed
+  // "cooling" or "ready".
+  if (evidence.scanAttempted) {
+    return {
+      state: "Cooling",
+      tone: "muted",
+      detail: `Cooling state unknown · the snapshot projects no cooldown deadline, and a temperature reading alone cannot confirm one · verify at the source before exposure`,
+      active: false,
+    };
+  }
+  return {
+    state: "Stopped",
+    tone: "muted",
+    detail: `Queue idle · no scan in flight · ${total > 0 ? `${total} projections configured` : "scan setup not configured"}`,
+    active: false,
+  };
+}
+
+/** Ring progress read-out. Unknown progress is never drawn as 0%. */
+function RingReadout({
+  percent,
+  tone,
+  label,
+  known,
+}: {
+  percent: number;
+  tone: ConsoleStateTone;
+  label: string;
+  known: boolean;
+}) {
+  const radius = 13;
+  const circumference = 2 * Math.PI * radius;
+  const offset = known ? circumference * (1 - percent / 100) : 0;
+  return (
+    <span className={`dock-ring dock-ring--${known ? "known" : "unknown"} ${feedbackToneClass(tone)}`}>
+      <svg className="dock-ring__svg" viewBox="0 0 36 36" aria-hidden="true" focusable="false">
+        <circle className="dock-ring__track" cx="18" cy="18" r={radius} fill="none" strokeWidth="3" />
+        <circle
+          className="dock-ring__value"
+          cx="18"
+          cy="18"
+          r={radius}
+          fill="none"
+          strokeWidth="3"
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          transform="rotate(-90 18 18)"
+        />
+      </svg>
+      <span className="dock-ring__text">{known ? `${percent}` : label}</span>
+    </span>
+  );
+}
+
+/**
+ * Dynamic-Island control dock.
+ *
+ * Collapsed it is a small frosted capsule with a ring progress indicator and a
+ * readable numeric read-out. It expands into the four frosted keys through
+ * hover, keyboard focus, an explicit click and touch. `aria-expanded` is bound
+ * to the shipped state; the toggle keeps its footprint while expanding, so a
+ * mis-tap between the two states is not possible; and only the committed
+ * snapshot progress reaches the ring.
+ */
+function ControlDock({
+  snapshot,
+  ws,
+  dispatch,
+  stale = false,
+  setupInvalid = false,
+}: {
+  snapshot: EngineSnapshot;
+  ws: WorkstationView;
+  dispatch: (c: EngineCommand) => void;
+  stale?: boolean;
+  setupInvalid?: boolean;
+}) {
+  const [hoverOpen, setHoverOpen] = useState(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  const [focusInside, setFocusInside] = useState(false);
+  const [approaching, setApproaching] = useState(false);
+  const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  // An explicit click pins the dock open and wins over hover, so hovering a
+  // collapsed capsule can never leave the pointer sitting on a key it did not
+  // aim at, and an explicit click can always close the dock again.
+  const [clickOpen, setClickOpen] = useState(false);
+  // A touch tap has no hover: pointerdown expands the capsule and the click that
+  // the same tap generates must not immediately fold it away again.
+  const touchHandled = useRef(false);
+  const expandTimer = useRef<number | null>(null);
+  const feedback = deriveConsoleFeedback(snapshot, ws, stale, hasDeviceSessionEverEstablished());
   const dock = ws.dock;
+
+  const expanded = hoverOpen || focusInside || clickOpen;
+  const percent = progressPercent(snapshot, ws, stale);
+  const percentKnown = percent !== null;
+  const progressReadout = percentKnown ? `${percent}% · ${ws.progress.captured}/${ws.progress.total}` : "UNKNOWN";
+
+  const clearExpandTimer = useCallback((): void => {
+    if (expandTimer.current !== null) {
+      window.clearTimeout(expandTimer.current);
+      expandTimer.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearExpandTimer, [clearExpandTimer]);
+
+  useEffect(() => {
+    const preference = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const syncReducedMotion = (event: MediaQueryListEvent): void => {
+      setReducedMotion(event.matches);
+      setHoverOpen(event.matches);
+      if (event.matches) {
+        clearExpandTimer();
+        setApproaching(false);
+        setHoverOpen(true);
+      }
+    };
+    if (preference.matches) setHoverOpen(true);
+    preference.addEventListener("change", syncReducedMotion);
+    return () => preference.removeEventListener("change", syncReducedMotion);
+  }, [clearExpandTimer]);
+
+  const openForHover = useCallback((): void => {
+    clearExpandTimer();
+    if (reducedMotion) {
+      setApproaching(false);
+      setHoverOpen(true);
+      return;
+    }
+    setApproaching(true);
+  }, [clearExpandTimer, reducedMotion]);
+
+  // Keep the approach ripple alive briefly as the pointer crosses the capsule.
+  const scheduleHoverClose = useCallback((): void => {
+    clearExpandTimer();
+    expandTimer.current = window.setTimeout(() => {
+      expandTimer.current = null;
+      setApproaching(false);
+    }, 260);
+  }, [clearExpandTimer]);
+
+  const collapse = useCallback((): void => {
+    clearExpandTimer();
+    setApproaching(false);
+    setHoverOpen(false);
+    setFocusInside(false);
+    setClickOpen(false);
+  }, [clearExpandTimer]);
+
+  // A click on the capsule first pins the panel open; only a later capsule click
+  // collapses it, so the pointer never lands on a newly revealed action key.
+  const toggleOpen = useCallback((): void => {
+    clearExpandTimer();
+    setApproaching(false);
+    if (touchHandled.current) {
+      // The tap already expanded the dock on pointerdown.
+      touchHandled.current = false;
+      return;
+    }
+    if (clickOpen) {
+      collapse();
+      return;
+    }
+    setClickOpen(true);
+  }, [clickOpen, collapse, clearExpandTimer]);
+
+  // Escape collapses the dock from anywhere, not only while one of its own keys
+  // holds focus: the dock can also be expanded by hover, and requiring focus
+  // would leave the pointer as the only way back to the collapsed state.
+  useEffect(() => {
+    if (!expanded) return;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") collapse();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [collapse, expanded]);
+
   const play =
     dock.playMode === "pause"
-      ? { src: "/assets/dock-pause.svg", label: "Pause", command: { type: "pause" } as EngineCommand }
+      ? { icon: "pause" as LineIconName, label: "Pause", command: { type: "pause" } as EngineCommand }
       : dock.playMode === "resume"
-        ? { src: "/assets/dock-resume.svg", label: "Resume", command: { type: "resume" } as EngineCommand }
-        : { src: "/assets/dock-play.svg", label: "Start", command: { type: "start_scan" } as EngineCommand };
+        ? { icon: "play" as LineIconName, label: "Resume", command: { type: "resume" } as EngineCommand }
+        : { icon: "play" as LineIconName, label: "Start", command: { type: "start_scan" } as EngineCommand };
+
+  // Availability comes from the engine's own `ws.dock` flags, plus the stale
+  // (control-service-lost) override. On top of that, a locally invalid setup
+  // draft must not be able to drive an operation that consumes scan parameters,
+  // which is the same rule the engineering menu applies. Stop is deliberately
+  // exempt: ending a scan must never depend on parameter-validity checks.
+  const keysDisabled = stale;
+  const setupBlocked = keysDisabled || setupInvalid;
+  const announcement = `${feedback.state}. ${feedback.detail} Progress ${progressReadout}.`;
 
   return (
-    <div className="control-dock" aria-label="Scan controls">
-      <button
-        type="button"
-        className="dock-key dock-key--home"
-        aria-label="Home"
-        title={dock.homeReason || "Home turntable"}
-        disabled={stale || !dock.home}
-        onClick={() => void dispatch({ type: "home" })}
-      >
-        <DockIcon src="/assets/dock-home.svg" alt="" />
-        <span className="dock-key__label">Home</span>
-      </button>
-      <button
-        type="button"
-        className="dock-key dock-key--play"
-        aria-label={play.label}
-        title={dock.playReason || play.label}
-        disabled={stale || !dock.play}
-        onClick={() => void dispatch(play.command)}
-      >
-        <DockIcon src={play.src} alt="" />
-        <span className="dock-key__label">{play.label}</span>
-      </button>
-      <button
-        type="button"
-        className="dock-key dock-key--restore"
-        aria-label="Restore"
-        disabled={stale || !dock.restore}
-        onClick={() => void dispatch({ type: "restore_previous" })}
-      >
-        <DockIcon src="/assets/dock-restore.svg" alt="" />
-        <span className="dock-key__label">Restore</span>
-      </button>
-      <button
-        type="button"
-        className="dock-key dock-key--stop"
-        aria-label="End scan"
-        title={dock.stop ? "End the active scan; already saved projections are retained" : "No active scan to end"}
-        disabled={stale || !dock.stop}
-        onClick={() => void dispatch({ type: "stop" })}
-      >
-        <DockIcon src="/assets/dock-stop.svg" alt="" />
-        <span className="dock-key__label">Stop</span>
-      </button>
+    <div
+      className={`control-dock ${expanded ? "is-expanded" : "is-collapsed"} ${approaching ? "is-approaching" : ""} ${reducedMotion ? "is-reduced-motion" : ""} dock-state--${feedback.state.toLowerCase()}`}
+      aria-label="Scan controls"
+      aria-expanded={expanded}
+      onMouseEnter={openForHover}
+      onMouseLeave={scheduleHoverClose}
+      onFocusCapture={() => {
+        clearExpandTimer();
+        setApproaching(false);
+        setFocusInside(true);
+      }}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocusInside(false);
+      }}
+      // Touch has no hover: a tap on the collapsed capsule expands it, and the
+      // four keys are only reachable once the capsule has visibly expanded.
+      onPointerDown={(event) => {
+        if (event.pointerType !== "touch" || !(event.target as HTMLElement).closest(".dock-capsule")) return;
+        clearExpandTimer();
+        setApproaching(false);
+        setHoverOpen(true);
+        setClickOpen(true);
+        touchHandled.current = true;
+      }}
+    >
+      <div className="dock-key-row" id="control-dock-keys">
+        <button
+          type="button"
+          className="dock-capsule"
+          aria-expanded={expanded}
+          aria-controls="control-dock-keys"
+          aria-label={
+            expanded
+              ? `Collapse scan controls. ${feedback.state}. Progress ${progressReadout}.`
+              : `Expand scan controls. ${feedback.state}. Progress ${progressReadout}.`
+          }
+          title={`${feedback.state} · ${feedback.detail}`}
+          onClick={toggleOpen}
+        >
+          <span className="dock-capsule__lead">
+            <RingReadout percent={percent ?? 0} tone={feedback.tone} label="–" known={percentKnown} />
+            <span className="dock-capsule__text">
+              <span className="dock-capsule__state">{feedback.state}</span>
+              <span className="dock-capsule__progress">{progressReadout}</span>
+            </span>
+          </span>
+          <span className="dock-capsule__chevron" aria-hidden="true" />
+        </button>
+        <DockKey
+          variant="home"
+          icon="crosshair"
+          label="Home"
+          title={setupInvalid ? "Complete valid scan parameters first" : dock.homeReason || "Home turntable"}
+          disabled={setupBlocked || !dock.home}
+          onClick={() => void dispatch({ type: "home" })}
+        />
+        <DockKey
+          variant="play"
+          icon={play.icon}
+          label={play.label}
+          title={setupInvalid ? "Complete valid scan parameters first" : dock.playReason || play.label}
+          disabled={setupBlocked || !dock.play}
+          onClick={() => void dispatch(play.command)}
+        />
+        <DockKey
+          variant="restore"
+          icon="history"
+          label="Restore"
+          title={setupInvalid ? "Complete valid scan parameters first" : "Restore the previous scan progress from the on-disk checkpoint"}
+          disabled={setupBlocked || !dock.restore}
+          onClick={() => void dispatch({ type: "restore_previous" })}
+        />
+        <DockKey
+          variant="stop"
+          icon="stop"
+          label="Stop"
+          title={dock.stop ? "End the active scan; already saved projections are retained" : "No active scan to end"}
+          disabled={keysDisabled || !dock.stop}
+          onClick={() => void dispatch({ type: "stop" })}
+        />
+      </div>
+      <span className="sr-only" role="status" aria-live="polite">{announcement}</span>
     </div>
   );
 }
 
-function LiveScene({ ws, theme, dispatch, stale, setupInvalid, feedbackId }: { ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string }) {
+/**
+ * Read-only eight-state console feedback strip. The active state is emphasised;
+ * its detail line always carries the meaning as text, so no reading depends on
+ * the colour of a dot. The strip scrolls horizontally inside its own row when
+ * the column is narrow, which never clips a fixed column.
+ */
+function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: boolean }) {
+  const active = stale ? "Fault" : feedback.state;
+  // The strip is one glance, not a paragraph: only the leading segment of the
+  // detail stays on the row; the full sentence lives in the help bubble.
+  const detailLead = feedback.detail.split(" · ")[0];
+  return (
+    <div className={`op-feedback ${feedback.active ? "is-hot" : ""}`}>
+      <div
+        className={`op-feedback__row ${feedbackToneClass(feedback.tone)}`}
+        role="status"
+        aria-live="polite"
+        aria-label={`Console feedback state: ${active}. ${feedback.detail}`}
+      >
+        <span className="op-feedback__word">{active}</span>
+        <span className="op-feedback__detail">{detailLead}</span>
+        <HelpTip text={feedback.detail} align="end" />
+      </div>
+      <div className="op-feedback__states">
+        {CONSOLE_FEEDBACK_STATES.map((state) => (
+          <span
+            key={state}
+            className={`op-feedback__chip ${state.toLowerCase()} ${state === active ? "is-active" : "is-idle"}`}
+          >
+            {state}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbackId }: { snapshot: EngineSnapshot; ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string }) {
   const [viewPreset, setViewPreset] = useState<ViewPreset>("iso");
   const [presetRevision, setPresetRevision] = useState(0);
   const fallback = useSceneFallback();
+  const feedback = deriveConsoleFeedback(snapshot, ws, stale, hasDeviceSessionEverEstablished());
   const sceneView = {
     dataState: ws.dataState,
     angleDeg: ws.scene.angleDeg,
@@ -545,6 +1475,7 @@ function LiveScene({ ws, theme, dispatch, stale, setupInvalid, feedbackId }: { w
     <section className="panel live-panel">
       <div className="scene-toolbar">
         <span className="chip chip--accent">3D RENDER</span>
+        <LineIcon name="cube" size={15} className="panel__icon" />
         <h2>Equipment View</h2>
         <HelpTip text={`Read-only geometry view. ${setupInvalid ? "Complete valid scan parameters first." : ws.dock.playReason || "Ready for the next operation."}`} />
         <span className="menu-spacer" />
@@ -564,7 +1495,7 @@ function LiveScene({ ws, theme, dispatch, stale, setupInvalid, feedbackId }: { w
         {fallback.reason ? (
           <StaticSceneFallback view={sceneView} reason={fallback.reason} />
         ) : (
-          <LiveSceneCanvas view={sceneView} preset={viewPreset} presetRevision={presetRevision} onContextLost={fallback.setContextLost} />
+          <LiveSceneCanvas view={sceneView} status={feedback} preset={viewPreset} presetRevision={presetRevision} onContextLost={fallback.setContextLost} />
         )}
         <span className="live-indicator">
           <i aria-hidden="true" />
@@ -580,13 +1511,19 @@ function LiveScene({ ws, theme, dispatch, stale, setupInvalid, feedbackId }: { w
           ))}
         </div>
         <div className="scene-readout-block">
-          <span className="scene-label">TURNTABLE ANGLE <HelpTip text="Latest confirmed turntable angle. The model follows these feedback samples with a short constant-speed transition; it does not predict the next position." /></span>
+          <span className="scene-label">TURNTABLE ANGLE <HelpTip side="up" text="Latest confirmed turntable angle. The model follows confirmed feedback without predicting a position; reduced motion jumps directly between samples." /></span>
           <strong className="scene-readout">{stale || !ws.scene.angleKnown ? "—" : ws.scene.angleDeg.toFixed(2)}°</strong>
           <span className={`scene-safety ${ws.safetyBar.tone !== "muted" ? "scene-safety--danger" : ""} ${ws.safetyBar.tone === "dangerBold" ? "scene-safety--bold" : ""}`}>
             {stale ? "Control service unavailable · readings are unknown" : ws.safetyBar.text}
           </span>
         </div>
-        <ControlDock ws={ws} dispatch={dispatch} stale={stale || setupInvalid} />
+        <ControlDock
+          snapshot={snapshot}
+          ws={ws}
+          dispatch={dispatch}
+          stale={stale}
+          setupInvalid={setupInvalid}
+        />
       </div>
     </section>
   );
@@ -633,6 +1570,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
   return (
     <section className="panel xray-panel">
       <div className="panel__header">
+        <LineIcon name="radiation" size={15} className="panel__icon" />
         <h2>12 Watt Controller</h2>
         <HelpTip text={sourceHelp} />
         <span className={`chip chip--${beamState === "on" ? "danger" : connected ? "accent" : "muted"}`}>
@@ -653,7 +1591,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
       </button>
       <div className="xray-channels">
         <div className="xray-channel">
-          <span className="xray-channel__label">Voltage · kV <HelpTip text="SET is the requested voltage. Measured is device readback; a dash means unknown." /></span>
+          <span className="xray-channel__label">Voltage · kV <HelpTip align="end" text="SET is the requested voltage. Measured is device readback; a dash means unknown." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
               <span className="xray-channel__key">SET</span>
@@ -673,7 +1611,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           </div>
         </div>
         <div className="xray-channel">
-          <span className="xray-channel__label">Current · µA <HelpTip text="SET is the requested current. Measured is device readback; a dash means unknown." /></span>
+          <span className="xray-channel__label">Current · µA <HelpTip align="end" text="SET is the requested current. Measured is device readback; a dash means unknown." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
               <span className="xray-channel__key">SET</span>
@@ -749,6 +1687,8 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
                 : "RELEASED · MANUAL"}
           </span>
         </div>
+        {/* Unknown readback is already indicated by NOT VERIFIED and the indeterminate
+            control. Never claim the hardware timer is armed until confirmed. */}
         <label className="check-row check-row--inset">
           <input
             type="checkbox"
@@ -786,13 +1726,16 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
   );
 }
 
-function OperationPanel({ ws, stale }: { ws: WorkstationView; stale: boolean }) {
+function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws: WorkstationView; stale: boolean }) {
+  const feedback = deriveConsoleFeedback(snapshot, ws, stale, hasDeviceSessionEverEstablished());
   return (
     <section className="panel operation-panel">
       <div className="panel__header">
+        <LineIcon name="gauge" size={15} className="panel__icon" />
         <h2>Operation Status</h2>
         <span className={`chip chip--${stale ? "muted" : ws.phaseTone}`}>{stale ? "UNKNOWN" : ws.phaseWord}</span>
       </div>
+      <StateFeedback feedback={feedback} stale={stale} />
       <div className="op-stats">
         <div className="op-stat">
           <span>CAPTURED</span>
@@ -841,12 +1784,12 @@ function OperationPanel({ ws, stale }: { ws: WorkstationView; stale: boolean }) 
 /* Bottom console                                                      */
 /* ------------------------------------------------------------------ */
 
-const bottomTabs: Array<{ id: BottomTab; label: string }> = [
-  { id: "aggregate", label: "Log Aggregation" },
-  { id: "xray", label: "X-ray Log" },
-  { id: "nano", label: "Turntable Log" },
-  { id: "camera", label: "Camera Log" },
-  { id: "images", label: "Image Preview" },
+const bottomTabs: Array<{ id: BottomTab; label: string; icon: LineIconName }> = [
+  { id: "aggregate", label: "Log Aggregation", icon: "terminal" },
+  { id: "xray", label: "X-ray Log", icon: "radiation" },
+  { id: "nano", label: "Turntable Log", icon: "rotate" },
+  { id: "camera", label: "Camera Log", icon: "camera" },
+  { id: "images", label: "Image Preview", icon: "image" },
 ];
 
 const logLevelClass: Record<ConsoleLogLine["level"], string> = {
@@ -950,7 +1893,8 @@ function BottomConsole({ ws, production }: { ws: WorkstationView; production: bo
             className="console__tab"
             onClick={() => setTab(item.id)}
           >
-            {item.label}
+            <LineIcon name={item.icon} size={13} className="console__tab-icon" />
+            <em>{item.label}</em>
             <span>{counts[item.id]}</span>
           </button>
         ))}
@@ -966,10 +1910,9 @@ function BottomConsole({ ws, production }: { ws: WorkstationView; production: bo
             {ws.progress.total === 0 && <div className="log-empty">No projections yet. Configure a scan task to view its image sequence.</div>}
             {Array.from({ length: ws.progress.total }, (_, index) => {
               const frame = ws.frames.find((item) => item.index === index + 1);
-              return (
-                frame ? <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} /> :
-                <div className="image-tile" key={index}><strong>VIEW {String(index + 1).padStart(2, "0")}</strong><span>queued</span></div>
-              );
+              return frame ?
+                <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} /> :
+                <div className="image-tile" key={index}><strong>VIEW {String(index + 1).padStart(2, "0")}</strong><span>queued</span></div>;
             })}
           </div>
         ) : (
@@ -994,7 +1937,15 @@ const DIALOG_TITLES: Record<DialogKind, string> = {
   diagnostics: "Device Diagnostics",
 };
 
-const APP_VERSION = "0.1.0";
+const DIALOG_ICONS: Record<DialogKind, LineIconName> = {
+  guide: "book",
+  safety: "warning",
+  about: "info",
+  preferences: "sliders",
+  diagnostics: "pulse",
+};
+
+const APP_VERSION = "0.7.0";
 
 function InfoDialog({
   kind,
@@ -1161,6 +2112,7 @@ function InfoDialog({
         onClick={(event) => event.stopPropagation()}
       >
         <header className="modal-card__head">
+          <LineIcon name={DIALOG_ICONS[kind]} size={15} className="panel__icon" />
           <h2 id="menu-dialog-title">{DIALOG_TITLES[kind]}</h2>
           <button type="button" className="modal-card__close" onClick={onClose} aria-label="Close dialog">
             ×
@@ -1397,6 +2349,7 @@ export function App() {
         <div className="app-divider" />
         {error || actionError || setupDraftError ? (
           <div className="error-toast" role="alert">
+            <LineIcon name="warning" size={13} />
             {setupDraftError ?? actionError ?? error}
           </div>
         ) : null}
@@ -1424,13 +2377,12 @@ export function App() {
                 onValidationError={setSetupDraftError}
               />
             </aside>
-            <LiveScene ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} />
+            <LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} />
           </section>
-          <div className="app-divider" />
           <BottomConsole ws={ws} production={adapterKind === "tauri"} />
           <aside className="col col--right">
             <XrayPanel ws={ws} busy={busy || Boolean(transportError)} dispatch={dispatch} stale={Boolean(transportError)} />
-            <OperationPanel ws={ws} stale={Boolean(transportError)} />
+            <OperationPanel snapshot={snapshot} ws={ws} stale={Boolean(transportError)} />
           </aside>
         </section>
         <div className="app-divider" />
@@ -1448,6 +2400,7 @@ export function App() {
             <div className="theme-toggle" role="group" aria-label="Theme">
               {(["light", "dark"] as const).map(value => (
                 <button type="button" key={value} className="theme-toggle__seg" aria-pressed={theme === value} onClick={() => setTheme(value)}>
+                  <LineIcon name={value === "light" ? "sun" : "moon"} size={11} />
                   {value === "light" ? "Light" : "Dark"}
                 </button>
               ))}

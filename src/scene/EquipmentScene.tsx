@@ -4,7 +4,7 @@
  * geometry here is illustrative and must never be used as hardware telemetry.
  */
 
-import { Line, RoundedBox } from "@react-three/drei";
+import { Html, Line, RoundedBox } from "@react-three/drei";
 import { useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useMemo, useRef } from "react";
 import { FeedbackAngle } from "./angle-feedback";
@@ -27,6 +27,9 @@ import type { SceneTheme, SceneViewModel } from "./types";
 // parses 3- or 6-digit hex - an 8-digit value is rejected outright and leaves the
 // material at its default white, which vanishes on the light stage.
 const AXIS_GREY = "#575a5e";
+const RACEWAY_COLOR = "#e2ddcf";
+const LOAD_WHEEL_COLOR = "#374044";
+const LOAD_BRACKET_COLOR = "#c1cbc7";
 
 // Colour of the optical path when the tube is not emitting: a near-white haze
 // that still marks where the beam would run without lighting the scene up. Its
@@ -272,9 +275,9 @@ function SourceAssembly({ theme }: { theme: SceneTheme }) {
 
   // Without an environment map metals only pick up specular highlights, so the
   // metalness values stay moderate to keep the surfaces readable.
-  const aluBody = { color: theme.chassis, roughness: 0.5, metalness: 0.32 };
-  const aluPlate = { color: theme.panelHeader, roughness: 0.45, metalness: 0.35 };
-  const brass = { color: "#cba558", roughness: 0.3, metalness: 0.62 };
+  const aluBody = { color: "#f3e9d7", roughness: 0.66, metalness: 0.16 };
+  const aluPlate = { color: "#91b9b3", roughness: 0.56, metalness: 0.18 };
+  const brass = { color: "#d8ac63", roughness: 0.39, metalness: 0.44 };
   const darkPart = { color: theme.well, roughness: 0.7, metalness: 0.22 };
   const steel = { color: theme.sceneLine, roughness: 0.32, metalness: 0.5 };
   const ceramic = { color: "#ddd7c6", roughness: 0.52, metalness: 0.04 };
@@ -562,11 +565,11 @@ function CameraAssembly() {
   // carries its brass and ceramic. The ramp starts at a mid grey and lifts every
   // step proportionally from there to chrome: the darkest finish on the camera
   // is now the LCD cover, and the rubbers and dials sit above it.
-  const shell = { color: "#c6c8ca", roughness: 0.78, metalness: 0.05 };
-  const deck = { color: "#dfe1e3", roughness: 0.36, metalness: 0.45 };
-  const rubber = { color: "#8a8c8e", roughness: 0.92, metalness: 0.03 };
-  const barrel = { color: "#d1d3d5", roughness: 0.3, metalness: 0.5 };
-  const trim = { color: "#eef0f1", roughness: 0.2, metalness: 0.5 };
+  const shell = { color: "#f1e9db", roughness: 0.7, metalness: 0.06 };
+  const deck = { color: "#91b9b3", roughness: 0.52, metalness: 0.18 };
+  const rubber = { color: "#c88073", roughness: 0.88, metalness: 0.02 };
+  const barrel = { color: "#c3d6d2", roughness: 0.43, metalness: 0.28 };
+  const trim = { color: "#f8f0de", roughness: 0.35, metalness: 0.26 };
   const dial = { color: "#e5e7e9", roughness: 0.28, metalness: 0.5 };
   const knurl = { color: "#7d7f81", roughness: 0.88, metalness: 0.04 };
   const faceDark = { color: "#838587", roughness: 0.6, metalness: 0.18 };
@@ -939,9 +942,9 @@ function AnnularSolid({ inner, outer, bottom, top, color }: {
     new THREE.Vector2(inner, bottom),
   ], [inner, outer, bottom, top]);
   return (
-    <mesh>
+    <mesh receiveShadow>
       <latheGeometry args={[profile, 256]} />
-      <meshStandardMaterial color={color} roughness={0.32} metalness={0.48} />
+      <meshStandardMaterial color={color} roughness={0.62} metalness={0.22} />
     </mesh>
   );
 }
@@ -955,9 +958,9 @@ function RingTrack() {
       const unit = canvas.width / (2 * RING_TRACK.scaleOuterRadius);
       ctx.translate(canvas.width / 2, canvas.height / 2);
       ctx.scale(unit, unit);
-      ctx.fillStyle = "#c9cbcd";
+      ctx.fillStyle = "#e5e4d9";
       ctx.fillRect(-432, -432, 864, 864);
-      ctx.strokeStyle = ctx.fillStyle = "#25282b";
+      ctx.strokeStyle = ctx.fillStyle = "#506763";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.font = "600 11px Arial";
@@ -983,10 +986,10 @@ function RingTrack() {
   const rail = RING_TRACK;
   return (
     <group name="stationary-circular-track">
-      <AnnularSolid inner={rail.innerRadius} outer={rail.outerRadius} bottom={rail.bottomY} top={rail.baseTopY} color="#a7abad" />
-      <AnnularSolid inner={rail.innerRadius} outer={rail.innerRadius + rail.raceWidth} bottom={rail.baseTopY} top={rail.railTopY} color="#d3d5d6" />
-      <AnnularSolid inner={rail.outerRadius - rail.raceWidth} outer={rail.outerRadius} bottom={rail.baseTopY} top={rail.railTopY} color="#d3d5d6" />
-      <AnnularSolid inner={rail.scaleInnerRadius} outer={rail.scaleOuterRadius} bottom={rail.baseTopY} top={rail.railTopY - 2} color="#b9bdc0" />
+      <AnnularSolid inner={rail.innerRadius} outer={rail.outerRadius} bottom={rail.bottomY} top={rail.baseTopY} color="#8eaaa5" />
+      <AnnularSolid inner={rail.innerRadius} outer={rail.innerRadius + rail.raceWidth} bottom={rail.baseTopY} top={rail.railTopY} color={RACEWAY_COLOR} />
+      <AnnularSolid inner={rail.outerRadius - rail.raceWidth} outer={rail.outerRadius} bottom={rail.baseTopY} top={rail.railTopY} color={RACEWAY_COLOR} />
+      <AnnularSolid inner={rail.scaleInnerRadius} outer={rail.scaleOuterRadius} bottom={rail.baseTopY} top={rail.railTopY - 2} color="#d9d9c9" />
       <mesh position={[0, rail.railTopY - 1.9, 0]} rotation={[-Math.PI / 2, 0, 0]}>
         <ringGeometry args={[rail.scaleInnerRadius, rail.scaleOuterRadius, 256]} />
         <meshStandardMaterial map={scaleTexture} roughness={0.53} metalness={0.22} />
@@ -994,7 +997,7 @@ function RingTrack() {
       {[rail.innerRadius + 1, rail.outerRadius - 1].map((radius) => (
         <mesh key={radius} position={[0, rail.bottomY + 5, 0]} rotation={[-Math.PI / 2, 0, 0]}>
           <torusGeometry args={[radius, 1.1, 8, 256]} />
-          <meshStandardMaterial color="#64696d" roughness={0.4} metalness={0.45} />
+          <meshStandardMaterial color="#56716d" roughness={0.52} metalness={0.24} />
         </mesh>
       ))}
     </group>
@@ -1012,8 +1015,8 @@ function ScissorLift({ side }: { side: "source" | "camera" }) {
   const armAngle = Math.atan2(upperY - lowerY, 2 * halfSpan);
   const screwY = baseTopY + 8;
   const screwEndX = mount.centerX + mount.width / 2 + 17;
-  const steel = { color: "#aeb4b8", metalness: 0.55, roughness: 0.34 };
-  const black = { color: "#303539", metalness: 0.32, roughness: 0.62 };
+  const steel = { color: "#bdd1ce", metalness: 0.3, roughness: 0.48 };
+  const black = { color: "#56716d", metalness: 0.15, roughness: 0.68 };
   return (
     <group name={`${side}-fixed-scissor-lift`}>
       {[baseTopY - lift.plateThickness / 2, topY - lift.plateThickness / 2].map((y, index) => (
@@ -1024,10 +1027,9 @@ function ScissorLift({ side }: { side: "source" | "camera" }) {
       {[-lift.sideSpacing, lift.sideSpacing].map((z) => (
         <group key={z} position={[mount.centerX, 0, mount.centerZ + z]}>
           {[1, -1].map((direction) => (
-            <mesh key={direction} position={[0, (lowerY + upperY) / 2, 0]} rotation={[0, 0, direction * armAngle]}>
-              <boxGeometry args={[armLength, 5, 5]} />
+            <RoundedBox key={direction} args={[armLength, 5, 5]} radius={1.5} smoothness={2} position={[0, (lowerY + upperY) / 2, 0]} rotation={[0, 0, direction * armAngle]}>
               <meshStandardMaterial {...steel} />
-            </mesh>
+            </RoundedBox>
           ))}
           {[-halfSpan, 0, halfSpan].flatMap((x) => (x === 0 ? [(lowerY + upperY) / 2] : [lowerY, upperY]).map((y) => (
             <mesh key={`${x}-${y}`} position={[x, y, 0]} rotation={[Math.PI / 2, 0, 0]}>
@@ -1108,9 +1110,9 @@ function RailCarriage({ side }: { side: "source" | "camera" }) {
         const plateEdgeX = mount.centerX + Math.sign(offset) * mount.width / 2;
         return (
           <group key={`load-${radius}-${offset}`} name="radial-axle-load-roller" position={[pose.x, loadY, pose.z]} rotation={[0, pose.yaw, 0]}>
-            <mesh rotation={[Math.PI / 2, 0, 0]}>
+            <mesh castShadow rotation={[Math.PI / 2, 0, 0]}>
               <cylinderGeometry args={[c.loadRadius, c.loadRadius, c.loadWidth, 36]} />
-              <meshStandardMaterial color="#666c70" roughness={0.4} metalness={0.45} />
+              <meshStandardMaterial color={LOAD_WHEEL_COLOR} roughness={0.82} metalness={0.08} />
             </mesh>
             <mesh rotation={[Math.PI / 2, 0, 0]}>
               <cylinderGeometry args={[3, 3, 16, 24]} />
@@ -1119,13 +1121,13 @@ function RailCarriage({ side }: { side: "source" | "camera" }) {
             {[-6, 6].map((z) => (
               <mesh key={z} position={[0, (plateBottom - loadY) / 2, z]}>
                 <boxGeometry args={[7, Math.abs(plateBottom - loadY), 3]} />
-                <meshStandardMaterial color="#aeb4b8" roughness={0.38} metalness={0.42} />
+                <meshStandardMaterial color={LOAD_BRACKET_COLOR} roughness={0.46} metalness={0.24} />
               </mesh>
             ))}
             {side === "camera" && (
               <mesh position={[(plateEdgeX - pose.x) / 2, plateBottom - loadY + 2, 0]}>
                 <boxGeometry args={[Math.abs(plateEdgeX - pose.x) + 10, 4, 18]} />
-                <meshStandardMaterial color="#aeb4b8" roughness={0.38} metalness={0.42} />
+                <meshStandardMaterial color={LOAD_BRACKET_COLOR} roughness={0.46} metalness={0.24} />
               </mesh>
             )}
           </group>
@@ -1155,7 +1157,12 @@ function MountedEquipment({ side, theme }: { side: "source" | "camera"; theme: S
   );
 }
 
-function TurntableAndSample({ view, theme }: { view: SceneViewModel; theme: SceneTheme }) {
+function TurntableAndSample({ view, status, reducedMotion, theme }: {
+  view: SceneViewModel;
+  status: { state: string; detail: string };
+  reducedMotion: boolean;
+  theme: SceneTheme;
+}) {
   const movingGroup = useRef<THREE.Group>(null);
   const motion = useRef(new FeedbackAngle());
   const { invalidate, gl } = useThree();
@@ -1173,11 +1180,11 @@ function TurntableAndSample({ view, theme }: { view: SceneViewModel; theme: Scen
     motion.current.accept({
       id: view.feedbackId, taskId: view.taskId, angleDeg: view.angleDeg,
       direction: view.rotationDirection, valid: view.feedbackValid,
-      running: view.dataState === "scanning",
-    }, now);
+      running: view.dataState === "scanning" && status.state !== "Stopping",
+    }, now, reducedMotion);
     applyRotation(now);
     invalidate();
-  }, [view.feedbackId, view.taskId, view.angleDeg, view.rotationDirection, view.feedbackValid, view.dataState, invalidate]);
+  }, [view.feedbackId, view.taskId, view.angleDeg, view.rotationDirection, view.feedbackValid, view.dataState, status.state, reducedMotion, invalidate]);
   useFrame(() => {
     const now = performance.now();
     applyRotation(now);
@@ -1191,7 +1198,7 @@ function TurntableAndSample({ view, theme }: { view: SceneViewModel; theme: Scen
     <group>
       <mesh position={[0, TURNTABLE.baseY, 0]}>
         <cylinderGeometry args={[TURNTABLE.baseRadius, TURNTABLE.baseRadius, TURNTABLE.baseHeight, 48]} />
-        <meshStandardMaterial color={theme.chassis} roughness={0.4} metalness={0.45} />
+        <meshStandardMaterial color="#8eaaa5" roughness={0.55} metalness={0.2} />
       </mesh>
       <group ref={movingGroup} name="feedback-turntable">
         <mesh position={[0, (TURNTABLE.baseY + TURNTABLE.baseHeight / 2 + TURNTABLE.platterY - TURNTABLE.platterHeight / 2) / 2, 0]}>
@@ -1205,7 +1212,7 @@ function TurntableAndSample({ view, theme }: { view: SceneViewModel; theme: Scen
               metalness the blue fill used to paint half the platter. Mid
               metalness plus a coarser surface keeps the satin look without the
               cast. */}
-          <meshStandardMaterial color={theme.panelHeader} roughness={0.42} metalness={0.4} />
+          <meshStandardMaterial color="#f2e9d7" roughness={0.58} metalness={0.16} />
         </mesh>
         <mesh position={markerPosition} rotation={[-Math.PI / 2, 0, 0]}>
           <circleGeometry args={[4.2, 20]} />
@@ -1222,7 +1229,12 @@ function TurntableAndSample({ view, theme }: { view: SceneViewModel; theme: Scen
   );
 }
 
-export function EquipmentScene({ view, theme }: { view: SceneViewModel; theme: SceneTheme }) {
+export function EquipmentScene({ view, status, reducedMotion, theme }: {
+  view: SceneViewModel;
+  status: { state: string; detail: string };
+  reducedMotion: boolean;
+  theme: SceneTheme;
+}) {
   // Light colours are fixed rather than taken from the theme tokens. The light
   // theme's tokens are near-white so they happen to work, but the dark theme's
   // are near-black (#212834) - and a light whose colour is near-black emits
@@ -1276,12 +1288,42 @@ export function EquipmentScene({ view, theme }: { view: SceneViewModel; theme: S
             decay={2}
             distance={3600}
           />
-          <directionalLight position={[620, 520, 780]} intensity={0.65} color="#e8e9ea" />
+          <directionalLight
+            position={[620, 520, 780]}
+            intensity={0.65}
+            color="#e8e9ea"
+            castShadow
+            shadow-mapSize-width={1024}
+            shadow-mapSize-height={1024}
+            shadow-camera-left={-560}
+            shadow-camera-right={560}
+            shadow-camera-top={360}
+            shadow-camera-bottom={-560}
+            shadow-camera-near={0.5}
+            shadow-camera-far={1800}
+            shadow-bias={-0.0001}
+            shadow-normalBias={0.035}
+          />
           <directionalLight position={[-420, 260, -360]} intensity={0.3} color="#e6e8ea" />
         </>
       ) : (
         <>
-          <directionalLight position={[420, 650, 360]} intensity={0.78} color={theme.panelHeader} />
+          <directionalLight
+            position={[420, 650, 360]}
+            intensity={0.78}
+            color={theme.panelHeader}
+            castShadow
+            shadow-mapSize-width={1024}
+            shadow-mapSize-height={1024}
+            shadow-camera-left={-560}
+            shadow-camera-right={560}
+            shadow-camera-top={360}
+            shadow-camera-bottom={-560}
+            shadow-camera-near={0.5}
+            shadow-camera-far={1800}
+            shadow-bias={-0.0001}
+            shadow-normalBias={0.035}
+          />
           <directionalLight position={[-420, 260, -360]} intensity={0.22} color="#e6e8ea" />
         </>
       )}
@@ -1289,7 +1331,7 @@ export function EquipmentScene({ view, theme }: { view: SceneViewModel; theme: S
       <StageSurroundings theme={theme} />
       <RingTrack />
       <MountedEquipment side="source" theme={surfaces} />
-      <TurntableAndSample view={view} theme={surfaces} />
+      <TurntableAndSample view={view} status={status} reducedMotion={reducedMotion} theme={surfaces} />
       <MountedEquipment side="camera" theme={surfaces} />
       <Beam view={view} theme={theme} />
       {/* optical axis as a long-dashed light grey rule - a construction line
@@ -1312,6 +1354,42 @@ export function EquipmentScene({ view, theme }: { view: SceneViewModel; theme: S
         <planeGeometry args={[1000, 1000]} />
         <shadowMaterial color={theme.sceneLine} transparent opacity={0.18} />
       </mesh>
+      <Html fullscreen zIndexRange={[4, 0]}>
+        <div
+          role="status"
+          data-scene-feedback-state={status.state}
+          aria-label={`Scene state ${status.state}: ${status.detail}`}
+          title={status.detail}
+          style={{
+            position: "absolute",
+            right: "14px",
+            bottom: "48px",
+            display: "flex",
+            alignItems: "baseline",
+            gap: "8px",
+            boxSizing: "border-box",
+            maxWidth: "min(420px, calc(100% - 28px))",
+            padding: "5px 9px",
+            border: `1px solid ${theme.sceneLine}`,
+            borderRadius: "7px",
+            backgroundColor: theme.panel,
+            color: theme.textPrimary,
+            fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace",
+            fontSize: "9px",
+            lineHeight: 1.35,
+            opacity: 0.86,
+            pointerEvents: "none",
+            userSelect: "none",
+          }}
+        >
+          <strong style={{ flex: "0 0 auto", fontSize: "9px", letterSpacing: "0.06em" }}>
+            {status.state.toUpperCase()}
+          </strong>
+          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {status.detail}
+          </span>
+        </div>
+      </Html>
     </group>
   );
 }

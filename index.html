@@ -4,20 +4,25 @@
   src/main.tsx; this file only defines document metadata, the root mount node,
   and the earliest theme initialization needed to avoid a color flash.
 -->
-<html lang="en" data-theme="light">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#F5F5F7" />
+    <meta name="theme-color" content="#E8EDF2" />
     <title>Micro-CT Workstation</title>
     <script>
-      // Apply the persisted theme before first paint to avoid a theme flash.
+      // Resolve the explicit user choice first, otherwise follow the OS before
+      // first paint so the initial HTML and React state begin on the same theme.
       try {
         var saved = window.localStorage.getItem("micro-ct-workstation.theme");
-        document.documentElement.dataset.theme = saved === "dark" ? "dark" : "light";
+        var theme = saved === "dark" || saved === "light"
+          ? saved
+          : window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
       } catch (err) {
-        document.documentElement.dataset.theme = "light";
+        var theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
       }
+      document.documentElement.dataset.theme = theme;
+      document.querySelector('meta[name="theme-color"]').content = theme === "dark" ? "#111821" : "#E8EDF2";
     </script>
   </head>
   <body>

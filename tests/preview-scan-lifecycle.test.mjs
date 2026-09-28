@@ -372,6 +372,96 @@ test("normal Stop during finalization cancels the return move without becoming a
   }
 });
 
+/*
+ * Regression coverage for the X-ray panel's "USB Auto Shut Down" indicator,
+ * which does not display correctly on the FIRST open of the panel.
+ *
+ * The row in src/App.tsx is `checked={!stale && known && value}` plus
+ * `ref={(element) => { if (element) element.indeterminate = stale || !known; }}`.
+ * So the indicator is a TWO-BIT value: `known` decides between a real answer and
+ * the explicit unknown dash, and `value` decides armed versus released. These
+ * tests pin both bits and the session behaviour of the preview projection, so a
+ * change that makes the indicator lie about an unverified setpoint is caught here.
+ *
+ * The desktop first-open transition itself is a Rust projection
+ * (crates/ct-engine/src/lib.rs: `usbAutoShutDownKnown` is false until the operator
+ * has confirmed the control), which no preview test can produce; see
+ * tmp/tests/frontend/20260926-xray-first-open/ for the browser evidence.
+ */
+test("the preview projection exposes the USB auto shutdown armed/released value together with an explicit known flag", async () => {
+  const { workflow } = await preparedWorkflow(1);
+  try {
+    const armed = (await snapshotFor(workflow)).workstation.xray;
+    assert.equal(armed.usbAutoShutDown, true, "a fresh preview session arms the USB deadman");
+    assert.equal(
+      armed.usbAutoShutDownKnown,
+      true,
+      "the preview projects a verified value; only the production engine can project unknown",
+    );
+
+    workflow.usbAutoShutDownToggle();
+    const released = (await snapshotFor(workflow)).workstation.xray;
+    assert.equal(released.usbAutoShutDown, false);
+    assert.equal(released.usbAutoShutDownKnown, true);
+
+    workflow.usbAutoShutDownToggle();
+    const rearmed = (await snapshotFor(workflow)).workstation.xray;
+    assert.equal(rearmed.usbAutoShutDown, true);
+    assert.equal(rearmed.usbAutoShutDownKnown, true);
+  } finally {
+    workflow.close();
+  }
+});
+
+test("the preview USB auto shutdown selection does not survive a new session, and the projection must still read known", async () => {
+  const { workflow } = await preparedWorkflow(1);
+  try {
+    workflow.usbAutoShutDownToggle();
+    assert.equal((await snapshotFor(workflow)).workstation.xray.usbAutoShutDown, false);
+  } finally {
+    workflow.close();
+  }
+
+  // A new session mirrors the production engine's connect path, which resets the
+  // value and marks the control as awaiting the operator's selection.
+  const { workflow: reopened } = await preparedWorkflow(1);
+  try {
+    const reopenedXray = (await snapshotFor(reopened)).workstation.xray;
+    assert.equal(
+      reopenedXray.usbAutoShutDown,
+      true,
+      "the preview session default is restored; only the value inside one session persists",
+    );
+    assert.equal(
+      reopenedXray.usbAutoShutDownKnown,
+      true,
+      "the preview hardcodes usbAutoShutDownKnown (src/engine/workstationAdapter.ts), so it can never display the desktop 'unknown' first-open state",
+    );
+  } finally {
+    reopened.close();
+  }
+});
+
+test("the USB auto shutdown indicator's trusted bit stays the two-input expression the unknown-first-open defect depends on", async () => {
+  const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(
+    app,
+    /indeterminate\s*=\s*stale\s*\|\|\s*!ws\.xray\.usbAutoShutDownKnown/,
+    "the row must keep rendering an explicit unknown instead of an assumed OFF or ON",
+  );
+  assert.match(
+    app,
+    /checked=\{!stale && ws\.xray\.usbAutoShutDownKnown && ws\.xray\.usbAutoShutDown\}/,
+    "the row must keep gating the armed value on the known bit",
+  );
+  const engine = await readFile(new URL("../crates/ct-engine/src/lib.rs", import.meta.url), "utf8");
+  assert.match(
+    engine,
+    /"usbAutoShutDownKnown"\s*:\s*self\.preview\s*\|\|\s*\(live_xray\.is_some\(\)\s*&&\s*self\.usb_auto_shut_down_confirmed\)/,
+    "the production projection decides the trusted bit; changing it changes the first-open rendering",
+  );
+});
+
 test("finishing and stopping phases lock manual X-ray, setpoint, and timer controls at the adapter and workflow", async () => {
   const { workflow } = await preparedWorkflow(1);
   try {
