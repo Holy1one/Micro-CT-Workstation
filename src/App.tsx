@@ -27,6 +27,7 @@ import {
   type TopMenu,
 } from "./menuActions";
 import { LiveSceneCanvas } from "./scene/LiveSceneCanvas";
+import { ReconstructionPreview, type PreviewVolume } from "./scene/ReconstructionPreview";
 import { StaticSceneFallback } from "./scene/StaticSceneFallback";
 import { useSceneFallback } from "./scene/useSceneFallback";
 import type { ViewPreset } from "./scene/types";
@@ -36,11 +37,15 @@ import type {
   DeviceId,
   EngineCommand,
   EngineSnapshot,
+  ReconstructionGeometry,
+  ReconstructionMethodId,
+  ScanPromptStage,
   WorkstationView,
 } from "./engine/types";
 
 type Theme = "light" | "dark";
-type BottomTab = "aggregate" | "xray" | "nano" | "camera" | "images";
+type BottomTab = "aggregate" | "xray" | "nano" | "camera" | "images" | "reconstruction";
+type CenterView = "equipment" | "reconstruction";
 
 const THEME_KEY = "micro-ct-workstation.theme";
 
@@ -230,7 +235,7 @@ function MenuBar({
       <div className="workstation-brand" data-tauri-drag-region>
         <img src="/assets/micro-ct-logo.png" alt="" draggable={false} />
         <strong>Micro-CT Workstation</strong>
-        <span>v0.7.8</span>
+        <span>v0.8.0</span>
       </div>
       <nav className="sys-menu" aria-label="Application menu">
         {MENU_GROUPS.map((group) => {
@@ -697,6 +702,7 @@ const FIRST_START_PARAMETER_KEYS = ["taskId", "savePath", "projectionCount", "an
 const FIRST_START_PROGRESS_KEYS = ["current", "total", "percent", "angleDeg", "etaSeconds"];
 const FIRST_START_LOG_KEYS = ["id", "timestamp", "level", "source", "message"];
 const FIRST_START_WORKSTATION_KEYS = [
+  "scanFlow", "reconstruction",
   "cameraExposure", "dataState", "phaseWord", "phaseTone", "devices", "onlineSummary", "preflight",
   "floats", "safetyBar", "scene", "xray", "progress", "summary", "statusbar", "dock", "scanSetup",
   "consoleLogs", "frames", "checkpointAvailable",
@@ -808,6 +814,19 @@ function hasCompleteFirstStartSnapshot(snapshot: EngineSnapshot): boolean {
 
 function hasCompleteFirstStartWorkstation(ws: WorkstationView): boolean {
   if (!hasExactOwnKeys(ws, FIRST_START_WORKSTATION_KEYS)) return false;
+  if (!hasExactOwnKeys(ws.scanFlow, ["stage", "prompt", "references", "geometry", "checkpointPath"]) ||
+    ws.scanFlow.stage !== "idle" || ws.scanFlow.prompt !== null || ws.scanFlow.geometry !== null ||
+    (ws.scanFlow.checkpointPath !== null && !isString(ws.scanFlow.checkpointPath)) ||
+    !hasExactOwnKeys(ws.scanFlow.references, ["preDark", "preFlat", "postFlat", "postDark", "required"]) ||
+    [ws.scanFlow.references.preDark, ws.scanFlow.references.preFlat, ws.scanFlow.references.postFlat, ws.scanFlow.references.postDark].some(value => value !== 0) ||
+    ws.scanFlow.references.required !== 10) return false;
+  if (!hasExactOwnKeys(ws.reconstruction, ["unlocked", "methods", "selectedMethod", "status", "percent", "message", "cachePath"]) ||
+    ws.reconstruction.unlocked !== false || ws.reconstruction.selectedMethod !== null || ws.reconstruction.status !== "idle" ||
+    ws.reconstruction.percent !== 0 || ws.reconstruction.cachePath !== null || !isString(ws.reconstruction.message) ||
+    !hasExactArrayEntries(ws.reconstruction.methods) ||
+    !ws.reconstruction.methods.every(method => hasExactOwnKeys(method, ["id", "label", "enabled", "reason"]) &&
+      ["fdk", "sirt", "cgls"].includes(method.id) && isString(method.label) && typeof method.enabled === "boolean" &&
+      (method.reason === null || isString(method.reason)))) return false;
   if (!hasExactOwnKeys(ws.cameraExposure, ["minMs", "maxMs", "known"])) return false;
   if (!hasDeviceIds(ws.devices, FIRST_START_DEVICE_IDS)) return false;
   if (!ws.devices.every((device) =>
@@ -1468,7 +1487,7 @@ function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: 
   );
 }
 
-function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbackId }: { snapshot: EngineSnapshot; ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string }) {
+function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbackId, centerView, volume, previewError, volumeMode, volumeResetRevision, onVolumeAvailable }: { snapshot: EngineSnapshot; ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string; centerView: CenterView; volume: PreviewVolume | null; previewError: string | null; volumeMode: "mip" | "opacity"; volumeResetRevision: number; onVolumeAvailable: (available: boolean) => void }) {
   const [viewPreset, setViewPreset] = useState<ViewPreset>("iso");
   const [presetRevision, setPresetRevision] = useState(0);
   const fallback = useSceneFallback();
@@ -1489,10 +1508,10 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
       <div className="scene-toolbar">
         <span className="chip chip--accent">3D RENDER</span>
         <LineIcon name="cube" size={15} className="panel__icon" />
-        <h2>Equipment View</h2>
-        <HelpTip text={`Read-only geometry view. ${setupInvalid ? "Complete valid scan parameters first." : ws.dock.playReason || "Ready for the next operation."}`} />
+        <h2>{centerView === "equipment" ? "Equipment View" : "Reconstruction Preview"}</h2>
+        <HelpTip text={centerView === "equipment" ? `Read-only geometry view. ${setupInvalid ? "Complete valid scan parameters first." : ws.dock.playReason || "Ready for the next operation."}` : "Three linked slices and a rotatable volume from the saved reconstruction."} />
         <span className="menu-spacer" />
-        {(["iso", "front", "top"] as const).map((preset) => (
+        {centerView === "equipment" && (["iso", "front", "top"] as const).map((preset) => (
           <button
             key={preset}
             type="button"
@@ -1504,13 +1523,15 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
           </button>
         ))}
       </div>
-      <div className="live-scene">
-        {fallback.reason ? (
+      <div className={`live-scene ${centerView === "reconstruction" ? "live-scene--reconstruction" : ""}`}>
+        {centerView === "reconstruction" ? (
+          volume ? <ReconstructionPreview key={ws.reconstruction.cachePath || "preview"} volume={volume} mode={volumeMode} resetRevision={volumeResetRevision} onVolumeAvailable={onVolumeAvailable} /> : <div className="recon-empty" role="status">{previewError ? reconstructionMessageEn(previewError, "failed") : ws.reconstruction.status === "running" ? "Reconstructing…" : "Waiting for result data"}</div>
+        ) : fallback.reason ? (
           <StaticSceneFallback view={sceneView} reason={fallback.reason} />
         ) : (
           <LiveSceneCanvas view={sceneView} status={feedback} preset={viewPreset} presetRevision={presetRevision} onContextLost={fallback.setContextLost} />
         )}
-        <span className="live-indicator">
+        {centerView === "equipment" && <><span className="live-indicator">
           <i aria-hidden="true" />
           GEOMETRY VIEW · {stale ? "STATUS UNAVAILABLE" : "OPTICAL AXIS"}
         </span>
@@ -1528,6 +1549,7 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
           stale={stale}
           setupInvalid={setupInvalid}
         />
+        </>}
       </div>
     </section>
   );
@@ -1798,6 +1820,7 @@ const bottomTabs: Array<{ id: BottomTab; label: string; icon: LineIconName }> = 
   { id: "nano", label: "Turntable Log", icon: "rotate" },
   { id: "camera", label: "Camera Log", icon: "camera" },
   { id: "images", label: "Image Preview", icon: "image" },
+  { id: "reconstruction", label: "Reconstruction", icon: "cube" },
 ];
 
 const logLevelClass: Record<ConsoleLogLine["level"], string> = {
@@ -1866,69 +1889,176 @@ function FrameThumbnail({ frame, production }: { frame: ConsoleFrame; production
   </div>;
 }
 
-function BottomConsole({ ws, production }: { ws: WorkstationView; production: boolean }) {
+type ReconstructionEvent = { key: string; time: string; level: "INFO" | "ERR"; message: string };
+
+function reconstructionMessageEn(message: string, status: WorkstationView["reconstruction"]["status"]): string {
+  const known: Record<string, string> = {
+    "\u51c6\u5907\u91cd\u6784": "Preparing reconstruction",
+    "\u6838\u5bf9\u626b\u63cf\u6570\u636e": "Validating scan data",
+    "\u5904\u7406\u6821\u6b63\u5e27": "Correcting reference frames",
+    "\u4fdd\u5b58\u7ed3\u679c": "Saving result",
+    "\u91cd\u6784\u5b8c\u6210": "Reconstruction complete",
+    "\u91cd\u6784\u5df2\u7f13\u5b58": "Verified result loaded from cache",
+    "GPU \u5931\u8d25，\u6539\u7528 CPU \u91cd\u7b97": "GPU failed; restarting on CPU",
+    "GPU \u8bfb\u53d6\u5931\u8d25，\u6539\u7528 CPU \u91cd\u7b97": "GPU readback failed; restarting on CPU",
+  };
+  if (known[message]) return known[message];
+  const views = /^\u91cd\u6784 (\d+)\/(\d+)$/.exec(message);
+  if (views) return `Processed ${views[1]} / ${views[2]} views`;
+  if (/[\u3400-\u9fff]/u.test(message)) return status === "failed" ? "Reconstruction failed; check the scan data and compute environment" : "Reconstruction status updated";
+  return message;
+}
+
+function ReconstructionConsole({ ws, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, follow, onFollow, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction }: { ws: WorkstationView; centerView: CenterView; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; follow: boolean; onFollow: (value: boolean) => void; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId) => void }) {
+  const reconstruction = ws.reconstruction;
+  const [method, setMethod] = useState<ReconstructionMethodId>("fdk");
+  const [changingMethod, setChangingMethod] = useState(false);
+  const [showError, setShowError] = useState(false);
+  const [events, setEvents] = useState<ReconstructionEvent[]>([]);
+  const lastEvent = useRef("");
+  const eventSequence = useRef(0);
+  const eventList = useRef<HTMLDivElement>(null);
+  const running = reconstruction.status === "running";
+  const completed = reconstruction.status === "completed";
+  const failed = reconstruction.status === "failed";
+  const canChooseMethod = reconstruction.unlocked && !running && (!completed || changingMethod);
+  const selectedMethod = reconstruction.methods.find(entry => entry.id === method);
+  const canStart = canChooseMethod && selectedMethod?.enabled === true && !busy && !stale;
+  const showVolumeControls = completed && centerView === "reconstruction" && volumeReady && volume3DAvailable;
+  const percent = completed ? 100 : Math.max(0, Math.min(100, reconstruction.percent));
+  const captured = reconstruction.unlocked ? ws.scanSetup.projectionCount : ws.progress.captured;
+
+  useEffect(() => {
+    if (reconstruction.selectedMethod) setMethod(reconstruction.selectedMethod);
+    if (reconstruction.status !== "completed") setChangingMethod(false);
+  }, [reconstruction.selectedMethod, reconstruction.status]);
+  // This list records snapshot changes observed by this UI session; the engine remains authoritative.
+  useEffect(() => {
+    const key = `${ws.scanSetup.taskId}|${reconstruction.unlocked}|${reconstruction.status}|${reconstruction.message}`;
+    if (lastEvent.current === key) return;
+    lastEvent.current = key;
+    if (!reconstruction.unlocked && reconstruction.status === "idle") { setEvents([]); return; }
+    const message = reconstruction.message ? reconstructionMessageEn(reconstruction.message, reconstruction.status)
+      : failed ? "Reconstruction failed" : completed ? "Result cached"
+      : running ? "Computing volume" : "Scan dataset sealed; select a method";
+    const now = new Date();
+    const time = `${now.toLocaleTimeString("en-GB", { hour12: false })}.${String(now.getMilliseconds()).padStart(3, "0")}`;
+    const event: ReconstructionEvent = { key: `${key}|${++eventSequence.current}`, time, level: failed ? "ERR" : "INFO", message };
+    setEvents(previous => [...previous, event].slice(-40));
+  }, [ws.scanSetup.taskId, reconstruction.unlocked, reconstruction.status, reconstruction.message, failed, completed, running]);
+  useEffect(() => { if (follow && eventList.current) eventList.current.scrollTop = eventList.current.scrollHeight; }, [events, follow]);
+
+  const currentStatus = failed ? "Reconstruction failed" : running ? `Reconstructing · ${percent}%`
+    : completed ? centerView === "reconstruction" ? "Viewing result" : "Complete · Result cached"
+    : reconstruction.unlocked ? "Ready to reconstruct"
+    : ws.dataState === "scanning" || ws.dataState === "paused" ? "Scan in progress" : "Awaiting scan";
+  const dataset = reconstruction.unlocked ? `${ws.scanSetup.projectionCount} projections · Sealed`
+    : captured > 0 ? `${captured} / ${ws.scanSetup.projectionCount} projections captured` : "No sealed dataset";
+  const compute = !reconstruction.unlocked ? "Available after scan sealing"
+    : method === "sirt" ? "SIRT · CPU"
+    : "Auto · GPU only if at least 15% faster";
+  const primaryLabel = !reconstruction.unlocked ? "Available after scan"
+    : changingMethod ? "Start Reconstruction"
+    : running ? "Reconstructing…"
+    : completed ? "Reconstruction Complete"
+    : failed ? "Retry Reconstruction" : "Start Reconstruction";
+  const primaryDisabled = !reconstruction.unlocked || stale || busy || running || (completed && !changingMethod) || !canStart;
+  const start = () => { setChangingMethod(false); setShowError(false); onStartReconstruction(method); };
+  const activatePrimary = () => {
+    start();
+  };
+
+  return <div className="recon-workspace">
+    <section className="recon-workspace__control" aria-label="Reconstruction controls">
+      <div className="recon-workspace__status"><span>CURRENT STATUS</span><strong className={failed ? "recon-workspace__error" : ""}>{currentStatus}</strong></div>
+      <div className="recon-workspace__facts">
+        <div><span>DATASET</span><strong>{dataset}</strong></div>
+        <div><span>REFERENCES</span><strong>Dark {ws.scanFlow.references.preDark} · Flat {ws.scanFlow.references.preFlat}</strong></div>
+        <div><span>COMPUTE</span><strong title={compute}>{compute}</strong></div>
+      </div>
+      <div className="recon-workspace__method-title">METHOD</div>
+      <div className="recon-workspace__methods" role="radiogroup" aria-label="Reconstruction method" tabIndex={0}>
+        {reconstruction.methods.map(entry => {
+          const enabled = canChooseMethod && entry.enabled && !busy && !stale;
+          const selected = method === entry.id;
+          const hint = entry.id === "cgls" ? "Backend unavailable"
+            : !reconstruction.unlocked ? "Available after scan"
+            : ws.scanSetup.projectionCount < 3 ? "At least 3 projections required"
+            : !entry.enabled ? "Runtime limit" : entry.id === "fdk" ? "Recommended" : "";
+          return <button key={entry.id} type="button" role="radio" aria-checked={selected} disabled={!enabled} className={`recon-workspace__method${selected ? " is-selected" : ""}${selected && reconstruction.unlocked ? " is-active" : ""}`} title={hint || entry.label} onClick={() => setMethod(entry.id)}>
+            <span className="recon-workspace__radio" aria-hidden="true" /><strong>{entry.label}</strong><small>{hint}</small>
+          </button>;
+        })}
+      </div>
+      <div className={`recon-workspace__progress${running ? " is-running" : completed ? " is-complete" : failed ? " is-failed" : ""}`} role="progressbar" aria-label="Reconstruction progress" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
+        <span className="recon-workspace__progress-track"><i style={{ width: `${percent}%` }} /></span><strong>{running ? `${percent}%` : completed ? "100% · Cached" : failed ? `Stopped at ${percent}%` : "0% · Waiting"}</strong>
+      </div>
+      <div className="recon-workspace__view-controls" role="group" aria-label="3D display mode">
+        <button type="button" aria-pressed={centerView === "equipment"} onClick={onShowEquipment}>Equipment</button>
+        <button type="button" disabled={!completed} aria-pressed={centerView === "reconstruction"} onClick={onOpenReconstruction}>Result</button>
+        <button type="button" disabled={!showVolumeControls} aria-pressed={showVolumeControls && volumeMode === "mip"} onClick={() => onVolumeMode("mip")}>MIP</button>
+        <button type="button" disabled={!showVolumeControls} aria-pressed={showVolumeControls && volumeMode === "opacity"} onClick={() => onVolumeMode("opacity")}>Opacity</button>
+        <button type="button" disabled={!showVolumeControls} onClick={onResetVolume}>Reset View</button>
+      </div>
+      <div className="recon-workspace__actions">
+        <button type="button" className="recon-workspace__primary" disabled={primaryDisabled} onClick={activatePrimary}>{primaryLabel}</button>
+        <button type="button" className="recon-workspace__secondary" disabled={(!completed && !failed) || busy || stale} onClick={() => {
+          if (failed) setShowError(value => !value);
+          else if (changingMethod) { setChangingMethod(false); setMethod(reconstruction.selectedMethod || "fdk"); }
+          else setChangingMethod(true);
+        }}>{failed ? "Error Details" : changingMethod ? "Cancel Change" : "Change Method"}</button>
+      </div>
+    </section>
+    <section className="recon-workspace__events" aria-label="Reconstruction events">
+      <header><span title="Status changes observed in this UI session">RECONSTRUCTION EVENTS</span><button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => onFollow(!follow)}>{follow ? "Following latest" : "Resume follow"}</button></header>
+      <div className="recon-workspace__event-list" ref={eventList} onScroll={event => { const node = event.currentTarget; onFollow(node.scrollHeight - node.scrollTop - node.clientHeight < 8); }}>
+        {events.length === 0 ? <p className="recon-workspace__empty">No reconstruction events yet</p> : events.map(event => <div className={`recon-workspace__event${event.level === "ERR" ? " is-error" : ""}`} key={event.key}><time>[{event.time}]</time><span>{event.level} · recon</span><strong>{event.message}</strong></div>)}
+        {running && <p className="recon-workspace__note">The first calculation may take longer. Later openings use the cache.</p>}
+        {showError && failed && <p className="recon-workspace__error-detail" role="alert">{reconstructionMessageEn(reconstruction.message || "Reconstruction failed; check the scan data and compute environment", "failed")}</p>}
+      </div>
+    </section>
+  </div>;
+}
+
+function BottomConsole({ ws, production, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction }: { ws: WorkstationView; production: boolean; centerView: CenterView; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId) => void }) {
   const [tab, setTab] = useState<BottomTab>("aggregate");
   const [follow, setFollow] = useState(true);
   const logs = ws.consoleLogs;
   const frames = useMemo(() => [...ws.frames].sort((a, b) => a.index - b.index), [ws.frames]);
   const filtered = useMemo(() => {
-    if (tab === "aggregate" || tab === "images") return logs;
-    return logs.filter((entry) => entry.source === tab);
+    if (tab === "aggregate" || tab === "images" || tab === "reconstruction") return logs;
+    return logs.filter(entry => entry.source === tab);
   }, [logs, tab]);
-  const counts = useMemo(
-    () => ({
-      aggregate: logs.length,
-      xray: logs.filter((entry) => entry.source === "xray").length,
-      nano: logs.filter((entry) => entry.source === "nano").length,
-      camera: logs.filter((entry) => entry.source === "camera").length,
-      images: ws.frames.length,
-    }),
-    [logs, ws.frames.length],
-  );
-  const header =
-    tab === "images"
-      ? `CAPTURED IMAGES · ${ws.scanSetup.taskId} · ${ws.progress.captured} / ${ws.progress.total} VIEWS · ${ws.scanSetup.angleStepDeg.toFixed(2)}° STEP · ${ws.scanSetup.exposureMs} ms`
-      : tab === "aggregate"
-        ? "SESSION EVENTS · ALL SOURCES"
-        : `${tab === "xray" ? "X-RAY" : tab === "nano" ? "TURNTABLE" : "CAMERA"} EVENTS`;
+  const counts = useMemo(() => ({
+    aggregate: logs.length,
+    xray: logs.filter(entry => entry.source === "xray").length,
+    nano: logs.filter(entry => entry.source === "nano").length,
+    camera: logs.filter(entry => entry.source === "camera").length,
+    images: ws.frames.length,
+    reconstruction: ws.reconstruction.status === "completed" ? 1 : 0,
+  }), [logs, ws.frames.length, ws.reconstruction.status]);
+  const header = tab === "images"
+    ? `CAPTURED IMAGES · ${ws.scanSetup.taskId} · ${ws.progress.captured} / ${ws.progress.total} VIEWS · ${ws.scanSetup.angleStepDeg.toFixed(2)}° STEP · ${ws.scanSetup.exposureMs} ms`
+    : tab === "aggregate" ? "SESSION EVENTS · ALL SOURCES"
+    : `${tab === "xray" ? "X-RAY" : tab === "nano" ? "TURNTABLE" : "CAMERA"} EVENTS`;
 
-  return (
-    <section className="console">
-      <div className="console__tabs" role="tablist" aria-label="Logs and image preview">
-        {bottomTabs.map((item) => (
-          <button
-            key={item.id}
-            type="button"
-            role="tab"
-            aria-selected={tab === item.id}
-            className="console__tab"
-            onClick={() => setTab(item.id)}
-          >
-            <LineIcon name={item.icon} size={13} className="console__tab-icon" />
-            <em>{item.label}</em>
-            <span>{counts[item.id]}</span>
-          </button>
-        ))}
-      </div>
-      <div className="console__body" role="tabpanel">
-        <div className="console__head"><span>{header}</span>{tab !== "images" && (
-          <button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => setFollow(!follow)}>
-            {follow ? "Following latest" : "Resume live log"}
-          </button>
-        )}</div>
-        {tab === "images" ? (
-          <div className="image-strip">
-            {frames.length === 0 && <div className="image-strip__empty">No projections yet. Configure a scan task to view its image sequence.</div>}
-            {frames.map((frame) => (
-              <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} />
-            ))}
-          </div>
-        ) : (
-          <LogLines logs={filtered} follow={follow} onFollow={setFollow} />
-        )}
-      </div>
-    </section>
-  );
+  return <section className="console">
+    <div className="console__tabs" role="tablist" aria-label="Logs and image preview">
+      {bottomTabs.map(item => <button key={item.id} type="button" role="tab" aria-selected={tab === item.id} className="console__tab" onClick={() => setTab(item.id)}>
+        <LineIcon name={item.icon} size={13} className="console__tab-icon" /><em>{item.label}</em><span>{counts[item.id]}</span>
+      </button>)}
+    </div>
+    <div className="console__body" role="tabpanel">
+      <div className="recon-workspace-mount" hidden={tab !== "reconstruction"}><ReconstructionConsole ws={ws} centerView={centerView} volumeReady={volumeReady} volume3DAvailable={volume3DAvailable} busy={busy} stale={stale} volumeMode={volumeMode} follow={follow} onFollow={setFollow} onVolumeMode={onVolumeMode} onResetVolume={onResetVolume} onOpenReconstruction={onOpenReconstruction} onShowEquipment={onShowEquipment} onStartReconstruction={onStartReconstruction} /></div>
+      {tab !== "reconstruction" && <>
+        <div className="console__head"><span>{header}</span>{tab !== "images" && <button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => setFollow(!follow)}>{follow ? "Following latest" : "Resume live log"}</button>}</div>
+        {tab === "images" ? <div className="image-strip">
+          {frames.length === 0 && <div className="image-strip__empty">No projections yet. Configure a scan task to view its image sequence.</div>}
+          {frames.map(frame => <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} />)}
+        </div> : <LogLines logs={filtered} follow={follow} onFollow={setFollow} />}
+      </>}
+    </div>
+  </section>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1953,7 +2083,7 @@ const DIALOG_ICONS: Record<DialogKind, LineIconName> = {
   diagnostics: "pulse",
 };
 
-const APP_VERSION = "0.7.8";
+const APP_VERSION = "0.8.0";
 
 function InfoDialog({
   kind,
@@ -2138,6 +2268,89 @@ function InfoDialog({
   );
 }
 
+const SCAN_PROMPT_COPY: Record<ScanPromptStage, { title: string; body: string; confirm: string }> = {
+  geometry: { title: "Scan Geometry", body: "Enter measured scan geometry.", confirm: "Save and Continue" },
+  preReferences: { title: "Reference Frames", body: "Remove the sample. Capture 10 dark frames, then enable X-ray for 10 flat frames.", confirm: "Start Capture" },
+  placeSample: { title: "Place Sample", body: "X-ray is off. Place the sample; scanning will enable X-ray after confirmation.", confirm: "Sample Placed" },
+};
+
+function ScanStageDialog({ stage, recorded, beamState, busy, onConfirm, onCancel }: {
+  stage: ScanPromptStage;
+  recorded: ReconstructionGeometry | null;
+  beamState: "on" | "off" | "unknown";
+  busy: boolean;
+  onConfirm: (geometry?: ReconstructionGeometry) => Promise<void>;
+  onCancel: () => Promise<void>;
+}) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const locked = busy || submitting;
+  const [values, setValues] = useState<Record<string, string>>(() => ({
+    sodMm: recorded?.sodMm.toString() ?? "",
+    objectToDetectorMm: recorded?.objectToDetectorMm.toString() ?? "",
+    detectorWidthMm: recorded?.detectorWidthMm.toString() ?? "",
+    centerOffsetXMm: recorded?.centerOffsetXMm.toString() ?? "",
+    centerOffsetYMm: recorded?.centerOffsetYMm.toString() ?? "",
+    mirrorX: recorded ? String(recorded.mirrorX) : "",
+  }));
+  const [attempted, setAttempted] = useState(false);
+  const geometry = useMemo<ReconstructionGeometry | null>(() => {
+    const numbers = ["sodMm", "objectToDetectorMm", "detectorWidthMm", "centerOffsetXMm", "centerOffsetYMm"] as const;
+    if (numbers.some(key => values[key].trim() === "" || !Number.isFinite(Number(values[key])))) return null;
+    const [sodMm, objectToDetectorMm, detectorWidthMm, centerOffsetXMm, centerOffsetYMm] = numbers.map(key => Number(values[key]));
+    if (sodMm <= 0 || objectToDetectorMm <= 0 || detectorWidthMm <= 0 || !["true", "false"].includes(values.mirrorX)) return null;
+    return { sodMm, objectToDetectorMm, detectorWidthMm, centerOffsetXMm, centerOffsetYMm,
+      rotationDirection: "counterclockwise", mirrorX: values.mirrorX === "true", measurement: "measured" };
+  }, [values]);
+  const copy = SCAN_PROMPT_COPY[stage];
+  const sampleAccessBlocked = stage === "placeSample" && beamState !== "off";
+  useEffect(() => {
+    const priorFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const initial = dialogRef.current?.querySelector<HTMLInputElement>("input") ?? dialogRef.current?.querySelector<HTMLButtonElement>(".scan-stage-confirm");
+    initial?.focus();
+    return () => priorFocus?.focus();
+  }, []);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); if (!locked) { setSubmitting(true); void onCancel().finally(() => setSubmitting(false)); } }
+      if (event.key === "Tab") {
+        const controls = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled)") ?? []);
+        if (!controls.length) { event.preventDefault(); return; }
+        const current = controls.indexOf(document.activeElement as HTMLElement);
+        const next = event.shiftKey ? (current <= 0 ? controls.length - 1 : current - 1) : (current >= controls.length - 1 ? 0 : current + 1);
+        event.preventDefault(); controls[next]?.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [locked, onCancel]);
+  const cancel = () => { if (!locked) { setSubmitting(true); void onCancel().finally(() => setSubmitting(false)); } };
+  const field = (key: string, label: string, hint: string) => <label className="scan-geometry-field" key={key}>
+    <span>{label}</span><input type="number" inputMode="decimal" step="any" value={values[key]} aria-label={label} placeholder={hint} disabled={locked} onChange={event => setValues(current => ({ ...current, [key]: event.target.value }))} />
+  </label>;
+  const select = (key: string, label: string, options: Array<[string, string]>) => <label className="scan-geometry-field" key={key}>
+    <span>{label}</span><select value={values[key]} disabled={locked} onChange={event => setValues(current => ({ ...current, [key]: event.target.value }))}><option value="">Select</option>{options.map(([value, text]) => <option value={value} key={value}>{text}</option>)}</select>
+  </label>;
+  return <div className="modal-backdrop scan-stage-backdrop" onClick={cancel}>
+    <section ref={dialogRef} className="modal-card scan-stage-card" role="dialog" aria-modal="true" aria-labelledby="scan-stage-title" onClick={event => event.stopPropagation()}>
+      <header className="modal-card__head"><LineIcon name="warning" size={15} className="panel__icon" /><h2 id="scan-stage-title">{copy.title}</h2><button type="button" className="modal-card__close" aria-label="Cancel this scan" disabled={locked} onClick={cancel}>×</button></header>
+      <div className="modal-card__body"><p className="scan-stage-copy">{copy.body}</p>
+        {stage === "geometry" && <div className="scan-geometry-grid">
+          {field("sodMm", "Source to axis · mm", "Above 0")}
+          {field("objectToDetectorMm", "Axis to detector · mm", "Above 0")}
+          {field("detectorWidthMm", "Active detector width · mm", "Above 0")}
+          {field("centerOffsetXMm", "Horizontal offset · mm", "May be 0")}
+          {field("centerOffsetYMm", "Vertical offset · mm", "May be 0")}
+          {select("mirrorX", "Mirror image horizontally", [["false", "No"], ["true", "Yes"]])}
+        </div>}
+        {attempted && stage === "geometry" && !geometry && <p className="scan-stage-error" role="alert">Enter complete, valid geometry values.</p>}
+        {sampleAccessBlocked && <p className="scan-stage-error" role="alert">X-ray OFF is unconfirmed. Do not handle the sample.</p>}
+        <div className="scan-stage-actions"><button type="button" disabled={locked} onClick={cancel}>Cancel Scan</button><button type="button" className="scan-stage-confirm" disabled={locked || sampleAccessBlocked} onClick={() => { if (stage === "geometry") { setAttempted(true); if (!geometry) return; } setSubmitting(true); void onConfirm(stage === "geometry" ? geometry ?? undefined : undefined).finally(() => setSubmitting(false)); }}>{copy.confirm}</button></div>
+      </div>
+    </section>
+  </div>;
+}
+
 /* ------------------------------------------------------------------ */
 /* App                                                                 */
 /* ------------------------------------------------------------------ */
@@ -2147,12 +2360,22 @@ export function App() {
   const [theme, setTheme] = useTheme();
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [centerView, setCenterView] = useState<CenterView>("equipment");
+  const [volumeMode, setVolumeMode] = useState<"mip" | "opacity">("mip");
+  const [volumeResetRevision, setVolumeResetRevision] = useState(0);
+  const [volume3DAvailable, setVolume3DAvailable] = useState(false);
+  const [previewData, setPreviewData] = useState<{ key: string; volume: PreviewVolume } | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewRetry, setPreviewRetry] = useState(0);
   const [setupDraftInvalid, setSetupDraftInvalid] = useState(true);
   const [setupDraftError, setSetupDraftError] = useState<string | null>(null);
   const [canvasLayout, setCanvasLayout] = useState<CanvasLayout>(() =>
     computeCanvasLayout(window.innerWidth, window.innerHeight),
   );
   const ws: WorkstationView | undefined = snapshot?.workstation;
+  const previewKey = ws?.reconstruction.status === "completed" && ws.reconstruction.cachePath && ws.reconstruction.selectedMethod
+    ? `${ws.reconstruction.selectedMethod}|${ws.reconstruction.cachePath}` : null;
+  const activeVolume = previewKey && previewData?.key === previewKey ? previewData.volume : null;
   const [setupSync, setSetupSync] = useState(0);
   const setupPendingSync = useRef(false);
   const setupSignature = ws
@@ -2183,6 +2406,52 @@ export function App() {
   useEffect(() => {
     if (ws) document.documentElement.dataset.state = ws.dataState;
   }, [ws]);
+
+  useEffect(() => {
+    if (ws && !ws.reconstruction.unlocked) {
+      setCenterView("equipment");
+    }
+  }, [ws?.reconstruction.unlocked]);
+
+  useEffect(() => {
+    if (!previewKey || adapterKind !== "tauri" || previewData?.key === previewKey) return;
+    let active = true;
+    setPreviewError(null);
+    void invoke<PreviewVolume>("reconstruction_preview", { method: ws?.reconstruction.selectedMethod }).then(data => {
+      if (!active) return;
+      const [z, y, x] = data.shape ?? [];
+      if (![z, y, x].every(value => Number.isSafeInteger(value) && value > 0 && value <= 256)
+        || z * y * x > 256 ** 3 || !Array.isArray(data.voxels) || data.voxels.length !== z * y * x
+        || !Array.isArray(data.spacingMm) || data.spacingMm.length !== 3 || data.spacingMm.some(value => !Number.isFinite(value) || value <= 0)
+        || !Number.isFinite(data.windowMin) || !Number.isFinite(data.windowMax) || data.windowMax <= data.windowMin
+        || data.voxels.some(value => !Number.isInteger(value) || value < 0 || value > 255)) throw new Error("Invalid preview volume data");
+      setPreviewData({ key: previewKey, volume: data });
+      setCenterView("reconstruction");
+    }).catch(reason => {
+      if (active) {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setPreviewError(message);
+        setActionError(`Reconstruction preview: ${message}. Use Result to retry loading.`);
+      }
+    });
+    return () => { active = false; };
+  }, [adapterKind, previewData?.key, previewKey, previewRetry, ws?.reconstruction.selectedMethod]);
+
+  const openReconstruction = useCallback(() => {
+    if (activeVolume) {
+      setCenterView("reconstruction");
+    } else if (previewKey) {
+      setActionError(null);
+      setPreviewRetry(value => value + 1);
+    }
+  }, [activeVolume, previewKey]);
+
+  const startReconstruction = useCallback((method: ReconstructionMethodId) => {
+    setPreviewError(null);
+    setPreviewData(null);
+    setCenterView("equipment");
+    void dispatch({ type: "start_reconstruction", method });
+  }, [dispatch]);
 
   const availability: MenuAvailability = useMemo(() => {
     const ok = { available: true, reason: null };
@@ -2391,9 +2660,9 @@ export function App() {
                 onValidationError={setSetupDraftError}
               />
             </aside>
-            <LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} />
+            <LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} centerView={centerView} volume={activeVolume} previewError={previewError ? reconstructionMessageEn(previewError, "failed") : ws.reconstruction.status === "failed" ? reconstructionMessageEn(ws.reconstruction.message, "failed") : adapterKind !== "tauri" && centerView === "reconstruction" ? "No volume data in offline preview" : null} volumeMode={volumeMode} volumeResetRevision={volumeResetRevision} onVolumeAvailable={setVolume3DAvailable} />
           </section>
-          <BottomConsole ws={ws} production={adapterKind === "tauri"} />
+          <BottomConsole ws={ws} production={adapterKind === "tauri"} centerView={centerView} volumeReady={Boolean(activeVolume)} volume3DAvailable={volume3DAvailable} busy={busy} stale={Boolean(transportError)} volumeMode={volumeMode} onVolumeMode={setVolumeMode} onResetVolume={() => setVolumeResetRevision(value => value + 1)} onOpenReconstruction={openReconstruction} onShowEquipment={() => setCenterView("equipment")} onStartReconstruction={startReconstruction} />
           <aside className="col col--right">
             <XrayPanel ws={ws} busy={busy || Boolean(transportError)} dispatch={dispatch} stale={Boolean(transportError)} />
             <OperationPanel snapshot={snapshot} ws={ws} stale={Boolean(transportError)} />
@@ -2432,6 +2701,15 @@ export function App() {
             onClose={() => setDialog(null)}
           />
         ) : null}
+        {ws.scanFlow.prompt && <ScanStageDialog
+          key={`${ws.scanSetup.taskId}:${ws.scanFlow.prompt.stage}`}
+          stage={ws.scanFlow.prompt.stage}
+          recorded={ws.scanFlow.geometry}
+          beamState={ws.xray.beamState}
+          busy={busy}
+          onConfirm={geometry => dispatch({ type: "confirm_scan_stage", stage: ws.scanFlow.prompt!.stage, geometry })}
+          onCancel={() => dispatch({ type: "cancel_scan_stage", stage: ws.scanFlow.prompt!.stage })}
+        />}
       </div>
     </main>
   );

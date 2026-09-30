@@ -11,3 +11,5 @@
 - `binaries/`: regenerated sidecar copies created by `npm.cmd run engine:build`; ignored by Git.
 
 The shell does not own hardware or scan state. IPC failures are surfaced and never replaced with browser simulation.
+
+`reconstruction_preview` accepts a method ID after the engine reports a completed reconstruction. It reads only the engine-registered cache inside the scan output directory, verifies the bounded uint8 volume and SHA-256 recorded in `preview.json`, and returns voxel bytes plus shape, spacing and display-window metadata. It does not start computation or own reconstruction state.

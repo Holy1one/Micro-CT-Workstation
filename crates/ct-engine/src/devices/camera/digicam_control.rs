@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -258,6 +259,9 @@ impl DigiCamControlAdapter {
             for staging in &staging_candidates {
                 let _ = fs::remove_file(staging);
             }
+            return self.fail(error);
+        }
+        if let Err(error) = confirm_nef_file(&destination) {
             return self.fail(error);
         }
         if staging != appended_staging {
@@ -523,9 +527,32 @@ fn commit_when_released(
     }
 }
 
+fn confirm_nef_file(path: &Path) -> Result<(), CameraError> {
+    let mut file = fs::File::open(path).map_err(|error| CameraError::Io(error.to_string()))?;
+    let mut signature = [0u8; 4];
+    file.read_exact(&mut signature).map_err(|error| CameraError::Io(error.to_string()))?;
+    if signature != [b'I', b'I', 42, 0] && signature != [b'M', b'M', 0, 42] {
+        return Err(CameraError::Safety(format!("camera output is not a NEF/TIFF file: {}", path.display())));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_capture_must_have_a_nef_tiff_header() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/tests/camera")
+            .join(format!("{}-nef-header-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), std::process::id()))
+            .join("frame-0001.nef");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"II\x2a\x00NEF").unwrap();
+        assert!(confirm_nef_file(&path).is_ok());
+        fs::write(&path, b"partial transfer").unwrap();
+        assert!(confirm_nef_file(&path).is_err());
+    }
 
     #[test]
     fn task_id_rejects_path_traversal() {

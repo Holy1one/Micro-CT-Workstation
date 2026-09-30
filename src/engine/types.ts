@@ -54,6 +54,59 @@ export interface ScanProgress {
   etaSeconds: number | null;
 }
 
+/** Geometry is recorded with the acquisition, not inferred from the 3D view. */
+export interface ReconstructionGeometry {
+  sodMm: number;
+  objectToDetectorMm: number;
+  detectorWidthMm: number;
+  centerOffsetXMm: number;
+  centerOffsetYMm: number;
+  rotationDirection: "clockwise" | "counterclockwise";
+  mirrorX: boolean;
+  measurement: "measured" | "estimated";
+}
+
+export type ScanPromptStage = "geometry" | "preReferences" | "placeSample";
+
+export interface ScanFlowView {
+  stage: "idle" | "geometry" | "preDark" | "preFlat" | "placeSample" |
+    "projections" |
+    "finalizing" | "completed" | "stopped" | "fault";
+  prompt: null | {
+    stage: ScanPromptStage;
+    title: string;
+    message: string;
+    confirmLabel: string;
+    cancelLabel: string;
+  };
+  references: {
+    preDark: number;
+    preFlat: number;
+    postFlat: number;
+    postDark: number;
+    required: number;
+  };
+  geometry: ReconstructionGeometry | null;
+  checkpointPath: string | null;
+}
+
+export type ReconstructionMethodId = "fdk" | "sirt" | "cgls";
+
+export interface ReconstructionView {
+  unlocked: boolean;
+  methods: Array<{
+    id: ReconstructionMethodId;
+    label: string;
+    enabled: boolean;
+    reason: string | null;
+  }>;
+  selectedMethod: ReconstructionMethodId | null;
+  status: "idle" | "running" | "completed" | "failed";
+  percent: number;
+  message: string;
+  cachePath: string | null;
+}
+
 export interface LogEntry {
   id: string;
   timestamp: string;
@@ -101,6 +154,9 @@ export type EngineCommand =
   | { type: "preflight" }
   | { type: "home" }
   | { type: "start_scan" }
+  | { type: "confirm_scan_stage"; stage: ScanPromptStage; geometry?: ReconstructionGeometry }
+  | { type: "cancel_scan_stage"; stage: ScanPromptStage }
+  | { type: "start_reconstruction"; method: ReconstructionMethodId }
   | { type: "pause" }
   | { type: "resume" }
   | { type: "restore_previous" }
@@ -168,6 +224,8 @@ export interface ConsoleFrame {
 }
 
 export interface WorkstationView {
+  scanFlow: ScanFlowView;
+  reconstruction: ReconstructionView;
   cameraExposure: { minMs: number; maxMs: number; known: boolean };
   dataState: ConsoleDataState;
   phaseWord: string;

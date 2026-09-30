@@ -6,6 +6,7 @@ This directory contains the current PC-direct hardware implementations. Each chi
 
 - `moxtek.rs` discovers and validates the Moxtek source.
 - Owns binary serial framing, requested setpoints, measured readback, beam transitions, USB auto-shutdown, and fail-closed disconnect.
+- The recovered Windows controller uses a five-second serial read allowance. Only a new beam's `0x80` confirmation uses up to five seconds, bounded by the scan's continuous-output deadline; active monitoring and OFF confirmation keep the one-second timeout. Any failed confirmation still forces OFF and never accepts an unverified beam.
 - Does not decide when a scan may expose; that policy belongs to the engine and scan coordinator.
 
 ## `camera/`

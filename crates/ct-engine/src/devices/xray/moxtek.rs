@@ -17,6 +17,10 @@ const MOXTEK_PID: u16 = 0x07D1;
 const MOXTEK_SERIAL: &str = "183616";
 const BAUD_RATE: u32 = 57_600;
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
+// The recovered Windows controller allows five seconds for a serial read.
+// Use that allowance only while confirming a new emission; active monitoring
+// and shutdown retain the short fail-closed timeout.
+const ENABLE_STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PACKET_HEADER: u8 = 0x1B;
 const CMD_SET_VOLTAGE: u8 = 0x40;
 const CMD_SET_CURRENT: u8 = 0x41;
@@ -113,7 +117,7 @@ impl std::error::Error for XrayError {}
 trait BinaryTransport: Send {
     fn clear_input(&mut self) -> io::Result<()>;
     fn write_all_bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
-    fn read_exact_bytes(&mut self, bytes: &mut [u8]) -> io::Result<()>;
+    fn read_exact_bytes(&mut self, bytes: &mut [u8], timeout: Duration) -> io::Result<()>;
 }
 
 type SharedTransport = std::sync::Arc<std::sync::Mutex<Box<dyn BinaryTransport>>>;
@@ -130,11 +134,45 @@ impl BinaryTransport for SerialBinaryTransport {
     }
 
     fn write_all_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.port.write_all(bytes)
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let mut written = 0;
+        while written < bytes.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut,
+                    format!("Moxtek packet write timed out after {written}/{} bytes", bytes.len())));
+            }
+            self.port.set_timeout(remaining)
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            match self.port.write(&bytes[written..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "Moxtek packet write made no progress")),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
-    fn read_exact_bytes(&mut self, bytes: &mut [u8]) -> io::Result<()> {
-        self.port.read_exact(bytes)
+    fn read_exact_bytes(&mut self, bytes: &mut [u8], timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut received = 0;
+        while received < bytes.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut,
+                    format!("Moxtek packet read timed out after {received}/{} bytes", bytes.len())));
+            }
+            self.port.set_timeout(remaining)
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            match self.port.read(&mut bytes[received..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Moxtek packet read ended early")),
+                Ok(count) => received += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -274,7 +312,20 @@ impl MoxtekAdapter {
     }
 
     pub fn beam_on(&mut self, cancel: &AtomicBool) -> Result<XrayHealth, XrayError> {
-        let result = self.beam_on_inner(cancel);
+        self.beam_on_guarded(cancel, None)
+    }
+
+    /// A scan also supplies its absolute continuous-output deadline, so a
+    /// slower startup read cannot silently run past the configured limit.
+    pub fn beam_on_until(&mut self, cancel: &AtomicBool, deadline: Instant) -> Result<XrayHealth, XrayError> {
+        self.beam_on_guarded(cancel, Some(deadline))
+    }
+
+    fn beam_on_guarded(&mut self, cancel: &AtomicBool, output_deadline: Option<Instant>) -> Result<XrayHealth, XrayError> {
+        if self.health.beam_on {
+            return Err(XrayError::Safety("Moxtek beam is already ON; duplicate enable is forbidden".into()));
+        }
+        let result = self.beam_on_inner(cancel, output_deadline);
         if let Err(error) = &result {
             let _ = self.force_off_inner();
             self.health.beam_off_confirmed = false;
@@ -558,7 +609,12 @@ impl MoxtekAdapter {
         Ok(())
     }
 
-    fn beam_on_inner(&mut self, cancel: &AtomicBool) -> Result<(), XrayError> {
+    fn beam_on_inner(&mut self, cancel: &AtomicBool, output_deadline: Option<Instant>) -> Result<(), XrayError> {
+        if !self.health.beam_off_confirmed || self.last_off.is_none() {
+            return Err(XrayError::Safety(
+                "beam enable requires confirmed OFF and a known OFF interval".into(),
+            ));
+        }
         let (requested_voltage, requested_current) = self.requested_setpoint.ok_or_else(|| {
             XrayError::Safety("beam enable requires a setpoint verified in this session".into())
         })?;
@@ -569,7 +625,9 @@ impl MoxtekAdapter {
                 "Moxtek setpoint readback no longer matches the requested operating point".into(),
             ));
         }
-        let initial = self.read_status()?;
+        let initial = self.read_status().map_err(|error| XrayError::Transport(format!(
+            "pre-enable 0x80 status check failed: {error}"
+        )))?;
         if initial.locked {
             return Err(XrayError::Safety("Moxtek digital interlock is open".into()));
         }
@@ -592,6 +650,9 @@ impl MoxtekAdapter {
         if cancel.load(Ordering::SeqCst) {
             return Err(XrayError::Safety("beam enable cancelled".into()));
         }
+        if output_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(XrayError::Safety("continuous X-ray limit reached before beam enable".into()));
+        }
         let enable_ack_warning = match self.transact(CMD_SET_XRAY_ENABLE, &[1], 4) {
             Ok(_) => None,
             Err(error) if is_transport_timeout(&error) => Some(format!(
@@ -600,7 +661,8 @@ impl MoxtekAdapter {
             Err(error) => return Err(error),
         };
 
-        let deadline = Instant::now() + EMISSION_STABILITY_TIMEOUT;
+        let stability_deadline = Instant::now() + EMISSION_STABILITY_TIMEOUT;
+        let deadline = output_deadline.map_or(stability_deadline, |limit| limit.min(stability_deadline));
         let mut stable_samples = 0_u8;
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -608,10 +670,23 @@ impl MoxtekAdapter {
             }
             if Instant::now() >= deadline {
                 return Err(XrayError::Safety(
-                    "Moxtek measured output did not stabilize within 8 seconds".into(),
+                    "Moxtek measured output did not stabilize before the enable deadline".into(),
                 ));
             }
-            let status = self.read_status()?;
+            let read_timeout = deadline.saturating_duration_since(Instant::now())
+                .min(ENABLE_STATUS_READ_TIMEOUT);
+            if read_timeout.is_zero() {
+                return Err(XrayError::Safety("Moxtek beam enable deadline reached".into()));
+            }
+            let status = self.read_status_with_timeout(read_timeout).map_err(|error| {
+                let ack = enable_ack_warning.as_deref().unwrap_or("0x42 acknowledgement received");
+                XrayError::Transport(format!(
+                    "post-enable 0x80 emission verification failed ({ack}): {error}"
+                ))
+            })?;
+            if Instant::now() >= deadline {
+                return Err(XrayError::Safety("Moxtek beam enable deadline reached".into()));
+            }
             let setpoints = self.read_setpoints()?;
             if status.locked {
                 return Err(XrayError::Safety(
@@ -701,7 +776,11 @@ impl MoxtekAdapter {
     }
 
     fn read_status(&mut self) -> Result<Status, XrayError> {
-        let response = self.transact(CMD_GET_STATUS, &[], 19)?;
+        self.read_status_with_timeout(IO_TIMEOUT)
+    }
+
+    fn read_status_with_timeout(&mut self, timeout: Duration) -> Result<Status, XrayError> {
+        let response = self.transact_with_timeout(CMD_GET_STATUS, &[], 19, timeout)?;
         Ok(Status {
             voltage_kv: raw_to_kv(read_u16(&response, 3)?),
             current_ua: raw_to_ua(read_u16(&response, 5)?),
@@ -758,11 +837,21 @@ impl MoxtekAdapter {
         payload: &[u8],
         expected_length: usize,
     ) -> Result<Vec<u8>, XrayError> {
+        self.transact_with_timeout(command, payload, expected_length, IO_TIMEOUT)
+    }
+
+    fn transact_with_timeout(
+        &mut self,
+        command: u8,
+        payload: &[u8],
+        expected_length: usize,
+        read_timeout: Duration,
+    ) -> Result<Vec<u8>, XrayError> {
         let transport = self
             .transport
             .as_ref()
             .ok_or_else(|| XrayError::Transport("Moxtek adapter is not connected".into()))?;
-        transact_transport(transport, command, payload, expected_length)
+        transact_transport(transport, command, payload, expected_length, read_timeout)
     }
 }
 
@@ -771,6 +860,7 @@ fn transact_transport(
     command: u8,
     payload: &[u8],
     expected_length: usize,
+    read_timeout: Duration,
 ) -> Result<Vec<u8>, XrayError> {
     let mut transport = transport
         .lock()
@@ -787,7 +877,7 @@ fn transact_transport(
         .map_err(|error| XrayError::Transport(format!("write failed: {error}")))?;
     let mut response = vec![0; expected_length];
     transport
-        .read_exact_bytes(&mut response)
+        .read_exact_bytes(&mut response, read_timeout)
         .map_err(|error| XrayError::Transport(format!("read failed for command 0x{command:02X}: {error}")))?;
     if response.len() < 3
         || response[0] != PACKET_HEADER
@@ -900,6 +990,7 @@ mod tests {
 
     struct FakeState {
         writes: Vec<Vec<u8>>,
+        beam_enable_times: Vec<Instant>,
         response: Option<Vec<u8>>,
         set_voltage_raw: u16,
         set_current_raw: u16,
@@ -912,6 +1003,9 @@ mod tests {
         ua_enabled: bool,
         usb_auto_shutdown: bool,
         timeout_enable_ack: bool,
+        timeout_status_after_enable: bool,
+        minimum_enabled_status_timeout: Option<Duration>,
+        enabled_status_timeouts: Vec<Duration>,
         next_read_timeout: bool,
     }
 
@@ -919,6 +1013,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 writes: Vec::new(),
+                beam_enable_times: Vec::new(),
                 response: None,
                 set_voltage_raw: 0,
                 set_current_raw: 0,
@@ -931,6 +1026,9 @@ mod tests {
                 ua_enabled: false,
                 usb_auto_shutdown: true,
                 timeout_enable_ack: false,
+                timeout_status_after_enable: false,
+                minimum_enabled_status_timeout: None,
+                enabled_status_timeouts: Vec::new(),
                 next_read_timeout: false,
             }
         }
@@ -968,6 +1066,7 @@ mod tests {
                 CMD_SET_XRAY_ENABLE => {
                     state.enabled = bytes[3] != 0;
                     if state.enabled {
+                        state.beam_enable_times.push(Instant::now());
                         state.kv_enabled = true;
                         state.ua_enabled = true;
                         state.measured_voltage_raw = state.set_voltage_raw;
@@ -1002,6 +1101,10 @@ mod tests {
                     ]
                 }
                 CMD_GET_STATUS => {
+                    if state.enabled && state.timeout_status_after_enable {
+                        state.timeout_status_after_enable = false;
+                        state.next_read_timeout = true;
+                    }
                     let voltage = state.measured_voltage_raw.to_le_bytes();
                     let current = state.measured_current_raw.to_le_bytes();
                     let temperature = state.temperature_raw.to_le_bytes();
@@ -1037,9 +1140,20 @@ mod tests {
             Ok(())
         }
 
-        fn read_exact_bytes(&mut self, bytes: &mut [u8]) -> io::Result<()> {
+        fn read_exact_bytes(&mut self, bytes: &mut [u8], timeout: Duration) -> io::Result<()> {
             {
                 let mut state = self.lock();
+                if state.writes.last().is_some_and(|packet| packet[1] == CMD_GET_STATUS)
+                    && state.enabled {
+                    state.enabled_status_timeouts.push(timeout);
+                }
+                if state.writes.last().is_some_and(|packet| packet[1] == CMD_GET_STATUS)
+                    && state.enabled
+                    && state.minimum_enabled_status_timeout.is_some_and(|required| timeout < required)
+                {
+                    state.response = None;
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "simulated slow enabled status"));
+                }
                 if state.next_read_timeout {
                     state.next_read_timeout = false;
                     state.response = None;
@@ -1264,6 +1378,93 @@ mod tests {
         }));
         assert!(state.lock().unwrap().enabled);
         adapter.force_off().unwrap();
+    }
+    #[test]
+    fn beam_enable_waits_two_seconds_after_confirmed_off() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_adapter(state.clone());
+        adapter.set_parameters(60.0, 100.0).unwrap();
+        let off_at = Instant::now() - Duration::from_millis(1700);
+        adapter.last_off = Some(off_at);
+
+        adapter.beam_on(&AtomicBool::new(false)).unwrap();
+
+        let fake = state.lock().unwrap();
+        assert_eq!(fake.beam_enable_times.len(), 1);
+        assert!(fake.beam_enable_times[0].duration_since(off_at) >= MIN_REENABLE_INTERVAL);
+        drop(fake);
+        adapter.force_off().unwrap();
+    }
+    #[test]
+    fn duplicate_enable_does_not_cycle_an_active_beam() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_adapter(state.clone());
+        adapter.set_parameters(60.0, 100.0).unwrap();
+        adapter.last_off = Some(Instant::now() - MIN_REENABLE_INTERVAL);
+        adapter.beam_on(&AtomicBool::new(false)).unwrap();
+
+        let result = adapter.beam_on(&AtomicBool::new(false));
+
+        assert!(matches!(result, Err(XrayError::Safety(message))
+            if message.contains("duplicate enable is forbidden")));
+        let fake = state.lock().unwrap();
+        assert!(fake.enabled);
+        assert_eq!(fake.beam_enable_times.len(), 1);
+        drop(fake);
+        adapter.force_off().unwrap();
+    }
+    #[test]
+    fn status_timeout_after_enable_forces_off_without_reenabling() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_adapter(state.clone());
+        adapter.set_parameters(60.0, 100.0).unwrap();
+        adapter.last_off = Some(Instant::now() - MIN_REENABLE_INTERVAL);
+        state.lock().unwrap().timeout_status_after_enable = true;
+
+        let result = adapter.beam_on(&AtomicBool::new(false));
+
+        assert!(matches!(result, Err(XrayError::Transport(message))
+            if message.contains("post-enable 0x80 emission verification failed")));
+        let fake = state.lock().unwrap();
+        assert!(!fake.enabled && !fake.kv_enabled && !fake.ua_enabled);
+        assert_eq!(fake.beam_enable_times.len(), 1);
+        assert!(fake.writes.iter().any(|packet|
+            packet.as_slice() == [PACKET_HEADER, CMD_SET_XRAY_ENABLE, 1, 0]));
+    }
+    #[test]
+    fn slow_post_enable_status_uses_controller_read_allowance() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_adapter(state.clone());
+        adapter.set_parameters(60.0, 100.0).unwrap();
+        adapter.last_off = Some(Instant::now() - MIN_REENABLE_INTERVAL);
+        state.lock().unwrap().minimum_enabled_status_timeout = Some(Duration::from_secs(2));
+
+        let health = adapter.beam_on_until(&AtomicBool::new(false), Instant::now() + Duration::from_secs(10)).unwrap();
+
+        assert!(health.beam_on);
+        let fake = state.lock().unwrap();
+        assert_eq!(fake.enabled_status_timeouts.len(), 2);
+        assert!(fake.enabled_status_timeouts.iter().all(|timeout| *timeout > IO_TIMEOUT
+            && *timeout <= ENABLE_STATUS_READ_TIMEOUT));
+        drop(fake);
+        adapter.force_off().unwrap();
+    }
+    #[test]
+    fn startup_read_never_outlives_scan_beam_budget() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_adapter(state.clone());
+        adapter.set_parameters(60.0, 100.0).unwrap();
+        adapter.last_off = Some(Instant::now() - MIN_REENABLE_INTERVAL);
+        state.lock().unwrap().minimum_enabled_status_timeout = Some(Duration::from_secs(2));
+
+        let result = adapter.beam_on_until(&AtomicBool::new(false), Instant::now() + Duration::from_secs(1));
+
+        assert!(matches!(result, Err(XrayError::Transport(message))
+            if message.contains("post-enable 0x80 emission verification failed")));
+        let fake = state.lock().unwrap();
+        assert!(!fake.enabled);
+        assert_eq!(fake.enabled_status_timeouts.len(), 1);
+        assert!(fake.enabled_status_timeouts[0] <= Duration::from_secs(1));
     }
     #[test]
     fn beam_enable_rejects_case_temperature_above_65_c() {

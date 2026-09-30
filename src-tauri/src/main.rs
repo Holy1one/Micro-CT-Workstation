@@ -451,6 +451,87 @@ async fn frame_preview(index: u32, state: tauri::State<'_, EngineState>) -> Resu
     embedded_jpeg(&bytes).ok_or_else(|| "NEF contains no displayable embedded JPEG".into())
 }
 
+/// Return only the completed, engine-registered preview volume. The renderer
+/// chooses a method, never a filesystem path.
+#[tauri::command]
+async fn reconstruction_preview(
+    method: String,
+    state: tauri::State<'_, EngineState>,
+) -> Result<Value, String> {
+    if !matches!(method.as_str(), "fdk" | "sirt" | "cgls") {
+        return Err("Unknown reconstruction method".into());
+    }
+    let snapshot = {
+        let mut guard = state.0.lock().map_err(|_| "Engine client unavailable")?;
+        guard.as_mut().ok_or("ct-engine is still starting")?
+            .request("snapshot", serde_json::json!({}))?
+    };
+    let workstation = snapshot.get("workstation").ok_or("Workstation snapshot missing")?;
+    let reconstruction = workstation.get("reconstruction").ok_or("Reconstruction state missing")?;
+    if reconstruction.get("unlocked").and_then(Value::as_bool) != Some(true)
+        || reconstruction.get("status").and_then(Value::as_str) != Some("completed")
+        || reconstruction.get("selectedMethod").and_then(Value::as_str) != Some(method.as_str()) {
+        return Err("Reconstruction preview is not ready".into());
+    }
+    let path = reconstruction.get("cachePath").and_then(Value::as_str)
+        .ok_or("Reconstruction cache is missing")?;
+    let save_path = workstation.get("scanSetup").and_then(|setup| setup.get("savePath"))
+        .and_then(Value::as_str).ok_or("Scan output directory is missing")?;
+    let output_root = std::fs::canonicalize(save_path)
+        .map_err(|error| format!("Scan output directory unavailable: {error}"))?;
+    let cache_dir = std::fs::canonicalize(path)
+        .map_err(|error| format!("Reconstruction cache unavailable: {error}"))?;
+    if !cache_dir.starts_with(&output_root) || cache_dir == output_root {
+        return Err("Reconstruction cache is outside the scan output".into());
+    }
+    let metadata_path = std::fs::canonicalize(cache_dir.join("preview.json"))
+        .map_err(|error| format!("Preview metadata unavailable: {error}"))?;
+    let volume_path = std::fs::canonicalize(cache_dir.join("preview.bin"))
+        .map_err(|error| format!("Preview volume unavailable: {error}"))?;
+    if !metadata_path.starts_with(&cache_dir) || !volume_path.starts_with(&cache_dir) {
+        return Err("Preview file escaped its cache directory".into());
+    }
+    let metadata: Value = serde_json::from_slice(&std::fs::read(metadata_path)
+        .map_err(|error| format!("Preview metadata read failed: {error}"))?)
+        .map_err(|error| format!("Preview metadata invalid: {error}"))?;
+    let shape = metadata.get("shape").and_then(Value::as_array)
+        .filter(|shape| shape.len() == 3).ok_or("Preview shape missing")?;
+    let mut voxel_count = 1usize;
+    for dimension in shape {
+        let n = dimension.as_u64().ok_or("Preview shape invalid")?;
+        if n == 0 || n > 160 { return Err("Preview shape exceeds limit".into()); }
+        voxel_count = voxel_count.checked_mul(n as usize).ok_or("Preview shape overflow")?;
+    }
+    let spacing = metadata.get("spacingMm").and_then(Value::as_array)
+        .filter(|spacing| spacing.len() == 3).ok_or("Preview spacing missing")?;
+    if spacing.iter().any(|value| value.as_f64().is_none_or(|n| !n.is_finite() || n <= 0.0)) {
+        return Err("Preview spacing invalid".into());
+    }
+    let window_min = metadata.get("windowMin").and_then(Value::as_f64)
+        .ok_or("Preview window missing")?;
+    let window_max = metadata.get("windowMax").and_then(Value::as_f64)
+        .ok_or("Preview window missing")?;
+    if !window_min.is_finite() || !window_max.is_finite() || window_max <= window_min {
+        return Err("Preview window invalid".into());
+    }
+    let bytes = std::fs::read(volume_path)
+        .map_err(|error| format!("Preview volume read failed: {error}"))?;
+    if bytes.len() != voxel_count { return Err("Preview volume size changed".into()); }
+    use sha2::{Digest, Sha256};
+    let expected_hash = metadata.get("sha256").and_then(Value::as_str)
+        .ok_or("Preview checksum missing")?;
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
+        return Err("Preview volume checksum changed".into());
+    }
+    Ok(serde_json::json!({
+        "shape": shape,
+        "spacingMm": spacing,
+        "windowMin": window_min,
+        "windowMax": window_max,
+        "voxels": bytes,
+    }))
+}
+
 fn embedded_jpeg(nef: &[u8]) -> Option<Vec<u8>> {
     let mut largest: Option<(usize, usize)> = None;
     let mut cursor = 0;
@@ -682,6 +763,7 @@ fn main() {
             engine_snapshot,
             engine_command,
             frame_preview,
+            reconstruction_preview,
             resolve_default_image_directory,
             open_directory_in_shell,
             export_session_log

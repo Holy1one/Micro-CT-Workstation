@@ -8,6 +8,7 @@
 //! acquiring a second copy of application state.
 
 pub mod devices;
+pub mod reconstruction;
 mod scan;
 
 use devices::camera::{CameraHealth, DigiCamControlAdapter, valid_exposure_ms, EXPOSURE_MIN_MS, EXPOSURE_MAX_MS};
@@ -16,7 +17,8 @@ use devices::xray::{
     MoxtekAdapter, XrayHealth, MAX_CURRENT_UA, MAX_SETPOINT_POWER_W, MAX_VOLTAGE_KV,
     MIN_VOLTAGE_KV,
 };
-use scan::{RealFrame, RealScanConfig, RealScanHandle, ScanCompletion};
+use scan::{RealFrame, RealScanConfig, RealScanHandle, ReferenceFrames, ScanCompletion, ScanGeometry, ScanResume};
+use reconstruction::{ReconstructionHandle, ReconstructionMethod, ReconstructionRequest};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -109,6 +111,10 @@ impl Parameters {
         if self.task_id.trim().is_empty() || self.save_path.trim().is_empty() {
             return Err("INVALID_PARAMETERS");
         }
+        let task_id = self.task_id.trim();
+        if task_id == "." || task_id == ".." || task_id.contains(['/', '\\', '\0']) {
+            return Err("INVALID_PARAMETERS");
+        }
         if !(1..=3600).contains(&self.projection_count)
             || !self.angle_step_deg.is_finite()
             || self.angle_step_deg <= 0.0
@@ -162,7 +168,9 @@ impl ScanSetupInput {
             parameters.save_path = save_path.clone();
         }
         if let Some(task_id) = &self.task_id {
-            if task_id.trim().is_empty() {
+            let value = task_id.trim();
+            if value.is_empty() || value == "." || value == ".."
+                || value.contains(['/', '\\', '\0']) {
                 return Err("INVALID_PARAMETERS");
             }
             parameters.task_id = task_id.clone();
@@ -251,6 +259,17 @@ pub struct Engine {
     real_scan: Option<RealScanHandle>,
     real_scan_revision: u64,
     real_scan_message_count: usize,
+    scan_stage: &'static str,
+    scan_prompt: Option<&'static str>,
+    scan_geometry: Option<ScanGeometry>,
+    scan_references: ReferenceFrames,
+    restored_scan: Option<ScanResume>,
+    reconstruction: Option<ReconstructionHandle>,
+    reconstruction_method: Option<ReconstructionMethod>,
+    reconstruction_status: &'static str,
+    reconstruction_percent: u8,
+    reconstruction_message: String,
+    reconstruction_cache_path: Option<String>,
     scan_angle_deg: Option<f64>,
     real_frames: Vec<Value>,
     restored_frames: Vec<RealFrame>,
@@ -292,6 +311,17 @@ impl Engine {
             real_scan: None,
             real_scan_revision: 0,
             real_scan_message_count: 0,
+            scan_stage: "idle",
+            scan_prompt: None,
+            scan_geometry: None,
+            scan_references: ReferenceFrames::default(),
+            restored_scan: None,
+            reconstruction: None,
+            reconstruction_method: None,
+            reconstruction_status: "idle",
+            reconstruction_percent: 0,
+            reconstruction_message: String::new(),
+            reconstruction_cache_path: None,
             scan_angle_deg: None,
             real_frames: Vec::new(),
             restored_frames: Vec::new(),
@@ -308,6 +338,7 @@ impl Engine {
 
     pub fn handle(&mut self, request: Request) -> Response {
         self.sync_real_scan();
+        self.sync_reconstruction();
         self.tick();
         self.sync_nano_health();
         self.sync_xray_live_status();
@@ -353,7 +384,8 @@ impl Engine {
     }
 
     fn busy(&self) -> bool {
-        self.real_scan.is_some() || matches!(self.phase, Phase::Running | Phase::Paused | Phase::Finishing | Phase::Stopping)
+        self.real_scan.is_some() || self.reconstruction.is_some()
+            || matches!(self.phase, Phase::Running | Phase::Paused | Phase::Finishing | Phase::Stopping)
     }
 
     fn sync_real_scan(&mut self) {
@@ -363,6 +395,9 @@ impl Engine {
         if progress.revision != self.real_scan_revision {
             self.real_scan_revision = progress.revision;
             self.current = progress.captured;
+            self.scan_stage = progress.stage;
+            self.scan_prompt = progress.prompt;
+            self.scan_references = progress.references.clone();
             self.scan_angle_deg = Some(progress.angle_deg);
             self.beam_on = progress.beam_on;
             if self.fault_latched || progress.phase == "fault" {
@@ -391,6 +426,8 @@ impl Engine {
         match outcome {
             Err(error) => {
                 self.last_error = Some(error.clone());
+                self.scan_stage = "fault";
+                self.scan_prompt = None;
                 self.fault_latched = true;
                 self.preflight = false;
                 self.homed = false;
@@ -412,15 +449,21 @@ impl Engine {
                 match outcome.result {
                     Ok(ScanCompletion::Completed) if !self.fault_latched => {
                         self.phase = Phase::Completed;
+                        self.scan_stage = "completed";
+                        self.scan_prompt = None;
                         self.last_error = None;
                     }
                     Ok(ScanCompletion::Stopped) if !self.fault_latched => {
                         self.invalidate(Phase::Stopped);
+                        self.scan_stage = "stopped";
+                        self.scan_prompt = None;
                         self.last_error = None;
                         self.log("INFO", "system", "Scan ended; saved projections retained. Repeat Preflight and HOME before a new scan.");
                     }
                     result => {
                         if let Err(error) = result { self.last_error = Some(error); }
+                        self.scan_stage = "fault";
+                        self.scan_prompt = None;
                         self.fault_latched = true;
                         self.preflight = false;
                         self.homed = false;
@@ -452,6 +495,8 @@ impl Engine {
         self.homed = false;
         self.phase = phase;
         self.restored_frames.clear();
+        self.restored_scan = None;
+        self.scan_prompt = None;
     }
 
     fn nano_error(&mut self, context: &str, error: impl std::fmt::Display) -> &'static str {
@@ -638,10 +683,16 @@ impl Engine {
             if self.real_scan.is_some() {
                 return Err("SCAN_SHUTDOWN_TIMEOUT");
             }
-            let xray_off = self.force_xray_off("Disconnect");
+            let mut xray_off = self.force_xray_off("Disconnect");
+            let mut failed_xray_health = None;
             if let Some(mut xray) = self.xray.take() {
                 if let Err(error) = xray.disconnect() {
-                    self.log("ERR", "xray", &format!("Disconnect cleanup could not reconfirm Moxtek OFF: {error}"));
+                    let message = format!("Disconnect cleanup could not reconfirm Moxtek OFF: {error}");
+                    failed_xray_health = Some(xray.health());
+                    self.last_error = Some(message.clone());
+                    self.fault_latched = true;
+                    self.log("ERR", "xray", &message);
+                    if xray_off.is_ok() { xray_off = Err("XRAY_DISCONNECT_FAILED"); }
                 }
             }
             if let Some(nano) = self.nano.take() {
@@ -653,7 +704,7 @@ impl Engine {
                 camera.disconnect();
             }
             self.cached_camera_health = None;
-            self.cached_xray_health = None;
+            self.cached_xray_health = failed_xray_health;
             self.set_kv_confirmed = false;
             self.set_ua_confirmed = false;
             self.usb_auto_shut_down = true;
@@ -721,6 +772,14 @@ impl Engine {
                 parameters.validate()?;
                 self.parameters = parameters;
                 self.current = 0;
+                self.scan_geometry = None;
+                self.scan_references = ReferenceFrames::default();
+                self.scan_stage = "idle";
+                self.reconstruction_method = None;
+                self.reconstruction_status = "idle";
+                self.reconstruction_percent = 0;
+                self.reconstruction_message.clear();
+                self.reconstruction_cache_path = None;
                 self.invalidate(Phase::Idle);
                 self.log("INFO", "system", "Scan parameters updated · safety checks invalidated");
             }
@@ -748,6 +807,16 @@ impl Engine {
                 self.parameters = parameters;
                 self.max_xray_sec = max_xray_sec;
                 self.current = 0;
+                self.restored_scan = None;
+                self.scan_geometry = None;
+                self.scan_references = ReferenceFrames::default();
+                self.scan_prompt = None;
+                self.scan_stage = "idle";
+                self.reconstruction_method = None;
+                self.reconstruction_status = "idle";
+                self.reconstruction_percent = 0;
+                self.reconstruction_message.clear();
+                self.reconstruction_cache_path = None;
                 self.invalidate(Phase::Idle);
                 self.log("INFO", "system", "Scan setup updated · repeat preflight and HOME");
             }
@@ -758,6 +827,10 @@ impl Engine {
                 }
                 if !self.preview {
                     self.parameters.validate()?;
+                    if scan::manifest_file_exists(&self.parameters)
+                        && !scan::resume_manifest_exists(&self.parameters) {
+                        return Err("SCAN_OUTPUT_EXISTS_USE_NEW_TASK");
+                    }
                     if !(1..=600).contains(&self.max_xray_sec) {
                         return Err("INVALID_PARAMETERS");
                     }
@@ -883,6 +956,11 @@ impl Engine {
                     };
                     self.fault_latched = false;
                     self.preflight = true;
+                    self.scan_geometry = None;
+                    self.scan_references = ReferenceFrames::default();
+                    let restoring = scan::resume_manifest_exists(&self.parameters);
+                    self.scan_prompt = if restoring { None } else { Some("geometry") };
+                    self.scan_stage = if restoring { "idle" } else { "geometry" };
                     self.homed = reusable_reference;
                     self.phase = if reusable_reference { Phase::Ready } else { Phase::ReadyForHome };
                     self.last_error = None;
@@ -905,6 +983,10 @@ impl Engine {
                     }
                     self.fault_latched = false;
                     self.preflight = true;
+                    self.scan_geometry = None;
+                    self.scan_references = ReferenceFrames::default();
+                    self.scan_prompt = Some("geometry");
+                    self.scan_stage = "geometry";
                     self.homed = false;
                     self.phase = Phase::ReadyForHome;
                     self.log("PASS", "preflight", "8/8 preview checks passed · real interlocks unverified");
@@ -949,6 +1031,94 @@ impl Engine {
                     self.log("INFO", "nano", "Preview HOME complete · 0.00°");
                 }
             }
+            "confirm_scan_stage" => {
+                let stage = payload.get("stage").and_then(Value::as_str).ok_or("INVALID_SCAN_STAGE")?;
+                if stage == "geometry" {
+                    if self.scan_prompt != Some("geometry") || !self.preflight { return Err("SCAN_PROMPT_MISMATCH"); }
+                    let geometry: ScanGeometry = serde_json::from_value(payload.get("geometry").cloned()
+                        .ok_or("INVALID_SCAN_GEOMETRY")?).map_err(|_| "INVALID_SCAN_GEOMETRY")?;
+                    geometry.validate()?;
+                    if geometry.rotation_direction != "counterclockwise" || geometry.measurement != "measured" {
+                        return Err("INVALID_SCAN_GEOMETRY");
+                    }
+                    self.scan_geometry = Some(geometry);
+                    self.scan_prompt = None;
+                    self.scan_stage = "idle";
+                    return Ok(());
+                }
+                if !matches!(stage, "preReferences" | "placeSample") {
+                    return Err("INVALID_SCAN_STAGE");
+                }
+                self.real_scan.as_ref().ok_or("SCAN_PROMPT_MISMATCH")?.confirm_stage(stage)?;
+                self.scan_prompt = None;
+                return Ok(());
+            }
+            "cancel_scan_stage" => {
+                let stage = payload.get("stage").and_then(Value::as_str).ok_or("INVALID_SCAN_STAGE")?;
+                if self.scan_prompt != Some(stage) { return Err("SCAN_PROMPT_MISMATCH"); }
+                if let Some(scan) = self.real_scan.as_ref() {
+                    scan.request_stop().map_err(|error| self.nano_error("Scan cancel STOP failed", error))?;
+                    self.phase = Phase::Stopping;
+                } else {
+                    let saved = scan::persist_preparation_checkpoint(&self.parameters, self.set_kv, self.set_ua);
+                    self.invalidate(Phase::Stopped);
+                    self.scan_stage = "stopped";
+                    if let Err(error) = saved {
+                        self.last_error = Some(error);
+                        self.phase = Phase::Fault;
+                        return Err("CHECKPOINT_SAVE_FAILED");
+                    }
+                }
+                self.scan_prompt = None;
+                return Ok(());
+            }
+            "start_reconstruction" => {
+                if self.real_scan.is_some() || self.busy() {
+                    return Err("RECONSTRUCTION_LOCKED");
+                }
+                if self.reconstruction.is_some() { return Err("RECONSTRUCTION_ACTIVE"); }
+                let method = match payload.get("method").and_then(Value::as_str) {
+                    Some("fdk") => ReconstructionMethod::Fdk,
+                    Some("sirt") => ReconstructionMethod::Sirt,
+                    Some("cgls") => ReconstructionMethod::Cgls,
+                    _ => return Err("INVALID_RECONSTRUCTION_METHOD"),
+                };
+                if !reconstruction::available_methods().iter().any(|entry| entry.method == method && entry.enabled) {
+                    return Err("RECONSTRUCTION_METHOD_UNAVAILABLE");
+                }
+                if self.parameters.projection_count < 3 { return Err("RECONSTRUCTION_METHOD_UNAVAILABLE"); }
+                if method == ReconstructionMethod::Sirt
+                    && !reconstruction::sirt_feasible(self.parameters.projection_count) {
+                    return Err("RECONSTRUCTION_METHOD_UNAVAILABLE");
+                }
+                let scan_dir = Path::new(self.parameters.save_path.trim()).join(self.parameters.task_id.trim());
+                if !scan::completed_manifest_exists(&self.parameters) {
+                    return Err("RECONSTRUCTION_LOCKED");
+                }
+                self.reconstruction_method = Some(method);
+                match reconstruction::cached_result(&scan_dir, method) {
+                    Ok(Some(result)) => {
+                        self.reconstruction_status = "completed";
+                        self.reconstruction_percent = 100;
+                        self.reconstruction_message = "重构已缓存".into();
+                        self.reconstruction_cache_path = Some(result.cache_path.display().to_string());
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error);
+                        return Err("RECONSTRUCTION_CACHE_INVALID");
+                    }
+                    Ok(None) => {}
+                }
+                let handle = ReconstructionHandle::start(ReconstructionRequest { scan_dir, method })
+                    .map_err(|error| { self.last_error = Some(error); "RECONSTRUCTION_START_FAILED" })?;
+                self.reconstruction = Some(handle);
+                self.reconstruction_status = "running";
+                self.reconstruction_percent = 0;
+                self.reconstruction_message = "准备重构".into();
+                self.reconstruction_cache_path = None;
+                return Ok(());
+            }
             "start_scan" => {
                 if !self.preview {
                     self.require_connected()?;
@@ -961,6 +1131,9 @@ impl Engine {
                     if !self.homed {
                         return Err("HOME_REQUIRED");
                     }
+                    if self.scan_prompt.is_some() || self.scan_geometry.is_none() {
+                        return Err("SCAN_GEOMETRY_REQUIRED");
+                    }
                     if self.fault_latched {
                         return Err("FAULT_RECOVERY_REQUIRED");
                     }
@@ -970,7 +1143,7 @@ impl Engine {
                     }
                     self.parameters.validate()?;
                     self.validate_setpoint(self.set_kv, self.set_ua)?;
-                    let starting_new_scan = self.restored_frames.is_empty();
+                    let starting_new_scan = self.restored_scan.is_none();
                     if starting_new_scan && scan::manifest_file_exists(&self.parameters) {
                         return Err("SCAN_OUTPUT_EXISTS_USE_RESTORE");
                     }
@@ -986,10 +1159,12 @@ impl Engine {
                     self.cached_camera_health = Some(camera.health());
                     self.cached_xray_health = Some(xray.health());
                     self.current = self.restored_frames.len() as u32;
+                    self.restored_frames.clear();
                     self.scan_angle_deg = Some(0.0);
-                    if self.restored_frames.is_empty() { self.real_frames.clear(); }
+                    if starting_new_scan { self.real_frames.clear(); }
                     self.real_scan_revision = 0;
                     self.real_scan_message_count = 0;
+                    self.scan_stage = "preDark";
                     self.phase = Phase::Running;
                     self.beam_on = false;
                     self.last_error = None;
@@ -1002,7 +1177,8 @@ impl Engine {
                             max_xray_sec: self.max_xray_sec,
                             voltage_kv: self.set_kv,
                             current_ua: self.set_ua,
-                            resume_frames: std::mem::take(&mut self.restored_frames),
+                            geometry: self.scan_geometry.clone().ok_or("SCAN_GEOMETRY_REQUIRED")?,
+                            resume: self.restored_scan.take(),
                         },
                     ));
                     self.log("ACTION", "operator", &format!(
@@ -1083,19 +1259,24 @@ impl Engine {
                 }
                 if !self.preview {
                     self.verify_current_nano_reference()?;
-                    let frames = match scan::load_resume_frames(&self.parameters, self.set_kv, self.set_ua) {
-                        Ok(frames) => frames,
+                    let restored = match scan::load_resume(&self.parameters, self.set_kv, self.set_ua) {
+                        Ok(restored) => restored,
                         Err(error) => {
                             self.last_error = Some(error.clone());
                             self.log("ERR", "system", &format!("Scan Restore rejected: {error}"));
                             return Err("RESTORE_VALIDATION_FAILED");
                         }
                     };
-                    self.current = frames.len() as u32;
-                    self.real_frames = frames.iter()
+                    self.current = restored.frames.len() as u32;
+                    self.real_frames = restored.frames.iter()
                         .map(|frame| serde_json::to_value(frame).unwrap_or_else(|_| json!({})))
                         .collect();
-                    self.restored_frames = frames;
+                    self.scan_geometry = Some(restored.geometry.clone());
+                    self.scan_references = restored.references.clone();
+                    self.scan_stage = "idle";
+                    self.scan_prompt = None;
+                    self.restored_frames = restored.frames.clone();
+                    self.restored_scan = Some(restored);
                     self.scan_angle_deg = Some(0.0);
                     self.phase = Phase::Ready;
                     self.last_error = None;
@@ -1113,6 +1294,9 @@ impl Engine {
                 let device = payload.get("device").and_then(Value::as_str).ok_or("INVALID_DEVICE")?;
                 if !matches!(device, "turntable" | "camera" | "xray") {
                     return Err("INVALID_DEVICE");
+                }
+                if self.busy() {
+                    return Err("SCAN_ACTIVE");
                 }
                 if !self.preview {
                     match device {
@@ -1159,8 +1343,18 @@ impl Engine {
                             self.last_error = None;
                         }
                         "xray" => {
-                            if self.xray.is_some() {
+                            if self.xray.as_ref().is_some_and(|xray|
+                                xray.health().connected && xray.health().beam_off_confirmed
+                                    && !self.fault_latched) {
                                 return Err("XRAY_ALREADY_CONNECTED");
+                            }
+                            if let Some(mut stale) = self.xray.take() {
+                                if let Err(error) = stale.disconnect() {
+                                    self.log("WARN", "xray", &format!(
+                                        "Moxtek stale link cleanup could not confirm OFF: {error}; reconnect will read and force OFF"
+                                    ));
+                                }
+                                self.cached_xray_health = None;
                             }
                             let mut xray = MoxtekAdapter::new();
                             let health = match xray.discover_and_connect() {
@@ -1227,20 +1421,23 @@ impl Engine {
                 }
                 let mut xray = self.xray.take().ok_or("XRAY_NOT_CONNECTED")?;
                 let result = xray.disconnect();
-                self.cached_xray_health = None;
+                self.cached_xray_health = result.as_ref().err().map(|_| xray.health());
                 self.set_kv_confirmed = false;
                 self.set_ua_confirmed = false;
                 self.usb_auto_shut_down = true;
                 self.usb_auto_shut_down_confirmed = false;
                 self.preflight = false;
                 self.homed = false;
-                self.phase = Phase::Idle;
                 result.map_err(|error| {
                     let message = format!("Moxtek disconnect failed: {error}");
                     self.last_error = Some(message.clone());
+                    self.fault_latched = true;
+                    self.invalidate(Phase::Fault);
                     self.log("ERR", "xray", &message);
                     "XRAY_DISCONNECT_FAILED"
                 })?;
+                self.beam_on = false;
+                self.phase = Phase::Idle;
                 self.last_error = None;
                 self.log("PASS", "xray", "Moxtek OFF confirmed and manually disconnected");
             }
@@ -1580,6 +1777,28 @@ impl Engine {
         if self.connected { Ok(()) } else { Err("NOT_CONNECTED") }
     }
 
+    fn sync_reconstruction(&mut self) {
+        let Some(handle) = self.reconstruction.as_mut() else { return; };
+        let progress = handle.progress();
+        self.reconstruction_status = if progress.status == "fault" { "failed" } else { progress.status };
+        self.reconstruction_percent = progress.percent;
+        self.reconstruction_message = progress.message;
+        let Some(result) = handle.try_finish() else { return; };
+        self.reconstruction = None;
+        match result {
+            Ok(result) => {
+                self.reconstruction_status = "completed";
+                self.reconstruction_percent = 100;
+                self.reconstruction_message = "重构完成".into();
+                self.reconstruction_cache_path = Some(result.cache_path.display().to_string());
+            }
+            Err(error) => {
+                self.reconstruction_status = "failed";
+                self.reconstruction_message = error;
+            }
+        }
+    }
+
     fn verify_current_nano_reference(&mut self) -> Result<(), &'static str> {
         let nano = self.nano.as_ref().ok_or("NANO_NOT_CONNECTED")?.clone();
         let status = nano.status()
@@ -1799,6 +2018,28 @@ impl Engine {
         } else {
             self.real_frames.clone()
         };
+        let scan_prompt = self.scan_prompt.map(|stage| {
+            let (title, message, confirm_label) = match stage {
+                "geometry" => ("几何参数", "输入扫描几何参数。", "确认"),
+                "preReferences" => ("扫描前参考", "移走样品。确认后拍暗场，随后开射线拍空场。", "确认"),
+                "placeSample" => ("放置样品", "射线已关闭。放好样品；确认后开始扫描，扫描时会开射线。", "确认"),
+                _ => ("扫描确认", "确认后继续。", "确认"),
+            };
+            json!({"stage":stage,"title":title,"message":message,"confirmLabel":confirm_label,"cancelLabel":"取消"})
+        });
+        let reconstruction_unlocked = !self.preview && self.real_scan.is_none()
+            && scan::completed_manifest_exists(&self.parameters);
+        let reconstruction_methods: Vec<Value> = reconstruction::available_methods().into_iter().map(|entry| {
+            let id = entry.method.id();
+            let projections_ok = self.parameters.projection_count >= 3;
+            let sirt_ok = entry.method != ReconstructionMethod::Sirt
+                || reconstruction::sirt_feasible(self.parameters.projection_count);
+            let enabled = entry.enabled && projections_ok && sirt_ok;
+            let reason = if !projections_ok { Some("至少需要 3 个投影".to_owned()) }
+                else if !sirt_ok { Some("预计计算较慢，当前数据规模不可用".to_owned()) }
+                else { entry.reason };
+            json!({"id":id,"label":id.to_uppercase(),"enabled":enabled,"reason":reason})
+        }).collect();
         json!({
             "dataState": data_state,
             "cameraExposure":{
@@ -1872,6 +2113,31 @@ impl Engine {
             "scanSetup":{
                 "savePath":self.parameters.save_path,"taskId":self.parameters.task_id,"projectionCount":total,
                 "angleStepDeg":self.parameters.angle_step_deg,"exposureMs":self.parameters.exposure_ms,"maxXraySec":self.max_xray_sec
+            },
+            "scanFlow":{
+                "stage":self.scan_stage,
+                "prompt":scan_prompt,
+                "references":{"preDark":self.scan_references.pre_dark.len(),"preFlat":self.scan_references.pre_flat.len(),
+                    "postFlat":self.scan_references.post_flat.len(),"postDark":self.scan_references.post_dark.len(),"required":10},
+                "geometry":self.scan_geometry,
+                "checkpointPath":if self.preview || self.parameters.save_path.trim().is_empty()
+                    || self.parameters.task_id.trim().is_empty() { None }
+                    else if scan::manifest_file_exists(&self.parameters) {
+                        Some(Path::new(self.parameters.save_path.trim())
+                            .join(self.parameters.task_id.trim()).join("manifest.json").display().to_string())
+                    } else if scan::preparation_checkpoint_exists(&self.parameters) {
+                        Some(Path::new(self.parameters.save_path.trim())
+                            .join(self.parameters.task_id.trim()).join("preparation-checkpoint.json").display().to_string())
+                    } else { None }
+            },
+            "reconstruction":{
+                "unlocked":reconstruction_unlocked,
+                "methods":reconstruction_methods,
+                "selectedMethod":self.reconstruction_method.map(ReconstructionMethod::id),
+                "status":self.reconstruction_status,
+                "percent":self.reconstruction_percent,
+                "message":self.reconstruction_message,
+                "cachePath":self.reconstruction_cache_path
             },
             "consoleLogs":console_logs,"frames":frames,"checkpointAvailable":checkpoint_available
         })
@@ -2013,6 +2279,11 @@ mod tests {
         .error_code
         .is_none());
         assert!(send(engine, "preflight", json!({})).error_code.is_none());
+        assert!(send(engine, "confirm_scan_stage", json!({"stage":"geometry","geometry":{
+            "sodMm":100.0,"objectToDetectorMm":100.0,"detectorWidthMm":100.0,
+            "centerOffsetXMm":0.0,"centerOffsetYMm":0.0,
+            "rotationDirection":"counterclockwise","mirrorX":false,"measurement":"measured"
+        }})).error_code.is_none());
         assert!(send(engine, "home", json!({})).error_code.is_none());
     }
 
@@ -2277,6 +2548,11 @@ mod tests {
                 .as_deref(),
             Some("HOME_REQUIRED")
         );
+        assert!(send(&mut engine, "confirm_scan_stage", json!({"stage":"geometry","geometry":{
+            "sodMm":100.0,"objectToDetectorMm":100.0,"detectorWidthMm":100.0,
+            "centerOffsetXMm":0.0,"centerOffsetYMm":0.0,
+            "rotationDirection":"counterclockwise","mirrorX":false,"measurement":"measured"
+        }})).error_code.is_none());
         assert!(send(&mut engine, "home", json!({}))
             .error_code
             .is_none());

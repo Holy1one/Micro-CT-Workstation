@@ -181,6 +181,13 @@ async function preparedWorkflow(projectionCount = 2) {
 async function snapshotFor(workflow) {
   const adapter = Object.create(WorkstationAdapter.prototype);
   adapter.workflow = workflow;
+  adapter.scanFlow = {
+    stage: "idle",
+    prompt: null,
+    references: { preDark: 0, preFlat: 0, postFlat: 0, postDark: 0, required: 10 },
+    geometry: null,
+    checkpointPath: null,
+  };
   return adapter.getSnapshot();
 }
 

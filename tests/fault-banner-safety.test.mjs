@@ -155,6 +155,12 @@ function workstation(overrides = {}) {
   const beamState = xray.beamState ?? "off";
   const outputText = beamState === "unknown" ? "OUTPUT UNKNOWN · READBACK REQUIRED" : "SAFETY · OUTPUT DISABLED";
   const base = {
+    scanFlow: { stage: "idle", prompt: null, references: { preDark: 0, preFlat: 0, postFlat: 0, postDark: 0, required: 10 }, geometry: null, checkpointPath: null },
+    reconstruction: { unlocked: false, methods: [
+      { id: "fdk", label: "FDK", enabled: true, reason: null },
+      { id: "sirt", label: "SIRT", enabled: false, reason: "Unavailable" },
+      { id: "cgls", label: "CGLS", enabled: false, reason: "Unavailable" },
+    ], selectedMethod: null, status: "idle", percent: 0, message: "", cachePath: null },
     cameraExposure: { minMs: 0.125, maxMs: 30000, known: false },
     dataState: "ready",
     phaseWord: "IDLE",

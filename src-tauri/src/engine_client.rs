@@ -132,8 +132,9 @@ impl EngineClient {
         if let Err(error) = &result {
             if !error.starts_with("ENGINE:") {
                 self.failed = true;
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                // EOF lets ct-engine run its shutdown path after a slow request.
+                // Killing it here would bypass the scan worker's beam-off cleanup.
+                drop(self.stdin.take());
             }
         }
         result
@@ -195,9 +196,10 @@ impl Drop for EngineClient {
         //    (scan stop + Moxtek OFF + device release) even if the stop
         //    request itself failed.
         drop(self.stdin.take());
-        // 3. Give the engine a bounded window to finish that cleanup; only a
-        //    genuinely stuck process is killed.
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        // 3. ct-engine may wait up to 65 seconds for an active scan worker to
+        //    confirm cleanup after EOF. Keep the child alive through that
+        //    window and the subsequent device OFF/disconnect transactions.
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
         loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => return,

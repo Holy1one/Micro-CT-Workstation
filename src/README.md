@@ -25,6 +25,10 @@
 
 Read-only Three.js visualization. `scene-config.ts` owns display geometry, `EquipmentScene.tsx` builds the model, and `LiveSceneCanvas.tsx` owns camera interaction. WebGL fallback and theme conversion remain display-only.
 
+`ReconstructionPreview.tsx` displays three linked slices and a rotatable volume from the engine-registered, hash-verified preview. It never sends device commands.
+
+Reconstruction starts without replacing the equipment view. The UI preloads and validates completed preview data before automatically showing it once; independent Equipment/Result controls switch the loaded view without starting computation or requiring a live device connection.
+
 `angle-feedback.ts` linearly follows confirmed angle samples over 300 ms without extrapolation. The turntable platter, marker and sample share one animated transform; the camera and source stay fixed. Unknown feedback freezes the displayed pose; paused/stopped/completed snapshots settle at the confirmed angle. Long gaps and task changes re-anchor instead of replaying unobserved motion. Renderer diagnostics expose the actual mesh angle as a canvas data attribute for offline QA; they never feed device state back into the engine.
 
 ## `platform/`

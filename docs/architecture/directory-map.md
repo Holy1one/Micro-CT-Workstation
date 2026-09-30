@@ -42,6 +42,7 @@ crates/ct-engine/
     ├── main.rs                JSONL sidecar process entry and EOF shutdown
     ├── lib.rs                 domain commands, safety state, snapshots, API DTOs
     ├── scan.rs                transactional projection coordinator
+    ├── reconstruction.rs      offline correction and volume reconstruction
     └── devices/
         ├── mod.rs             device namespace and topology boundary
         ├── xray/
@@ -83,6 +84,7 @@ src/
 │   └── desktopPaths.ts        desktop dialogs and path services
 └── scene/
     ├── LiveSceneCanvas.tsx    Three.js canvas and camera controller
+    ├── ReconstructionPreview.tsx linked slices and read-only volume preview
     ├── EquipmentScene.tsx     equipment geometry and beam visualization
     ├── angle-feedback.ts     bounded constant-speed interpolation of confirmed pose
     ├── scene-config.ts        optical-axis geometry constants

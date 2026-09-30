@@ -17,6 +17,8 @@ import type {
   EnginePhase,
   EngineSnapshot,
   LogEntry,
+  ReconstructionGeometry,
+  ScanFlowView,
   WorkstationView,
 } from "./types";
 
@@ -62,6 +64,14 @@ export class WorkstationAdapter implements EngineAdapter {
   readonly kind = "developer_preview" as const;
   private workflow: ScanWorkflow;
   private revision = 0;
+  private scanFlow: ScanFlowView = {
+    stage: "idle",
+    prompt: null,
+    references: { preDark: 0, preFlat: 0, postFlat: 0, postDark: 0, required: 10 },
+    geometry: null,
+    checkpointPath: null,
+  };
+  private referenceRun = 0;
 
   constructor() {
     this.workflow = new ScanWorkflow(() => {
@@ -86,14 +96,52 @@ export class WorkstationAdapter implements EngineAdapter {
         break;
       case "preflight":
         await wf.runPreflight();
+        if (wf.preflightPassed && this.scanFlow.stage !== "projections") {
+          this.scanFlow.stage = "geometry";
+          this.scanFlow.prompt = this.prompt("geometry");
+        }
         break;
       case "home":
         await wf.home();
         break;
       case "start_scan":
+        if (!this.scanFlow.geometry) throw new Error("Enter reconstruction geometry first");
+        if (this.scanFlow.stage === "projections" && wf.phase === "paused") {
+          void wf.startScan();
+          break;
+        }
+        if (this.scanFlow.stage !== "geometry" || this.scanFlow.prompt) {
+          throw new Error("Confirm the current scan step first");
+        }
+        this.scanFlow.prompt = this.prompt("preReferences");
+        break;
       case "resume":
         void wf.startScan();
         break;
+      case "confirm_scan_stage":
+        if (this.scanFlow.prompt?.stage !== command.stage) throw new Error("Scan prompt is no longer active");
+        if (command.stage === "geometry") {
+          if (!command.geometry) throw new Error("Geometry is required");
+          this.scanFlow.geometry = this.validGeometry(command.geometry);
+          this.scanFlow.prompt = null;
+        } else if (command.stage === "preReferences") {
+          this.scanFlow.prompt = null;
+          void this.simulateReferences();
+        } else if (command.stage === "placeSample") {
+          this.scanFlow.prompt = null;
+          this.scanFlow.stage = "projections";
+          void wf.startScan();
+        }
+        break;
+      case "cancel_scan_stage":
+        if (this.scanFlow.prompt?.stage !== command.stage) throw new Error("Scan prompt is no longer active");
+        this.referenceRun++;
+        this.scanFlow.prompt = null;
+        this.scanFlow.stage = "stopped";
+        if (["scanning", "paused", "finishing"].includes(wf.phase)) await wf.stop();
+        break;
+      case "start_reconstruction":
+        throw new Error("Browser preview has no acquired NEF files to reconstruct");
       case "pause":
         wf.pause();
         break;
@@ -101,6 +149,9 @@ export class WorkstationAdapter implements EngineAdapter {
         void wf.restore();
         break;
       case "stop":
+        this.referenceRun++;
+        this.scanFlow.prompt = null;
+        this.scanFlow.stage = "stopped";
         await wf.stop();
         break;
       case "retry_device":
@@ -144,9 +195,54 @@ export class WorkstationAdapter implements EngineAdapter {
     return this.buildSnapshot();
   }
 
+  private prompt(stage: NonNullable<ScanFlowView["prompt"]>["stage"]): NonNullable<ScanFlowView["prompt"]> {
+    const copy = {
+      geometry: ["Geometry", "Enter measured scan geometry.", "Save geometry"],
+      preReferences: ["Reference frames", "Remove sample. Capture dark, then X-ray flat frames?", "Continue"],
+      placeSample: ["Place sample", "X-ray off. Place sample on turntable.", "Continue"],
+    }[stage];
+    return { stage, title: copy[0], message: copy[1], confirmLabel: copy[2], cancelLabel: "Cancel scan" };
+  }
+
+  private validGeometry(value: ReconstructionGeometry): ReconstructionGeometry {
+    if (![value.sodMm, value.objectToDetectorMm, value.detectorWidthMm].every((n) => Number.isFinite(n) && n > 0)
+      || ![value.centerOffsetXMm, value.centerOffsetYMm].every(Number.isFinite)
+      || value.rotationDirection !== "counterclockwise"
+      || value.measurement !== "measured"
+      || typeof value.mirrorX !== "boolean") throw new Error("Invalid reconstruction geometry");
+    return { ...value };
+  }
+
+  private async simulateReferences(): Promise<void> {
+    const run = ++this.referenceRun;
+    for (const [stage, field] of [["preDark", "preDark"], ["preFlat", "preFlat"]] as const) {
+      this.scanFlow.stage = stage;
+      for (let count = 1; count <= 10; count++) {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        if (this.referenceRun !== run) return;
+        this.scanFlow.references[field] = count;
+        this.revision++;
+      }
+    }
+    this.scanFlow.stage = "placeSample";
+    this.scanFlow.prompt = this.prompt("placeSample");
+    this.revision++;
+  }
+
+  private refreshScanFlow(): void {
+    if (this.scanFlow.stage === "projections" && this.workflow.phase === "completed") {
+      this.scanFlow.stage = "completed";
+    }
+    if (this.scanFlow.stage === "projections" && this.workflow.phase === "fault") {
+      this.scanFlow.stage = "fault";
+      this.scanFlow.prompt = null;
+    }
+  }
+
   // ------------------------------------------------------------ view mapping
 
   private buildSnapshot(): EngineSnapshot {
+    this.refreshScanFlow();
     const wf = this.workflow;
     const ws = this.buildWorkstationView();
     const rb = wf.source.readback();
@@ -355,6 +451,19 @@ export class WorkstationAdapter implements EngineAdapter {
                 : `READY  ${total} views · ${fixed2(step)}°/view · ${captured} / ${total} captured · queue idle · awaiting operator`;
 
     return {
+      scanFlow: { ...this.scanFlow, references: { ...this.scanFlow.references } },
+      reconstruction: {
+        unlocked: false,
+        methods: (["fdk", "sirt", "cgls"] as const).map((id) => ({
+          id, label: id.toUpperCase(), enabled: false,
+          reason: "Browser preview has no acquired RAW dataset",
+        })),
+        selectedMethod: null,
+        status: "idle",
+        percent: 0,
+        message: "No production reconstruction is available in browser preview",
+        cachePath: null,
+      },
       dataState,
       phaseWord,
       phaseTone,

@@ -33,7 +33,7 @@ async function loadTracker() {
 }
 
 async function loadProductionFirstLaunchSnapshot() {
-  const path = new URL("tmp/tests/frontend/20260927-portable-feedback/first-launch-response.jsonl", ROOT);
+  const path = new URL("tests/first-launch-response.jsonl", ROOT);
   const contents = await readFile(path, "utf8");
   const lines = contents.split(/\r?\n/).filter((line) => line.length > 0);
   assert.equal(lines.length, 1, "expected one real production ct-engine JSONL response");

@@ -80,9 +80,9 @@ function MiniatureTree({ x, z, night }: { x: number; z: number; night: boolean }
   );
 }
 
-/** A fixed mesh cascade: the open wall and pale vertical ribs suggest motion
- * without a texture upload or a continuously running render loop. */
-function Cascade({ angle, night }: { angle: number; night: boolean }) {
+/** A thin falling sheet. Its small colour map moves down with gravity while
+ * the fixed ribs and outlet foam describe the steady shape of the flow. */
+function Cascade({ angle, index, night }: { angle: number; index: number; night: boolean }) {
   const radius = GARDEN_RADIUS;
   const x = Math.sin(angle);
   const z = Math.cos(angle);
@@ -94,7 +94,7 @@ function Cascade({ angle, night }: { angle: number; night: boolean }) {
       <group position={[x * 435, POND_Y - 1, z * 435]} rotation={[0, angle, 0]}>
         <mesh>
           <boxGeometry args={[42, 2.5, 254]} />
-          <meshStandardMaterial color={water} roughness={0.25} metalness={0.12} />
+          <meshStandardMaterial color={water} roughness={0.25} metalness={0} />
         </mesh>
         <mesh position={[-12, 1.6, 0]}>
           <boxGeometry args={[4, 0.8, 248]} />
@@ -104,18 +104,18 @@ function Cascade({ angle, night }: { angle: number; night: boolean }) {
       <group position={[x * (radius + 2), (POND_Y + PLINTH_BOTTOM_Y) / 2, z * (radius + 2)]} rotation={[0, angle, 0]}>
         <mesh>
           <planeGeometry args={[53, fallHeight]} />
-          <meshStandardMaterial color={water} side={THREE.DoubleSide} roughness={0.18} metalness={0.12} />
+          <meshStandardMaterial color={water} map={CASCADE_FLOW_MAPS[index]} side={THREE.DoubleSide} roughness={0.22} metalness={0} />
         </mesh>
         {[-17, -3, 13].map((offset, index) => (
           <mesh key={offset} position={[offset, 0, 0.8]}>
             <planeGeometry args={[index === 1 ? 3 : 5, fallHeight - 5]} />
-            <meshBasicMaterial color={glint} side={THREE.DoubleSide} transparent opacity={index === 1 ? 0.78 : 0.45} depthWrite={false} />
+            <meshBasicMaterial color={glint} side={THREE.DoubleSide} transparent opacity={index === 1 ? 0.5 : 0.28} depthWrite={false} />
           </mesh>
         ))}
       </group>
       <mesh position={[x * (radius + 27), PLINTH_BOTTOM_Y + 4, z * (radius + 27)]} rotation={[-Math.PI / 2, 0, 0]}>
         <circleGeometry args={[31, 16]} />
-        <meshStandardMaterial color={water} roughness={0.3} metalness={0.08} />
+        <meshStandardMaterial color={water} roughness={0.3} metalness={0} />
       </mesh>
       <mesh position={[x * (radius + 27), PLINTH_BOTTOM_Y + 5, z * (radius + 27)]} rotation={[-Math.PI / 2, 0, 0]}>
         <ringGeometry args={[21, 25, 20]} />
@@ -124,6 +124,55 @@ function Cascade({ angle, night }: { angle: number; night: boolean }) {
     </group>
   );
 }
+
+/** Small, deterministic textures stay resident for the lifetime of the scene.
+ * Only their UV offsets change; animation never uploads a new image. */
+function waterTexture(size: number, pixel: (u: number, v: number) => [number, number, number], repeat: [number, number], color: boolean): THREE.DataTexture {
+  const data = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const [r, g, b] = pixel(x / size, y / size);
+      const offset = (y * size + x) * 4;
+      data[offset] = Math.round(r * 255);
+      data[offset + 1] = Math.round(g * 255);
+      data[offset + 2] = Math.round(b * 255);
+      data[offset + 3] = 255;
+    }
+  }
+  const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+  texture.repeat.set(...repeat);
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
+  if (color) texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+const POND_NORMAL_MAP = waterTexture(128, (u, v) => {
+  // The normal is the derivative of three low-amplitude travelling waves.
+  const first = Math.PI * 2 * (2 * u + v);
+  const second = Math.PI * 2 * (u - 3 * v);
+  const third = Math.PI * 2 * (5 * u - 2 * v);
+  const slopeU = Math.PI * 2 * (0.008 * 2 * Math.cos(first) + 0.004 * Math.cos(second) + 0.002 * 5 * Math.cos(third));
+  const slopeV = Math.PI * 2 * (0.008 * Math.cos(first) - 0.004 * 3 * Math.cos(second) - 0.002 * 2 * Math.cos(third));
+  const inverseLength = 1 / Math.hypot(slopeU, slopeV, 1);
+  return [(1 - slopeU * inverseLength) / 2, (1 - slopeV * inverseLength) / 2, (1 + inverseLength) / 2];
+}, [1, 1], false);
+
+const POND_DEPTH_MAP = waterTexture(64, (u, v) => {
+  const radius = Math.min(1, Math.hypot(u - 0.5, v - 0.5) * 2);
+  const brightness = 0.68 + 0.28 * radius ** 1.5;
+  return [brightness, brightness, brightness];
+}, [1, 1], true);
+POND_DEPTH_MAP.wrapS = POND_DEPTH_MAP.wrapT = THREE.ClampToEdgeWrapping;
+
+const CASCADE_FLOW_MAPS = [0, 1].map(() => waterTexture(64, (u, v) => {
+  const streak = 0.5 + 0.5 * Math.cos(Math.PI * 2 * (6 * u + 0.35 * Math.sin(Math.PI * 4 * v)));
+  const brokenFoam = 0.5 + 0.5 * Math.sin(Math.PI * 2 * (7 * v + 2 * u));
+  const brightness = 0.56 + 0.3 * streak + 0.14 * brokenFoam;
+  return [brightness, brightness, brightness];
+}, [1, 2], true));
 
 /** Builds a tiling greyscale grain map. Grey-only on purpose: the surface takes
  *  its colour from `material.color`, so the same map survives a theme switch and
@@ -253,7 +302,7 @@ const GROUND_FALLOFF_DARK = createGroundFalloffMap("#ededed");
  *  The same grain map serves as map, roughnessMap, bumpMap and emissiveMap, so
  *  the cloth and the paper still read once the surface is this bright: the weave
  *  is carried by the colour it multiplies as well as by the relief. */
-export function StageSurroundings({ theme }: { theme: SceneTheme }) {
+export function StageSurroundings({ theme, reducedMotion }: { theme: SceneTheme; reducedMotion: boolean }) {
   const night = theme.stageGlow < 0.3;
   const { scene, invalidate } = useThree();
   useEffect(() => {
@@ -266,6 +315,38 @@ export function StageSurroundings({ theme }: { theme: SceneTheme }) {
       invalidate();
     };
   }, [invalidate, night, scene, theme.stageWall]);
+
+  useEffect(() => {
+    if (reducedMotion) return;
+    let timer: number | null = null;
+    let elapsed = 0;
+    let previous = performance.now();
+    const tick = () => {
+      const now = performance.now();
+      elapsed += Math.min((now - previous) / 1000, 0.1);
+      previous = now;
+      POND_NORMAL_MAP.offset.set((elapsed * 0.018) % 1, (elapsed * 0.011) % 1);
+      CASCADE_FLOW_MAPS.forEach((map, index) => { map.offset.y = (elapsed * 0.8 + index * 0.37) % 1; });
+      invalidate();
+    };
+    const syncVisibility = () => {
+      if (document.visibilityState === "visible") {
+        if (timer === null) {
+          previous = performance.now();
+          timer = window.setInterval(tick, 50);
+        }
+      } else if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    };
+    syncVisibility();
+    document.addEventListener("visibilitychange", syncVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", syncVisibility);
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [invalidate, reducedMotion]);
 
   return (
     <group>
@@ -317,14 +398,8 @@ export function StageSurroundings({ theme }: { theme: SceneTheme }) {
         ))}
         <mesh position={[0, POND_Y, 0]} rotation={[-Math.PI / 2, 0, 0]}>
           <circleGeometry args={[POND_RADIUS - 3, 64]} />
-          <meshStandardMaterial color={night ? "#376b76" : "#669ea8"} roughness={0.25} metalness={0.12} />
+          <meshStandardMaterial color={night ? "#376b76" : "#669ea8"} map={POND_DEPTH_MAP} normalMap={POND_NORMAL_MAP} normalScale={new THREE.Vector2(0.18, 0.18)} roughness={0.38} metalness={0} />
         </mesh>
-        {[90, 156, 230].map((radius) => (
-          <mesh key={radius} position={[0, POND_Y + 0.8, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-            <ringGeometry args={[radius, radius + 1.8, 48]} />
-            <meshBasicMaterial color={night ? "#81b6bd" : "#d4eddd"} transparent opacity={0.42} depthWrite={false} />
-          </mesh>
-        ))}
         <mesh position={[0, (TABLE_Y + POND_Y) / 2, 0]}>
           <cylinderGeometry args={[55, 67, TABLE_Y - POND_Y, 16]} />
           <meshStandardMaterial color={night ? "#6a746b" : "#c5bea3"} roughness={1} flatShading />
@@ -333,7 +408,7 @@ export function StageSurroundings({ theme }: { theme: SceneTheme }) {
           <circleGeometry args={[55, 16]} />
           <meshStandardMaterial color={night ? "#7d8474" : "#d4ceb5"} roughness={1} />
         </mesh>
-        {DRAIN_ANGLES.map((angle) => <Cascade key={angle} angle={angle} night={night} />)}
+        {DRAIN_ANGLES.map((angle, index) => <Cascade key={angle} angle={angle} index={index} night={night} />)}
         {SHRUB_POSITIONS.map(([x, z, size]) => (
           <Shrub key={`${x}:${z}`} x={x} z={z} size={size} night={night} />
         ))}

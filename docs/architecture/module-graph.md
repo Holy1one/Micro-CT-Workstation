@@ -30,6 +30,7 @@ flowchart LR
   developer_preview -->|consumes-contract| frontend_contract
   frontend_client -->|ipc-command| desktop_shell
   ui_shell -->|frame-preview-ipc| desktop_shell
+  ui_shell -->|reconstruction-preview-ipc| desktop_shell
   desktop_shell -->|jsonl-protocol| engine_core
   engine_core -->|safety-device-contract| device_xray
   engine_core -->|capture-contract| device_camera
@@ -71,6 +72,7 @@ flowchart LR
 | `developer-preview` | `frontend-contract` | consumes-contract | strong | Preview output must stay structurally and semantically compatible with production snapshots. |
 | `frontend-client` | `desktop-shell` | ipc-command | strong | Tauri invoke command names and payload fields are string-based runtime contracts. |
 | `ui-shell` | `desktop-shell` | frame-preview-ipc | strong | The frame_preview command accepts a committed frame index and returns an embedded JPEG from the engine-registered, hash-verified NEF. |
+| `ui-shell` | `desktop-shell` | reconstruction-preview-ipc | strong | The reconstruction_preview command accepts only a method ID and returns an engine-registered, hash-verified preview volume for a completed reconstruction. |
 | `desktop-shell` | `engine-core` | jsonl-protocol | strong | Versioned JSONL carries fractional exposureMs, native camera exposure limits, projection counts up to 3600 and maxXraySec; UI minutes must convert without changing the seconds contract. |
 | `engine-core` | `device-xray` | safety-device-contract | strong | Every exposure transaction depends on verified X-ray readback and fail-closed shutdown. |
 | `engine-core` | `device-camera` | capture-contract | strong | Projection commit requires a confirmed host-side image file. |

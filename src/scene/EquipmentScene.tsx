@@ -1328,7 +1328,7 @@ export function EquipmentScene({ view, status, reducedMotion, theme }: {
         </>
       )}
       {/* The room first, so the shells of the beam composite over it. */}
-      <StageSurroundings theme={theme} />
+      <StageSurroundings theme={theme} reducedMotion={reducedMotion} />
       <RingTrack />
       <MountedEquipment side="source" theme={surfaces} />
       <TurntableAndSample view={view} status={status} reducedMotion={reducedMotion} theme={surfaces} />

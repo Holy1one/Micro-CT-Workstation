@@ -11,6 +11,19 @@ function assertSnapshot(snapshot: EngineSnapshot): EngineSnapshot {
   if (!snapshot.workstation) {
     throw new Error("Engine protocol error: workstation view is missing");
   }
+  const flow = snapshot.workstation.scanFlow;
+  const reconstruction = snapshot.workstation.reconstruction;
+  if (!flow || !flow.references || typeof flow.stage !== "string"
+      || !Number.isFinite(flow.references.preDark)
+      || !Number.isFinite(flow.references.preFlat)
+      || !Number.isFinite(flow.references.postFlat)
+      || !Number.isFinite(flow.references.postDark)
+      || !reconstruction || typeof reconstruction.unlocked !== "boolean"
+      || !Array.isArray(reconstruction.methods)
+      || !Number.isFinite(reconstruction.percent)
+      || !["idle", "running", "completed", "failed"].includes(reconstruction.status)) {
+    throw new Error("Engine protocol error: scan flow or reconstruction state is missing");
+  }
   const xray = snapshot.workstation.xray;
   const scene = snapshot.workstation.scene;
   if (!scene || !Number.isFinite(scene.angleDeg) || typeof scene.angleKnown !== "boolean"
