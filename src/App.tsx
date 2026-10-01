@@ -235,7 +235,7 @@ function MenuBar({
       <div className="workstation-brand" data-tauri-drag-region>
         <img src="/assets/micro-ct-logo.png" alt="" draggable={false} />
         <strong>Micro-CT Workstation</strong>
-        <span>v0.8.1</span>
+        <span>v0.8.2</span>
       </div>
       <nav className="sys-menu" aria-label="Application menu">
         {MENU_GROUPS.map((group) => {
@@ -2087,7 +2087,7 @@ const DIALOG_ICONS: Record<DialogKind, LineIconName> = {
   diagnostics: "pulse",
 };
 
-const APP_VERSION = "0.8.1";
+const APP_VERSION = "0.8.2";
 
 function InfoDialog({
   kind,
