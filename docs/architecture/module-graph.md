@@ -19,7 +19,7 @@ flowchart LR
   scene["Read-only 3D equipment scene"]
   platform["Frontend platform integration"]
   build_tooling["Build and verification tooling"]
-  extensions["Optional algorithms and service bridges"]
+  extensions["Sites-compatible static preview worker"]
   documentation["Architecture, guides, and evidence"]
   release_artifacts["Generated release artifacts"]
   release_artifacts -->|release-pipeline| build_tooling
@@ -56,7 +56,7 @@ flowchart LR
 | `scene` | medium | Owns visualization geometry, theme conversion, camera navigation, and WebGL fallback. | npm.cmd run typecheck<br>npm.cmd run test:sites |
 | `platform` | medium | Provides desktop-only paths, dialogs, directory reveal, and log export behind small functions. | npm.cmd run typecheck<br>npm.cmd run test:sites |
 | `build-tooling` | medium | Owns dependency locks, build entry points, contract tests, module-map generation, and impact analysis. | npm.cmd run module-map:check<br>npm.cmd run test:sites |
-| `extensions` | low | Holds optional algorithm contracts and the Sites-compatible static worker, outside the safety control loop. | npm.cmd run test:sites<br>npm.cmd run build |
+| `extensions` | low | Holds the optional static hosted-preview worker that serves built assets, outside the desktop application and the safety control loop. | npm.cmd run test:sites<br>npm.cmd run build |
 | `documentation` | low | Explains current architecture, operating constraints, historical plans, and verification evidence. | npm.cmd run module-map:check |
 | `release-artifacts` | low | Contains replaceable packaged binaries and is never a source of design truth. | None |
 

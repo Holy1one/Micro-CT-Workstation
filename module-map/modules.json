@@ -24,7 +24,7 @@
     {
       "id": "device-camera",
       "name": "Nikon D7100 camera",
-      "owns": ["crates/ct-engine/src/devices/camera/**", "bridges/digicam/**"],
+      "owns": ["crates/ct-engine/src/devices/camera/**"],
       "publicApi": ["crates/ct-engine/src/devices/camera/mod.rs"],
       "risk": "critical",
       "description": "Owns camera discovery, exposure configuration, host-side capture, and image-file confirmation.",
@@ -123,12 +123,12 @@
     },
     {
       "id": "extensions",
-      "name": "Optional algorithms and service bridges",
-      "owns": ["algorithm-plugins/**", "worker/**"],
-      "publicApi": ["algorithm-plugins/README.md", "worker/index.js"],
+      "name": "Sites-compatible static preview worker",
+      "owns": ["worker/**"],
+      "publicApi": ["worker/index.js", "worker/README.md"],
       "risk": "low",
-      "description": "Holds optional algorithm contracts and the Sites-compatible static worker, outside the safety control loop.",
-      "execution": "Extensions consume exported data or serve built assets; they cannot command production devices.",
+      "description": "Holds the optional static hosted-preview worker that serves built assets, outside the desktop application and the safety control loop.",
+      "execution": "The worker only serves built assets with a single-page fallback; it must never expose device-control endpoints and cannot command production devices.",
       "gates": ["npm.cmd run test:sites", "npm.cmd run build"]
     },
     {

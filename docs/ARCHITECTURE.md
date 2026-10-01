@@ -1,6 +1,6 @@
 # 架构选型与边界
 
-> 本文保留高层技术选型理由。当前目录、设备模块和执行链以 `docs/architecture/README.md` 与生成的 module graph 为准；本文中的未来 bridge/worker 描述不表示已经实现。
+> 本文保留高层技术选型理由。当前目录、设备模块和执行链以 `docs/architecture/README.md` 与生成的 module graph 为准。进程外 .NET 相机 bridge 与 Python 算法插件两条候选路线均未采用，理由见 `docs/decisions/0002-no-out-of-process-camera-bridge-or-algorithm-plugins.md`。
 
 ## 结论
 
@@ -10,8 +10,8 @@
 |---|---|
 | 表现层 | Tauri 2 + React/TypeScript；固定工业工作台，未来在中央场景加入 vtk.js 2.5D/3D |
 | 领域内核 | Rust `ct-engine`；唯一任务状态、设备所有权、安全门控、采集编排、产物提交 |
-| 设备适配 | Rust adapter 为主；受 Windows SDK 限制的相机功能通过独立 .NET bridge 接入 |
-| 算法运行 | 独立 Python worker；manifest 声明能力、输入输出和环境，不把 Python 动态加载进 engine |
+| 设备适配 | 三类设备全部由 `ct-engine` 内的 Rust adapter 直接连接；相机在 Windows 上通过 DigiCamControl 控制，不经进程外 .NET bridge |
+| 算法运行 | 重构算法编译进 `ct-engine`，由 `ReconstructionMethod` 声明并按方法选择后端；不启动外部算法进程 |
 | 数据层 | 不可变采集/科学产物 + manifest；SQLite 只保存索引、任务与恢复点，不保存大体数据 |
 
 这是“可部署的模块化单体”，不是分布式系统。只有 ABI、运行时或故障隔离确有必要的部分才拆成进程。
@@ -57,26 +57,28 @@ ct-workstation
   -> ct-engine
        -> MotionActor
        -> XRayActor
-       -> CameraActor -> digicam-bridge (.NET, Windows)
+       -> CameraActor（进程内，Windows DigiCamControl）
        -> AcquisitionCoordinator
        -> SafetyCoordinator
        -> ArtifactStore
-       -> AlgorithmSupervisor -> plugin venv / python -m ct_worker
+       -> 重构方法（FDK / SIRT，编译进 engine）
 ```
 
-重构结果区分不可变 Scientific Artifact 与用于 vtk.js 的降采样 Render Artifact。用户算法通过版本化 manifest 与独立环境加入，不动态加载进 engine 进程。
+重构结果区分不可变 Scientific Artifact 与用于 vtk.js 的降采样 Render Artifact。新增重构算法以 `ReconstructionMethod` 新方法加入，随源码编译、离线测试和版本发布进入产品。
+
+进程外 .NET 相机 bridge 与 Python 算法插件两条路线经评估后不采用：整个产品已是 Windows 单一宿主，进程外桥接不再换来兼容性收益；算法插件需要额外运行时、来源信任确认和资源边界，当前需求可由源码级方法满足。记录见 `docs/decisions/0002-no-out-of-process-camera-bridge-or-algorithm-plugins.md`。
 
 ## 算法规则
 
-- 默认三维重建：内置 FBP worker；没有用户插件时自动选择。
-- 用户三维重建：上传符合 manifest/schema 的独立插件包后，由 AlgorithmSupervisor 启动隔离进程。
-- 材料分辨：没有默认算法；未提供指定格式插件时功能保持不可用。
-- 算法进程只读输入产物，写入新的临时产物；engine 校验完成后原子提交，失败或取消不污染已有结果。
+- 默认三维重建：`ct-engine` 内置 FDK 与五轮 SIRT；GPU 只在首帧实测与数值比对通过后选用，否则全量 CPU 重算。
+- CGLS 保留 `ReconstructionMethod` 标识但无后端实现，界面保持不可选；不得用模拟成功冒充可用算法。
+- 新增算法必须作为 engine 方法实现，随源码编译、离线测试和版本发布进入产品；不从外部目录动态加载算法包。
+- 重构只读已落盘的投影产物；结果原子写入扫描目录，失败或取消不污染已有结果。
 - UI 只消费状态、缩略图与 Render Artifact；原始投影和完整体数据不经前端 IPC 传输。
 
 ## 扩展约束
 
-- `ct-engine` 保持唯一真相源，UI、bridge 和 worker 不自行推进扫描状态。
+- `ct-engine` 保持唯一真相源，UI 和静态预览 worker 不自行推进扫描状态。
 - 每个设备 adapter 实现相同生命周期：discover/connect/health/command/stop/disconnect。
 - 新模块通过 capability 注册，不通过 UI 直接调用 SDK。
 - 真实 X-ray 必须有独立硬件联锁和验收；软件状态永远不能替代急停链。

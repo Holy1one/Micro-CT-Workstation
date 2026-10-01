@@ -5,14 +5,11 @@
     {
       "path": ".",
       "allowedChildren": [
-        ".git", ".vite", "algorithm-plugins", "bridges", "crates", "dist", "docs",
+        ".git", ".vite", "crates", "dist", "docs",
         "module-map", "node_modules", "portable-release", "public", "release", "scripts",
         "src", "src-tauri", "target", "tests", "tmp", "worker"
       ]
     },
-    { "path": "algorithm-plugins", "allowedChildren": [] },
-    { "path": "bridges", "allowedChildren": ["digicam"] },
-    { "path": "bridges/digicam", "allowedChildren": [] },
     { "path": "crates", "allowedChildren": ["ct-engine"] },
     { "path": "crates/ct-engine", "allowedChildren": ["src"] },
     { "path": "crates/ct-engine/src", "allowedChildren": ["devices"] },

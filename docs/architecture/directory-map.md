@@ -17,8 +17,6 @@
 
 | 路径 | 功能定位 | 执行关系 / 约束 |
 |---|---|---|
-| `algorithm-plugins/` | 可选算法扩展的契约与未来实现入口 | 只能消费已导出的数据，不进入设备安全控制环 |
-| `bridges/` | 外部工具或厂商软件桥接说明 | 当前 `digicam/` 记录 DigiCamControl 集成边界；生产调用实现在 Rust 相机模块 |
 | `crates/` | Rust workspace 的领域 crate | 当前只有 `ct-engine`；新增 crate 必须保持 Tauri 壳轻量 |
 | `docs/` | 当前架构、使用指南、历史方案和验收证据 | 当前事实必须与源码同步；历史内容必须明确标记 |
 | `module-map/` | 模块归属与隐藏依赖的声明式事实源 | 由 `scripts/` 生成图谱并计算影响面 |
