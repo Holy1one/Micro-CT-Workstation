@@ -58,5 +58,14 @@ fn backproject(@builtin(global_invocation_id) gid: vec3<u32>) {
     volume[index] = volume[index] + sampled * weight;
     let ux = (px - detector_half) / (f32(params.detector_n) * 0.5);
     let vy = (py - detector_half) / (f32(params.detector_n) * 0.5);
-    if ux * ux + vy * vy > 0.94 * 0.94 { coverage[index] = 0u; }
+    if (ux * ux + vy * vy) * 1.01 * 1.01 > 1.0 { coverage[index] = 0u; }
+    // The second detector plane is a support mask, never attenuation data.
+    let col = u32(floor(px));
+    let row = u32(floor(py));
+    let i = params.detector_n * params.detector_n + row * params.detector_n + col;
+    let tx = px - f32(col);
+    let ty = py - f32(row);
+    let valid = mix(mix(projection[i], projection[i + 1u], tx),
+        mix(projection[i + params.detector_n], projection[i + params.detector_n + 1u], tx), ty);
+    if valid < 0.999 { coverage[index] = 0u; }
 }

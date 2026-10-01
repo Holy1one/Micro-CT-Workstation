@@ -7,6 +7,7 @@
 - `src/main.rs`: bounded JSONL stdin/stdout process loop and deterministic shutdown on parent EOF.
 - `src/lib.rs`: public request/response DTOs, domain commands, safety checks, complete snapshots, and top-level engine state.
 - `src/scan.rs`: transactional multi-device projection workflow and manifest persistence.
+- `src/reconstruction_preprocess.rs`: offline reference variance, noise censoring, support masks, normalized smoothing and confidence-gated conjugate-ray axis estimation; no device access.
 - `src/devices/`: physical-device communication implementations, separated by device role.
 
 The executable is started and monitored by Tauri. React never imports this crate directly; it communicates through Tauri and the versioned JSONL envelope.

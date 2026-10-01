@@ -460,6 +460,7 @@ i.tone-danger { background: var(--danger); }
 .recon-volume-tools span { margin-right: auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font: 9px var(--fontMono); color: var(--textMuted); }
 
 .live-scene { position: relative; flex: 1 1 auto; min-height: 0; isolation: isolate; }
+.equipment-scene-layer { position: absolute; inset: 0; }
 .scene-canvas { position: absolute !important; inset: 0; width: 100% !important; height: 100% !important; z-index: 1; touch-action: none; }
 .scene-canvas > div, .scene-canvas canvas { width: 100% !important; height: 100% !important; display: block; }
 .scene-fallback { position: absolute; inset: 0; z-index: 1; }

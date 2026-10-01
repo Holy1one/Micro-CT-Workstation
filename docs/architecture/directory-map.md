@@ -43,6 +43,7 @@ crates/ct-engine/
     ├── lib.rs                 domain commands, safety state, snapshots, API DTOs
     ├── scan.rs                transactional projection coordinator
     ├── reconstruction.rs      offline correction and volume reconstruction
+    ├── reconstruction_preprocess.rs reference noise, support and axis estimation
     └── devices/
         ├── mod.rs             device namespace and topology boundary
         ├── xray/

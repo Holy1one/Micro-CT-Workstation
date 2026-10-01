@@ -4,7 +4,7 @@
     {
       "id": "engine-core",
       "name": "Production engine and scan coordinator",
-      "owns": ["crates/ct-engine/AGENTS.md", "crates/ct-engine/README.md", "crates/ct-engine/src/lib.rs", "crates/ct-engine/src/main.rs", "crates/ct-engine/src/scan.rs", "crates/ct-engine/src/reconstruction.rs", "crates/ct-engine/src/fdk.wgsl", "crates/ct-engine/src/devices/README.md", "crates/ct-engine/src/devices/mod.rs", "crates/ct-engine/Cargo.toml"],
+      "owns": ["crates/ct-engine/AGENTS.md", "crates/ct-engine/README.md", "crates/ct-engine/src/lib.rs", "crates/ct-engine/src/main.rs", "crates/ct-engine/src/scan.rs", "crates/ct-engine/src/reconstruction.rs", "crates/ct-engine/src/reconstruction_preprocess.rs", "crates/ct-engine/src/fdk.wgsl", "crates/ct-engine/src/devices/README.md", "crates/ct-engine/src/devices/mod.rs", "crates/ct-engine/Cargo.toml"],
       "publicApi": ["crates/ct-engine/src/lib.rs"],
       "risk": "critical",
       "description": "Owns the JSONL API, safety gates, authoritative device state, and projection transaction ordering.",

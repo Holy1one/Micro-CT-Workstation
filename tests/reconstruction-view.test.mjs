@@ -5,6 +5,24 @@ import test from 'node:test';
 const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
 const between = (start,end) => source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
 
+test('equipment canvas stays mounted and full-sized behind the result view', () => {
+  const layer = between('<div className="equipment-scene-layer"', '{centerView === "equipment" && <>');
+  assert.match(layer, /visibility: centerView === "equipment" \? "visible" : "hidden"/);
+  assert.match(layer, /pointerEvents: centerView === "equipment" \? "auto" : "none"/);
+  assert.match(layer, /aria-hidden=\{centerView !== "equipment"\}/);
+  assert.ok(layer.indexOf('<LiveSceneCanvas') < layer.indexOf('{centerView === "reconstruction" &&'));
+  assert.doesNotMatch(layer, /display:|key=\{centerView/);
+  const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(css, /\.equipment-scene-layer \{ position: absolute; inset: 0; \}/);
+});
+
+test('equipment context-loss listener is removed before renderer disposal', () => {
+  const canvas = readFileSync(new URL('../src/scene/LiveSceneCanvas.tsx', import.meta.url), 'utf8');
+  assert.match(canvas, /canvas.addEventListener\("webglcontextlost", handleContextLost\)/);
+  assert.match(canvas, /return \(\) => canvas.removeEventListener\("webglcontextlost", handleContextLost\)/);
+  assert.doesNotMatch(canvas.slice(canvas.indexOf('onCreated=')), /addEventListener/);
+});
+
 test('starting reconstruction keeps equipment visible and submits only the requested method', () => {
   const start=between('const startReconstruction =','const availability:');
   assert.match(start,/setCenterView\("equipment"\)/);

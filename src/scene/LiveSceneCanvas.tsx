@@ -56,8 +56,19 @@ function usePrefersReducedMotion(): boolean {
 }
 
 /** Build a single static shadow map; the track and carriages do not move. */
-function SceneCanvasSettings({ reducedMotion }: { reducedMotion: boolean }) {
+function SceneCanvasSettings({ reducedMotion, onContextLost }: { reducedMotion: boolean; onContextLost: () => void }) {
   const { gl, invalidate } = useThree();
+  useEffect(() => {
+    const canvas = gl.domElement;
+    const handleContextLost = (event: Event) => {
+      event.preventDefault();
+      onContextLost();
+    };
+    canvas.addEventListener("webglcontextlost", handleContextLost);
+    // Fiber deliberately loses the context after unmount. That is disposal,
+    // not a graphics failure in the still-mounted equipment view.
+    return () => canvas.removeEventListener("webglcontextlost", handleContextLost);
+  }, [gl, onContextLost]);
   useEffect(() => {
     gl.shadowMap.enabled = true;
     gl.shadowMap.type = PCFSoftShadowMap;
@@ -220,18 +231,10 @@ export function LiveSceneCanvas({
       gl={{ alpha: true, antialias: false, powerPreference: "high-performance" }}
       onCreated={({ gl, invalidate }) => {
         gl.setClearColor(0x000000, 0);
-        gl.domElement.addEventListener(
-          "webglcontextlost",
-          (event: Event) => {
-            event.preventDefault();
-            onContextLost();
-          },
-          { once: true },
-        );
         invalidate();
       }}
     >
-      <SceneCanvasSettings reducedMotion={reducedMotion} />
+      <SceneCanvasSettings reducedMotion={reducedMotion} onContextLost={onContextLost} />
       <OrthographicCamera
         makeDefault
         near={-9000}

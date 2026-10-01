@@ -1524,12 +1524,16 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
         ))}
       </div>
       <div className={`live-scene ${centerView === "reconstruction" ? "live-scene--reconstruction" : ""}`}>
-        {centerView === "reconstruction" ? (
+        {/* Keep the live canvas and its orbit state mounted across result navigation. */}
+        <div className="equipment-scene-layer" aria-hidden={centerView !== "equipment"} style={{ visibility: centerView === "equipment" ? "visible" : "hidden", pointerEvents: centerView === "equipment" ? "auto" : "none" }}>
+          {fallback.reason ? (
+            <StaticSceneFallback view={sceneView} reason={fallback.reason} />
+          ) : (
+            <LiveSceneCanvas view={sceneView} status={feedback} preset={viewPreset} presetRevision={presetRevision} onContextLost={fallback.setContextLost} />
+          )}
+        </div>
+        {centerView === "reconstruction" && (
           volume ? <ReconstructionPreview key={ws.reconstruction.cachePath || "preview"} volume={volume} mode={volumeMode} resetRevision={volumeResetRevision} onVolumeAvailable={onVolumeAvailable} /> : <div className="recon-empty" role="status">{previewError ? reconstructionMessageEn(previewError, "failed") : ws.reconstruction.status === "running" ? "Reconstructing…" : "Waiting for result data"}</div>
-        ) : fallback.reason ? (
-          <StaticSceneFallback view={sceneView} reason={fallback.reason} />
-        ) : (
-          <LiveSceneCanvas view={sceneView} status={feedback} preset={viewPreset} presetRevision={presetRevision} onContextLost={fallback.setContextLost} />
         )}
         {centerView === "equipment" && <><span className="live-indicator">
           <i aria-hidden="true" />

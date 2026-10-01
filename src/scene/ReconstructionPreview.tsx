@@ -236,7 +236,7 @@ function VolumeView({ volume, mode, resetRevision, onVolumeAvailable }: { volume
       }} onPointerUp={() => { pose.current.dragging = false; }} onPointerCancel={() => { pose.current.dragging = false; }} onWheel={(event) => { event.preventDefault(); pose.current.span = Math.max(.55, Math.min(2.7, pose.current.span * Math.exp(event.deltaY * .001))); renderer.current?.(); }} onDoubleClick={() => { pose.current.yaw = .55; pose.current.pitch = .35; pose.current.span = 1.15; renderer.current?.(); }} />
       {error && <div className="recon-volume-error" role="status">{error}</div>}
     </div>
-    <div className="recon-volume-tools"><span title="Display window; grayscale values are not HU">WINDOW {volume.windowMin.toFixed(2)}–{volume.windowMax.toFixed(2)} · NOT HU</span></div>
+    <div className="recon-volume-tools"><span title="Entire reconstructed volume is shown; no coverage-mask clipping. Low-signal, low-gain and partially covered regions may contain artifacts and are not quantitative. Signed values and coverage diagnostics are saved separately.">WINDOW {volume.windowMin.toFixed(2)}–{volume.windowMax.toFixed(2)} · NOT HU · FULL VOLUME</span></div>
   </section>;
 }
 

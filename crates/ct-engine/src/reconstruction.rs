@@ -17,6 +17,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
+#[path = "reconstruction_preprocess.rs"]
+mod preprocessing;
+
 const DETECTOR_N: usize = 256;
 const VOLUME_N: usize = 256;
 const PREVIEW_N: usize = 128;
@@ -24,7 +27,9 @@ const SIRT_N: usize = 64;
 const SIRT_ITERATIONS: usize = 5;
 const SIRT_CPU_WORK_BUDGET: u64 = 200_000_000;
 const REFERENCE_COUNT: usize = 10;
-const CACHE_SCHEMA: u32 = 3;
+const CACHE_SCHEMA: u32 = 5;
+// Small rim-fit guard; the physical screen diameter is NOT enlarged by padding.
+const SCREEN_CROP_SCALE: f64 = 1.01;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -206,6 +211,8 @@ struct CacheMetadata {
     volume_sha256: String,
     preview_sha256: String,
     coverage_sha256: String,
+    preprocessing_sha256: String,
+    calibration_sha256: String,
     backend: String,
     cpu_estimated_ms: u64,
     gpu_estimated_ms: Option<u64>,
@@ -256,6 +263,10 @@ pub fn cached_result(scan_dir: &Path, method: ReconstructionMethod) -> Result<Op
     let Ok(meta) = serde_json::from_reader::<_, CacheMetadata>(
         File::open(&metadata_path).map_err(io_error)?) else { return Ok(None); };
     if meta.schema_version != CACHE_SCHEMA || meta.method != method { return Ok(None); }
+    for (name,expected) in [("preprocessing.json",&meta.preprocessing_sha256),("calibration.json",&meta.calibration_sha256)] {
+        let path=root.join(name);
+        if !path.is_file() || &hash_file(&path)?.1!=expected {return Ok(None);}
+    }
     let manifest_path = scan_dir.join("manifest.json");
     if !manifest_path.is_file() || hash_file(&manifest_path)?.1 != meta.manifest_sha256 { return Ok(None); }
     let volume_path = root.join("volume.f32le");
@@ -453,25 +464,47 @@ fn bilinear(image: &BlueImage, x: f64, y: f64) -> f32 {
 }
 
 fn remap(image: &BlueImage, map: &ScreenMap, mirror_x: bool) -> Result<Vec<f32>, String> {
-    if image.width != map.width || image.height != map.height { return Err("RAW dimensions changed during scan".into()); }
-    let mut output = vec![0f32; DETECTOR_N * DETECTOR_N];
-    for row in 0..DETECTOR_N {
-        for col in 0..DETECTOR_N {
+    remap_at_size(image,map,mirror_x,DETECTOR_N)
+}
+
+/// Materialize the entire circumscribing square before detector resampling.
+/// One-pixel interpolation guard surrounds the 1% rim-fit padding.
+fn crop_screen_square(image:&BlueImage,map:&ScreenMap)->Result<(BlueImage,usize,usize),String> {
+    if image.width!=map.width || image.height!=map.height {return Err("RAW dimensions changed during scan".into());}
+    let half=map.rx.max(map.ry)*SCREEN_CROP_SCALE;
+    let left=(map.cx-half-1.).floor();let top=(map.cy-half-1.).floor();
+    let side=(2.*half).ceil() as usize+3;
+    if left<0. || top<0. || left as usize+side>image.width || top as usize+side>image.height {
+        return Err("full screen square leaves RAW image; verify screen alignment".into());
+    }
+    let (left,top)=(left as usize,top as usize);
+    let mut pixels=Vec::with_capacity(side*side);
+    for row in top..top+side {pixels.extend_from_slice(&image.pixels[row*image.width+left..row*image.width+left+side]);}
+    Ok((BlueImage {width:side,height:side,pixels,white:image.white},left,top))
+}
+
+fn remap_at_size(image: &BlueImage, map: &ScreenMap, mirror_x: bool,n:usize) -> Result<Vec<f32>, String> {
+    let (cropped,left,top)=crop_screen_square(image,map)?;
+    let mut output = vec![0f32; n * n];
+    for row in 0..n {
+        for col in 0..n {
             let mut sum = 0.0;
             for sy in 0..3 {
                 for sx in 0..3 {
-                    let u = (col as f64 + (sx as f64 + 0.5) / 3.0) / DETECTOR_N as f64 * 2.0 - 1.0;
-                    let v = (row as f64 + (sy as f64 + 0.5) / 3.0) / DETECTOR_N as f64 * 2.0 - 1.0;
+                    let u = (col as f64 + (sx as f64 + 0.5) / 3.0) / n as f64 * 2.0 - 1.0;
+                    let v = (row as f64 + (sy as f64 + 0.5) / 3.0) / n as f64 * 2.0 - 1.0;
                     let physical_u = if mirror_x { -u } else { u };
-                    sum += bilinear(image, map.cx + physical_u * map.rx, map.cy - v * map.ry);
+                    sum += bilinear(&cropped, map.cx-left as f64 + physical_u * map.rx*SCREEN_CROP_SCALE,
+                        map.cy-top as f64 - v * map.ry*SCREEN_CROP_SCALE);
                 }
             }
-            output[row * DETECTOR_N + col] = sum / 9.0;
+            output[row * n + col] = sum / 9.0;
         }
     }
     Ok(output)
 }
 
+#[cfg(test)]
 fn mean_reference(scan_dir: &Path, frames: &[ReferenceFrame], map: &ScreenMap,
     mirror_x: bool, progress: &Mutex<ReconstructionProgress>, completed: &mut usize) -> Result<Vec<f32>, String> {
     let mut mean = vec![0f32; DETECTOR_N * DETECTOR_N];
@@ -494,7 +527,7 @@ fn write_floats(writer: &mut impl Write, values: &[f32]) -> Result<(), String> {
 /// Materialize a separate cropped linear detector stack before reconstruction.
 /// NEFs remain read-only; geometry is referenced to the fitted full screen rim.
 fn prepare_projections(scan_dir: &Path, manifest: &Manifest, screen: &ScreenMap,
-    dark: &[f32], flat: &[f32], root: &Path, progress: &Mutex<ReconstructionProgress>) -> Result<PathBuf, String> {
+    dark: &preprocessing::ReferenceStats, flat: &preprocessing::ReferenceStats, root: &Path, progress: &Mutex<ReconstructionProgress>) -> Result<PathBuf, String> {
     fs::create_dir_all(root).map_err(io_error)?;
     // Invalidate a previous completion seal before replacing derived files.
     let seal = root.join("result.json");
@@ -502,33 +535,19 @@ fn prepare_projections(scan_dir: &Path, manifest: &Manifest, screen: &ScreenMap,
     let mut crops = BufWriter::new(File::create(root.join("detector-crops.f32le")).map_err(io_error)?);
     let corrected_path = root.join("projections.f32le");
     let mut corrected = BufWriter::new(File::create(&corrected_path).map_err(io_error)?);
+    let mut masks=BufWriter::new(File::create(root.join("detector-quality.bin")).map_err(io_error)?);
+    let support_threshold=preprocessing::support_threshold(dark,flat);
     let mut quality = Vec::new();
     for frame in &manifest.frames {
         let path = verified_path(scan_dir, &frame.path, frame.bytes, &frame.sha256)?;
         let image = decode_blue(&path)?;
         let raw = remap(&image, screen, manifest.geometry.mirror_x)?;
         write_floats(&mut crops, &raw)?;
-        let mut projection = vec![0.0; raw.len()];
-        let (mut measured, mut weak, mut saturated, mut nonpositive) = (0usize,0usize,0usize,0usize);
-        for i in 0..raw.len() {
-            let u = ((i % DETECTOR_N) as f64 + 0.5) / DETECTOR_N as f64 * 2.0 - 1.0;
-            let v = ((i / DETECTOR_N) as f64 + 0.5) / DETECTOR_N as f64 * 2.0 - 1.0;
-            if u*u + v*v >= 0.94_f64.powi(2) { continue; }
-            measured += 1;
-            let gain = flat[i] - dark[i];
-            if gain <= 1.0 || !gain.is_finite() { weak += 1; continue; }
-            if raw[i] >= image.white { saturated += 1; continue; }
-            let trans = (raw[i]-dark[i])/gain;
-            if trans <= 0.0 { nonpositive += 1; }
-            projection[i] = -trans.max(1.0e-4).ln();
-        }
-        quality.push(serde_json::json!({"index":frame.index,"samples":measured,"weakGain":weak,"saturated":saturated,"nonpositive":nonpositive}));
-        if measured == 0 || weak+saturated+nonpositive > measured/5 {
-            write_json(&root.join("quality-failure.json"), &quality)?;
-            return Err(format!("too many invalid detector samples in cropped view {}: {} / {} (weak gain {}, saturated {}, nonpositive {}); check references and exposure",
-                frame.index,weak+saturated+nonpositive,measured,weak,saturated,nonpositive));
-        }
-        write_floats(&mut corrected, &projection)?;
+        let correction=preprocessing::correct(&raw,image.white,dark,flat,support_threshold,frame.index)
+            .map_err(|error| {let _=write_json(&root.join("quality-failure.json"),&serde_json::json!({"index":frame.index,"error":error}));error})?;
+        quality.push(correction.quality);
+        masks.write_all(&correction.flags).map_err(io_error)?;
+        write_floats(&mut corrected, &correction.projection)?;
         set_progress(progress,"running",(20+frame.index as usize*30/manifest.frames.len()) as u8,
             &format!("Crop and correct {}/{}",frame.index,manifest.frames.len()));
     }
@@ -536,7 +555,10 @@ fn prepare_projections(scan_dir: &Path, manifest: &Manifest, screen: &ScreenMap,
         writer.flush().map_err(io_error)?;
         writer.get_ref().sync_all().map_err(io_error)?;
     }
-    for (name, data) in [("dark-crop.f32le",dark),("flat-crop.f32le",flat)] {
+    masks.flush().map_err(io_error)?;
+    masks.get_ref().sync_all().map_err(io_error)?;
+    for (name, data) in [("dark-crop.f32le",&dark.mean),("flat-crop.f32le",&flat.mean),
+        ("dark-variance.f32le",&dark.variance),("flat-variance.f32le",&flat.variance)] {
         let mut writer = BufWriter::new(File::create(root.join(name)).map_err(io_error)?);
         write_floats(&mut writer,data)?;
         writer.flush().map_err(io_error)?;
@@ -545,11 +567,22 @@ fn prepare_projections(scan_dir: &Path, manifest: &Manifest, screen: &ScreenMap,
         "schemaVersion":CACHE_SCHEMA,"manifestSha256":hash_file(&scan_dir.join("manifest.json"))?.1,
         "screenBluePixels":screen,"detectorShape":[DETECTOR_N,DETECTOR_N],
         "projectionCount":manifest.frames.len(),"detectorWidthMm":manifest.geometry.detector_width_mm,
+        "cropSquareBluePixels":{
+            "left":(screen.cx-screen.rx.max(screen.ry)*SCREEN_CROP_SCALE-1.).floor(),
+            "top":(screen.cy-screen.rx.max(screen.ry)*SCREEN_CROP_SCALE-1.).floor(),
+            "side":(2.*screen.rx.max(screen.ry)*SCREEN_CROP_SCALE).ceil() as usize+3},
+        "cropPaddingScale":SCREEN_CROP_SCALE,
+        "sampledSquareWidthMm":manifest.geometry.detector_width_mm*SCREEN_CROP_SCALE,
         "mirrorX":manifest.geometry.mirror_x,"rowOrder":"physical detector v increases with row",
-        "validRadiusFraction":0.94,"format":"little-endian float32; view,row,column",
+        "validRadiusFraction":1.0,"format":"little-endian float32; view,row,column",
+        "noiseFloor":"max(1 ADU, sqrt(dark sample variance * (1 + 1/10)))",
+        "smoothingSigmaPixels":0.7,"taperRadiusFractions":[0.98,1.0],
+        "lowGainWarningThresholdAdu":support_threshold,"driftCorrectionApplied":false,
+        "qualityFlags":{"0":"outside screen","1":"measured","2":"noise censored, not quantitative","3":"missing reference","4":"saturated","5":"low gain retained, not excluded"},
+        "qualitySha256":hash_file(&root.join("detector-quality.bin"))?.1,
         "cropSha256":hash_file(&root.join("detector-crops.f32le"))?.1,
         "correctedSha256":hash_file(&corrected_path)?.1,"quality":quality,
-        "note":"Linear Bayer-blue crop/resampling precedes dark-flat log correction and reconstruction. Full circular rim defines measured detector width; pixels outside 94% radius are excluded."
+        "note":"Full circumscribing square is copied before resampling/correction. Entire disk is retained, including lower half. Low gain is a warning, not a crop. Only the outermost 2% radius is tapered. Coverage is diagnostic and never a default preview clipping mask."
     }))?;
     Ok(corrected_path)
 }
@@ -653,7 +686,11 @@ fn backproject(volume: &mut [f32], coverage: &mut [u8], projection: &[f32],
                     volume[i] += sample_detector(projection, detector_x, detector_y) * weight as f32;
                     let ux = (detector_x - detector_half) / (DETECTOR_N as f64 / 2.0);
                     let vy = (detector_y - detector_half) / (DETECTOR_N as f64 / 2.0);
-                    if ux * ux + vy * vy > 0.94_f64.powi(2) { coverage[i] = 0; }
+                    if (ux * ux + vy * vy)*SCREEN_CROP_SCALE.powi(2) > 1.0 { coverage[i] = 0; }
+                    if projection.len()==2*DETECTOR_N*DETECTOR_N
+                        && sample_detector(&projection[DETECTOR_N*DETECTOR_N..],detector_x,detector_y)<0.999 {
+                        coverage[i]=0;
+                    }
                 } else { coverage[i] = 0; }
             }
         }
@@ -677,7 +714,7 @@ fn sirt_detector(x: f64, y: f64, z: f64, sin: f64, cos: f64,
     let v = v.round().clamp(0.0, SIRT_N as f64 - 1.0) as usize;
     let du = (u as f64 - half) / (SIRT_N as f64 / 2.0);
     let dv = (v as f64 - half) / (SIRT_N as f64 / 2.0);
-    (du * du + dv * dv <= 0.94_f64.powi(2)).then_some(v * SIRT_N + u)
+    ((du * du + dv * dv)*SCREEN_CROP_SCALE.powi(2) <= 1.0).then_some(v * SIRT_N + u)
 }
 
 fn downsample_sirt_projection(projection: &[f32]) -> Vec<f32> {
@@ -700,8 +737,8 @@ fn downsample_sirt_projection(projection: &[f32]) -> Vec<f32> {
 fn reconstruct_sirt(frames: &[(f64, Vec<f32>)], sod: f64, sdd: f64,
     detector_width: f64, center_u: f64, center_v: f64,
     progress: &Mutex<ReconstructionProgress>) -> Result<(Vec<f32>, Vec<u8>, f64), String> {
-    let pitch = detector_width / SIRT_N as f64;
-    let voxel = detector_width * sod / sdd * 0.90 / SIRT_N as f64;
+    let pitch = detector_width * SCREEN_CROP_SCALE / SIRT_N as f64;
+    let voxel = detector_width * sod / sdd / SIRT_N as f64;
     if voxel * SIRT_N as f64 / 2.0 >= sod {
         return Err("scan geometry puts SIRT volume at source".into());
     }
@@ -813,7 +850,7 @@ impl GpuFdk {
         }
         let projection = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("FDK filtered projection"),
-            size: (DETECTOR_N * DETECTOR_N * 4) as u64,
+            size: (DETECTOR_N * DETECTOR_N * 8) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -852,6 +889,9 @@ impl GpuFdk {
         let start = Instant::now();
         let mut pixels = Vec::with_capacity(filtered.len() * 4);
         for value in filtered { pixels.extend_from_slice(&value.to_le_bytes()); }
+        if filtered.len()==DETECTOR_N*DETECTOR_N {
+            for _ in 0..DETECTOR_N*DETECTOR_N {pixels.extend_from_slice(&1f32.to_le_bytes());}
+        }
         self.queue.write_buffer(&self.projection, 0, &pixels);
         let values = [theta as f32, pitch as f32, voxel as f32, sod as f32, sdd as f32,
             center_u as f32, center_v as f32, angle_weight as f32];
@@ -957,19 +997,30 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
     let screen = find_screen(&flat_image, &dark_image)?;
     set_progress(progress, "running", 10, "处理校正帧");
     let mut completed = 0;
-    let pre_dark = mean_reference(scan_dir, &manifest.references.pre_dark, &screen,
+    let pre_dark = preprocessing::references(scan_dir, &manifest.references.pre_dark, &screen,
         manifest.geometry.mirror_x, progress, &mut completed)?;
-    let pre_flat = mean_reference(scan_dir, &manifest.references.pre_flat, &screen,
+    let pre_flat = preprocessing::references(scan_dir, &manifest.references.pre_flat, &screen,
         manifest.geometry.mirror_x, progress, &mut completed)?;
     let prepared = prepare_projections(scan_dir, &manifest, &screen, &pre_dark, &pre_flat,
         &cache_dir(scan_dir, request.method), progress)?;
+    let stack_bytes=fs::read(&prepared).map_err(io_error)?;
+    let stack:Vec<f32>=stack_bytes.chunks_exact(4).map(|b|f32::from_le_bytes(b.try_into().unwrap())).collect();
+    drop(stack_bytes);
+    let angles:Vec<f64>=manifest.frames.iter().map(|frame|if manifest.geometry.rotation_direction=="counterclockwise" {
+        frame.angle_deg.to_radians()
+    }else{-frame.angle_deg.to_radians()}).collect();
     let mut projections = BufReader::new(File::open(prepared).map_err(io_error)?);
+    let mut quality_masks=BufReader::new(File::open(cache_dir(scan_dir,request.method).join("detector-quality.bin")).map_err(io_error)?);
     let sod = manifest.geometry.sod_mm;
     let sdd = sod + manifest.geometry.object_to_detector_mm;
-    let pitch = manifest.geometry.detector_width_mm / DETECTOR_N as f64;
-    let center_u = manifest.geometry.center_offset_x_mm;
+    let pitch = manifest.geometry.detector_width_mm * SCREEN_CROP_SCALE / DETECTOR_N as f64;
+    let axis=preprocessing::estimate_axis(&stack,&angles,pitch,sdd,
+        manifest.geometry.center_offset_x_mm,manifest.geometry.center_offset_y_mm);
+    drop(stack);
+    write_json(&cache_dir(scan_dir,request.method).join("calibration.json"),&axis)?;
+    let center_u = axis.applied_offset_mm;
     let center_v = manifest.geometry.center_offset_y_mm;
-    let voxel = manifest.geometry.detector_width_mm * sod / sdd * 0.90 / VOLUME_N as f64;
+    let voxel = manifest.geometry.detector_width_mm * sod / sdd / VOLUME_N as f64;
     if voxel * VOLUME_N as f64 / 2.0 >= sod { return Err("scan geometry puts reconstruction volume at source".into()); }
     let mut volume = vec![0f32; VOLUME_N * VOLUME_N * VOLUME_N];
     let mut coverage = vec![1u8; volume.len()];
@@ -988,6 +1039,8 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
         projections.read_exact(&mut bytes).map_err(io_error)?;
         let mut projection: Vec<f32> = bytes.chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let mut flags=vec![0u8;DETECTOR_N*DETECTOR_N];
+        quality_masks.read_exact(&mut flags).map_err(io_error)?;
         let angle = if manifest.geometry.rotation_direction == "counterclockwise" {
             frame.angle_deg.to_radians()
         } else { -frame.angle_deg.to_radians() };
@@ -1000,6 +1053,7 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
         set_progress(progress, "running", (50 + (index * 45 / manifest.frames.len())) as u8,
             &format!("重构 {}/{}", index + 1, manifest.frames.len()));
         filter_projection(&mut projection, pitch, sod, sdd, center_u, center_v);
+        projection.extend(flags.iter().map(|f|if matches!(*f,1|2|5) {1.}else{0.}));
         if index == 0 {
             let started = Instant::now();
             backproject(&mut volume, &mut coverage, &projection, angle, pitch, voxel,
@@ -1015,7 +1069,7 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
                         let dispatch = candidate.project(&projection, angle, pitch, voxel,
                             sod, sdd, center_u, center_v, angle_weight)?;
                         let (sample, mask, readback) = candidate.readback()?;
-                        if !gpu_matches_cpu(&volume, &sample, &mask) {
+                        if !gpu_matches_cpu(&volume, &sample, &mask) || coverage!=mask {
                             return Err("GPU numerical check disagreed with CPU FDK".to_owned());
                         }
                         Ok::<_, String>(estimated_duration(dispatch, manifest.frames.len()) + readback)
@@ -1090,6 +1144,24 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
         voxel, request.method, &selection)
 }
 
+/// Deliberately has no coverage argument: partial angular support must never
+/// silently remove anatomy from the default display.
+fn full_volume_preview(volume:&[f32],n:usize,preview_n:usize,lo:f32,hi:f32)->Result<Vec<u8>,String> {
+    if preview_n==0 || n%preview_n!=0 || volume.len()!=n.pow(3) || !lo.is_finite() || !hi.is_finite() || hi<=lo {
+        return Err("invalid preview shape or window".into());
+    }
+    let factor=n/preview_n;
+    let mut preview=vec![0u8;preview_n.pow(3)];
+    for z in 0..preview_n {for y in 0..preview_n {for x in 0..preview_n {
+        let mut sum=0f32;
+        for dz in 0..factor {for dy in 0..factor {for dx in 0..factor {
+            sum+=volume[((z*factor+dz)*n+y*factor+dy)*n+x*factor+dx];
+        }}}
+        preview[(z*preview_n+y)*preview_n+x]=((sum/factor.pow(3) as f32-lo)/(hi-lo)*255.).clamp(0.,255.) as u8;
+    }}}
+    Ok(preview)
+}
+
 fn persist_result(scan_dir: &Path, manifest: &Manifest, manifest_sha256: String,
     volume: &[f32], coverage: &[u8], voxel: f64, method: ReconstructionMethod,
     selection: &BackendSelection) -> Result<ReconstructionResult, String> {
@@ -1116,41 +1188,18 @@ fn persist_result(scan_dir: &Path, manifest: &Manifest, manifest_sha256: String,
     writer.flush().map_err(io_error)?;
     writer.get_ref().sync_all().map_err(io_error)?;
     write_bytes_durable(&coverage_path, coverage)?;
-    let mut finite: Vec<f32> = volume.iter().zip(coverage).filter_map(|(value, mask)| {
-        if *mask != 0 && value.is_finite() { Some(*value) } else { None }
-    }).collect();
+    // Coverage describes all-angle support, not the display domain. Applying
+    // its intersection here used to cut away the entire obstructed lower half.
+    let mut finite: Vec<f32> = volume.iter().copied().filter(|v|v.is_finite()).collect();
     if finite.len() < volume.len() / 100 { return Err("usable reconstruction coverage is too small".into()); }
     finite.sort_by(f32::total_cmp);
-    let window_min = finite[finite.len() / 100];
+    let window_min = 0.0;
     let window_max = finite[finite.len() * 995 / 1000].max(window_min + 1e-6);
     let factor = volume_n / preview_n;
     if factor == 0 || factor * preview_n != volume_n {
         return Err("preview grid does not divide scientific volume".into());
     }
-    let mut preview = vec![0u8; preview_n * preview_n * preview_n];
-    for z in 0..preview_n {
-        for y in 0..preview_n {
-            for x in 0..preview_n {
-                let mut sum = 0f32;
-                let mut count = 0u32;
-                for dz in 0..factor {
-                    for dy in 0..factor {
-                        for dx in 0..factor {
-                            let source = (((z * factor + dz) * volume_n + y * factor + dy) * volume_n)
-                                + x * factor + dx;
-                            if coverage[source] != 0 { sum += volume[source]; count += 1; }
-                        }
-                    }
-                }
-                if count != 0 {
-                    let value = sum / count as f32;
-                    let normalized = (value - window_min) / (window_max - window_min);
-                    preview[(z * preview_n + y) * preview_n + x] =
-                        (normalized * 255.0).clamp(0.0, 255.0) as u8;
-                }
-            }
-        }
-    }
+    let preview=full_volume_preview(volume,volume_n,preview_n,window_min,window_max)?;
     write_bytes_durable(&preview_path, &preview)?;
     let volume_sha256 = hash_file(&volume_path)?.1;
     let preview_sha256 = hash_file(&preview_path)?.1;
@@ -1168,6 +1217,8 @@ fn persist_result(scan_dir: &Path, manifest: &Manifest, manifest_sha256: String,
         schema_version: CACHE_SCHEMA, method, manifest_sha256: manifest_sha256.clone(),
         shape, spacing_mm, preview_shape, preview_spacing_mm,
         volume_sha256, preview_sha256, coverage_sha256,
+        preprocessing_sha256:hash_file(&root.join("preprocessing.json"))?.1,
+        calibration_sha256:hash_file(&root.join("calibration.json"))?.1,
         backend: selection.name.clone(),
         cpu_estimated_ms: selection.cpu_estimated_ms,
         gpu_estimated_ms: selection.gpu_estimated_ms,
@@ -1182,7 +1233,7 @@ fn persist_result(scan_dir: &Path, manifest: &Manifest, manifest_sha256: String,
             mirror_x: manifest.geometry.mirror_x,
             measurement: manifest.geometry.measurement.clone(),
         },
-        note: format!("{}; calibrated preview window is display-only; spacing is computational sampling, not measured resolution",
+        note: format!("{}; geometry is recorded acquisition geometry, applied axis correction is in calibration.json; full volume preview, coverage is diagnostic only and never clips display; low-gain/censored/partially covered values remain approximate; signed volume is preserved; spacing is computational sampling, not measured resolution",
             if method == ReconstructionMethod::Fdk { "Circular cone-beam FDK approximation" }
             else { "Five-iteration nonnegative SIRT at 64^3 with matched nearest-detector operators" }),
     })?;
@@ -1231,6 +1282,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_square_crop_contains_all_four_screen_extremes() {
+        let map=ScreenMap {cx:503.3,cy:401.7,rx:170.,ry:170.,width:1000,height:800};
+        let mut image=BlueImage {width:1000,height:800,pixels:vec![0.;800000],white:16000.};
+        for (x,y) in [(503,231),(503,572),(333,402),(674,402)] {image.pixels[y*1000+x]=123.;}
+        let (crop,left,top)=crop_screen_square(&image,&map).unwrap();
+        assert_eq!(crop.width,crop.height);
+        assert!(crop.width<350);
+        assert_eq!(crop.pixels.iter().filter(|v|**v==123.).count(),4);
+        assert!((left as f64)<map.cx-map.rx && (top as f64)<map.cy-map.ry);
+        assert!((left+crop.width) as f64>map.cx+map.rx && (top+crop.height) as f64>map.cy+map.ry);
+    }
+
+    #[test]
+    fn preview_keeps_lower_and_upper_halves_without_coverage_clipping() {
+        let mut volume=vec![0.25;64];volume[32..].fill(0.75);
+        let preview=full_volume_preview(&volume,4,2,0.,1.).unwrap();
+        assert!(preview[..4].iter().all(|v|*v==63));
+        assert!(preview[4..].iter().all(|v|*v==191));
+        assert_eq!(volume[0],0.25); // Display leaves scientific data untouched.
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_full_square_crops() {
+        let scan=PathBuf::from(std::env::var("CT_SCAN_DIR").expect("CT_SCAN_DIR"));
+        let out=PathBuf::from(std::env::var("CT_DIAGNOSTIC_DIR").expect("CT_DIAGNOSTIC_DIR"));
+        fs::create_dir_all(&out).unwrap();
+        let (manifest,_)=read_manifest(&scan).unwrap();
+        let load=|f:&ReferenceFrame|decode_blue(&verified_path(&scan,&f.path,f.bytes,&f.sha256).unwrap()).unwrap();
+        let d=load(&manifest.references.pre_dark[0]);let f=load(&manifest.references.pre_flat[0]);
+        let map=find_screen(&f,&d).unwrap();
+        let mut frames=vec![("dark".to_owned(),d),("flat".to_owned(),f)];
+        for frame in manifest.frames.iter().step_by(90) {
+            frames.push((format!("view-{}",frame.index),decode_blue(&verified_path(&scan,&frame.path,frame.bytes,&frame.sha256).unwrap()).unwrap()));
+        }
+        for (name,image) in frames {
+            let (crop,left,top)=crop_screen_square(&image,&map).unwrap();
+            let mut writer=BufWriter::new(File::create(out.join(format!("{name}-square.f32le"))).unwrap());
+            write_floats(&mut writer,&crop.pixels).unwrap();writer.flush().unwrap();
+            write_json(&out.join("square.json"),&serde_json::json!({"left":left,"top":top,"side":crop.width,"screen":map})).unwrap();
+        }
+    }
+
+    #[test]
     fn screen_fit_rejects_full_sensor_noise_and_ignores_hot_pixels() {
         let (width,height)=(1000,800);
         let dark=BlueImage {width,height,pixels:vec![100.0;width*height],white:16000.0};
@@ -1249,6 +1344,69 @@ mod tests {
         assert!(find_screen(&dark,&dark).is_err());
         let cropped=remap(&flat,&map,false).unwrap();
         assert!(cropped[128*DETECTOR_N+128]>200.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_reference_statistics() {
+        let scan=PathBuf::from(std::env::var("CT_SCAN_DIR").expect("CT_SCAN_DIR"));
+        let out=PathBuf::from(std::env::var("CT_DIAGNOSTIC_DIR").expect("CT_DIAGNOSTIC_DIR"));
+        fs::create_dir_all(&out).unwrap();
+        let (manifest,_)=read_manifest(&scan).unwrap();
+        let load=|f:&ReferenceFrame| decode_blue(&verified_path(&scan,&f.path,f.bytes,&f.sha256).unwrap()).unwrap();
+        let d=load(&manifest.references.pre_dark[0]);
+        let f=load(&manifest.references.pre_flat[0]);
+        let map=find_screen(&f,&d).unwrap();
+        for (name,frames) in [("dark",&manifest.references.pre_dark),("flat",&manifest.references.pre_flat)] {
+            let mut stack=BufWriter::new(File::create(out.join(format!("{name}-stack.f32le"))).unwrap());
+            let mut mean=vec![0f32;f.pixels.len()];
+            for frame in frames {
+                let image=load(frame);
+                for (dst,src) in mean.iter_mut().zip(&image.pixels) {*dst+=*src/frames.len() as f32;}
+                write_floats(&mut stack,&remap(&image,&map,manifest.geometry.mirror_x).unwrap()).unwrap();
+            }
+            stack.flush().unwrap();
+            let mut writer=BufWriter::new(File::create(out.join(format!("{name}-mean-blue.f32le"))).unwrap());
+            write_floats(&mut writer,&mean).unwrap();writer.flush().unwrap();
+        }
+        write_json(&out.join("screen.json"),&map).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_detector_sampling() {
+        let scan=PathBuf::from(std::env::var("CT_SCAN_DIR").expect("CT_SCAN_DIR"));
+        let out=PathBuf::from(std::env::var("CT_DIAGNOSTIC_DIR").expect("CT_DIAGNOSTIC_DIR"));
+        let (manifest,_)=read_manifest(&scan).unwrap();
+        let load=|f:&ReferenceFrame| decode_blue(&verified_path(&scan,&f.path,f.bytes,&f.sha256).unwrap()).unwrap();
+        let d=load(&manifest.references.pre_dark[0]);let f=load(&manifest.references.pre_flat[0]);
+        let map=find_screen(&f,&d).unwrap();
+        for (name,frames) in [("dark",&manifest.references.pre_dark),("flat",&manifest.references.pre_flat)] {
+            let mut writer=BufWriter::new(File::create(out.join(format!("{name}-512.f32le"))).unwrap());
+            for frame in frames {write_floats(&mut writer,&remap_at_size(&load(frame),&map,manifest.geometry.mirror_x,512).unwrap()).unwrap();}
+            writer.flush().unwrap();
+        }
+        let mut writer=BufWriter::new(File::create(out.join("crops-512.f32le")).unwrap());
+        for frame in manifest.frames.iter().step_by(5) {
+            let image=decode_blue(&verified_path(&scan,&frame.path,frame.bytes,&frame.sha256).unwrap()).unwrap();
+            write_floats(&mut writer,&remap_at_size(&image,&map,manifest.geometry.mirror_x,512).unwrap()).unwrap();
+            println!("512 detector view {}",frame.index);
+        }writer.flush().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_axis_estimate() {
+        let scan=PathBuf::from(std::env::var("CT_SCAN_DIR").expect("CT_SCAN_DIR"));
+        let out=PathBuf::from(std::env::var("CT_DIAGNOSTIC_DIR").expect("CT_DIAGNOSTIC_DIR"));
+        let (manifest,_)=read_manifest(&scan).unwrap();
+        let bytes=fs::read(cache_dir(&scan,ReconstructionMethod::Fdk).join("projections.f32le")).unwrap();
+        let stack:Vec<f32>=bytes.chunks_exact(4).map(|b|f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let angles:Vec<_>=manifest.frames.iter().map(|f|f.angle_deg.to_radians()*if manifest.geometry.rotation_direction=="counterclockwise" {1.}else{-1.}).collect();
+        let axis=preprocessing::estimate_axis(&stack,&angles,manifest.geometry.detector_width_mm*SCREEN_CROP_SCALE/DETECTOR_N as f64,
+            manifest.geometry.sod_mm+manifest.geometry.object_to_detector_mm,manifest.geometry.center_offset_x_mm,manifest.geometry.center_offset_y_mm);
+        write_json(&out.join("axis-revised.json"),&axis).unwrap();
+        println!("{}",serde_json::to_string_pretty(&axis).unwrap());
     }
 
     #[test]
@@ -1301,7 +1459,7 @@ mod tests {
             for i in 0..raw.len() {
                 let u = ((i%DETECTOR_N) as f64+0.5)/DETECTOR_N as f64*2.0-1.0;
                 let v = ((i/DETECTOR_N) as f64+0.5)/DETECTOR_N as f64*2.0-1.0;
-                if u*u+v*v>=0.94_f64.powi(2) {continue;}
+                if (u*u+v*v)*SCREEN_CROP_SCALE.powi(2)>1.0 {continue;}
                 n+=1;
                 if f[i]-d[i]<=1.0 {weak+=1;}
                 if raw[i]>=image.white {saturated+=1;}
@@ -1372,8 +1530,8 @@ mod tests {
         let sod = 500.0;
         let sdd = 700.0;
         let width = 48.0;
-        let pitch = width / SIRT_N as f64;
-        let voxel = width * sod / sdd * 0.90 / SIRT_N as f64;
+        let pitch = width * SCREEN_CROP_SCALE / SIRT_N as f64;
+        let voxel = width * sod / sdd / SIRT_N as f64;
         let half = (SIRT_N as f64 - 1.0) * 0.5;
         let angles = [0.0, PI / 2.0, PI, 3.0 * PI / 2.0];
         let mut frames = Vec::new();
