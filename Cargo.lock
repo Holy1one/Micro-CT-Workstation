@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "ct-engine"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "pollster",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "ct-workstation"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ct-engine",
  "serde",
