@@ -24,6 +24,33 @@ pub struct EngineClient {
 
 const EMBEDDED_ENGINE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ct-engine.bin"));
 
+/// Deletes engines extracted from earlier builds so the content-addressed
+/// runtime cache cannot grow without bound. Only files that exactly match our
+/// own `ct-engine-<16 hex>.exe|.tmp` naming are candidates, and the file in use
+/// is never touched. Best effort: an engine still held by another running
+/// instance cannot be deleted on Windows and is simply left in place.
+fn prune_stale_engines(runtime_dir: &Path, keep: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(runtime_dir) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix("ct-engine-") else { continue };
+        let Some(stem) = rest.strip_suffix(".exe").or_else(|| rest.strip_suffix(".tmp")) else { continue };
+        if stem.len() != 16 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 fn embedded_engine_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let digest = Sha256::digest(EMBEDDED_ENGINE);
     let version = digest[..8]
@@ -67,6 +94,8 @@ fn embedded_engine_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
     }
+
+    prune_stale_engines(&runtime_dir, &path);
 
     Ok(path)
 }
@@ -234,6 +263,32 @@ mod tests {
             .to_string();
         assert!(error.contains("failed to launch ct-engine sidecar at"));
         assert!(error.contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn stale_extracted_engines_are_pruned_without_touching_foreign_files() {
+        let root = std::env::temp_dir().join(format!("micro-ct-prune-engines-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let keep = root.join("ct-engine-0123456789abcdef.exe");
+        let stale = root.join("ct-engine-fedcba9876543210.exe");
+        let leftover = root.join("ct-engine-0011223344556677.tmp");
+        let foreign = root.join("ct-engine-not-hex.exe");
+        let unrelated = root.join("ct-workstation.exe");
+        let directory = root.join("ct-engine-aabbccddeeff0011.exe");
+        for path in [&keep, &stale, &leftover, &foreign, &unrelated] {
+            fs::write(path, b"stub").unwrap();
+        }
+        fs::create_dir(&directory).unwrap();
+
+        assert_eq!(prune_stale_engines(&root, &keep), 2, "only the stale engine and its leftover temp file may go");
+        assert!(keep.is_file(), "the engine in use must survive");
+        assert!(!stale.exists());
+        assert!(!leftover.exists());
+        assert!(foreign.is_file(), "names outside our own pattern must survive");
+        assert!(unrelated.is_file(), "unrelated executables must survive");
+        assert!(directory.is_dir(), "directories must survive");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
