@@ -1,0 +1,2 @@
+# Preserve the approved recovered source identity on Windows checkouts.
+firmware/rts9060_nano/rts9060_nano.ino text eol=lf

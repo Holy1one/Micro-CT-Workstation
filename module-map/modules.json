@@ -124,7 +124,7 @@
     {
       "id": "build-tooling",
       "name": "Build and verification tooling",
-      "owns": ["scripts/**", "tests/**", "package.json", "package-lock.json", "tsconfig.json", "vite.config.mjs", "Cargo.toml", "Cargo.lock", ".npmrc", ".gitignore", "module-map/**"],
+      "owns": ["scripts/**", "tests/**", "package.json", "package-lock.json", "tsconfig.json", "vite.config.mjs", "Cargo.toml", "Cargo.lock", ".npmrc", ".gitignore", ".gitattributes", "module-map/**"],
       "publicApi": ["package.json", "Cargo.toml", "module-map/modules.json"],
       "risk": "medium",
       "description": "Owns dependency locks, build entry points, contract tests, module-map generation, and impact analysis.",
