@@ -4,7 +4,7 @@
     {
       "id": "engine-core",
       "name": "Production engine and scan coordinator",
-      "owns": ["crates/ct-engine/AGENTS.md", "crates/ct-engine/README.md", "crates/ct-engine/src/lib.rs", "crates/ct-engine/src/main.rs", "crates/ct-engine/src/scan.rs", "crates/ct-engine/src/reconstruction.rs", "crates/ct-engine/src/reconstruction_preprocess.rs", "crates/ct-engine/src/fdk.wgsl", "crates/ct-engine/src/devices/README.md", "crates/ct-engine/src/devices/mod.rs", "crates/ct-engine/Cargo.toml"],
+      "owns": ["crates/ct-engine/AGENTS.md", "crates/ct-engine/README.md", "crates/ct-engine/src/lib.rs", "crates/ct-engine/src/main.rs", "crates/ct-engine/src/scan.rs", "crates/ct-engine/src/operations.rs", "crates/ct-engine/src/device_controls.rs", "crates/ct-engine/src/capture_profile.rs", "crates/ct-engine/src/presets.rs", "crates/ct-engine/src/task_registry.rs", "crates/ct-engine/src/reconstruction.rs", "crates/ct-engine/src/reconstruction_preprocess.rs", "crates/ct-engine/src/fdk.wgsl", "crates/ct-engine/src/devices/README.md", "crates/ct-engine/src/devices/mod.rs", "crates/ct-engine/Cargo.toml"],
       "publicApi": ["crates/ct-engine/src/lib.rs"],
       "risk": "critical",
       "description": "Owns the JSONL API, safety gates, authoritative device state, and projection transaction ordering.",
@@ -42,6 +42,16 @@
       "gates": ["cargo test -p ct-engine devices::turntable"]
     },
     {
+      "id": "turntable-firmware",
+      "name": "Recovered RTS9060 Nano firmware candidate",
+      "owns": ["firmware/rts9060_nano/**"],
+      "publicApi": ["firmware/rts9060_nano/rts9060_nano.ino", "firmware/rts9060_nano/build-config.json"],
+      "risk": "critical",
+      "description": "Preserves the approved, hash-verified firmware source candidate and its reproducible offline build and real-source host harness.",
+      "execution": "Pinned AVR source rebuild and host harness run offline; neither build identity nor VERSION text certifies device flash, physical motion or interrupt timing.",
+      "gates": ["node scripts/build-turntable-firmware.mjs", "node scripts/test-turntable-firmware.mjs", "cargo test -p ct-engine devices::turntable"]
+    },
+    {
       "id": "desktop-shell",
       "name": "Tauri desktop shell",
       "owns": ["src-tauri/**"],
@@ -64,7 +74,7 @@
     {
       "id": "frontend-client",
       "name": "Frontend engine client",
-      "owns": ["src/engine/adapter.ts", "src/engine/tauriAdapter.ts", "src/engine/useEngine.ts"],
+      "owns": ["src/engine/adapter.ts", "src/engine/tauriAdapter.ts", "src/engine/useEngine.ts", "src/engine/deviceControls.ts"],
       "publicApi": ["src/engine/adapter.ts", "src/engine/useEngine.ts"],
       "risk": "high",
       "description": "Selects the runtime adapter and exposes engine snapshots to React without fallback after Tauri errors.",
@@ -84,7 +94,7 @@
     {
       "id": "ui-shell",
       "name": "React workstation shell",
-      "owns": ["src/AGENTS.md", "src/README.md", "src/App.tsx", "src/main.tsx", "src/canvas-layout.ts", "src/scan-input.ts", "src/menuActions.ts", "src/icons.tsx", "src/styles.css", "src/tokens.css", "src/vite-env.d.ts", "public/**", "index.html"],
+      "owns": ["src/AGENTS.md", "src/README.md", "src/App.tsx", "src/DeviceConsoles.tsx", "src/main.tsx", "src/canvas-layout.ts", "src/scan-input.ts", "src/menuActions.ts", "src/icons.tsx", "src/styles.css", "src/tokens.css", "src/vite-env.d.ts", "public/**", "index.html"],
       "publicApi": ["src/App.tsx"],
       "risk": "medium",
       "description": "Owns panels, menus, safety presentation, layout, themes, and static UI assets.",

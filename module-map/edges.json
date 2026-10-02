@@ -1,6 +1,8 @@
 {
   "version": 1,
   "edges": [
+    { "from": "device-turntable", "to": "turntable-firmware", "type": "candidate-serial-contract", "strength": "strong", "reason": "The prescribed-direction planner and Nano protocol share the recovered source candidate's pulse scale, capture hold IDs and HOME exceptions; hardware flash consistency remains a separate acceptance gate." },
+    { "from": "developer-preview", "to": "turntable-firmware", "type": "offline-motion-semantics", "strength": "strong", "reason": "Preview preserves negative ordinary moves, bounded HOME exceptions and confirmed capture hold semantics from the candidate without representing hardware evidence." },
     { "from": "release-artifacts", "to": "build-tooling", "type": "release-pipeline", "strength": "strong", "reason": "portable:build must compile current assets and publish the verified desktop executable with build metadata." },
     { "from": "release-artifacts", "to": "desktop-shell", "type": "embedded-release", "strength": "strong", "reason": "The portable executable contains the desktop host, frontend assets and verified engine payload." },
     { "from": "desktop-shell", "to": "ui-shell", "type": "embedded-assets", "strength": "strong", "reason": "Tauri embeds current frontend assets and shares its 1920x1080 design baseline; DPI-aware window limits and edge-to-edge client filling must stay aligned." },

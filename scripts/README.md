@@ -1,7 +1,9 @@
 # Build and verification scripts
 
 - `prepare-engine-sidecar.mjs`: builds `ct-engine` and copies it to Tauri's target-specific sidecar name.
-- `build-portable.mjs`: runs a fresh native Windows Tauri release build and publishes the verified EXE and build metadata to `portable-release/`.
+- `build-portable.mjs`: runs a fresh native Windows Tauri release build; `--offline-candidate` publishes to `release/native-device-controls-offline/` and verifies that the existing formal portable EXE stays unchanged.
+- `build-turntable-firmware.mjs`: verifies the imported candidate source hash and rebuilds sketch/core from the pinned Arduino AVR source/toolchain, without serial discovery or upload.
+- `test-turntable-firmware.mjs`: compiles the unchanged candidate's actual HOST_HARNESS branch and runs its deterministic parser/state/pulse checks.
 - `prepare-sites-build.mjs`: assembles the optional hosted-preview output.
 - `process-logo.mjs`: explicit one-time logo asset transformation.
 - `gen-module-graph.mjs`: generates the human-readable module graph.

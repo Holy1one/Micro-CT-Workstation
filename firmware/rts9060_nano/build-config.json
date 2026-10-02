@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "candidate": {
+    "source": "rts9060_nano.ino",
+    "bytes": 32429,
+    "sha256": "470133efbb0f2192c725a0aef223cf6256030ce1f9c0dc541bd3cea4efa8e562",
+    "recoveredFrom": "tmp/tests/turntable/20260929-firmware-recovery/rts9060_nano/rts9060_nano.ino",
+    "hardwareCertified": false
+  },
+  "avr": {
+    "core": "arduino:avr",
+    "coreVersion": "1.8.8",
+    "compilerVersion": "7.3.0-atmel3.6.1-arduino7",
+    "board": "arduino:avr:nano:cpu=atmega328",
+    "mcu": "atmega328p",
+    "cpuHz": 16000000,
+    "variant": "eightanaloginputs",
+    "arduinoVersion": 10819,
+    "microsteps": 8,
+    "pulsesPerRev": 96000,
+    "flashMaximumBytes": 30720,
+    "ramMaximumBytes": 2048
+  }
+}

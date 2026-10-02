@@ -11,6 +11,7 @@ flowchart LR
   device_xray["Moxtek X-ray source"]
   device_camera["Nikon D7100 camera"]
   device_turntable["RTS9060 Nano turntable"]
+  turntable_firmware["Recovered RTS9060 Nano firmware candidate"]
   desktop_shell["Tauri desktop shell"]
   frontend_contract["Frontend engine contract"]
   frontend_client["Frontend engine client"]
@@ -22,6 +23,8 @@ flowchart LR
   extensions["Sites-compatible static preview worker"]
   documentation["Architecture, guides, and evidence"]
   release_artifacts["Generated release artifacts"]
+  device_turntable -->|candidate-serial-contract| turntable_firmware
+  developer_preview -->|offline-motion-semantics| turntable_firmware
   release_artifacts -->|release-pipeline| build_tooling
   release_artifacts -->|embedded-release| desktop_shell
   desktop_shell -->|embedded-assets| ui_shell
@@ -48,6 +51,7 @@ flowchart LR
 | `device-xray` | critical | Owns Moxtek discovery, binary serial transport, measured readback, and fail-closed beam shutdown. | cargo test -p ct-engine devices::xray |
 | `device-camera` | critical | Owns camera discovery, exposure configuration, host-side capture, and image-file confirmation. | cargo test -p ct-engine devices::camera |
 | `device-turntable` | critical | Owns Nano identity validation, line protocol, motion acknowledgement, warning output, and emergency stop. | cargo test -p ct-engine devices::turntable |
+| `turntable-firmware` | critical | Preserves the approved, hash-verified firmware source candidate and its reproducible offline build and real-source host harness. | node scripts/build-turntable-firmware.mjs<br>node scripts/test-turntable-firmware.mjs<br>cargo test -p ct-engine devices::turntable |
 | `desktop-shell` | critical | Owns native dialogs and paths, sidecar lifecycle, and IPC forwarding without owning scan state. | cargo test --workspace<br>npm.cmd run test:sites |
 | `frontend-contract` | critical | Defines the TypeScript command and snapshot vocabulary shared by production and preview clients. | npm.cmd run typecheck<br>npm.cmd run test:sites |
 | `frontend-client` | high | Selects the runtime adapter and exposes engine snapshots to React without fallback after Tauri errors. | npm.cmd run typecheck<br>npm.cmd run test:sites |
@@ -64,6 +68,8 @@ flowchart LR
 
 | Consumer | Provider | Type | Strength | Reason |
 |---|---|---|---|---|
+| `device-turntable` | `turntable-firmware` | candidate-serial-contract | strong | The prescribed-direction planner and Nano protocol share the recovered source candidate's pulse scale, capture hold IDs and HOME exceptions; hardware flash consistency remains a separate acceptance gate. |
+| `developer-preview` | `turntable-firmware` | offline-motion-semantics | strong | Preview preserves negative ordinary moves, bounded HOME exceptions and confirmed capture hold semantics from the candidate without representing hardware evidence. |
 | `release-artifacts` | `build-tooling` | release-pipeline | strong | portable:build must compile current assets and publish the verified desktop executable with build metadata. |
 | `release-artifacts` | `desktop-shell` | embedded-release | strong | The portable executable contains the desktop host, frontend assets and verified engine payload. |
 | `desktop-shell` | `ui-shell` | embedded-assets | strong | Tauri embeds current frontend assets and shares its 1920x1080 design baseline; DPI-aware window limits and edge-to-edge client filling must stay aligned. |

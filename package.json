@@ -15,6 +15,9 @@
     "tauri:dev": "npm run engine:build && tauri dev",
     "tauri:build": "npm run engine:build -- --release && tauri build",
     "portable:build": "node scripts/build-portable.mjs",
+    "candidate:build": "node scripts/build-portable.mjs --offline-candidate",
+    "firmware:build": "node scripts/build-turntable-firmware.mjs",
+    "firmware:test": "node scripts/test-turntable-firmware.mjs",
     "preview": "vite preview",
     "test:sites": "npm run build && node --experimental-strip-types --test tests/*.test.mjs"
   },

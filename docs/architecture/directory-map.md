@@ -19,6 +19,7 @@
 |---|---|---|
 | `crates/` | Rust workspace 的领域 crate | 当前只有 `ct-engine`；新增 crate 必须保持 Tauri 壳轻量 |
 | `docs/` | 当前架构、使用指南、历史方案和验收证据 | 当前事实必须与源码同步；历史内容必须明确标记 |
+| `firmware/rts9060_nano/` | 已批准恢复来源的 Nano 固件源码候选、固定构建配置与真实源码 host harness | 只跟踪源码；离线重建不证明当前 flash、物理方向或脉冲时序，产物进入 `tmp/tests/turntable/` |
 | `module-map/` | 模块归属与隐藏依赖的声明式事实源 | 由 `scripts/` 生成图谱并计算影响面 |
 | `portable-release/` | 免安装版本机构建输出及构建校验信息 | 由 `npm.cmd run portable:build` 更新；EXE 与 `build-info.json` 不提交，只跟踪说明用 `README.md`；不是源码或设计事实源 |
 | `target/release/` | Cargo/Tauri release 编译输出和缓存 | 不作为日常启动入口；可清理，下次构建自动再生成 |

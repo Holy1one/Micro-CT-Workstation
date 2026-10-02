@@ -5,12 +5,14 @@
     {
       "path": ".",
       "allowedChildren": [
-        ".git", ".vite", "crates", "dist", "docs",
+        ".git", ".vite", "crates", "dist", "docs", "firmware",
         "module-map", "node_modules", "portable-release", "public", "release", "scripts",
         "src", "src-tauri", "target", "tests", "tmp", "worker"
       ]
     },
     { "path": "crates", "allowedChildren": ["ct-engine"] },
+    { "path": "firmware", "allowedChildren": ["rts9060_nano"] },
+    { "path": "firmware/rts9060_nano", "allowedChildren": [] },
     { "path": "crates/ct-engine", "allowedChildren": ["src"] },
     { "path": "crates/ct-engine/src", "allowedChildren": ["devices"] },
     { "path": "crates/ct-engine/src/devices", "allowedChildren": ["camera", "turntable", "xray"] },
