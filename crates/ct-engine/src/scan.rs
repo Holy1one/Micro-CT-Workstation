@@ -8,8 +8,11 @@
 //! coordinator never changes it. Every exit path still attempts verified beam
 //! OFF and warning OFF before returning.
 
-use crate::devices::camera::{CameraError, DigiCamControlAdapter};
-use crate::devices::turntable::{MoveTicket, NanoAdapter};
+use crate::capture_profile::CaptureProfile;
+use crate::devices::camera::{CameraAdapter, CameraCaptureEvent, CameraError};
+use crate::devices::turntable::{
+    plan_projection, verify_fixed_configuration, verify_plan_capture_hold, MoveTicket, NanoAdapter,
+};
 use crate::devices::xray::{MoxtekAdapter, XrayHealth};
 use crate::{timestamp, Parameters};
 use serde::{Deserialize, Serialize};
@@ -17,7 +20,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -47,13 +50,22 @@ pub struct ScanGeometry {
 
 impl ScanGeometry {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !self.sod_mm.is_finite() || self.sod_mm <= 0.0
-            || !self.object_to_detector_mm.is_finite() || self.object_to_detector_mm <= 0.0
-            || !self.detector_width_mm.is_finite() || self.detector_width_mm <= 0.0
-            || !self.center_offset_x_mm.is_finite() || !self.center_offset_y_mm.is_finite()
-            || !matches!(self.rotation_direction.as_str(), "clockwise" | "counterclockwise")
+        if !self.sod_mm.is_finite()
+            || self.sod_mm <= 0.0
+            || !self.object_to_detector_mm.is_finite()
+            || self.object_to_detector_mm <= 0.0
+            || !self.detector_width_mm.is_finite()
+            || self.detector_width_mm <= 0.0
+            || !self.center_offset_x_mm.is_finite()
+            || !self.center_offset_y_mm.is_finite()
+            || !matches!(
+                self.rotation_direction.as_str(),
+                "clockwise" | "counterclockwise"
+            )
             || !matches!(self.measurement.as_str(), "measured" | "estimated")
-        { return Err("INVALID_SCAN_GEOMETRY"); }
+        {
+            return Err("INVALID_SCAN_GEOMETRY");
+        }
         Ok(())
     }
 }
@@ -80,6 +92,8 @@ pub struct ReferenceFrame {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScanResume {
+    pub capture_profile: CaptureProfile,
+    pub max_xray_sec: u32,
     pub geometry: ScanGeometry,
     pub frames: Vec<RealFrame>,
     pub references: ReferenceFrames,
@@ -87,13 +101,20 @@ pub struct ScanResume {
 }
 
 #[derive(Clone, Debug, Default)]
-struct PromptGate { pending: Option<&'static str>, confirmed: bool }
+struct PromptGate {
+    pending: Option<&'static str>,
+    confirmed: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanCompletion { Completed, Stopped }
+pub enum ScanCompletion {
+    Completed,
+    Stopped,
+}
 
 #[derive(Clone)]
 pub struct RealScanConfig {
+    pub capture_profile: CaptureProfile,
     pub parameters: Parameters,
     pub max_xray_sec: u32,
     pub voltage_kv: f64,
@@ -189,37 +210,52 @@ impl Default for RealScanProgress {
 
 impl RealScanProgress {
     fn refresh_estimate(&mut self, now: Instant) {
-        self.cooldown_remaining_seconds = self.cooldown_until
-            .map(|deadline| {
-                let remaining = deadline.saturating_duration_since(now);
-                remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)
-            });
+        self.cooldown_remaining_seconds = self.cooldown_until.map(|deadline| {
+            let remaining = deadline.saturating_duration_since(now);
+            remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)
+        });
         self.estimated_remaining_seconds = None;
-        if !matches!(self.phase, "running" | "cooling") || self.error.is_some() { return; }
-        let Some(sample) = self.measured_projection_time else { return; };
+        if !matches!(self.phase, "running" | "cooling") || self.error.is_some() {
+            return;
+        }
+        let Some(sample) = self.measured_projection_time else {
+            return;
+        };
         let remaining = self.projection_count.saturating_sub(self.captured);
-        if remaining == 0 { self.estimated_remaining_seconds = Some(0); return; }
-        let cooling_in_progress = self.cooldown_wait_started
+        if remaining == 0 {
+            self.estimated_remaining_seconds = Some(0);
+            return;
+        }
+        let cooling_in_progress = self
+            .cooldown_wait_started
             .map(|started| now.saturating_duration_since(started))
             .unwrap_or_default();
-        let current_elapsed = self.projection_started.map(|started| {
-            now.saturating_duration_since(started)
-                .saturating_sub(self.projection_cooling_elapsed + cooling_in_progress)
-        }).unwrap_or_default();
-        let work = sample.saturating_mul(remaining).saturating_sub(current_elapsed);
+        let current_elapsed = self
+            .projection_started
+            .map(|started| {
+                now.saturating_duration_since(started)
+                    .saturating_sub(self.projection_cooling_elapsed + cooling_in_progress)
+            })
+            .unwrap_or_default();
+        let work = sample
+            .saturating_mul(remaining)
+            .saturating_sub(current_elapsed);
         let mut seconds = work.as_secs_f64();
         if let Some(deadline) = self.cooldown_until {
             let pending = deadline.saturating_duration_since(now);
             // Work still being done with the beam OFF overlaps this interval.
             let overlap = if self.phase == "running" && self.projection_started.is_some() {
                 sample.saturating_sub(current_elapsed)
-            } else { Duration::ZERO };
+            } else {
+                Duration::ZERO
+            };
             seconds += pending.saturating_sub(overlap).as_secs_f64();
         }
         // Active projection time is an upper bound for future beam time. A
         // completed five-minute OFF interval must never enter that sample.
         if !self.block_limit.is_zero() {
-            let active = self.beam_started
+            let active = self
+                .beam_started
                 .map(|started| now.saturating_duration_since(started).as_secs_f64())
                 .unwrap_or(0.0);
             let limit = self.block_limit.as_secs_f64();
@@ -232,7 +268,7 @@ impl RealScanProgress {
 }
 
 pub struct ScanOutcome {
-    pub camera: DigiCamControlAdapter,
+    pub camera: CameraAdapter,
     pub xray: MoxtekAdapter,
     pub result: Result<ScanCompletion, String>,
 }
@@ -250,23 +286,39 @@ pub struct RealScanHandle {
 impl RealScanHandle {
     pub fn start(
         nano: Arc<NanoAdapter>,
-        camera: DigiCamControlAdapter,
+        camera: CameraAdapter,
         xray: MoxtekAdapter,
         config: RealScanConfig,
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(false));
         let prompt_gate = Arc::new(Mutex::new(PromptGate::default()));
-        let initial_stage = config.resume.as_ref().map_or("preDark", |resume| match resume.stage.as_str() {
-            "preDark" => "preDark", "preFlat" => "preFlat", "placeSample" => "placeSample",
-            "projections" => "projections", "removeSample" | "postFlat" | "postDark" => "finalizing",
-            "finalizing" => "finalizing",
-            _ => "preDark",
-        });
+        let initial_stage =
+            config
+                .resume
+                .as_ref()
+                .map_or("preDark", |resume| match resume.stage.as_str() {
+                    "preDark" => "preDark",
+                    "preFlat" => "preFlat",
+                    "placeSample" => "placeSample",
+                    "projections" => "projections",
+                    "removeSample" | "postFlat" | "postDark" => "finalizing",
+                    "finalizing" => "finalizing",
+                    _ => "preDark",
+                });
         let progress = Arc::new(Mutex::new(RealScanProgress {
-            captured: config.resume.as_ref().map_or(0, |resume| resume.frames.len() as u32),
-            frames: config.resume.as_ref().map_or_else(Vec::new, |resume| resume.frames.clone()),
-            references: config.resume.as_ref().map_or_else(ReferenceFrames::default, |resume| resume.references.clone()),
+            captured: config
+                .resume
+                .as_ref()
+                .map_or(0, |resume| resume.frames.len() as u32),
+            frames: config
+                .resume
+                .as_ref()
+                .map_or_else(Vec::new, |resume| resume.frames.clone()),
+            references: config
+                .resume
+                .as_ref()
+                .map_or_else(ReferenceFrames::default, |resume| resume.references.clone()),
             stage: initial_stage,
             ..RealScanProgress::default()
         }));
@@ -292,7 +344,7 @@ impl RealScanHandle {
                     &worker_prompt_gate,
                 ))).unwrap_or_else(|_| {
                     let off = xray.force_off();
-                    let warning = worker_nano.set_xray_warning(false);
+                    let warning = warning_after_off(&worker_nano,&xray);
                     Err(format!("scan worker panicked; shutdown attempted: X-ray={off:?}, warning={warning:?}"))
                 });
                 if matches!(result, Ok(ScanCompletion::Stopped)) {
@@ -350,7 +402,11 @@ impl RealScanHandle {
     }
 
     pub fn progress(&self) -> RealScanProgress {
-        let mut snapshot = self.progress.lock().expect("scan progress mutex poisoned").clone();
+        let mut snapshot = self
+            .progress
+            .lock()
+            .expect("scan progress mutex poisoned")
+            .clone();
         snapshot.refresh_estimate(Instant::now());
         snapshot
     }
@@ -361,7 +417,9 @@ impl RealScanHandle {
 
     pub fn confirm_stage(&self, stage: &str) -> Result<(), &'static str> {
         let mut gate = self.prompt_gate.lock().expect("scan prompt mutex poisoned");
-        if gate.pending != Some(stage) || gate.confirmed { return Err("SCAN_PROMPT_MISMATCH"); }
+        if gate.pending != Some(stage) || gate.confirmed {
+            return Err("SCAN_PROMPT_MISMATCH");
+        }
         gate.confirmed = true;
         Ok(())
     }
@@ -370,8 +428,16 @@ impl RealScanHandle {
         self.pause.store(false, Ordering::SeqCst);
     }
 
+    /// Signal cancellation without waiting for the domain's parallel STOP/OFF.
+    pub fn cancel_only(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        update_phase(&self.progress, "stopping");
+    }
+
     pub fn request_stop(&self) -> Result<(), String> {
-        if self.cancel.swap(true, Ordering::SeqCst) { return Ok(()); }
+        if self.cancel.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
         update_phase(&self.progress, "stopping");
         self.nano
             .stop()
@@ -383,12 +449,19 @@ impl RealScanHandle {
     }
 }
 
-fn poll_scan_outcome<T>(receiver: &mpsc::Receiver<T>, worker: &mut Option<JoinHandle<()>>) -> Option<Result<T, String>> {
+fn poll_scan_outcome<T>(
+    receiver: &mpsc::Receiver<T>,
+    worker: &mut Option<JoinHandle<()>>,
+) -> Option<Result<T, String>> {
     match receiver.try_recv() {
         Ok(outcome) => {
             // Receipt is the terminal ownership handoff. Do not leave a handle
             // whose Drop could send STOP after a successful completion.
-            if let Some(worker) = worker.take() { if worker.is_finished() { let _ = worker.join(); } }
+            if let Some(worker) = worker.take() {
+                if worker.is_finished() {
+                    let _ = worker.join();
+                }
+            }
             Some(Ok(outcome))
         }
         Err(mpsc::TryRecvError::Empty) => None,
@@ -396,7 +469,9 @@ fn poll_scan_outcome<T>(receiver: &mpsc::Receiver<T>, worker: &mut Option<JoinHa
             if worker.as_ref().is_some_and(JoinHandle::is_finished) {
                 let _ = worker.take().unwrap().join();
             }
-            Some(Err("scan worker exited without a cleanup outcome; output state is unconfirmed".into()))
+            Some(Err(
+                "scan worker exited without a cleanup outcome; output state is unconfirmed".into(),
+            ))
         }
     }
 }
@@ -409,7 +484,9 @@ impl Drop for RealScanHandle {
                 let _ = self.nano.stop();
             }
             // Never block IPC or process shutdown on an unbounded join.
-            if worker.is_finished() { let _ = worker.join(); }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -418,6 +495,8 @@ impl Drop for RealScanHandle {
 #[serde(rename_all = "camelCase")]
 struct ScanManifest<'a> {
     schema_version: u32,
+    capture_profile: &'a CaptureProfile,
+    max_xray_sec: u32,
     scan_id: &'a str,
     created_at: String,
     completed: bool,
@@ -435,6 +514,10 @@ struct ScanManifest<'a> {
 #[serde(rename_all = "camelCase")]
 struct StoredScanManifest {
     schema_version: u32,
+    #[serde(default)]
+    capture_profile: Option<CaptureProfile>,
+    #[serde(default)]
+    max_xray_sec: Option<u32>,
     scan_id: String,
     completed: bool,
     voltage_kv: f64,
@@ -463,57 +546,101 @@ pub fn manifest_file_exists(parameters: &Parameters) -> bool {
 
 pub fn completed_manifest_exists(parameters: &Parameters) -> bool {
     let path = Path::new(parameters.save_path.trim())
-        .join(parameters.task_id.trim()).join("manifest.json");
-    let Ok(file) = File::open(path) else { return false; };
+        .join(parameters.task_id.trim())
+        .join("manifest.json");
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
     serde_json::from_reader::<_, StoredScanManifest>(file).is_ok_and(|manifest| {
-        manifest.schema_version == 2 && manifest.completed && manifest.stage == "completed"
+        matches!(manifest.schema_version, 2 | 3)
+            && manifest.completed
+            && manifest.stage == "completed"
+            && (manifest.schema_version == 2
+                || manifest
+                    .capture_profile
+                    .as_ref()
+                    .is_some_and(|profile| profile.validate().is_ok())
+                    && manifest
+                        .max_xray_sec
+                        .is_some_and(|maximum| (1..=600).contains(&maximum)))
             && manifest.scan_id == parameters.task_id
             && manifest.projection_count == parameters.projection_count
             && (manifest.exposure_ms - parameters.exposure_ms).abs() < 1e-6
             && manifest.frames.len() == parameters.projection_count as usize
             && [&manifest.references.pre_dark, &manifest.references.pre_flat]
-                .iter().all(|frames| frames.len() == REFERENCE_COUNT)
+                .iter()
+                .all(|frames| frames.len() == REFERENCE_COUNT)
     })
 }
 
 pub fn preparation_checkpoint_exists(parameters: &Parameters) -> bool {
-    Path::new(parameters.save_path.trim()).join(parameters.task_id.trim())
-        .join("preparation-checkpoint.json").is_file()
+    Path::new(parameters.save_path.trim())
+        .join(parameters.task_id.trim())
+        .join("preparation-checkpoint.json")
+        .is_file()
 }
 
-pub fn persist_preparation_checkpoint(parameters: &Parameters, voltage_kv: f64, current_ua: f64) -> Result<(), String> {
+pub fn persist_preparation_checkpoint(
+    parameters: &Parameters,
+    voltage_kv: f64,
+    current_ua: f64,
+    max_xray_sec: u32,
+    capture_profile: &CaptureProfile,
+) -> Result<(), String> {
+    capture_profile.validate()?;
+    if !(1..=600).contains(&max_xray_sec) {
+        return Err("Invalid frozen continuous X-ray limit".into());
+    }
     let root = Path::new(parameters.save_path.trim()).join(parameters.task_id.trim());
     fs::create_dir_all(&root).map_err(io_error)?;
-    if root.join("manifest.json").exists() { return Err("scan manifest already exists".into()); }
+    if root.join("manifest.json").exists() {
+        return Err("scan manifest already exists".into());
+    }
     let path = root.join("preparation-checkpoint.json");
-    let checkpoint = json!({"schemaVersion":2,"scanId":parameters.task_id,"createdAt":timestamp(),
+    let checkpoint = json!({"schemaVersion":3,"captureProfile":capture_profile,"maxXraySec":max_xray_sec,"scanId":parameters.task_id,"createdAt":timestamp(),
         "stage":"geometry","projectionCount":parameters.projection_count,
         "exposureMs":parameters.exposure_ms,"voltageKv":voltage_kv,"currentUa":current_ua});
-    let file = File::create(path).map_err(io_error)?;
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, &checkpoint).map_err(|error| error.to_string())?;
-    writer.flush().map_err(io_error)?;
-    writer.get_ref().sync_all().map_err(io_error)
+    crate::task_registry::atomic_store(
+        &path,
+        &serde_json::to_vec_pretty(&checkpoint).map_err(|error| error.to_string())?,
+    )
 }
 
 fn preparation_checkpoint_matches(root: &Path, config: &RealScanConfig) -> Result<bool, String> {
     let path = root.join("preparation-checkpoint.json");
-    if !path.exists() { return Ok(false); }
+    if !path.exists() {
+        return Ok(false);
+    }
     let data: serde_json::Value = serde_json::from_reader(File::open(path).map_err(io_error)?)
         .map_err(|error| error.to_string())?;
-    Ok(data["schemaVersion"].as_u64() == Some(2) && data["stage"].as_str() == Some("geometry")
+    let profile: CaptureProfile =
+        serde_json::from_value(data["captureProfile"].clone()).map_err(|error| {
+            format!("Preparation checkpoint lacks a frozen capture profile: {error}")
+        })?;
+    config.capture_profile.matches(&profile)?;
+    Ok(data["schemaVersion"].as_u64() == Some(3)
+        && data["stage"].as_str() == Some("geometry")
+        && data["maxXraySec"].as_u64() == Some(u64::from(config.max_xray_sec))
         && data["scanId"].as_str() == Some(config.parameters.task_id.as_str())
         && data["projectionCount"].as_u64() == Some(u64::from(config.parameters.projection_count))
-        && data["exposureMs"].as_f64().is_some_and(|value| (value-config.parameters.exposure_ms).abs() < 1e-6)
-        && data["voltageKv"].as_f64().is_some_and(|value| (value-config.voltage_kv).abs() < 0.01)
-        && data["currentUa"].as_f64().is_some_and(|value| (value-config.current_ua).abs() < 0.01))
+        && data["exposureMs"]
+            .as_f64()
+            .is_some_and(|value| (value - config.parameters.exposure_ms).abs() < 1e-6)
+        && data["voltageKv"]
+            .as_f64()
+            .is_some_and(|value| (value - config.voltage_kv).abs() < 0.01)
+        && data["currentUa"]
+            .as_f64()
+            .is_some_and(|value| (value - config.current_ua).abs() < 0.01))
 }
 
 pub fn resume_manifest_exists(parameters: &Parameters) -> bool {
     let path = Path::new(parameters.save_path.trim())
         .join(parameters.task_id.trim())
         .join("manifest.json");
-    let Ok(file) = File::open(path) else { return false; };
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
     serde_json::from_reader::<_, StoredScanManifestHeader>(file)
         .is_ok_and(|manifest| !manifest.completed)
 }
@@ -522,12 +649,18 @@ pub fn load_resume(
     parameters: &Parameters,
     voltage_kv: f64,
     current_ua: f64,
+    actual_profile: &CaptureProfile,
 ) -> Result<ScanResume, String> {
     let root = Path::new(parameters.save_path.trim()).join(parameters.task_id.trim());
     let file = File::open(root.join("manifest.json")).map_err(io_error)?;
-    let manifest: StoredScanManifest = serde_json::from_reader(file)
-        .map_err(|error| format!("invalid scan manifest: {error}"))?;
-    if manifest.schema_version != 2 || manifest.completed
+    let manifest: StoredScanManifest =
+        serde_json::from_reader(file).map_err(|error| format!("invalid scan manifest: {error}"))?;
+    if manifest.schema_version == 2 {
+        return Err("LEGACY_SCHEMA_2_READ_ONLY: native acquisition cannot append projections without complete camera evidence; use the retained legacy version".into());
+    }
+
+    if manifest.schema_version != 3
+        || manifest.completed
         || manifest.scan_id != parameters.task_id
         || manifest.projection_count != parameters.projection_count
         || (manifest.exposure_ms - parameters.exposure_ms).abs() > 1e-6
@@ -537,9 +670,26 @@ pub fn load_resume(
     {
         return Err("unfinished scan manifest does not match the current task, exposure, projection count or X-ray setpoints".into());
     }
+    let capture_profile = manifest
+        .capture_profile
+        .ok_or("Frozen capture profile is missing")?;
+    capture_profile.matches(actual_profile)?;
+    let max_xray_sec = manifest
+        .max_xray_sec
+        .filter(|maximum| (1..=600).contains(maximum))
+        .ok_or("Frozen continuous X-ray limit is missing or invalid")?;
     manifest.geometry.validate().map_err(str::to_owned)?;
-    if !matches!(manifest.stage.as_str(), "preDark" | "preFlat" | "placeSample" |
-        "projections" | "removeSample" | "postFlat" | "postDark" | "finalizing") {
+    if !matches!(
+        manifest.stage.as_str(),
+        "preDark"
+            | "preFlat"
+            | "placeSample"
+            | "projections"
+            | "removeSample"
+            | "postFlat"
+            | "postDark"
+            | "finalizing"
+    ) {
         return Err("invalid scan checkpoint stage".into());
     }
     let pre_dark = manifest.references.pre_dark.len();
@@ -551,7 +701,9 @@ pub fn load_resume(
     let full_projection = projections == parameters.projection_count as usize;
     let stage_consistent = match manifest.stage.as_str() {
         "preDark" => pre_flat == 0 && post_flat == 0 && post_dark == 0 && projections == 0,
-        "preFlat" => pre_dark == REFERENCE_COUNT && post_flat == 0 && post_dark == 0 && projections == 0,
+        "preFlat" => {
+            pre_dark == REFERENCE_COUNT && post_flat == 0 && post_dark == 0 && projections == 0
+        }
         "placeSample" => full_pre && post_flat == 0 && post_dark == 0,
         "projections" => full_pre && post_flat == 0 && post_dark == 0,
         "removeSample" => full_pre && full_projection && post_flat == 0 && post_dark == 0,
@@ -560,12 +712,18 @@ pub fn load_resume(
         "finalizing" => full_pre && full_projection,
         _ => false,
     };
-    if !stage_consistent { return Err("scan checkpoint stage and committed frame counts disagree".into()); }
+    if !stage_consistent {
+        return Err("scan checkpoint stage and committed frame counts disagree".into());
+    }
     verify_references(&root, &manifest.references)?;
-    for reference in manifest.references.pre_dark.iter()
+    for reference in manifest
+        .references
+        .pre_dark
+        .iter()
         .chain(&manifest.references.pre_flat)
         .chain(&manifest.references.post_flat)
-        .chain(&manifest.references.post_dark) {
+        .chain(&manifest.references.post_dark)
+    {
         if (reference.exposure_ms - parameters.exposure_ms).abs() > 1e-6 {
             return Err("reference exposure does not match scan setup".into());
         }
@@ -576,23 +734,34 @@ pub fn load_resume(
         let index = zero_index as u32 + 1;
         let expected_name = format!("frame-{index:04}.nef");
         let expected_path = frames_dir.join(&expected_name);
-        if frame.index != index || frame.file_name != expected_name
+        if frame.index != index
+            || frame.file_name != expected_name
             || Path::new(&frame.path) != expected_path
-            || (frame.angle_deg - projection_job(zero_index as u32, parameters.projection_count).angle_deg).abs() > 0.01
+            || (frame.angle_deg
+                - projection_job(zero_index as u32, parameters.projection_count).angle_deg)
+                .abs()
+                > 0.01
             || (frame.exposure_ms - parameters.exposure_ms).abs() > 1e-6
         {
-            return Err(format!("resume frame {index} does not match the recorded scan geometry"));
+            return Err(format!(
+                "resume frame {index} does not match the recorded scan geometry"
+            ));
         }
         let (bytes, sha256) = hash_file(&expected_path)?;
         if bytes != frame.bytes || sha256 != frame.sha256 {
-            return Err(format!("resume frame {index} failed size or SHA-256 verification"));
+            return Err(format!(
+                "resume frame {index} failed size or SHA-256 verification"
+            ));
         }
     }
     let mut file_count = 0;
     for entry in fs::read_dir(&frames_dir).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         if !entry.file_type().map_err(io_error)?.is_file() {
-            return Err("scan frames directory contains a non-file entry; inspect it before restoring".into());
+            return Err(
+                "scan frames directory contains a non-file entry; inspect it before restoring"
+                    .into(),
+            );
         }
         file_count += 1;
     }
@@ -600,38 +769,57 @@ pub fn load_resume(
         return Err("scan frames directory has an uncommitted or unexpected file; inspect it before restoring".into());
     }
     Ok(ScanResume {
+        capture_profile,
+        max_xray_sec,
         geometry: manifest.geometry,
         frames: manifest.frames,
         references: manifest.references,
-        stage: if matches!(manifest.stage.as_str(), "removeSample" | "postFlat" | "postDark") {
+        stage: if matches!(
+            manifest.stage.as_str(),
+            "removeSample" | "postFlat" | "postDark"
+        ) {
             "finalizing".to_owned()
-        } else { manifest.stage },
+        } else {
+            manifest.stage
+        },
     })
 }
 
 fn verify_references(root: &Path, references: &ReferenceFrames) -> Result<(), String> {
     for (group, frames) in [
-        ("pre-dark", &references.pre_dark), ("pre-flat", &references.pre_flat),
-        ("post-flat", &references.post_flat), ("post-dark", &references.post_dark),
+        ("pre-dark", &references.pre_dark),
+        ("pre-flat", &references.pre_flat),
+        ("post-flat", &references.post_flat),
+        ("post-dark", &references.post_dark),
     ] {
-        if frames.len() > REFERENCE_COUNT { return Err(format!("too many {group} references")); }
+        if frames.len() > REFERENCE_COUNT {
+            return Err(format!("too many {group} references"));
+        }
         let dir = root.join("references").join(group).join("frames");
         for (zero_index, frame) in frames.iter().enumerate() {
             let index = zero_index as u32 + 1;
             let expected_name = format!("frame-{index:04}.nef");
             let path = dir.join(&expected_name);
-            if frame.index != index || frame.file_name != expected_name
+            if frame.index != index
+                || frame.file_name != expected_name
                 || Path::new(&frame.path) != path
-                || !frame.exposure_ms.is_finite() || frame.exposure_ms <= 0.0
-            { return Err(format!("{group} reference {index} path mismatch")); }
+                || !frame.exposure_ms.is_finite()
+                || frame.exposure_ms <= 0.0
+            {
+                return Err(format!("{group} reference {index} path mismatch"));
+            }
             let (bytes, sha256) = hash_file(&path)?;
             if bytes != frame.bytes || sha256 != frame.sha256 {
-                return Err(format!("{group} reference {index} failed SHA-256 verification"));
+                return Err(format!(
+                    "{group} reference {index} failed SHA-256 verification"
+                ));
             }
         }
         if dir.exists() {
             let entries = fs::read_dir(&dir).map_err(io_error)?.count();
-            if entries != frames.len() { return Err(format!("{group} has an uncommitted file")); }
+            if entries != frames.len() {
+                return Err(format!("{group} has an uncommitted file"));
+            }
         }
     }
     Ok(())
@@ -639,19 +827,37 @@ fn verify_references(root: &Path, references: &ReferenceFrames) -> Result<(), St
 
 fn run_scan(
     nano: &NanoAdapter,
-    camera: &mut DigiCamControlAdapter,
+    camera: &mut CameraAdapter,
     xray: &mut MoxtekAdapter,
     config: &RealScanConfig,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     pause: &AtomicBool,
     progress: &Mutex<RealScanProgress>,
     prompt_gate: &Mutex<PromptGate>,
 ) -> Result<ScanCompletion, String> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || run_scan_inner(nano, camera, xray, config, cancel, pause, progress, prompt_gate)
-    )).unwrap_or_else(|_| Err("scan body panicked".into()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_scan_inner(
+            nano,
+            camera,
+            xray,
+            config,
+            cancel,
+            pause,
+            progress,
+            prompt_gate,
+        )
+    }))
+    .unwrap_or_else(|_| Err("scan body panicked".into()));
     let off = xray.force_off();
-    let warning_off = nano.set_xray_warning(false);
+    let warning_off = if off.is_ok() {
+        warning_after_off(nano, xray)
+    } else {
+        // Unknown emission keeps the physical warning asserted.
+        let _ = nano.set_xray_warning(true);
+        Err(crate::devices::turntable::NanoError::Safety(
+            "Warning retained because Moxtek OFF is unconfirmed".into(),
+        ))
+    };
     if off.is_ok() {
         push_message(
             progress,
@@ -666,14 +872,30 @@ fn run_scan(
         let _ = nano.stop();
     }
 
-    let completion = finish_scan_result(result, off.map(|_| ()).map_err(|e| e.to_string()), warning_off.map_err(|e| e.to_string()));
+    let completion = finish_scan_result(
+        result,
+        off.map(|_| ()).map_err(|e| e.to_string()),
+        warning_off.map_err(|e| e.to_string()),
+    );
     let root = Path::new(config.parameters.save_path.trim()).join(config.parameters.task_id.trim());
-    let owned = progress.lock().expect("scan progress mutex poisoned").output_dir_owned;
+    let owned = progress
+        .lock()
+        .expect("scan progress mutex poisoned")
+        .output_dir_owned;
     let checkpoint = if owned {
         let stage = progress.lock().expect("scan progress mutex poisoned").stage;
-        persist_progress(&root, &config.parameters, config, progress,
-            if completion == Ok(ScanCompletion::Completed) { "completed" } else { stage },
-            completion == Ok(ScanCompletion::Completed))
+        persist_progress(
+            &root,
+            &config.parameters,
+            config,
+            progress,
+            if completion == Ok(ScanCompletion::Completed) {
+                "completed"
+            } else {
+                stage
+            },
+            completion == Ok(ScanCompletion::Completed),
+        )
     } else {
         Ok(())
     };
@@ -685,66 +907,151 @@ fn run_scan(
     }
     if completion == Ok(ScanCompletion::Completed) {
         update_phase(progress, "completed");
-        let frame_count = progress.lock().expect("scan progress mutex poisoned").frames.len();
-        push_message(progress, "PASS", "system", format!(
-            "Real scan complete · {} projections · X-ray OFF", frame_count
-        ));
+        let frame_count = progress
+            .lock()
+            .expect("scan progress mutex poisoned")
+            .frames
+            .len();
+        push_message(
+            progress,
+            "PASS",
+            "system",
+            format!(
+                "Real scan complete · {} projections · X-ray OFF",
+                frame_count
+            ),
+        );
     }
     completion
 }
 
-fn finish_scan_result(result: Result<(), String>, off: Result<(), String>, warning: Result<(), String>) -> Result<ScanCompletion, String> {
+fn finish_scan_result(
+    result: Result<(), String>,
+    off: Result<(), String>,
+    warning: Result<(), String>,
+) -> Result<ScanCompletion, String> {
     let stopped = matches!(&result, Err(error) if error == CANCELLED);
     let mut errors = Vec::new();
-    if let Err(error) = result { if !stopped { errors.push(error); } }
-    if let Err(error) = off { errors.push(format!("final Moxtek OFF unconfirmed: {error}")); }
-    if let Err(error) = warning { errors.push(format!("final warning OFF unconfirmed: {error}")); }
-    if !errors.is_empty() { Err(errors.join("; ")) }
-    else if stopped { Ok(ScanCompletion::Stopped) }
-    else { Ok(ScanCompletion::Completed) }
+    if let Err(error) = result {
+        if !stopped {
+            errors.push(error);
+        }
+    }
+    if let Err(error) = off {
+        errors.push(format!("final Moxtek OFF unconfirmed: {error}"));
+    }
+    if let Err(error) = warning {
+        errors.push(format!("final warning OFF unconfirmed: {error}"));
+    }
+    if !errors.is_empty() {
+        Err(errors.join("; "))
+    } else if stopped {
+        Ok(ScanCompletion::Stopped)
+    } else {
+        Ok(ScanCompletion::Completed)
+    }
 }
 
 fn run_scan_inner(
     nano: &NanoAdapter,
-    camera: &mut DigiCamControlAdapter,
+    camera: &mut CameraAdapter,
     xray: &mut MoxtekAdapter,
     config: &RealScanConfig,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     pause: &AtomicBool,
     progress: &Mutex<RealScanProgress>,
     prompt_gate: &Mutex<PromptGate>,
 ) -> Result<(), String> {
     let parameters = &config.parameters;
+    config.capture_profile.validate()?;
+    if !(1..=600).contains(&config.max_xray_sec)
+        || config
+            .resume
+            .as_ref()
+            .is_some_and(|resume| resume.max_xray_sec != config.max_xray_sec)
+    {
+        return Err("Continuous X-ray limit differs from the frozen acquisition".into());
+    }
     let root = Path::new(parameters.save_path.trim()).join(parameters.task_id.trim());
-    let resume_count = config.resume.as_ref().map_or(0, |resume| resume.frames.len());
+    let resume_count = config
+        .resume
+        .as_ref()
+        .map_or(0, |resume| resume.frames.len());
     if config.resume.is_none() {
         if root.exists() {
-            let entries = fs::read_dir(&root).map_err(io_error)?
+            let entries = fs::read_dir(&root)
+                .map_err(io_error)?
                 .map(|entry| entry.map(|value| value.file_name().to_string_lossy().into_owned()))
-                .collect::<Result<Vec<_>, _>>().map_err(io_error)?;
-            if !entries.is_empty() && !(entries.len() == 1 && entries[0] == "preparation-checkpoint.json" && preparation_checkpoint_matches(&root, config)?) {
-                return Err(format!("scan output already exists: {} · use Restore after Preflight and HOME", root.display()));
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(io_error)?;
+            if !entries.is_empty()
+                && !(entries.len() == 1
+                    && entries[0] == "preparation-checkpoint.json"
+                    && preparation_checkpoint_matches(&root, config)?)
+            {
+                return Err(format!(
+                    "scan output already exists: {} · use Restore after Preflight and HOME",
+                    root.display()
+                ));
             }
         }
         fs::create_dir_all(root.join("frames")).map_err(io_error)?;
-    } else if load_resume(parameters, config.voltage_kv, config.current_ua)?
-        != *config.resume.as_ref().unwrap() {
+    } else if load_resume(
+        parameters,
+        config.voltage_kv,
+        config.current_ua,
+        &config.capture_profile,
+    )? != *config.resume.as_ref().unwrap()
+    {
         return Err("scan files changed after Restore; no device action was started".into());
     }
     update(progress, |value| value.output_dir_owned = true);
-    push_message(progress, "ACTION", "operator", if resume_count == 0 {
-        format!("Real scan started · {} projections · {:.1} kV / {:.1} µA",
-            parameters.projection_count, config.voltage_kv, config.current_ua)
-    } else {
-        format!("Real scan restored · {resume_count} files verified · continuing at view {}",
-            resume_count + 1)
-    });
+    push_message(
+        progress,
+        "ACTION",
+        "operator",
+        if resume_count == 0 {
+            format!(
+                "Real scan started · {} projections · {:.1} kV / {:.1} µA",
+                parameters.projection_count, config.voltage_kv, config.current_ua
+            )
+        } else {
+            format!(
+                "Real scan restored · {resume_count} files verified · continuing at view {}",
+                resume_count + 1
+            )
+        },
+    );
     let shutter = camera
         .set_exposure_ms(parameters.exposure_ms)
         .map_err(|error| format!("camera exposure configuration failed: {error}"))?;
-    push_message(progress, "PASS", "camera", format!("D7100 shutter set to {shutter}"));
-    xray
-        .set_parameters(config.voltage_kv, config.current_ua)
+    camera
+        .read_properties()
+        .map_err(|error| format!("Camera profile readback failed: {error}"))?;
+    let identity = camera
+        .health()
+        .identity
+        .ok_or("Camera identity is unknown")?;
+    let actual_profile = CaptureProfile::from_readback(
+        identity,
+        camera
+            .profile_readback()
+            .map_err(|error| error.to_string())?,
+        config.capture_profile.preset.clone(),
+    )?;
+    config.capture_profile.matches(&actual_profile)?;
+    if actual_profile.exposure_ms() != Some(parameters.exposure_ms) {
+        return Err(
+            "Native shutter readback does not exactly match the scan Exposure target".into(),
+        );
+    }
+    push_message(
+        progress,
+        "PASS",
+        "camera",
+        format!("D7100 shutter set to {shutter}"),
+    );
+    xray.set_parameters(config.voltage_kv, config.current_ua)
         .map_err(|error| format!("Moxtek setpoint configuration failed: {error}"))?;
     set_xray_health(progress, xray.health());
 
@@ -779,10 +1086,12 @@ fn run_scan_inner(
     if pre_references_incomplete {
         wait_for_prompt(nano, xray, progress, prompt_gate, cancel, "preReferences")?;
     }
-    capture_reference_group(nano, camera, xray, config, cancel, progress, &root,
-        "pre-dark", "preDark", false)?;
-    capture_reference_group(nano, camera, xray, config, cancel, progress, &root,
-        "pre-flat", "preFlat", true)?;
+    capture_reference_group(
+        nano, camera, xray, config, cancel, progress, &root, "pre-dark", "preDark", false,
+    )?;
+    capture_reference_group(
+        nano, camera, xray, config, cancel, progress, &root, "pre-flat", "preFlat", true,
+    )?;
     if resume_count < parameters.projection_count as usize {
         update(progress, |value| value.stage = "placeSample");
         persist_progress(&root, parameters, config, progress, "placeSample", false)?;
@@ -798,13 +1107,7 @@ fn run_scan_inner(
             wait_for_cooldown(progress, cancel, cooldown_deadline)?;
         }
         if pause.load(Ordering::SeqCst) && beam_started.is_some() {
-            close_scan_beam(
-                nano,
-                xray,
-                progress,
-                &mut beam_started,
-                "Pause boundary",
-            )?;
+            close_scan_beam(nano, xray, progress, &mut beam_started, "Pause boundary")?;
         }
         while pause.load(Ordering::SeqCst) {
             update_phase(progress, "paused");
@@ -813,12 +1116,21 @@ fn run_scan_inner(
             }
             thread::sleep(Duration::from_millis(50));
         }
-        if beam_started.is_some_and(|started| needs_cooldown_before_exposure(
-            started, Instant::now(), block_limit,
-            exposure_budget.saturating_add(MOVE_BUDGET_MARGIN),
-        )) {
-            close_scan_beam(nano, xray, progress, &mut beam_started,
-                "Cooling before the next projection's move and exposure")?;
+        if beam_started.is_some_and(|started| {
+            needs_cooldown_before_exposure(
+                started,
+                Instant::now(),
+                block_limit,
+                exposure_budget.saturating_add(MOVE_BUDGET_MARGIN),
+            )
+        }) {
+            close_scan_beam(
+                nano,
+                xray,
+                progress,
+                &mut beam_started,
+                "Cooling before the next projection's move and exposure",
+            )?;
             wait_for_cooldown(progress, cancel, Instant::now() + XRAY_COOLDOWN)?;
         }
         update_phase(progress, "running");
@@ -827,7 +1139,13 @@ fn run_scan_inner(
             value.projection_cooling_elapsed = Duration::ZERO;
         });
         let ticket = move_to_projection_monitored(
-            nano, xray, progress, job, cancel, &mut beam_started, block_limit,
+            nano,
+            xray,
+            progress,
+            job,
+            cancel,
+            &mut beam_started,
+            block_limit,
             &mut cooldown_until,
         )?;
 
@@ -838,11 +1156,16 @@ fn run_scan_inner(
             verify_capture_hold(nano, &ticket, job)?;
         }
 
-        if beam_started.is_some_and(|started| needs_cooldown_before_exposure(
-            started, Instant::now(), block_limit, exposure_budget,
-        )) {
-            close_scan_beam(nano, xray, progress, &mut beam_started,
-                "Cooling before the current projection's exposure")?;
+        if beam_started.is_some_and(|started| {
+            needs_cooldown_before_exposure(started, Instant::now(), block_limit, exposure_budget)
+        }) {
+            close_scan_beam(
+                nano,
+                xray,
+                progress,
+                &mut beam_started,
+                "Cooling before the current projection's exposure",
+            )?;
             wait_for_cooldown(progress, cancel, Instant::now() + XRAY_COOLDOWN)?;
             verify_capture_hold(nano, &ticket, job)?;
         }
@@ -853,54 +1176,114 @@ fn run_scan_inner(
             // Include the entire ON command latency in the continuous-output budget.
             beam_started = Some(Instant::now());
             update(progress, |value| value.beam_started = beam_started);
-            let emission = xray.beam_on_until(cancel, beam_started.expect("beam start set") + block_limit);
+            let emission = xray.beam_on_shared(
+                cancel.clone(),
+                beam_started.expect("beam start set") + block_limit,
+            );
             check_cancel(cancel)?;
-            emission.map_err(|error| format!("Moxtek beam-on failed: {error}"))?;
+            emission.map_err(|error| xray_operation_error(error, "Moxtek beam-on failed"))?;
             set_xray_health(progress, xray.health());
             set_beam(progress, true);
             if beam_started.is_some_and(|started| started.elapsed() >= block_limit) {
-                close_scan_beam(nano, xray, progress, &mut beam_started,
-                    "Continuous X-ray limit reached during beam-on confirmation")?;
+                close_scan_beam(
+                    nano,
+                    xray,
+                    progress,
+                    &mut beam_started,
+                    "Continuous X-ray limit reached during beam-on confirmation",
+                )?;
                 return Err("continuous X-ray limit reached before exposure started".into());
             }
-            if beam_started.is_some_and(|started| needs_cooldown_before_exposure(
-                started, Instant::now(), block_limit, exposure_budget,
-            )) {
-                close_scan_beam(nano, xray, progress, &mut beam_started,
-                    "Beam enable left insufficient time for a confirmed exposure")?;
-                return Err("configured X-ray time cannot accommodate beam enable and the current exposure".into());
+            if beam_started.is_some_and(|started| {
+                needs_cooldown_before_exposure(
+                    started,
+                    Instant::now(),
+                    block_limit,
+                    exposure_budget,
+                )
+            }) {
+                close_scan_beam(
+                    nano,
+                    xray,
+                    progress,
+                    &mut beam_started,
+                    "Beam enable left insufficient time for a confirmed exposure",
+                )?;
+                return Err(
+                    "configured X-ray time cannot accommodate beam enable and the current exposure"
+                        .into(),
+                );
             }
-            push_message(progress, "ACTION", "xray", format!(
+            push_message(
+                progress,
+                "ACTION",
+                "xray",
+                format!(
                 "Continuous beam block confirmed ON · view={} · {:.1} kV / {:.1} µA · limit {} s",
                 job.index, config.voltage_kv, config.current_ua, config.max_xray_sec
-            ));
+            ),
+            );
         }
 
         let frame_index = job.index;
         let final_projection = frame_index == parameters.projection_count;
         let mut abort_reason = None;
         let mut last_xray_poll = Instant::now();
-        let capture_started = Instant::now();
         let mut transfer_announced = false;
-        let camera_for_capture = &mut *camera;
+        let camera_for_capture = camera.clone();
+        let capture_session = camera
+            .health()
+            .session_id
+            .ok_or("Capture session is unknown")?;
+        let capture_operation = format!(
+            "scan-{}-{}-{}",
+            parameters.task_id,
+            frame_index,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let mut evidence =
+            ExposureEvidence::new(capture_session.clone(), capture_operation.clone());
         let capture_result = thread::scope(|scope| {
             let (capture_sender, capture_receiver) = mpsc::channel();
-            let save_path = PathBuf::from(&parameters.save_path);
-            let task_id = parameters.task_id.clone();
+            let (event_sender, event_receiver) = mpsc::channel();
+            let capture_path = root
+                .join("frames")
+                .join(format!("frame-{frame_index:04}.nef"));
+            let worker_operation = capture_operation.clone();
             scope.spawn(move || {
-                let result = camera_for_capture.capture_frame_cancellable(&save_path, &task_id, frame_index, cancel);
+                let result = camera_for_capture.capture_to_path(
+                    &capture_path,
+                    &worker_operation,
+                    cancel,
+                    Some(event_sender),
+                );
                 let _ = capture_sender.send(result);
             });
             loop {
+                for event in event_receiver.try_iter() {
+                    if let Err(error) = evidence.observe(&event) {
+                        abort_reason = Some(error);
+                        cancel.store(true, Ordering::SeqCst);
+                        let _ = xray.force_off();
+                        let _ = nano.stop();
+                    }
+                }
                 match capture_receiver.recv_timeout(Duration::from_millis(25)) {
-                    Ok(result) => break result,
+                    Ok(result) => {
+                        for event in event_receiver.try_iter() {
+                            if let Err(error) = evidence.observe(&event) {
+                                abort_reason = Some(error);
+                            }
+                        }
+                        break result;
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if abort_reason.is_none()
                             && beam_started.is_some()
                             && last_xray_poll.elapsed() >= Duration::from_millis(250)
                         {
                             last_xray_poll = Instant::now();
-                            match xray.refresh_emission_status() {
+                            match xray.refresh_emission_status_shared(cancel.clone()) {
                                 Ok(health) => {
                                     if let Some(warning) = health.telemetry_warning.clone() {
                                         push_message(progress, "WARN", "xray", warning);
@@ -908,11 +1291,13 @@ fn run_scan_inner(
                                     set_xray_health(progress, health);
                                 }
                                 Err(error) => {
-                                    abort_reason =
-                                        Some(format!("Moxtek emission monitor failed: {error}"));
+                                    abort_reason = Some(xray_operation_error(
+                                        error,
+                                        "Moxtek emission monitor failed",
+                                    ));
                                     cancel.store(true, Ordering::SeqCst);
                                     set_xray_health(progress, xray.health());
-                                    let _ = nano.set_xray_warning(false);
+                                    let _ = warning_after_off(nano, xray);
                                     set_beam(progress, xray.health().beam_on);
                                     let _ = nano.stop();
                                 }
@@ -923,21 +1308,12 @@ fn run_scan_inner(
                             cancel.store(true, Ordering::SeqCst);
                             let _ = xray.force_off();
                             set_xray_health(progress, xray.health());
-                            let _ = nano.set_xray_warning(false);
+                            let _ = warning_after_off(nano, xray);
                             set_beam(progress, xray.health().beam_on);
                             let _ = nano.stop();
                         }
                         if abort_reason.is_none() {
-                            let transfer_started = DigiCamControlAdapter::frame_transfer_started(
-                                Path::new(parameters.save_path.trim()),
-                                parameters.task_id.trim(),
-                                frame_index,
-                            );
-                            let exposure_complete = exposure_is_complete(
-                                transfer_started,
-                                capture_started.elapsed(),
-                                exposure_evidence_timeout,
-                            );
+                            let exposure_complete = evidence.exposure_ended;
                             let limit_reached = beam_started
                                 .is_some_and(|started| started.elapsed() >= block_limit);
                             if limit_reached && !exposure_complete {
@@ -949,11 +1325,12 @@ fn run_scan_inner(
                                 let _ = xray.force_off();
                                 set_xray_health(progress, xray.health());
                                 set_beam(progress, xray.health().beam_on);
-                                let _ = nano.set_xray_warning(false);
+                                let _ = warning_after_off(nano, xray);
                                 let _ = nano.stop();
                             }
                             let pause_requested = pause.load(Ordering::SeqCst);
-                            if abort_reason.is_none() && exposure_complete
+                            if abort_reason.is_none()
+                                && exposure_complete
                                 && beam_started.is_some()
                                 && (limit_reached || final_projection || pause_requested)
                             {
@@ -974,7 +1351,9 @@ fn run_scan_inner(
                                     Ok(_) => {
                                         if limit_reached && !final_projection {
                                             cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
-                                            update(progress, |value| value.cooldown_until = cooldown_until);
+                                            update(progress, |value| {
+                                                value.cooldown_until = cooldown_until
+                                            });
                                         }
                                     }
                                     Err(error) => {
@@ -984,14 +1363,14 @@ fn run_scan_inner(
                                     }
                                 }
                             }
-                            if transfer_started {
+                            if evidence.transfer_started {
                                 if !transfer_announced {
                                     push_message(
                                         progress,
                                         "PASS",
                                         "camera",
                                         format!(
-                                            "NEF transfer started · view={} · exposure complete",
+                                            "NEF transfer started · view={} · file confirmation pending",
                                             frame_index
                                         ),
                                     );
@@ -1012,9 +1391,18 @@ fn run_scan_inner(
             return Err(reason);
         }
         check_cancel(cancel)?;
-        let path = capture_result.map_err(|error| format!("D7100 capture failed: {error}"))?;
-        let limit_reached = beam_started
-            .is_some_and(|started| started.elapsed() >= block_limit);
+        let image = capture_result.map_err(|error| format!("D7100 capture failed: {error}"))?;
+        if image.session_id != capture_session
+            || image.operation_id != capture_operation
+            || !image.exposure_ended
+            || !evidence.exposure_ended
+        {
+            return Err(
+                "Capture completed without this operation's reliable ExposureEnded event".into(),
+            );
+        }
+        let path = image.path;
+        let limit_reached = beam_started.is_some_and(|started| started.elapsed() >= block_limit);
         if beam_started.is_some()
             && (limit_reached || final_projection || pause.load(Ordering::SeqCst))
         {
@@ -1025,41 +1413,53 @@ fn run_scan_inner(
             } else {
                 "Pause requested after completed exposure"
             };
-            close_scan_beam(
-                nano,
-                xray,
-                progress,
-                &mut beam_started,
-                reason,
-            )?;
+            close_scan_beam(nano, xray, progress, &mut beam_started, reason)?;
             if limit_reached && !final_projection {
                 cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
                 update(progress, |value| value.cooldown_until = cooldown_until);
             }
         }
         let frame = commit_projection_monitored(
-            nano, xray, progress, &root, parameters, config, cancel,
-            &path, job, &ticket, &mut beam_started, block_limit,
-            &mut cooldown_until, final_projection,
-        )?;
-        update(progress, |value| record_projection_sample(value, frame.index, Instant::now()));
-        push_message(progress, "PASS", "nano", format!(
-            "CAPTURE_DONE view={} id={} · committed file confirmed", job.index, ticket.command_id
-        ));
-        push_message(progress, "PASS", "camera", format!(
-            "Projection committed · view={} · {} bytes · SHA-256 {}",
-            frame.index, frame.bytes, frame.sha256
-        ));
-    }
-
-    if beam_started.is_some() {
-        close_scan_beam(
             nano,
             xray,
             progress,
+            &root,
+            parameters,
+            config,
+            cancel,
+            &path,
+            job,
+            &ticket,
             &mut beam_started,
-            "Scan completed",
+            block_limit,
+            &mut cooldown_until,
+            final_projection,
         )?;
+        update(progress, |value| {
+            record_projection_sample(value, frame.index, Instant::now())
+        });
+        push_message(
+            progress,
+            "PASS",
+            "nano",
+            format!(
+                "CAPTURE_DONE view={} id={} · committed file confirmed",
+                job.index, ticket.command_id
+            ),
+        );
+        push_message(
+            progress,
+            "PASS",
+            "camera",
+            format!(
+                "Projection committed · view={} · {} bytes · SHA-256 {}",
+                frame.index, frame.bytes, frame.sha256
+            ),
+        );
+    }
+
+    if beam_started.is_some() {
+        close_scan_beam(nano, xray, progress, &mut beam_started, "Scan completed")?;
     }
 
     update_phase(progress, "finishing");
@@ -1068,7 +1468,29 @@ fn run_scan_inner(
     Ok(())
 }
 
-fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
+fn xray_operation_error(error: crate::devices::xray::XrayError, context: &str) -> String {
+    if matches!(error, crate::devices::xray::XrayError::Cancelled) {
+        CANCELLED.into()
+    } else {
+        format!("{context}: {error}")
+    }
+}
+fn warning_after_off(
+    nano: &NanoAdapter,
+    xray: &MoxtekAdapter,
+) -> Result<(), crate::devices::turntable::NanoError> {
+    let health = xray.health();
+    if health.beam_off_confirmed && !health.beam_on {
+        nano.set_xray_warning(false)
+    } else {
+        let _ = nano.set_xray_warning(true);
+        Err(crate::devices::turntable::NanoError::Safety(
+            "Radiation warning retained while output is unknown".into(),
+        ))
+    }
+}
+
+fn check_cancel(cancel: &Arc<AtomicBool>) -> Result<(), String> {
     if cancel.load(Ordering::SeqCst) {
         Err(CANCELLED.into())
     } else {
@@ -1077,7 +1499,9 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
 }
 
 fn wait_for_cooldown(
-    progress: &Mutex<RealScanProgress>, cancel: &AtomicBool, deadline: Instant,
+    progress: &Mutex<RealScanProgress>,
+    cancel: &Arc<AtomicBool>,
+    deadline: Instant,
 ) -> Result<(), String> {
     let wait_started = Instant::now();
     update(progress, |value| {
@@ -1087,9 +1511,14 @@ fn wait_for_cooldown(
     });
     let remaining_duration = deadline.saturating_duration_since(wait_started);
     let remaining = remaining_duration.as_secs() + u64::from(remaining_duration.subsec_nanos() > 0);
-    push_message(progress, "WARN", "xray", format!(
+    push_message(
+        progress,
+        "WARN",
+        "xray",
+        format!(
         "X-ray OFF interval · {remaining} seconds remain of the 300-second interval before resuming"
-    ));
+    ),
+    );
     while Instant::now() < deadline {
         check_cancel(cancel)?;
         thread::sleep(Duration::from_millis(250));
@@ -1104,18 +1533,27 @@ fn wait_for_cooldown(
         value.cooldown_until = None;
         value.phase = "running";
     });
-    push_message(progress, "PASS", "xray", "Five-minute X-ray cooldown complete · scan resuming".into());
+    push_message(
+        progress,
+        "PASS",
+        "xray",
+        "Five-minute X-ray cooldown complete · scan resuming".into(),
+    );
     Ok(())
 }
 
 fn wait_for_prompt(
-    nano: &NanoAdapter, xray: &mut MoxtekAdapter,
-    progress: &Mutex<RealScanProgress>, gate: &Mutex<PromptGate>,
-    cancel: &AtomicBool, stage: &'static str,
+    nano: &NanoAdapter,
+    xray: &mut MoxtekAdapter,
+    progress: &Mutex<RealScanProgress>,
+    gate: &Mutex<PromptGate>,
+    cancel: &Arc<AtomicBool>,
+    stage: &'static str,
 ) -> Result<(), String> {
-    let off = xray.force_off()
+    let off = xray
+        .force_off()
         .map_err(|error| format!("{stage} prompt requires confirmed X-ray OFF: {error}"))?;
-    nano.set_xray_warning(false)
+    warning_after_off(nano, xray)
         .map_err(|error| format!("{stage} prompt warning OFF failed: {error}"))?;
     set_xray_health(progress, off);
     set_beam(progress, false);
@@ -1130,14 +1568,17 @@ fn wait_for_prompt(
         check_cancel(cancel)?;
         if last_poll.elapsed() >= Duration::from_millis(250) {
             last_poll = Instant::now();
-            let health = xray.refresh_status()
+            let health = xray
+                .refresh_status()
                 .map_err(|error| format!("{stage} prompt X-ray status unavailable: {error}"))?;
             let beam_on = health.beam_on;
             let off_confirmed = health.beam_off_confirmed;
             set_xray_health(progress, health);
             set_beam(progress, beam_on);
             if beam_on || !off_confirmed {
-                return Err(format!("{stage} prompt interrupted: X-ray OFF is unconfirmed"));
+                return Err(format!(
+                    "{stage} prompt interrupted: X-ray OFF is unconfirmed"
+                ));
             }
         }
         {
@@ -1152,9 +1593,10 @@ fn wait_for_prompt(
     }
     update(progress, |state| state.prompt = None);
     check_cancel(cancel)?;
-    let off = xray.force_off()
+    let off = xray
+        .force_off()
         .map_err(|error| format!("{stage} confirmation requires confirmed X-ray OFF: {error}"))?;
-    nano.set_xray_warning(false)
+    warning_after_off(nano, xray)
         .map_err(|error| format!("{stage} confirmation warning OFF failed: {error}"))?;
     set_xray_health(progress, off);
     set_beam(progress, false);
@@ -1171,7 +1613,10 @@ fn reference_list<'a>(references: &'a ReferenceFrames, group: &str) -> &'a Vec<R
     }
 }
 
-fn reference_list_mut<'a>(references: &'a mut ReferenceFrames, group: &str) -> &'a mut Vec<ReferenceFrame> {
+fn reference_list_mut<'a>(
+    references: &'a mut ReferenceFrames,
+    group: &str,
+) -> &'a mut Vec<ReferenceFrame> {
     match group {
         "pre-dark" => &mut references.pre_dark,
         "pre-flat" => &mut references.pre_flat,
@@ -1182,22 +1627,32 @@ fn reference_list_mut<'a>(references: &'a mut ReferenceFrames, group: &str) -> &
 }
 
 fn capture_reference_group(
-    nano: &NanoAdapter, camera: &mut DigiCamControlAdapter,
-    xray: &mut MoxtekAdapter, config: &RealScanConfig,
-    cancel: &AtomicBool, progress: &Mutex<RealScanProgress>, root: &Path,
-    group: &'static str, stage: &'static str, flat: bool,
+    nano: &NanoAdapter,
+    camera: &mut CameraAdapter,
+    xray: &mut MoxtekAdapter,
+    config: &RealScanConfig,
+    cancel: &Arc<AtomicBool>,
+    progress: &Mutex<RealScanProgress>,
+    root: &Path,
+    group: &'static str,
+    stage: &'static str,
+    flat: bool,
 ) -> Result<(), String> {
     let starting_at = {
         let state = progress.lock().expect("scan progress mutex poisoned");
         reference_list(&state.references, group).len()
     };
-    if starting_at == REFERENCE_COUNT { return Ok(()); }
+    if starting_at == REFERENCE_COUNT {
+        return Ok(());
+    }
     update(progress, |state| state.stage = stage);
     persist_progress(root, &config.parameters, config, progress, stage, false)?;
     // Every dark image is taken only after verified OFF; no warning is asserted.
     if !flat {
-        xray.force_off().map_err(|error| format!("{group} beam OFF failed: {error}"))?;
-        nano.set_xray_warning(false).map_err(|error| format!("{group} warning OFF failed: {error}"))?;
+        xray.force_off()
+            .map_err(|error| format!("{group} beam OFF failed: {error}"))?;
+        warning_after_off(nano, xray)
+            .map_err(|error| format!("{group} warning OFF failed: {error}"))?;
         set_xray_health(progress, xray.health());
         set_beam(progress, false);
     }
@@ -1210,20 +1665,28 @@ fn capture_reference_group(
         nano.set_xray_warning(true)
             .map_err(|error| format!("{group} warning ON failed: {error}"))?;
         let started = Instant::now();
-        xray.beam_on_until(cancel, started + block_limit)
+        xray.beam_on_shared(cancel.clone(), started + block_limit)
             .map_err(|error| format!("{group} beam ON failed: {error}"))?;
         set_xray_health(progress, xray.health());
         set_beam(progress, true);
-        push_message(progress, "ACTION", "xray", format!(
-            "{group} continuous beam confirmed ON · remaining references {}",
-            REFERENCE_COUNT - starting_at
-        ));
+        push_message(
+            progress,
+            "ACTION",
+            "xray",
+            format!(
+                "{group} continuous beam confirmed ON · remaining references {}",
+                REFERENCE_COUNT - starting_at
+            ),
+        );
         Some(started)
-    } else { None };
+    } else {
+        None
+    };
     for index in starting_at as u32 + 1..=REFERENCE_COUNT as u32 {
         check_cancel(cancel)?;
         if !flat {
-            let health = xray.refresh_status()
+            let health = xray
+                .refresh_status()
                 .map_err(|error| format!("{group} dark capture X-ray status failed: {error}"))?;
             if !health.beam_off_confirmed || health.beam_on {
                 return Err(format!("{group} dark capture requires confirmed X-ray OFF"));
@@ -1231,12 +1694,22 @@ fn capture_reference_group(
             set_xray_health(progress, health);
         } else {
             let started = flat_started_at.expect("flat group has one continuous beam block");
-            if started.elapsed().saturating_add(exposure_timeout)
-                .saturating_add(EXPOSURE_BUDGET_MARGIN) >= block_limit {
+            if started
+                .elapsed()
+                .saturating_add(exposure_timeout)
+                .saturating_add(EXPOSURE_BUDGET_MARGIN)
+                >= block_limit
+            {
                 return Err(format!("{group} cannot start reference {index}: continuous X-ray limit would be exceeded"));
             }
-            let health = xray.refresh_emission_status()
-                .map_err(|error| format!("{group} emission check before reference {index} failed: {error}"))?;
+            let health = xray
+                .refresh_emission_status_shared(cancel.clone())
+                .map_err(|error| {
+                    xray_operation_error(
+                        error,
+                        &format!("{group} emission check before reference {index} failed"),
+                    )
+                })?;
             set_xray_health(progress, health);
         }
         let mut abort = None;
@@ -1246,14 +1719,23 @@ fn capture_reference_group(
             let save_path_for_capture = save_path.clone();
             let camera_for_capture = &mut *camera;
             scope.spawn(move || {
-                let result = camera_for_capture.capture_frame_cancellable(&save_path_for_capture, group, index, cancel);
+                let result = camera_for_capture.capture_frame_cancellable(
+                    &save_path_for_capture,
+                    group,
+                    index,
+                    cancel,
+                );
                 let _ = sender.send(result);
             });
             let mut last_poll = Instant::now();
             loop {
                 match receiver.recv_timeout(Duration::from_millis(25)) {
                     Ok(result) => break result,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break Err(CameraError::Io("reference capture worker disconnected".into())),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(CameraError::Io(
+                            "reference capture worker disconnected".into(),
+                        ))
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
                 if cancel.load(Ordering::SeqCst) && abort.is_none() {
@@ -1270,7 +1752,8 @@ fn capture_reference_group(
                             abort = Some(format!("{group} dark capture lost confirmed X-ray OFF"));
                         }
                         Err(error) => {
-                            abort = Some(format!("{group} dark capture X-ray status failed: {error}"));
+                            abort =
+                                Some(format!("{group} dark capture X-ray status failed: {error}"));
                         }
                     }
                     if abort.is_some() {
@@ -1284,63 +1767,106 @@ fn capture_reference_group(
                 if flat {
                     if last_poll.elapsed() >= Duration::from_millis(250) && abort.is_none() {
                         last_poll = Instant::now();
-                        if let Err(error) = xray.refresh_emission_status() {
-                            abort = Some(format!("{group} emission monitor failed: {error}"));
+                        if let Err(error) = xray.refresh_emission_status_shared(cancel.clone()) {
+                            abort = Some(xray_operation_error(
+                                error,
+                                &format!("{group} emission monitor failed"),
+                            ));
                             cancel.store(true, Ordering::SeqCst);
-                        } else { set_xray_health(progress, xray.health()); }
+                        } else {
+                            set_xray_health(progress, xray.health());
+                        }
                     }
-                    if abort.is_none() && flat_started_at.is_some_and(|started| started.elapsed() >= block_limit) {
-                        abort = Some(format!("{group} continuous X-ray limit reached during reference {index}"));
+                    if abort.is_none()
+                        && flat_started_at.is_some_and(|started| started.elapsed() >= block_limit)
+                    {
+                        abort = Some(format!(
+                            "{group} continuous X-ray limit reached during reference {index}"
+                        ));
                         cancel.store(true, Ordering::SeqCst);
                     }
                     if abort.is_some() && !beam_shutdown_attempted {
                         beam_shutdown_attempted = true;
                         let off = xray.force_off();
-                        let warning_off = nano.set_xray_warning(false);
+                        let warning_off = warning_after_off(nano, xray);
                         set_xray_health(progress, xray.health());
                         set_beam(progress, xray.health().beam_on);
-                        if let Err(error) = off { abort = Some(format!("{group} beam OFF failed: {error}")); cancel.store(true, Ordering::SeqCst); }
-                        if let Err(error) = warning_off { abort = Some(format!("{group} warning OFF failed: {error}")); cancel.store(true, Ordering::SeqCst); }
+                        if let Err(error) = off {
+                            abort = Some(format!("{group} beam OFF failed: {error}"));
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                        if let Err(error) = warning_off {
+                            abort = Some(format!("{group} warning OFF failed: {error}"));
+                            cancel.store(true, Ordering::SeqCst);
+                        }
                     }
                 }
-                if abort.is_some() && !flat { cancel.store(true, Ordering::SeqCst); }
+                if abort.is_some() && !flat {
+                    cancel.store(true, Ordering::SeqCst);
+                }
             }
         });
-        if let Some(error) = abort { return Err(error); }
+        if let Some(error) = abort {
+            return Err(error);
+        }
         check_cancel(cancel)?;
-        let path = capture_result.map_err(|error| format!("{group} capture {index} failed: {error}"))?;
+        let path =
+            capture_result.map_err(|error| format!("{group} capture {index} failed: {error}"))?;
         if flat {
             if flat_started_at.is_some_and(|started| started.elapsed() >= block_limit) {
-                return Err(format!("{group} continuous X-ray limit reached during reference {index}"));
+                return Err(format!(
+                    "{group} continuous X-ray limit reached during reference {index}"
+                ));
             }
             if index == REFERENCE_COUNT as u32 {
-                let off = xray.force_off()
+                let off = xray
+                    .force_off()
                     .map_err(|error| format!("{group} beam OFF failed: {error}"))?;
                 set_xray_health(progress, off);
-                nano.set_xray_warning(false)
+                warning_after_off(nano, xray)
                     .map_err(|error| format!("{group} warning OFF failed: {error}"))?;
                 set_beam(progress, false);
-                push_message(progress, "PASS", "xray", format!(
-                    "{group} continuous beam OFF confirmed after {REFERENCE_COUNT} references"
-                ));
+                push_message(
+                    progress,
+                    "PASS",
+                    "xray",
+                    format!(
+                        "{group} continuous beam OFF confirmed after {REFERENCE_COUNT} references"
+                    ),
+                );
             }
         }
         let (bytes, sha256) = hash_file(&path)?;
         let frame = ReferenceFrame {
-            index, exposure_ms: config.parameters.exposure_ms,
-            file_name: path.file_name().and_then(|value| value.to_str()).unwrap_or_default().to_owned(),
-            path: path.display().to_string(), bytes, sha256,
+            index,
+            exposure_ms: config.parameters.exposure_ms,
+            file_name: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+            path: path.display().to_string(),
+            bytes,
+            sha256,
         };
-        update(progress, |state| reference_list_mut(&mut state.references, group).push(frame));
+        update(progress, |state| {
+            reference_list_mut(&mut state.references, group).push(frame)
+        });
         persist_progress(root, &config.parameters, config, progress, stage, false)?;
-        push_message(progress, "PASS", "camera", format!("{group} reference {index}/{REFERENCE_COUNT} saved"));
+        push_message(
+            progress,
+            "PASS",
+            "camera",
+            format!("{group} reference {index}/{REFERENCE_COUNT} saved"),
+        );
     }
     Ok(())
 }
 
 fn record_projection_sample(value: &mut RealScanProgress, index: u32, now: Instant) {
     if let Some(started) = value.projection_started.take() {
-        let active = now.saturating_duration_since(started)
+        let active = now
+            .saturating_duration_since(started)
             .saturating_sub(value.projection_cooling_elapsed);
         value.measured_projection_time = Some(match value.measured_projection_time {
             Some(previous) => (previous.saturating_mul(index - 1) + active) / index,
@@ -1365,7 +1891,7 @@ fn close_scan_beam(
         .force_off()
         .map_err(|error| format!("Moxtek OFF failed at {reason}: {error}"))?;
     set_xray_health(progress, health);
-    nano.set_xray_warning(false)
+    warning_after_off(nano, xray)
         .map_err(|error| format!("XRAY_WARNING OFF failed at {reason}: {error}"))?;
     set_beam(progress, false);
     update(progress, |value| value.beam_started = None);
@@ -1382,8 +1908,7 @@ fn close_scan_beam(
 }
 
 fn projection_job(zero_index: u32, projection_count: u32) -> ProjectionJob {
-    let angle_mdeg = -(((i64::from(zero_index) * 360_000)
-        + i64::from(projection_count / 2))
+    let angle_mdeg = -(((i64::from(zero_index) * 360_000) + i64::from(projection_count / 2))
         / i64::from(projection_count)) as i32;
     ProjectionJob {
         index: zero_index + 1,
@@ -1406,14 +1931,16 @@ fn verify_capture_hold(
     let status = nano
         .status()
         .map_err(|error| format!("Nano STATUS failed before view {}: {error}", job.index))?;
-    if status.pulses_per_rev == 0 {
-        return Err("Nano feedback has an invalid pulse scale".into());
-    }
+    verify_fixed_configuration(&status).map_err(|error| error.to_string())?;
     let expected = expected_pulses(job.angle_mdeg, status.pulses_per_rev);
     if status.state != "CAPTURE_HOLD"
         || status.capture_id != ticket.command_id
-        || ticket.position_pulses != expected
-        || status.position_pulses != expected
+        || ticket.position_pulses != status.position_pulses
+        || status.target_pulses != status.position_pulses
+        || status
+            .position_pulses
+            .rem_euclid(i64::from(status.pulses_per_rev))
+            != expected.rem_euclid(i64::from(status.pulses_per_rev))
         || !status.reference_valid
         || !status.homed
         || !status.rearmed
@@ -1438,18 +1965,29 @@ fn move_to_projection(
     nano: &NanoAdapter,
     progress: &Mutex<RealScanProgress>,
     job: ProjectionJob,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<MoveTicket, String> {
     check_cancel(cancel)?;
     push_message(
         progress,
         "ACTION",
         "nano",
-        format!("MOVE_ABS view={} angle={:.3}°", job.index, job.angle_deg),
+        format!(
+            "Prescribed-direction MOVE_REL view={} nominal angle={:.3}°",
+            job.index, job.angle_deg
+        ),
     );
-    let movement = nano.move_abs(job.angle_mdeg);
+    let starting_status = nano
+        .status()
+        .map_err(|error| format!("STATUS before view {} failed: {error}", job.index))?;
+    let plan = plan_projection(&starting_status, job.angle_mdeg)
+        .map_err(|error| format!("Plan view {} failed: {error}", job.index))?;
+    let movement = nano.execute_plan_cancelled(&plan, cancel.clone());
     check_cancel(cancel)?;
-    let ticket = movement.map_err(|error| format!("MOVE_ABS view {} failed: {error}", job.index))?;
+    let ticket =
+        movement.map_err(|error| format!("MOVE_REL view {} failed: {error}", job.index))?;
+    let status = nano.status().map_err(|error| error.to_string())?;
+    verify_plan_capture_hold(&plan, &ticket, &status).map_err(|error| error.to_string())?;
     let confirmed_angle = verify_capture_hold(nano, &ticket, job)?;
     // Only confirmed device position may advance the live scene. The planned
     // target is not a measurement, including while the move is still pending.
@@ -1471,14 +2009,19 @@ fn move_to_projection_monitored(
     xray: &mut MoxtekAdapter,
     progress: &Mutex<RealScanProgress>,
     job: ProjectionJob,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     beam_started: &mut Option<Instant>,
     block_limit: Duration,
     cooldown_until: &mut Option<Instant>,
 ) -> Result<MoveTicket, String> {
     if beam_started.is_some_and(|started| started.elapsed() >= block_limit) {
-        close_scan_beam(nano, xray, progress, beam_started,
-            "Continuous X-ray limit reached before turntable movement")?;
+        close_scan_beam(
+            nano,
+            xray,
+            progress,
+            beam_started,
+            "Continuous X-ray limit reached before turntable movement",
+        )?;
         let deadline = Instant::now() + XRAY_COOLDOWN;
         wait_for_cooldown(progress, cancel, deadline)?;
     }
@@ -1489,7 +2032,9 @@ fn move_to_projection_monitored(
     // enforce the continuous-output deadline while Nano owns its serial worker.
     thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel();
-        scope.spawn(move || { let _ = sender.send(move_to_projection(nano, progress, job, cancel)); });
+        scope.spawn(move || {
+            let _ = sender.send(move_to_projection(nano, progress, job, cancel));
+        });
         let mut last_poll = Instant::now();
         let mut abort: Option<String> = None;
         let mut warning_off_after_move = false;
@@ -1497,22 +2042,33 @@ fn move_to_projection_monitored(
             match receiver.recv_timeout(Duration::from_millis(25)) {
                 Ok(result) => {
                     if warning_off_after_move {
-                        nano.set_xray_warning(false).map_err(|error|
-                            format!("XRAY_WARNING OFF failed after timed move: {error}"))?;
+                        warning_after_off(nano, xray).map_err(|error| {
+                            format!("XRAY_WARNING OFF failed after timed move: {error}")
+                        })?;
                     }
-                    if abort.is_none() && beam_started.is_some_and(|started| started.elapsed() >= block_limit) {
-                        close_scan_beam(nano, xray, progress, beam_started,
-                            "Continuous X-ray limit reached at turntable arrival")?;
+                    if abort.is_none()
+                        && beam_started.is_some_and(|started| started.elapsed() >= block_limit)
+                    {
+                        close_scan_beam(
+                            nano,
+                            xray,
+                            progress,
+                            beam_started,
+                            "Continuous X-ray limit reached at turntable arrival",
+                        )?;
                         *cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
                         update(progress, |value| value.cooldown_until = *cooldown_until);
                     }
                     return abort.map_or(result, Err);
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) =>
-                    return Err("Nano move worker terminated without a result".into()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Nano move worker terminated without a result".into())
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            if abort.is_some() { continue; }
+            if abort.is_some() {
+                continue;
+            }
             if cancel.load(Ordering::SeqCst) {
                 abort = Some(CANCELLED.into());
                 let _ = xray.force_off();
@@ -1533,8 +2089,13 @@ fn move_to_projection_monitored(
                         warning_off_after_move = true;
                         *cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
                         update(progress, |value| value.cooldown_until = *cooldown_until);
-                        push_message(progress, "WARN", "xray",
-                            "Continuous X-ray limit reached during movement · beam OFF confirmed".into());
+                        push_message(
+                            progress,
+                            "WARN",
+                            "xray",
+                            "Continuous X-ray limit reached during movement · beam OFF confirmed"
+                                .into(),
+                        );
                     }
                     Err(error) => {
                         abort = Some(format!("Moxtek OFF failed during move: {error}"));
@@ -1543,10 +2104,13 @@ fn move_to_projection_monitored(
                 }
             } else if beam_started.is_some() && last_poll.elapsed() >= Duration::from_millis(250) {
                 last_poll = Instant::now();
-                match xray.refresh_emission_status() {
+                match xray.refresh_emission_status_shared(cancel.clone()) {
                     Ok(health) => set_xray_health(progress, health),
                     Err(error) => {
-                        abort = Some(format!("Moxtek emission monitor failed during move: {error}"));
+                        abort = Some(xray_operation_error(
+                            error,
+                            "Moxtek emission monitor failed during move",
+                        ));
                         set_xray_health(progress, xray.health());
                         set_beam(progress, xray.health().beam_on);
                         let _ = nano.stop();
@@ -1564,7 +2128,7 @@ fn commit_projection_monitored(
     root: &Path,
     parameters: &Parameters,
     config: &RealScanConfig,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     path: &Path,
     job: ProjectionJob,
     ticket: &MoveTicket,
@@ -1573,7 +2137,11 @@ fn commit_projection_monitored(
     cooldown_until: &mut Option<Instant>,
     final_projection: bool,
 ) -> Result<RealFrame, String> {
-    let mut frames = progress.lock().expect("scan progress mutex poisoned").frames.clone();
+    let mut frames = progress
+        .lock()
+        .expect("scan progress mutex poisoned")
+        .frames
+        .clone();
     thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel();
         scope.spawn(move || {
@@ -1583,17 +2151,34 @@ fn commit_projection_monitored(
                     index: job.index,
                     angle_deg: job.angle_deg,
                     exposure_ms: parameters.exposure_ms,
-                    file_name: path.file_name().and_then(|value| value.to_str())
-                        .unwrap_or("frame.nef").to_owned(),
-                    path: path.display().to_string(), bytes, sha256,
+                    file_name: path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("frame.nef")
+                        .to_owned(),
+                    path: path.display().to_string(),
+                    bytes,
+                    sha256,
                 };
                 check_cancel(cancel)?;
-                nano.capture_done(ticket.command_id)
+                nano.capture_done_cancelled(ticket.command_id, cancel.clone())
                     .map_err(|error| format!("CAPTURE_DONE view {} failed: {error}", job.index))?;
                 check_cancel(cancel)?;
                 frames.push(frame.clone());
-                let references = progress.lock().expect("scan progress mutex poisoned").references.clone();
-                persist(root, parameters, config, &frames, &references, "projections", false)?;
+                let references = progress
+                    .lock()
+                    .expect("scan progress mutex poisoned")
+                    .references
+                    .clone();
+                persist(
+                    root,
+                    parameters,
+                    config,
+                    &frames,
+                    &references,
+                    "projections",
+                    false,
+                )?;
                 push_frame(progress, frame.clone());
                 Ok(frame)
             })();
@@ -1606,16 +2191,20 @@ fn commit_projection_monitored(
             match receiver.recv_timeout(Duration::from_millis(25)) {
                 Ok(result) => {
                     if warning_off_after_commit {
-                        nano.set_xray_warning(false).map_err(|error|
-                            format!("XRAY_WARNING OFF failed after frame commit: {error}"))?;
+                        warning_after_off(nano, xray).map_err(|error| {
+                            format!("XRAY_WARNING OFF failed after frame commit: {error}")
+                        })?;
                     }
                     return abort.map_or(result, Err);
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) =>
-                    return Err("frame commit worker terminated without a result".into()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("frame commit worker terminated without a result".into())
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            if abort.is_some() || beam_started.is_none() { continue; }
+            if abort.is_some() || beam_started.is_none() {
+                continue;
+            }
             if cancel.load(Ordering::SeqCst) {
                 abort = Some(CANCELLED.into());
                 let _ = xray.force_off();
@@ -1642,10 +2231,13 @@ fn commit_projection_monitored(
                 }
             } else if last_poll.elapsed() >= Duration::from_millis(250) {
                 last_poll = Instant::now();
-                match xray.refresh_emission_status() {
+                match xray.refresh_emission_status_shared(cancel.clone()) {
                     Ok(health) => set_xray_health(progress, health),
                     Err(error) => {
-                        abort = Some(format!("Moxtek emission monitor failed during frame commit: {error}"));
+                        abort = Some(xray_operation_error(
+                            error,
+                            "Moxtek emission monitor failed during frame commit",
+                        ));
                         set_xray_health(progress, xray.health());
                         set_beam(progress, xray.health().beam_on);
                         let _ = nano.stop();
@@ -1656,12 +2248,54 @@ fn commit_projection_monitored(
     })
 }
 
-fn exposure_is_complete(
+struct ExposureEvidence {
+    session_id: String,
+    operation_id: String,
+    exposure_ended: bool,
     transfer_started: bool,
-    capture_elapsed: Duration,
-    evidence_timeout: Duration,
-) -> bool {
-    transfer_started || capture_elapsed >= evidence_timeout
+}
+impl ExposureEvidence {
+    fn new(session_id: String, operation_id: String) -> Self {
+        Self {
+            session_id,
+            operation_id,
+            exposure_ended: false,
+            transfer_started: false,
+        }
+    }
+    fn observe(&mut self, event: &CameraCaptureEvent) -> Result<(), String> {
+        let (session, operation) = match event {
+            CameraCaptureEvent::ExposureEnded {
+                session_id,
+                operation_id,
+            }
+            | CameraCaptureEvent::ObjectAdded {
+                session_id,
+                operation_id,
+                ..
+            }
+            | CameraCaptureEvent::TransferStarted {
+                session_id,
+                operation_id,
+                ..
+            } => (session_id, operation_id),
+            CameraCaptureEvent::FileComplete { image } => (&image.session_id, &image.operation_id),
+        };
+        if session != &self.session_id || operation != &self.operation_id {
+            return Err("Capture event belongs to a different session or operation".into());
+        }
+        match event {
+            CameraCaptureEvent::ExposureEnded { .. } => {
+                if self.exposure_ended {
+                    return Err("Duplicate ExposureEnded event".into());
+                }
+                self.exposure_ended = true;
+            }
+            CameraCaptureEvent::TransferStarted { .. } => self.transfer_started = true,
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn needs_cooldown_before_exposure(
@@ -1671,7 +2305,8 @@ fn needs_cooldown_before_exposure(
     required_budget: Duration,
 ) -> bool {
     now.saturating_duration_since(beam_started)
-        .saturating_add(required_budget) >= block_limit
+        .saturating_add(required_budget)
+        >= block_limit
 }
 
 fn update(progress: &Mutex<RealScanProgress>, apply: impl FnOnce(&mut RealScanProgress)) {
@@ -1724,7 +2359,11 @@ fn persist_scan_log(
         .open(root.join("scan.log"))
         .map_err(io_error)?;
     let mut writer = BufWriter::new(file);
-    let messages = progress.lock().expect("scan progress mutex poisoned").messages.clone();
+    let messages = progress
+        .lock()
+        .expect("scan progress mutex poisoned")
+        .messages
+        .clone();
     write_scan_log(&mut writer, &messages, result)?;
     writer.flush().map_err(io_error)?;
     writer.get_ref().sync_all().map_err(io_error)?;
@@ -1738,8 +2377,15 @@ fn write_scan_log(
 ) -> Result<(), String> {
     writeln!(writer, "Micro-CT scan log").map_err(io_error)?;
     for event in messages {
-        writeln!(writer, "{}\t{}\t{}\t{}", event.timestamp, event.level, event.source, event.message.replace(['\r', '\n'], " "))
-            .map_err(io_error)?;
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}",
+            event.timestamp,
+            event.level,
+            event.source,
+            event.message.replace(['\r', '\n'], " ")
+        )
+        .map_err(io_error)?;
     }
     let outcome = match result {
         Ok(ScanCompletion::Completed) => "COMPLETED".to_owned(),
@@ -1787,7 +2433,9 @@ fn persist(
     completed: bool,
 ) -> Result<(), String> {
     let manifest = ScanManifest {
-        schema_version: 2,
+        schema_version: 3,
+        capture_profile: &config.capture_profile,
+        max_xray_sec: config.max_xray_sec,
         scan_id: &parameters.task_id,
         created_at: timestamp(),
         completed,
@@ -1848,18 +2496,42 @@ fn replace_manifest(staging: &Path, destination: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "Kernel32")]
     extern "system" {
-        fn ReplaceFileW(replaced: *const u16, replacement: *const u16,
-            backup: *const u16, flags: u32, exclude: *const std::ffi::c_void,
-            reserved: *const std::ffi::c_void) -> i32;
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *const std::ffi::c_void,
+            reserved: *const std::ffi::c_void,
+        ) -> i32;
     }
-    if !destination.exists() { return fs::rename(staging, destination).map_err(io_error); }
-    let wide = |path: &Path| path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    if !destination.exists() {
+        return fs::rename(staging, destination).map_err(io_error);
+    }
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
     let destination_wide = wide(destination);
     let staging_wide = wide(staging);
     // ReplaceFileW keeps the prior manifest intact if replacement fails.
-    let replaced = unsafe { ReplaceFileW(destination_wide.as_ptr(), staging_wide.as_ptr(),
-        std::ptr::null(), 0, std::ptr::null(), std::ptr::null()) };
-    if replaced == 0 { Err(io_error(std::io::Error::last_os_error())) } else { Ok(()) }
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            staging_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(io_error(std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(windows))]
@@ -1868,11 +2540,26 @@ fn replace_manifest(staging: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn persist_progress(
-    root: &Path, parameters: &Parameters, config: &RealScanConfig,
-    progress: &Mutex<RealScanProgress>, stage: &str, completed: bool,
+    root: &Path,
+    parameters: &Parameters,
+    config: &RealScanConfig,
+    progress: &Mutex<RealScanProgress>,
+    stage: &str,
+    completed: bool,
 ) -> Result<(), String> {
-    let state = progress.lock().expect("scan progress mutex poisoned").clone();
-    persist(root, parameters, config, &state.frames, &state.references, stage, completed)
+    let state = progress
+        .lock()
+        .expect("scan progress mutex poisoned")
+        .clone();
+    persist(
+        root,
+        parameters,
+        config,
+        &state.frames,
+        &state.references,
+        stage,
+        completed,
+    )
 }
 
 fn io_error(error: std::io::Error) -> String {
@@ -1885,75 +2572,187 @@ mod tests {
     use crate::devices::turntable::{LineTransport, EXPECTED_DEVICE};
     use std::collections::VecDeque;
 
+    fn test_profile_for_exposure(exposure_ms: f64) -> CaptureProfile {
+        let profile = crate::capture_profile::test_profile();
+        let mut readback = profile.readback;
+        assert_eq!(exposure_ms, 1000.0);
+        readback.insert(
+            "shutter".into(),
+            crate::devices::camera::CameraValue::Integer(0x00010001),
+        );
+        CaptureProfile::from_readback(profile.identity, readback, None).unwrap()
+    }
+
     fn test_reference_series(root: &Path, group: &str) -> Vec<ReferenceFrame> {
         let dir = root.join("references").join(group).join("frames");
         fs::create_dir_all(&dir).unwrap();
-        (1..=REFERENCE_COUNT as u32).map(|index| {
-            let file_name = format!("frame-{index:04}.nef");
-            let path = dir.join(&file_name);
-            fs::write(&path, format!("{group} reference {index}")).unwrap();
-            let (bytes, sha256) = hash_file(&path).unwrap();
-            ReferenceFrame { index, exposure_ms: 1000.0, file_name,
-                path: path.to_string_lossy().into_owned(), bytes, sha256 }
-        }).collect()
+        (1..=REFERENCE_COUNT as u32)
+            .map(|index| {
+                let file_name = format!("frame-{index:04}.nef");
+                let path = dir.join(&file_name);
+                fs::write(&path, format!("{group} reference {index}")).unwrap();
+                let (bytes, sha256) = hash_file(&path).unwrap();
+                ReferenceFrame {
+                    index,
+                    exposure_ms: 1000.0,
+                    file_name,
+                    path: path.to_string_lossy().into_owned(),
+                    bytes,
+                    sha256,
+                }
+            })
+            .collect()
     }
 
     #[test]
     fn restore_keeps_274_verified_frames_and_rejects_an_uncommitted_275th() {
-        let run_id = format!("{}-restore-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), std::process::id());
+        let run_id = format!(
+            "{}-restore-{}",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+            std::process::id()
+        );
         let run = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/tests/ct-engine").join(run_id);
+            .join("../../tmp/tests/ct-engine")
+            .join(run_id);
         let root = run.join("demo6");
         let frames_dir = root.join("frames");
         fs::create_dir_all(&frames_dir).unwrap();
         fs::write(run.join("command.txt"), "cargo test -p ct-engine scan::tests::restore_keeps_274_verified_frames_and_rejects_an_uncommitted_275th\n").unwrap();
         let parameters = Parameters {
-            task_id: "demo6".into(), save_path: run.to_string_lossy().into_owned(),
-            projection_count: 360, angle_step_deg: 1.0, exposure_ms: 1000.0,
+            task_id: "demo6".into(),
+            save_path: run.to_string_lossy().into_owned(),
+            projection_count: 360,
+            angle_step_deg: 1.0,
+            exposure_ms: 1000.0,
         };
-        let config = RealScanConfig { parameters: parameters.clone(), max_xray_sec: 600,
-            voltage_kv: 59.9, current_ua: 200.0, resume: None,
-            geometry: ScanGeometry { sod_mm: 100.0, object_to_detector_mm: 100.0,
-                detector_width_mm: 100.0, center_offset_x_mm: 0.0, center_offset_y_mm: 0.0,
-                rotation_direction: "clockwise".into(), mirror_x: false, measurement: "measured".into() } };
+        let config = RealScanConfig {
+            capture_profile: test_profile_for_exposure(parameters.exposure_ms),
+            parameters: parameters.clone(),
+            max_xray_sec: 600,
+            voltage_kv: 59.9,
+            current_ua: 200.0,
+            resume: None,
+            geometry: ScanGeometry {
+                sod_mm: 100.0,
+                object_to_detector_mm: 100.0,
+                detector_width_mm: 100.0,
+                center_offset_x_mm: 0.0,
+                center_offset_y_mm: 0.0,
+                rotation_direction: "clockwise".into(),
+                mirror_x: false,
+                measurement: "measured".into(),
+            },
+        };
         let mut committed = Vec::new();
         for index in 1..=274 {
             let path = frames_dir.join(format!("frame-{index:04}.nef"));
             fs::write(&path, format!("verified projection {index}")).unwrap();
             let (bytes, sha256) = hash_file(&path).unwrap();
             committed.push(RealFrame {
-                index, angle_deg: projection_job(index - 1, 360).angle_deg,
-                exposure_ms: 1000.0, file_name: format!("frame-{index:04}.nef"),
-                path: path.to_string_lossy().into_owned(), bytes, sha256,
+                index,
+                angle_deg: projection_job(index - 1, 360).angle_deg,
+                exposure_ms: 1000.0,
+                file_name: format!("frame-{index:04}.nef"),
+                path: path.to_string_lossy().into_owned(),
+                bytes,
+                sha256,
             });
         }
-        persist(&root, &parameters, &config, &committed, &ReferenceFrames::default(), "projections", false).unwrap();
-        assert!(load_resume(&parameters, 59.9, 200.0).unwrap_err().contains("stage and committed"),
-            "projection restore must reject missing pre-scan references");
+        persist(
+            &root,
+            &parameters,
+            &config,
+            &committed,
+            &ReferenceFrames::default(),
+            "projections",
+            false,
+        )
+        .unwrap();
+        assert!(
+            load_resume(&parameters, 59.9, 200.0, &config.capture_profile)
+                .unwrap_err()
+                .contains("stage and committed"),
+            "projection restore must reject missing pre-scan references"
+        );
         let mut references = ReferenceFrames {
             pre_dark: test_reference_series(&root, "pre-dark"),
             pre_flat: test_reference_series(&root, "pre-flat"),
             ..ReferenceFrames::default()
         };
-        persist(&root, &parameters, &config, &committed, &references, "projections", false).unwrap();
+        persist(
+            &root,
+            &parameters,
+            &config,
+            &committed,
+            &references,
+            "projections",
+            false,
+        )
+        .unwrap();
         assert!(manifest_file_exists(&parameters));
         assert!(resume_manifest_exists(&parameters));
-        assert_eq!(load_resume(&parameters, 59.9, 200.0).unwrap().frames, committed);
+        assert_eq!(
+            load_resume(&parameters, 59.9, 200.0, &config.capture_profile)
+                .unwrap()
+                .frames,
+            committed
+        );
         assert_eq!(projection_job(committed.len() as u32, 360).index, 275);
-        assert_eq!(projection_job(committed.len() as u32, 360).angle_deg, -274.0);
+        assert_eq!(
+            projection_job(committed.len() as u32, 360).angle_deg,
+            -274.0
+        );
         let incomplete = frames_dir.join("frame-0275.nef");
         fs::write(&incomplete, b"incomplete exposure").unwrap();
-        assert!(load_resume(&parameters, 59.9, 200.0).unwrap_err().contains("uncommitted"));
+        assert!(
+            load_resume(&parameters, 59.9, 200.0, &config.capture_profile)
+                .unwrap_err()
+                .contains("uncommitted")
+        );
         fs::remove_file(incomplete).unwrap();
-        assert_eq!(load_resume(&parameters, 59.9, 200.0).unwrap().frames.len(), 274);
+        assert_eq!(
+            load_resume(&parameters, 59.9, 200.0, &config.capture_profile)
+                .unwrap()
+                .frames
+                .len(),
+            274
+        );
         references.post_flat = test_reference_series(&root, "post-flat");
         references.post_dark = test_reference_series(&root, "post-dark");
-        persist(&root, &parameters, &config, &committed, &references, "postDark", false).unwrap();
-        assert!(load_resume(&parameters, 59.9, 200.0).unwrap_err().contains("stage and committed"),
-            "post-dark checkpoint cannot claim completion before the last projection");
-        persist(&root, &parameters, &config, &committed, &references, "completed", true).unwrap();
-        assert!(!resume_manifest_exists(&parameters), "a completed manifest is not a resumable checkpoint");
-        assert!(!completed_manifest_exists(&parameters), "incomplete projections cannot unlock reconstruction");
+        persist(
+            &root,
+            &parameters,
+            &config,
+            &committed,
+            &references,
+            "postDark",
+            false,
+        )
+        .unwrap();
+        assert!(
+            load_resume(&parameters, 59.9, 200.0, &config.capture_profile)
+                .unwrap_err()
+                .contains("stage and committed"),
+            "post-dark checkpoint cannot claim completion before the last projection"
+        );
+        persist(
+            &root,
+            &parameters,
+            &config,
+            &committed,
+            &references,
+            "completed",
+            true,
+        )
+        .unwrap();
+        assert!(
+            !resume_manifest_exists(&parameters),
+            "a completed manifest is not a resumable checkpoint"
+        );
+        assert!(
+            !completed_manifest_exists(&parameters),
+            "incomplete projections cannot unlock reconstruction"
+        );
         fs::write(run.join("summary.md"), "PASS: 274 committed frames reload; an extra partial frame blocks restore; removing only the partial frame permits view 275.\n").unwrap();
     }
 
@@ -1961,34 +2760,110 @@ mod tests {
     fn completed_scan_needs_only_pre_scan_references() {
         let run = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp/tests/ct-engine")
-            .join(format!("{}-pre-only-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), std::process::id()));
+            .join(format!(
+                "{}-pre-only-{}",
+                chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+                std::process::id()
+            ));
         let root = run.join("pre-only");
         let frames_dir = root.join("frames");
         fs::create_dir_all(&frames_dir).unwrap();
         let path = frames_dir.join("frame-0001.nef");
         fs::write(&path, b"projection").unwrap();
         let (bytes, sha256) = hash_file(&path).unwrap();
-        let frame = RealFrame { index: 1, angle_deg: 0.0, exposure_ms: 1000.0,
-            file_name: "frame-0001.nef".into(), path: path.to_string_lossy().into_owned(), bytes, sha256 };
-        let parameters = Parameters { task_id: "pre-only".into(), save_path: run.to_string_lossy().into_owned(),
-            projection_count: 1, angle_step_deg: 360.0, exposure_ms: 1000.0 };
-        let config = RealScanConfig { parameters: parameters.clone(), voltage_kv: 59.9, current_ua: 200.0,
-            max_xray_sec: 600, geometry: ScanGeometry { sod_mm: 100.0, object_to_detector_mm: 100.0,
-                detector_width_mm: 40.0, center_offset_x_mm: 0.0, center_offset_y_mm: 0.0,
-                rotation_direction: "counterclockwise".into(), mirror_x: false,
-                measurement: "measured".into() }, resume: None };
-        let references = ReferenceFrames { pre_dark: test_reference_series(&root, "pre-dark"),
-            pre_flat: test_reference_series(&root, "pre-flat"), ..ReferenceFrames::default() };
-        persist(&root, &parameters, &config, &[frame], &references, "completed", true).unwrap();
+        let frame = RealFrame {
+            index: 1,
+            angle_deg: 0.0,
+            exposure_ms: 1000.0,
+            file_name: "frame-0001.nef".into(),
+            path: path.to_string_lossy().into_owned(),
+            bytes,
+            sha256,
+        };
+        let parameters = Parameters {
+            task_id: "pre-only".into(),
+            save_path: run.to_string_lossy().into_owned(),
+            projection_count: 1,
+            angle_step_deg: 360.0,
+            exposure_ms: 1000.0,
+        };
+        let config = RealScanConfig {
+            capture_profile: test_profile_for_exposure(parameters.exposure_ms),
+            parameters: parameters.clone(),
+            voltage_kv: 59.9,
+            current_ua: 200.0,
+            max_xray_sec: 600,
+            geometry: ScanGeometry {
+                sod_mm: 100.0,
+                object_to_detector_mm: 100.0,
+                detector_width_mm: 40.0,
+                center_offset_x_mm: 0.0,
+                center_offset_y_mm: 0.0,
+                rotation_direction: "counterclockwise".into(),
+                mirror_x: false,
+                measurement: "measured".into(),
+            },
+            resume: None,
+        };
+        let references = ReferenceFrames {
+            pre_dark: test_reference_series(&root, "pre-dark"),
+            pre_flat: test_reference_series(&root, "pre-flat"),
+            ..ReferenceFrames::default()
+        };
+        persist(
+            &root,
+            &parameters,
+            &config,
+            &[frame],
+            &references,
+            "completed",
+            true,
+        )
+        .unwrap();
         assert!(completed_manifest_exists(&parameters));
+        let path = root.join("manifest.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_reader(File::open(&path).unwrap()).unwrap();
+        legacy["schemaVersion"] = json!(2);
+        legacy.as_object_mut().unwrap().remove("captureProfile");
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(
+            completed_manifest_exists(&parameters),
+            "legacy completed scans remain readable"
+        );
+        legacy["completed"] = json!(false);
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let unfinished_before = fs::read(&path).unwrap();
+        assert!(
+            load_resume(&parameters, 59.9, 200.0, &config.capture_profile)
+                .unwrap_err()
+                .contains("LEGACY_SCHEMA_2")
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            unfinished_before,
+            "rejected legacy resume never rewrites data"
+        );
+        fs::write(&path, before).unwrap();
     }
 
     #[test]
     fn stopped_outcome_requires_confirmed_beam_and_warning_off() {
-        assert_eq!(finish_scan_result(Err(CANCELLED.into()), Ok(()), Ok(())).unwrap(), ScanCompletion::Stopped);
-        assert!(finish_scan_result(Err(CANCELLED.into()), Err("readback lost".into()), Ok(())).is_err());
-        assert!(finish_scan_result(Err(CANCELLED.into()), Ok(()), Err("warning stuck".into())).is_err());
-        assert_eq!(finish_scan_result(Ok(()), Ok(()), Ok(())).unwrap(), ScanCompletion::Completed);
+        assert_eq!(
+            finish_scan_result(Err(CANCELLED.into()), Ok(()), Ok(())).unwrap(),
+            ScanCompletion::Stopped
+        );
+        assert!(
+            finish_scan_result(Err(CANCELLED.into()), Err("readback lost".into()), Ok(())).is_err()
+        );
+        assert!(
+            finish_scan_result(Err(CANCELLED.into()), Ok(()), Err("warning stuck".into())).is_err()
+        );
+        assert_eq!(
+            finish_scan_result(Ok(()), Ok(()), Ok(())).unwrap(),
+            ScanCompletion::Completed
+        );
     }
 
     #[test]
@@ -2001,15 +2876,298 @@ mod tests {
     #[test]
     fn scan_log_keeps_the_fault_and_all_scan_events() {
         let messages = vec![
-            ScanMessage { timestamp: "2026-09-28T10:00:00Z".into(), level: "ACTION", source: "nano", message: "Verifying final position".into() },
-            ScanMessage { timestamp: "2026-09-28T10:00:01Z".into(), level: "ERR", source: "system", message: "final Nano STATUS failed\nread timed out".into() },
+            ScanMessage {
+                timestamp: "2026-09-28T10:00:00Z".into(),
+                level: "ACTION",
+                source: "nano",
+                message: "Verifying final position".into(),
+            },
+            ScanMessage {
+                timestamp: "2026-09-28T10:00:01Z".into(),
+                level: "ERR",
+                source: "system",
+                message: "final Nano STATUS failed\nread timed out".into(),
+            },
         ];
         let mut output = Vec::new();
-        write_scan_log(&mut output, &messages, &Err("final Nano STATUS failed: read timed out".into())).unwrap();
+        write_scan_log(
+            &mut output,
+            &messages,
+            &Err("final Nano STATUS failed: read timed out".into()),
+        )
+        .unwrap();
         let log = String::from_utf8(output).unwrap();
         assert!(log.contains("2026-09-28T10:00:00Z\tACTION\tnano\tVerifying final position"));
-        assert!(log.contains("2026-09-28T10:00:01Z\tERR\tsystem\tfinal Nano STATUS failed read timed out"));
+        assert!(log.contains(
+            "2026-09-28T10:00:01Z\tERR\tsystem\tfinal Nano STATUS failed read timed out"
+        ));
         assert!(log.contains("\tRESULT\tsystem\tFAULT: final Nano STATUS failed: read timed out"));
+    }
+
+    #[derive(Default)]
+    struct PipelineNanoState {
+        lines: VecDeque<String>,
+        writes: Vec<String>,
+        position: i64,
+        capture_id: u32,
+        rearmed: bool,
+        homed: bool,
+    }
+    struct PipelineNano(Arc<Mutex<PipelineNanoState>>);
+    impl LineTransport for PipelineNano {
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let id = fields.get(1).copied().unwrap_or("0");
+            let mut state = self.0.lock().unwrap();
+            state.writes.push(line.into());
+            match fields[0] {
+                "PING" => {
+                    state.lines.push_back(format!("ACK {id} PING"));
+                    state.lines.push_back(format!("PONG {id}"));
+                }
+                "INFO" => {
+                    state.lines.push_back(format!("ACK {id} INFO"));
+                    state.lines.push_back(format!("INFO {id} DEVICE={EXPECTED_DEVICE} VERSION=2.1.0 PROTOCOL=2 BUILD=offline-test BUZZER=1 CAPS=HEARTBEAT_ACK,XRAY_WARNING"));
+                }
+                "HEARTBEAT" => state.lines.push_back(format!("HBACK {id}")),
+                "STATUS" => {
+                    let position = state.position;
+                    let capture_id = state.capture_id;
+                    let phase = if !state.rearmed {
+                        "LOCKED"
+                    } else if capture_id == 0 {
+                        "IDLE"
+                    } else {
+                        "CAPTURE_HOLD"
+                    };
+                    let homed = u8::from(state.homed);
+                    let rearmed = u8::from(state.rearmed);
+                    state.lines.push_back(format!("ACK {id} STATUS"));
+                    state.lines.push_back(format!("STATUS {id} state={phase} pos={position} target={position} microsteps=8 ppr=96000 reference={homed} homed={homed} rearmed={rearmed} hall=0 capture_id={capture_id}"));
+                }
+                "MOVE_REL" => {
+                    let delta = fields[2].parse::<i64>().unwrap();
+                    assert!((-360000..=0).contains(&delta));
+                    state.position -= ((-delta) * 96000 + 180000) / 360000;
+                    state.capture_id = id.parse().unwrap();
+                    let position = state.position;
+                    state.lines.push_back(format!("ACK {id} MOVE_REL"));
+                    state
+                        .lines
+                        .push_back(format!("READY_TO_CAPTURE {id} POS={position}"));
+                }
+                "CAPTURE_DONE" => {
+                    if id.parse::<u32>().unwrap() != state.capture_id {
+                        state
+                            .lines
+                            .push_back(format!("ERR {id} CAPTURE_ID_MISMATCH"));
+                    } else {
+                        state.capture_id = 0;
+                        state.lines.push_back(format!("ACK {id} CAPTURE_DONE"));
+                        state.lines.push_back(format!("IDLE {id} CAPTURE_RELEASED"));
+                    }
+                }
+                "XRAY_WARNING" => {
+                    state.lines.push_back(format!("ACK {id} XRAY_WARNING"));
+                    state
+                        .lines
+                        .push_back(format!("OK {id} XRAY_WARNING={}", fields[2]));
+                }
+                "STOP" => {
+                    state.rearmed = false;
+                    state.homed = false;
+                    state.capture_id = 0;
+                    state.lines.push_back(format!("ACK {id} STOP"));
+                    state
+                        .lines
+                        .push_back(format!("STOPPED {id} POSITION_UNKNOWN reason=HOST_STOP"));
+                }
+                _ => panic!("Unexpected physical command in offline scan fake: {line}"),
+            }
+            Ok(())
+        }
+        fn read_line(&mut self, timeout: Duration) -> std::io::Result<Option<String>> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(line) = self.0.lock().unwrap().lines.pop_front() {
+                    return Ok(Some(line));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    fn pipeline_nano() -> (Arc<NanoAdapter>, Arc<Mutex<PipelineNanoState>>) {
+        let state = Arc::new(Mutex::new(PipelineNanoState {
+            rearmed: true,
+            homed: true,
+            ..Default::default()
+        }));
+        state.lock().unwrap().lines.push_back(format!("READY DEVICE={EXPECTED_DEVICE} VERSION=2.1.0 PROTOCOL=2 BUILD=offline-test BUZZER=1 CAPS=HEARTBEAT_ACK,XRAY_WARNING"));
+        let mut adapter = NanoAdapter::new();
+        adapter
+            .connect_transport_for_test("MEMORY-SCAN-ONLY", Box::new(PipelineNano(state.clone())))
+            .unwrap();
+        (Arc::new(adapter), state)
+    }
+    fn pipeline_config(run: &Path, task: &str, camera: &CameraAdapter) -> RealScanConfig {
+        let profile = CaptureProfile::from_readback(
+            camera.health().identity.unwrap(),
+            camera.profile_readback().unwrap(),
+            None,
+        )
+        .unwrap();
+        RealScanConfig {
+            parameters: Parameters {
+                task_id: task.into(),
+                save_path: run.to_string_lossy().into(),
+                projection_count: 3,
+                angle_step_deg: 120.0,
+                exposure_ms: 200.0,
+            },
+            capture_profile: profile,
+            max_xray_sec: 600,
+            voltage_kv: 20.0,
+            current_ua: 100.0,
+            geometry: ScanGeometry {
+                sod_mm: 100.0,
+                object_to_detector_mm: 100.0,
+                detector_width_mm: 40.0,
+                center_offset_x_mm: 0.0,
+                center_offset_y_mm: 0.0,
+                rotation_direction: "counterclockwise".into(),
+                mirror_x: false,
+                measurement: "measured".into(),
+            },
+            resume: None,
+        }
+    }
+    fn complete_pipeline(
+        mut handle: RealScanHandle,
+        camera: &CameraAdapter,
+        probe: &crate::devices::xray::TestXrayProbe,
+        task: &str,
+    ) -> (ScanOutcome, bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut confirmed = std::collections::BTreeSet::new();
+        let mut early_off = false;
+        loop {
+            let progress = handle.progress();
+            if let Some(stage) = progress.prompt {
+                if !confirmed.contains(stage) && handle.confirm_stage(stage).is_ok() {
+                    confirmed.insert(stage);
+                }
+            }
+            let health = camera.health();
+            if health.busy
+                && health
+                    .operation_id
+                    .as_ref()
+                    .is_some_and(|id| id.starts_with(&format!("scan-{task}-3-")))
+                && !probe.output_enabled()
+                && progress.captured < 3
+            {
+                early_off = true;
+            }
+            if let Some(outcome) = handle.try_finish() {
+                return (outcome.unwrap(), early_off);
+            }
+            if Instant::now() >= deadline {
+                handle.cancel_only();
+                panic!(
+                    "Offline production coordinator did not complete: {:?}",
+                    handle.progress()
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn production_coordinator_two_rounds_preserve_continuous_groups_and_end_beam_before_final_file()
+    {
+        use crate::devices::camera::{scripted_camera, ScriptedCameraConfig};
+        let run = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/tests/ct-engine")
+            .join(format!(
+                "{}-native-production-coordinator",
+                chrono::Local::now().format("%Y%m%d-%H%M%S")
+            ));
+        fs::create_dir_all(&run).unwrap();
+        fs::write(
+            run.join("command.txt"),
+            "cargo test -p ct-engine scan::tests::production_coordinator_two_rounds\n",
+        )
+        .unwrap();
+        let (nano, state) = pipeline_nano();
+        let camera = scripted_camera(ScriptedCameraConfig {
+            exposure_delay: Duration::from_millis(5),
+            transfer_delay: Duration::from_millis(150),
+            omit_exposure_end: false,
+            truncate_raw: false,
+            close_failure: false,
+        });
+        let (xray, probe) = crate::devices::xray::test_worker(20.0, 100.0);
+        let initial = probe.beam_transitions().len();
+        for (task, expected_position) in [("round-a", -64000), ("round-b", -160000)] {
+            let config = pipeline_config(&run, task, &camera);
+            let parameters = config.parameters.clone();
+            let handle = RealScanHandle::start(nano.clone(), camera.clone(), xray.clone(), config);
+            let (outcome, early_off) = complete_pipeline(handle, &camera, &probe, task);
+            assert_eq!(outcome.result.as_ref().unwrap(), &ScanCompletion::Completed);
+            assert!(
+                early_off,
+                "final ExposureEnded closes output while transfer/file commit remains pending"
+            );
+            assert!(completed_manifest_exists(&parameters));
+            let manifest: serde_json::Value =
+                serde_json::from_reader(File::open(run.join(task).join("manifest.json")).unwrap())
+                    .unwrap();
+            assert_eq!(manifest["schemaVersion"], 3);
+            assert_eq!(manifest["frames"].as_array().unwrap().len(), 3);
+            assert_eq!(
+                manifest["references"]["preDark"].as_array().unwrap().len(),
+                10
+            );
+            assert_eq!(
+                manifest["references"]["preFlat"].as_array().unwrap().len(),
+                10
+            );
+            assert_eq!(
+                manifest["references"]["postDark"].as_array().unwrap().len(),
+                0
+            );
+            assert_eq!(
+                manifest["references"]["postFlat"].as_array().unwrap().len(),
+                0
+            );
+            assert_eq!(nano.status().unwrap().position_pulses, expected_position);
+            assert!(!probe.output_enabled());
+        }
+        let transitions = probe.beam_transitions();
+        assert_eq!(
+            transitions[initial..]
+                .iter()
+                .filter(|(enabled, _)| *enabled)
+                .count(),
+            4,
+            "one pre-flat block and one projection block per scan"
+        );
+        let state = state.lock().unwrap();
+        assert!(!state
+            .writes
+            .iter()
+            .any(|line| line.starts_with("HOME ") || line.starts_with("MOVE_ABS ")));
+        assert_eq!(
+            state
+                .writes
+                .iter()
+                .filter(|line| line.starts_with("CAPTURE_DONE "))
+                .count(),
+            6
+        );
+        fs::write(run.join("summary.md"),"PASS: same production scan coordinator and all three production workers; two rounds, 10+10 front references, 3 projections, continuous blocks, ExposureEnded before file commit, matching hold release, no terminal HOME, original synthetic NEF retained. Only offline verification.\n").unwrap();
     }
 
     struct DeferredMoveTransport {
@@ -2024,27 +3182,41 @@ mod tests {
             let mut lines = self.lines.lock().unwrap();
             let id = fields.get(1).copied().unwrap_or("0");
             match fields[0] {
-                "PING" => { lines.push_back(format!("ACK {id} PING")); lines.push_back(format!("PONG {id}")); }
+                "PING" => {
+                    lines.push_back(format!("ACK {id} PING"));
+                    lines.push_back(format!("PONG {id}"));
+                }
                 "INFO" => {
                     lines.push_back(format!("ACK {id} INFO"));
                     lines.push_back(format!("INFO {id} DEVICE={EXPECTED_DEVICE} VERSION=2.1.0 PROTOCOL=2 BUILD=test BUZZER=1 CAPS=HEARTBEAT_ACK,XRAY_WARNING"));
                 }
                 "HEARTBEAT" => lines.push_back(format!("HBACK {id}")),
-                "MOVE_ABS" => {
+                "MOVE_REL" => {
                     self.capture_id = id.parse().unwrap();
-                    lines.push_back(format!("ACK {id} MOVE_ABS"));
+                    lines.push_back(format!("ACK {id} MOVE_REL"));
                     self.announced.send(self.capture_id).unwrap();
                     // The test withholds READY_TO_CAPTURE until it has sampled
                     // the live progress while this motion is still pending.
                 }
                 "STATUS" => {
                     lines.push_back(format!("ACK {id} STATUS"));
-                    lines.push_back(format!("STATUS {id} state=CAPTURE_HOLD pos=-24000 target=-24000 microsteps=8 ppr=96000 reference=1 homed=1 rearmed=1 hall=0 capture_id={}", self.capture_id));
+                    let (state, position) = if self.capture_id == 0 {
+                        ("IDLE", 0)
+                    } else {
+                        ("CAPTURE_HOLD", -24000)
+                    };
+                    lines.push_back(format!("STATUS {id} state={state} pos={position} target={position} microsteps=8 ppr=96000 reference=1 homed=1 rearmed=1 hall=0 capture_id={}", self.capture_id));
                 }
-                "STOP" => { lines.push_back(format!("ACK {id} STOP")); lines.push_back(format!("STOPPED {id} POS=-24000")); }
+                "STOP" => {
+                    lines.push_back(format!("ACK {id} STOP"));
+                    lines.push_back(format!("STOPPED {id} POS=-24000"));
+                }
                 "XRAY_WARNING" => {
                     lines.push_back(format!("ACK {id} XRAY_WARNING"));
-                    lines.push_back(format!("OK {id} XRAY_WARNING={}", fields.get(2).unwrap_or(&"OFF")));
+                    lines.push_back(format!(
+                        "OK {id} XRAY_WARNING={}",
+                        fields.get(2).unwrap_or(&"OFF")
+                    ));
                 }
                 _ => {}
             }
@@ -2053,8 +3225,12 @@ mod tests {
         fn read_line(&mut self, timeout: Duration) -> std::io::Result<Option<String>> {
             let deadline = Instant::now() + timeout;
             loop {
-                if let Some(line) = self.lines.lock().unwrap().pop_front() { return Ok(Some(line)); }
-                if Instant::now() >= deadline { return Ok(None); }
+                if let Some(line) = self.lines.lock().unwrap().pop_front() {
+                    return Ok(Some(line));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
                 thread::sleep(Duration::from_millis(1));
             }
         }
@@ -2067,25 +3243,45 @@ mod tests {
         )])));
         let (announced, receiver) = std::sync::mpsc::channel();
         let mut adapter = NanoAdapter::new();
-        adapter.connect_transport_for_test("MEMORY-ONLY", Box::new(DeferredMoveTransport {
-            lines: lines.clone(), announced, capture_id: 0,
-        })).unwrap();
+        adapter
+            .connect_transport_for_test(
+                "MEMORY-ONLY",
+                Box::new(DeferredMoveTransport {
+                    lines: lines.clone(),
+                    announced,
+                    capture_id: 0,
+                }),
+            )
+            .unwrap();
         let adapter = Arc::new(adapter);
         let progress = Arc::new(Mutex::new(RealScanProgress::default()));
         let worker_adapter = adapter.clone();
         let worker_progress = progress.clone();
-        let worker = thread::spawn(move || move_to_projection(&worker_adapter, &worker_progress, projection_job(1, 4), &AtomicBool::new(false)));
+        let worker = thread::spawn(move || {
+            move_to_projection(
+                &worker_adapter,
+                &worker_progress,
+                projection_job(1, 4),
+                &Arc::new(AtomicBool::new(false)),
+            )
+        });
         let arrival = receiver.recv_timeout(Duration::from_secs(2));
         let before = progress.lock().unwrap().angle_deg;
         if let Ok(id) = arrival {
-            lines.lock().unwrap().push_back(format!("READY_TO_CAPTURE {id} POS=-24000"));
+            lines
+                .lock()
+                .unwrap()
+                .push_back(format!("READY_TO_CAPTURE {id} POS=-24000"));
         } else {
             let _ = adapter.stop();
         }
         let result = worker.join().unwrap();
         assert!(arrival.is_ok(), "in-memory motion was not issued");
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(before, 0.0, "a target must not appear as current feedback before arrival");
+        assert_eq!(
+            before, 0.0,
+            "a target must not appear as current feedback before arrival"
+        );
         assert_eq!(progress.lock().unwrap().angle_deg, -90.0);
     }
 
@@ -2093,10 +3289,18 @@ mod tests {
     fn committing_an_older_frame_does_not_rewind_prefetched_live_position() {
         let progress = Mutex::new(RealScanProgress::default());
         set_angle(&progress, -90.0);
-        push_frame(&progress, RealFrame {
-            index:1, angle_deg:0.0, exposure_ms:200.0, file_name:"frame-0001.nef".into(),
-            path:"memory-only".into(), bytes:1, sha256:"test".into(),
-        });
+        push_frame(
+            &progress,
+            RealFrame {
+                index: 1,
+                angle_deg: 0.0,
+                exposure_ms: 200.0,
+                file_name: "frame-0001.nef".into(),
+                path: "memory-only".into(),
+                bytes: 1,
+                sha256: "test".into(),
+            },
+        );
         let state = progress.lock().unwrap();
         assert_eq!(state.captured, 1);
         assert_eq!(state.frames[0].angle_deg, 0.0);
@@ -2104,19 +3308,39 @@ mod tests {
     }
 
     #[test]
-    fn exposure_boundary_accepts_transfer_start_or_configured_time_evidence() {
-        let timeout = Duration::from_millis(2_200);
-        assert!(!exposure_is_complete(
-            false,
-            Duration::from_millis(2_199),
-            timeout
-        ));
-        assert!(exposure_is_complete(
-            true,
-            Duration::from_millis(100),
-            timeout
-        ));
-        assert!(exposure_is_complete(false, timeout, timeout));
+    fn exposure_boundary_requires_this_operations_event_and_rejects_old_or_duplicate_events() {
+        let mut evidence = ExposureEvidence::new("session-1".into(), "capture-1".into());
+        evidence
+            .observe(&CameraCaptureEvent::TransferStarted {
+                session_id: "session-1".into(),
+                operation_id: "capture-1".into(),
+                size: 50,
+            })
+            .unwrap();
+        assert!(
+            !evidence.exposure_ended,
+            "file transfer does not prove exposure end"
+        );
+        assert!(evidence
+            .observe(&CameraCaptureEvent::ExposureEnded {
+                session_id: "old-session".into(),
+                operation_id: "capture-1".into()
+            })
+            .is_err());
+        assert!(evidence
+            .observe(&CameraCaptureEvent::ExposureEnded {
+                session_id: "session-1".into(),
+                operation_id: "old-capture".into()
+            })
+            .is_err());
+        assert!(!evidence.exposure_ended);
+        let event = CameraCaptureEvent::ExposureEnded {
+            session_id: "session-1".into(),
+            operation_id: "capture-1".into(),
+        };
+        evidence.observe(&event).unwrap();
+        assert!(evidence.exposure_ended);
+        assert!(evidence.observe(&event).is_err());
     }
 
     #[test]
@@ -2126,13 +3350,22 @@ mod tests {
         let limit = Duration::from_secs(600);
         let exposure_budget = Duration::from_secs(5);
         assert!(needs_cooldown_before_exposure(
-            started, now, limit, exposure_budget + MOVE_BUDGET_MARGIN,
+            started,
+            now,
+            limit,
+            exposure_budget + MOVE_BUDGET_MARGIN,
         ));
         assert!(!needs_cooldown_before_exposure(
-            started, now, limit, exposure_budget,
+            started,
+            now,
+            limit,
+            exposure_budget,
         ));
         assert!(needs_cooldown_before_exposure(
-            started, now + Duration::from_secs(4), limit, exposure_budget,
+            started,
+            now + Duration::from_secs(4),
+            limit,
+            exposure_budget,
         ));
     }
 
@@ -2144,8 +3377,11 @@ mod tests {
         assert_eq!(expected_pulses(-360_000, 96_000), 0);
         let jobs: Vec<_> = (0..180).map(|index| projection_job(index, 180)).collect();
         assert_eq!(jobs.len(), 180);
-        assert!(jobs.iter().enumerate().all(|(index, job)|
-            job.index == index as u32 + 1 && job.angle_mdeg == -(index as i32 * 2_000)));
+        assert!(jobs
+            .iter()
+            .enumerate()
+            .all(|(index, job)| job.index == index as u32 + 1
+                && job.angle_mdeg == -(index as i32 * 2_000)));
         assert_eq!(jobs.last().unwrap().angle_mdeg, -358_000);
     }
 

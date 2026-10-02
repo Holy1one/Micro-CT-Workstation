@@ -6,6 +6,7 @@
  */
 
 import { FIRMWARE_VERSION, LINK_LABEL } from "./rts9060/protocol";
+import { PreviewDeviceControls } from "./rts9060/deviceControls";
 import { ScanWorkflow, type ConsoleLogEntry, type WorkflowPhase } from "./rts9060/workflow";
 import type {
   ConsoleDataState,
@@ -64,6 +65,9 @@ export class WorkstationAdapter implements EngineAdapter {
   readonly kind = "developer_preview" as const;
   private workflow: ScanWorkflow;
   private revision = 0;
+  private snapshotSequence = 0;
+  private controls?: PreviewDeviceControls;
+  private get nativeControls(): PreviewDeviceControls { return this.controls ??= new PreviewDeviceControls(this.workflow); }
   private scanFlow: ScanFlowView = {
     stage: "idle",
     prompt: null,
@@ -89,12 +93,15 @@ export class WorkstationAdapter implements EngineAdapter {
 
   async dispatch(command: EngineCommand): Promise<EngineSnapshot> {
     const wf = this.workflow;
+    if (["set_parameters", "update_scan_setup"].includes(command.type) && this.nativeControls.snapshot().taskLock.locked) throw new Error("UNFINISHED_TASK_MANUAL_LOCK · retain the frozen task parameters");
+    if (await this.nativeControls.dispatch(command)) return this.buildSnapshot();
     switch (command.type) {
       case "connect":
       case "disconnect":
         // The workstation link is established at boot and stays up.
         break;
       case "preflight":
+        if (this.nativeControls.snapshot().taskLock.locked && (!command.restore || !command.confirmUsbAutoShutdownRelease)) throw new Error("Use the confirmed Restore preflight entry in the device console");
         await wf.runPreflight();
         if (wf.preflightPassed && this.scanFlow.stage !== "projections") {
           this.scanFlow.stage = "geometry";
@@ -149,16 +156,27 @@ export class WorkstationAdapter implements EngineAdapter {
         void wf.restore();
         break;
       case "stop":
+        this.nativeControls.stop();
         this.referenceRun++;
         this.scanFlow.prompt = null;
         this.scanFlow.stage = "stopped";
-        await wf.stop();
+        if (["ready", "completed", "booting"].includes(wf.phase)) await wf.independentStop(); else await wf.stop();
         break;
       case "retry_device":
         void wf.retryDevice(command.device);
         break;
       case "xray_disconnect":
         wf.xrayDisconnect();
+        break;
+      case "xray_connect":
+        await wf.retryDevice("xray");
+        break;
+      case "xray_status":
+      case "xray_identity":
+        break;
+      case "xray_off":
+        wf.source.disable();
+        if (["scanning", "paused", "finishing", "stopping"].includes(wf.phase)) await wf.stop();
         break;
       case "camera_test_capture":
         throw new Error("Real camera capture is available only in the desktop runtime");
@@ -248,6 +266,11 @@ export class WorkstationAdapter implements EngineAdapter {
     const rb = wf.source.readback();
     const dataStateToPhase = phaseToEngine[wf.phase];
     return {
+      engineSessionId: this.nativeControls.session,
+      snapshotSequence: this.snapshotSequence = (this.snapshotSequence ?? 0) + 1,
+      operationId: this.nativeControls.lastOperationId,
+      operations: structuredClone(this.nativeControls.operations),
+      deviceControls: this.nativeControls.snapshot(),
       mode: "developer_preview",
       modeLabel: "DEVELOPER PREVIEW · NO REAL HARDWARE",
       connectionState: "connected",
@@ -437,7 +460,7 @@ export class WorkstationAdapter implements EngineAdapter {
       : phase === "scanning"
         ? `SCANNING  view ${Math.min(captured + 1, total)} / ${total} · ${fixed2(step)}°/view · ${captured} / ${total} captured · ${fixed2(angle)}° · exposing · ETA ${wf.etaText}`
         : phase === "finishing"
-          ? `FINISHING  ${captured} / ${total} committed · returning the turntable to zero · Stop is available`
+          ? `FINISHING  ${captured} / ${total} committed · preserving final projection angle · Stop is available`
           : phase === "stopping"
             ? `STOPPING  ${captured} / ${total} committed · output disabled · waiting for the scan task to exit`
         : phase === "paused"
@@ -473,7 +496,7 @@ export class WorkstationAdapter implements EngineAdapter {
       preflight,
       floats,
       safetyBar,
-      scene: { angleDeg: angle, rotated: !(dataState === "ready" && angle === 0), angleKnown: phase !== "fault" && phase !== "stopped" && phase !== "stopping", rotationDirection: 1 },
+      scene: { angleDeg: angle, rotated: !(dataState === "ready" && angle === 0), angleKnown: phase !== "fault" && phase !== "stopped" && phase !== "stopping", rotationDirection: -1 },
       xray: {
         connected: xrayConnected,
         setKv: rb.setKv,

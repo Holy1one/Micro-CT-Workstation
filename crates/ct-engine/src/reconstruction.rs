@@ -152,6 +152,8 @@ fn set_progress(progress: &Mutex<ReconstructionProgress>, status: &'static str, 
 #[serde(rename_all = "camelCase")]
 struct Manifest {
     schema_version: u32,
+    #[serde(default)]
+    capture_profile: Option<crate::capture_profile::CaptureProfile>,
     completed: bool,
     projection_count: u32,
     geometry: Geometry,
@@ -307,7 +309,10 @@ fn read_manifest(scan_dir: &Path) -> Result<(Manifest, String), String> {
     let digest = hash_file(&path)?.1;
     let manifest: Manifest = serde_json::from_reader(File::open(path).map_err(io_error)?)
         .map_err(|error| format!("invalid scan manifest: {error}"))?;
-    if manifest.schema_version != 2 || !manifest.completed { return Err("scan is not sealed".into()); }
+    if !matches!(manifest.schema_version,2|3) || !manifest.completed { return Err("scan is not sealed".into()); }
+    if manifest.schema_version==3 {
+        manifest.capture_profile.as_ref().ok_or("Schema 3 capture profile is missing")?.validate()?;
+    }
     if manifest.frames.len() != manifest.projection_count as usize || manifest.frames.len() < 3 {
         return Err("projection count does not match manifest".into());
     }

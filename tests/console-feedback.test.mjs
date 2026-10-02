@@ -91,7 +91,7 @@ async function loadProductionFirstLaunchSnapshot() {
   const lines = contents.split(/\r?\n/).filter((line) => line.length > 0);
   assert.equal(lines.length, 1, "expected one real production ct-engine JSONL response");
   const response = JSON.parse(lines[0]);
-  assert.equal(response.protocol_version, 1);
+  assert.equal(response.protocol_version, 2);
   assert.equal(response.command, "snapshot");
   assert.equal(response.error_code, null);
   assert.ok(response.payload && typeof response.payload === "object", "ct-engine response payload is missing");
@@ -156,7 +156,8 @@ const isNeutral = (feedback) =>
 function snapshot(overrides = {}) {
   const { safety = {}, ...rest } = overrides;
   return {
-    mode: "production_locked",
+    engineSessionId: "synthetic-engine", snapshotSequence: 1, operationId: null, operations: [],
+    deviceControls: { camera: null, turntable: { connected: false, identity: null, status: null, confirmedAngleDeg: null, benchMode: false, reason: null, hardwareCertified: false }, taskLock: { locked: false, reason: null, taskId: null, savePath: null, status: "unlocked", retained: false }, presets: { schemaVersion: 1, presets: [], error: null }, cameraDraft: {}, exportJson: null, presetComparison: null },    mode: "production_locked",
     modeLabel: "PRODUCTION LOCKED · NANO DISCONNECTED",
     connectionState: "disconnected",
     adapterLabel: "ct-engine · Nano CH340 · JSONL stdio",
@@ -245,7 +246,7 @@ function workstation(overrides = {}) {
       barLabel: progress.barLabel ?? `${progress.captured ?? 0} / ${progress.total ?? 0} · ${progress.percent ?? 0}%`,
     },
     summary: { savePath: "", acquisition: "Scan setup not configured", output: beamState === "unknown" ? "OUTPUT UNKNOWN · READBACK REQUIRED" : "OUTPUT OFF", ...summary },
-    statusbar: { left: "PRODUCTION LOCKED · SETUP REQUIRED", right: "ct-engine · JSONL v1 · LOCKED", dotTone: "muted", ...statusbar },
+    statusbar: { left: "PRODUCTION LOCKED · SETUP REQUIRED", right: "ct-engine · JSONL v2 · LOCKED", dotTone: "muted", ...statusbar },
     dock: { home: false, play: false, restore: false, stop: false, playMode: "start", homeReason: "Connect the Nano first", restoreReason: "Connect the Nano first", playReason: "Connect the Nano first", ...dock },
     scanSetup: { savePath: "", taskId: "", projectionCount: 0, angleStepDeg: 0, exposureMs: 0, maxXraySec: 600, ...scanSetup },
     consoleLogs,

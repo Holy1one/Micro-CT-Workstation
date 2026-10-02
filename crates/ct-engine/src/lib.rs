@@ -10,8 +10,13 @@
 pub mod devices;
 pub mod reconstruction;
 mod scan;
+mod operations;
+mod device_controls;
+pub mod capture_profile;
+pub mod task_registry;
+pub mod presets;
 
-use devices::camera::{CameraHealth, DigiCamControlAdapter, valid_exposure_ms, EXPOSURE_MIN_MS, EXPOSURE_MAX_MS};
+use devices::camera::{CameraHealth, CameraAdapter, valid_exposure_ms, EXPOSURE_MIN_MS, EXPOSURE_MAX_MS};
 use devices::turntable::{NanoAdapter, NanoConnectionState, NanoHealth, NanoStatus};
 use devices::xray::{
     MoxtekAdapter, XrayHealth, MAX_CURRENT_UA, MAX_SETPOINT_POWER_W, MAX_VOLTAGE_KV,
@@ -27,7 +32,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 const MAX_LOGS: usize = 100;
 
 pub fn timestamp() -> String {
@@ -62,6 +67,8 @@ fn may_reuse_home(calibrated_this_process: bool, status: &NanoStatus) -> bool {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Request {
+    #[serde(default)]
+    pub engine_session_id: Option<String>,
     pub protocol_version: u32,
     pub request_id: String,
     pub command: String,
@@ -75,6 +82,7 @@ pub struct Request {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Response {
+    pub engine_session_id: String,
     pub protocol_version: u32,
     pub request_id: String,
     pub command: String,
@@ -231,6 +239,23 @@ impl Phase {
 }
 
 pub struct Engine {
+    #[cfg(test)]
+    test_connections: device_controls::TestConnections,
+    engine_session_id: String,
+    operations: operations::Operations,
+    request_ids: std::collections::VecDeque<String>,
+    bench_mode: bool,
+    ever_xray: bool,
+    manual_lock: Option<String>,
+    task_registry: task_registry::TaskRegistry,
+    preset_store: presets::PresetStore,
+    preset_tag: Option<capture_profile::PresetTag>,
+    capture_profile: Option<capture_profile::CaptureProfile>,
+    camera_draft: devices::camera::CameraProperties,
+    preset_export_json: Option<String>,
+    preset_comparison: Value,
+    scan_stop_requested: bool,
+    metadata_generation:u64,metadata_manifest:bool,metadata_resume:bool,metadata_completed:bool,
     preview: bool,
     connected: bool,
     preflight: bool,
@@ -254,7 +279,7 @@ pub struct Engine {
     set_kv_confirmed: bool,
     set_ua_confirmed: bool,
     nano: Option<Arc<NanoAdapter>>,
-    camera: Option<DigiCamControlAdapter>,
+    camera: Option<CameraAdapter>,
     xray: Option<MoxtekAdapter>,
     real_scan: Option<RealScanHandle>,
     real_scan_revision: u64,
@@ -276,13 +301,40 @@ pub struct Engine {
     home_performed_this_process: bool,
     cached_camera_health: Option<CameraHealth>,
     cached_xray_health: Option<XrayHealth>,
-    last_xray_poll: Instant,
     last_error: Option<String>,
 }
 
 impl Engine {
     pub fn new(preview: bool) -> Self {
+        #[cfg(test)]
+        let storage = {
+            static TEST_STORAGE_SEQUENCE: std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/tests/ct-engine").join(format!("{}-engine-{}",Utc::now().format("%Y%m%d-%H%M%S%3f"),TEST_STORAGE_SEQUENCE.fetch_add(1,std::sync::atomic::Ordering::SeqCst)))
+        };
+        #[cfg(not(test))]
+        let storage = std::env::var_os("MICRO_CT_ENGINE_DATA_DIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(||std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("MicroCTWorkstation"));
+        Self::new_with_storage(preview,storage)
+    }
+    pub fn new_with_storage(preview: bool, storage: impl AsRef<Path>) -> Self {
         let mut engine = Self {
+            #[cfg(test)]
+            test_connections: device_controls::TestConnections::default(),
+            engine_session_id: format!("engine-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap_or_default()),
+            operations: operations::Operations::default(),
+            request_ids: std::collections::VecDeque::new(),
+            bench_mode: false,
+            ever_xray: false,
+            manual_lock: None,
+            task_registry: task_registry::TaskRegistry::load(storage.as_ref().join("active-task.json")),
+            preset_store: presets::PresetStore::load(storage.as_ref().join("camera-presets.json")),
+            preset_tag: None,
+            capture_profile: None,
+            camera_draft: Default::default(),
+            preset_export_json: None,
+            preset_comparison: Value::Null,
+            scan_stop_requested: false,
+            metadata_generation:0,metadata_manifest:false,metadata_resume:false,metadata_completed:false,
             preview,
             connected: preview,
             preflight: false,
@@ -328,22 +380,21 @@ impl Engine {
             home_performed_this_process: false,
             cached_camera_health: None,
             cached_xray_health: None,
-            last_xray_poll: Instant::now() - Duration::from_secs(10),
             last_error: None,
         };
+        if let Some(parameters)=engine.task_registry.restore_parameters(){engine.parameters=parameters;}
+        engine.schedule_metadata_probe();
         engine.log("INFO", "system", "ct-engine started; waiting for an explicit connection");
         engine.log("WARN", "xray", "NO REAL HARDWARE · output remains fail-closed");
         engine
     }
 
     pub fn handle(&mut self, request: Request) -> Response {
-        self.sync_real_scan();
-        self.sync_reconstruction();
         self.tick();
-        self.sync_nano_health();
-        self.sync_xray_live_status();
         let error = if request.protocol_version != PROTOCOL_VERSION {
             Some("PROTOCOL_VERSION_MISMATCH")
+        } else if request.error_code.as_deref()==Some("COMMAND_QUEUE_FULL") {
+            Some("COMMAND_QUEUE_FULL")
         } else if request.request_id.is_empty()
             || request.timestamp.is_empty()
             || request.error_code.is_some()
@@ -351,8 +402,15 @@ impl Engine {
             Some("INVALID_ENVELOPE")
         } else if request.sequence <= self.request_sequence {
             Some("STALE_REQUEST")
+        } else if self.request_ids.contains(&request.request_id) {
+            Some("DUPLICATE_REQUEST_ID")
+        } else if request.engine_session_id.as_deref() != Some(&self.engine_session_id)
+            && !(self.request_sequence == 0 && request.command == "snapshot" && request.engine_session_id.is_none()) {
+            Some("ENGINE_SESSION_MISMATCH")
         } else {
             self.request_sequence = request.sequence;
+            self.request_ids.push_back(request.request_id.clone());
+            if self.request_ids.len()>256 { self.request_ids.pop_front(); }
             self.validate_payload_type(&request.command, &request.payload)
                 .and_then(|_| self.command(&request.command, request.payload))
                 .err()
@@ -361,11 +419,16 @@ impl Engine {
         if let Some(code) = error {
             self.log("WARN", "system", &format!("Command rejected: {code}"));
         }
+        let mut snapshot=self.snapshot();
+        if error.is_none() && request.command=="camera_pipe_descriptor" {
+            snapshot["liveViewPipeDescriptor"]=serde_json::to_value(self.camera.as_ref().and_then(|c|c.pipe_descriptor())).unwrap_or(Value::Null);
+        }
         Response {
+            engine_session_id: self.engine_session_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             request_id: request.request_id,
             command: request.command,
-            payload: self.snapshot(),
+            payload: snapshot,
             timestamp: timestamp(),
             sequence: self.sequence,
             error_code: error.map(str::to_owned),
@@ -384,7 +447,7 @@ impl Engine {
     }
 
     fn busy(&self) -> bool {
-        self.real_scan.is_some() || self.reconstruction.is_some()
+        self.real_scan.is_some() || self.reconstruction.is_some() || self.operations.blocks_controls()
             || matches!(self.phase, Phase::Running | Phase::Paused | Phase::Finishing | Phase::Stopping)
     }
 
@@ -414,7 +477,7 @@ impl Engine {
                 .map(|frame| serde_json::to_value(frame).unwrap_or_else(|_| json!({}))).collect();
             if let Some(health) = progress.xray_health {
                 self.usb_auto_shut_down = health.usb_auto_shutdown.unwrap_or(self.usb_auto_shut_down);
-                self.cached_xray_health = Some(health);
+                self.cached_xray_health = Some(health.clone());
             }
             let messages = progress.messages.iter().skip(self.real_scan_message_count).cloned().collect::<Vec<_>>();
             self.real_scan_message_count = progress.messages.len();
@@ -437,7 +500,7 @@ impl Engine {
                     health.beam_off_confirmed = false;
                     health.last_error = Some(error.clone());
                 }
-                if let Some(nano) = self.nano.as_ref() { let _ = nano.stop(); }
+                let _=self.enqueue_stop_for_shutdown();self.phase=Phase::Fault;
                 self.log("ERR", "system", &error);
             }
             Ok(outcome) => {
@@ -447,18 +510,24 @@ impl Engine {
                 self.camera = Some(outcome.camera);
                 self.xray = Some(outcome.xray);
                 match outcome.result {
-                    Ok(ScanCompletion::Completed) if !self.fault_latched => {
-                        self.phase = Phase::Completed;
-                        self.scan_stage = "completed";
+                    Ok(ScanCompletion::Completed) if !self.fault_latched && !self.scan_stop_requested => {
+                        self.phase = Phase::Finishing;
+                        self.scan_stage = "persisting_completed";
                         self.scan_prompt = None;
                         self.last_error = None;
+                        if let Err(error)=self.enqueue_task_completed(){self.fault_latched=true;self.phase=Phase::Fault;self.last_error=Some(error.into());}
                     }
                     Ok(ScanCompletion::Stopped) if !self.fault_latched => {
+                        self.metadata_manifest=true;self.metadata_resume=true;self.metadata_completed=false;
                         self.invalidate(Phase::Stopped);
                         self.scan_stage = "stopped";
                         self.scan_prompt = None;
                         self.last_error = None;
                         self.log("INFO", "system", "Scan ended; saved projections retained. Repeat Preflight and HOME before a new scan.");
+                    }
+                    Ok(ScanCompletion::Completed) if self.scan_stop_requested&&!self.fault_latched=>{
+                        self.invalidate(Phase::Stopped);self.scan_stage="stopped";self.scan_prompt=None;
+                        self.log("INFO","system","Stop superseded a late completion; sealed files retained and persistent task lock remains");
                     }
                     result => {
                         if let Err(error) = result { self.last_error = Some(error); }
@@ -544,27 +613,14 @@ impl Engine {
     /// Active emission is checked more frequently and any safety failure is
     /// latched after the device module has attempted an immediate OFF.
     fn sync_xray_live_status(&mut self) {
-        if self.preview || self.real_scan.is_some() {
+        if self.preview {
             return;
         }
-        let poll_interval = if self.beam_on {
-            Duration::from_millis(250)
-        } else {
-            Duration::from_secs(2)
-        };
-        if self.last_xray_poll.elapsed() < poll_interval {
-            return;
-        }
-        let Some(xray) = self.xray.as_mut() else {
+        let Some(xray) = self.xray.as_ref() else {
             return;
         };
-        self.last_xray_poll = Instant::now();
-        let was_beam_on = self.beam_on;
-        let result = if was_beam_on {
-            xray.refresh_emission_status()
-        } else {
-            xray.refresh_status()
-        };
+        let health = xray.health();
+        let result = match health.last_error.as_ref() { Some(error) => Err(error.clone()), None=>Ok(health.clone()) };
         match result {
             Ok(health) => {
                 if let Some(warning) = health.telemetry_warning.as_deref() {
@@ -588,15 +644,16 @@ impl Engine {
                 self.cached_xray_health = Some(health);
             }
             Err(error) => {
-                let health = xray.health();
                 self.beam_on = health.beam_on;
                 self.usb_auto_shut_down = health
                     .usb_auto_shutdown
                     .unwrap_or(self.usb_auto_shut_down);
-                self.cached_xray_health = Some(health);
-                if was_beam_on {
+                self.cached_xray_health = Some(health.clone());
+                if health.last_error.is_some() || !health.beam_off_confirmed {
+                    let newly_faulted=!self.fault_latched;
                     self.fault_latched = true;
                     self.invalidate(Phase::Fault);
+                    if newly_faulted {let _=self.enqueue_stop_for_shutdown();self.phase=Phase::Fault;}
                 }
                 self.log(
                     "ERR",
@@ -611,36 +668,29 @@ impl Engine {
     /// closed, shell crashed or killed): stop any scan, then force the Moxtek
     /// OFF and release every device before the process exits.
     pub fn shutdown(&mut self) {
-        let _ = self.stop_real_scan();
-        if self.real_scan.is_some() {
-            let deadline = Instant::now() + Duration::from_secs(65);
-            while self.real_scan.is_some() && Instant::now() < deadline {
-                self.sync_real_scan();
-                thread::sleep(Duration::from_millis(50));
+        if !self.preview {
+            let _ = self.enqueue_stop_for_shutdown();
+            let deadline=Instant::now()+Duration::from_secs(65);
+            while (self.real_scan.is_some() || self.operations.blocks_controls()) && Instant::now()<deadline {
+                self.tick(); thread::sleep(Duration::from_millis(20));
             }
+            let off=self.xray.as_ref().is_none_or(|x|x.health().beam_off_confirmed)
+                && self.cached_xray_health.as_ref().is_none_or(|h|h.beam_off_confirmed);
+            let camera_clean=self.camera.as_ref().is_none_or(|c|c.health().cleanup_confirmed);
+            if let Some(mut xray)=self.xray.take(){let _=xray.disconnect();}
+            self.nano=None;
+            if camera_clean {if let Some(camera)=self.camera.take(){camera.disconnect();}}
+            eprintln!("ct-engine shutdown: OFF={}, camera cleanup={}, unresolved operations={}",off,camera_clean,self.operations.is_active());
         }
-        let _ = self.force_xray_off("Engine shutdown");
-        if let Some(mut xray) = self.xray.take() {
-            let _ = xray.disconnect();
-        }
-        if let Some(nano) = self.nano.take() {
-            if let Ok(mut nano) = Arc::try_unwrap(nano) {
-                nano.disconnect();
-            }
-        }
-        if let Some(mut camera) = self.camera.take() {
-            camera.disconnect();
-        }
-        self.beam_on = false;
-        eprintln!("ct-engine shutdown complete · Moxtek OFF and warning OFF attempted");
+        self.beam_on=false;
     }
-
     fn sync_nano_health(&mut self) {
         let Some(nano) = self.nano.as_ref() else {
             return;
         };
         let health = nano.health();
         if !matches!(health.state, NanoConnectionState::Connected) {
+            let newly_faulted=!self.fault_latched;
             let detail = health
                 .last_error
                 .unwrap_or_else(|| format!("Nano state {:?}", health.state));
@@ -649,10 +699,18 @@ impl Engine {
             self.home_performed_this_process = false;
             self.fault_latched = true;
             self.invalidate(Phase::Fault);
+            if newly_faulted {let _=self.enqueue_stop_for_shutdown();self.phase=Phase::Fault;}
         }
     }
 
     fn command(&mut self, command: &str, payload: Value) -> Result<(), &'static str> {
+        if !self.preview {
+            if let Some(result) = self.device_command(command, payload.clone()) { return result; }
+        }
+        self.command_core(command,payload)
+    }
+
+    fn command_core(&mut self, command: &str, payload: Value) -> Result<(), &'static str> {
         if command == "snapshot" {
             return Ok(());
         }
@@ -700,7 +758,7 @@ impl Engine {
                     nano.disconnect();
                 }
             }
-            if let Some(mut camera) = self.camera.take() {
+            if let Some(camera) = self.camera.take() {
                 camera.disconnect();
             }
             self.cached_camera_health = None;
@@ -784,6 +842,7 @@ impl Engine {
                 self.log("INFO", "system", "Scan parameters updated · safety checks invalidated");
             }
             "update_scan_setup" => {
+                if self.task_registry.locked(){return Err("UNFINISHED_TASK_LOCKED");}
                 if self.busy() {
                     return Err("SCAN_ACTIVE");
                 }
@@ -794,7 +853,7 @@ impl Engine {
                 let (parameters, max_xray_sec) =
                     setup.apply(&self.parameters, self.max_xray_sec)?;
                 if setup.exposure_ms.is_some() {
-                    let health = self.camera.as_ref().map(DigiCamControlAdapter::health)
+                    let health = self.camera.as_ref().map(CameraAdapter::health)
                         .or_else(|| self.cached_camera_health.clone());
                     if let Some(health) = health.filter(|health| health.connected) {
                         if let Some((min, max)) = health.exposure_min_ms.zip(health.exposure_max_ms) {
@@ -804,8 +863,14 @@ impl Engine {
                         }
                     }
                 }
+                if setup.exposure_ms.is_some() {
+                    if let Some(camera)=self.camera.as_ref().filter(|camera|camera.health().connected) {
+                        camera.set_exposure_target(parameters.exposure_ms).map_err(|_|"EXPOSURE_NOT_NATIVE_CAMERA_VALUE")?;
+                    }
+                }
                 self.parameters = parameters;
                 self.max_xray_sec = max_xray_sec;
+                self.schedule_metadata_probe();
                 self.current = 0;
                 self.restored_scan = None;
                 self.scan_geometry = None;
@@ -839,7 +904,7 @@ impl Engine {
                         .as_ref()
                         .is_some_and(|camera| camera.health().connected)
                     {
-                        let mut camera = DigiCamControlAdapter::discover()
+                        let camera = CameraAdapter::discover()
                             .map_err(|_| "CAMERA_BACKEND_UNAVAILABLE")?;
                         let health = match camera.connect() {
                             Ok(health) => health,
@@ -1060,14 +1125,7 @@ impl Engine {
                     scan.request_stop().map_err(|error| self.nano_error("Scan cancel STOP failed", error))?;
                     self.phase = Phase::Stopping;
                 } else {
-                    let saved = scan::persist_preparation_checkpoint(&self.parameters, self.set_kv, self.set_ua);
-                    self.invalidate(Phase::Stopped);
-                    self.scan_stage = "stopped";
-                    if let Err(error) = saved {
-                        self.last_error = Some(error);
-                        self.phase = Phase::Fault;
-                        return Err("CHECKPOINT_SAVE_FAILED");
-                    }
+                    self.enqueue_checkpoint()?;
                 }
                 self.scan_prompt = None;
                 return Ok(());
@@ -1144,15 +1202,13 @@ impl Engine {
                     self.parameters.validate()?;
                     self.validate_setpoint(self.set_kv, self.set_ua)?;
                     let starting_new_scan = self.restored_scan.is_none();
-                    if starting_new_scan && scan::manifest_file_exists(&self.parameters) {
-                        return Err("SCAN_OUTPUT_EXISTS_USE_RESTORE");
-                    }
+                    self.scan_stop_requested=false;
+                    self.metadata_generation+=1;
                     let nano = self.nano.as_ref().ok_or("NANO_NOT_CONNECTED")?.clone();
-                    let camera = self.camera.take().ok_or("CAMERA_NOT_CONNECTED")?;
-                    let xray = match self.xray.take() {
+                    let camera = self.camera.as_ref().cloned().ok_or("CAMERA_NOT_CONNECTED")?;
+                    let xray = match self.xray.as_ref().cloned() {
                         Some(xray) => xray,
                         None => {
-                            self.camera = Some(camera);
                             return Err("XRAY_NOT_CONNECTED");
                         }
                     };
@@ -1173,6 +1229,7 @@ impl Engine {
                         camera,
                         xray,
                         RealScanConfig {
+                            capture_profile: self.capture_profile.clone().ok_or("CAPTURE_PROFILE_REQUIRED")?,
                             parameters: self.parameters.clone(),
                             max_xray_sec: self.max_xray_sec,
                             voltage_kv: self.set_kv,
@@ -1259,7 +1316,7 @@ impl Engine {
                 }
                 if !self.preview {
                     self.verify_current_nano_reference()?;
-                    let restored = match scan::load_resume(&self.parameters, self.set_kv, self.set_ua) {
+                    let restored = match scan::load_resume(&self.parameters, self.set_kv, self.set_ua,self.capture_profile.as_ref().ok_or("CAPTURE_PROFILE_REQUIRED")?) {
                         Ok(restored) => restored,
                         Err(error) => {
                             self.last_error = Some(error.clone());
@@ -1326,7 +1383,7 @@ impl Engine {
                             );
                         }
                         "camera" => {
-                            let mut camera = DigiCamControlAdapter::discover()
+                            let camera = CameraAdapter::discover()
                                 .map_err(|_| "CAMERA_BACKEND_UNAVAILABLE")?;
                             let health = camera.connect().map_err(|_| "CAMERA_CONNECTION_FAILED")?;
                             self.cached_camera_health = Some(health.clone());
@@ -1441,34 +1498,7 @@ impl Engine {
                 self.last_error = None;
                 self.log("PASS", "xray", "Moxtek OFF confirmed and manually disconnected");
             }
-            "camera_test_capture" => {
-                if self.preview {
-                    return Err("REAL_CAMERA_REQUIRED");
-                }
-                if self.busy() {
-                    return Err("SCAN_ACTIVE");
-                }
-                self.parameters.validate()?;
-                let save_path = Path::new(self.parameters.save_path.trim());
-                let task_id = self.parameters.task_id.clone();
-                let camera = self.camera.as_mut().ok_or("CAMERA_NOT_CONNECTED")?;
-                let path = match camera.capture_test(save_path, &task_id) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        let message = format!("D7100 test capture failed: {error}");
-                        self.last_error = Some(message.clone());
-                        self.log("ERR", "camera", &message);
-                        return Err("CAMERA_CAPTURE_FAILED");
-                    }
-                };
-                self.log(
-                    "PASS",
-                    "camera",
-                    &format!("D7100 test capture saved · {}", path.display()),
-                );
-                self.cached_camera_health = self.camera.as_ref().map(DigiCamControlAdapter::health);
-                self.last_error = None;
-            }
+            "camera_test_capture" => return Err("REAL_CAMERA_REQUIRED"),
             "xray_toggle" => {
                 if !self.preview {
                     if self.busy() {
@@ -1801,8 +1831,7 @@ impl Engine {
 
     fn verify_current_nano_reference(&mut self) -> Result<(), &'static str> {
         let nano = self.nano.as_ref().ok_or("NANO_NOT_CONNECTED")?.clone();
-        let status = nano.status()
-            .map_err(|error| self.nano_error("Nano reference STATUS failed", error))?;
+        let status = nano.health().status.ok_or("NANO_STATUS_UNKNOWN")?;
         if !nano_reference_ready(&status) {
             self.homed = false;
             self.phase = Phase::ReadyForHome;
@@ -1824,7 +1853,13 @@ impl Engine {
         self.logs.truncate(MAX_LOGS);
     }
 
-    fn tick(&mut self) {
+    pub fn tick(&mut self) {
+        self.sync_operations();
+        self.sync_real_scan();
+        self.sync_reconstruction();
+        self.sync_nano_health();
+        self.sync_camera_health();
+        self.sync_xray_live_status();
         if !self.preview || !matches!(self.phase, Phase::Running | Phase::Finishing) {
             return;
         }
@@ -1907,7 +1942,7 @@ impl Engine {
         let configured = self.parameters.validate().is_ok()
             && (1..=600).contains(&self.max_xray_sec);
         let checkpoint_available = if self.preview { self.current > 0 || self.logs.iter().any(|entry| entry["message"].as_str().is_some_and(|message| message.contains("Preview scan ended"))) }
-            else { configured && self.phase != Phase::Completed && scan::resume_manifest_exists(&self.parameters) };
+            else { configured && self.phase != Phase::Completed && self.metadata_resume };
         let pending_restore = !self.preview && checkpoint_available && self.restored_frames.is_empty();
         let is_preview = self.preview;
         let nano_health = self.nano.as_ref().map(|nano| nano.health());
@@ -1922,7 +1957,7 @@ impl Engine {
         let camera_health = self
             .camera
             .as_ref()
-            .map(DigiCamControlAdapter::health)
+            .map(CameraAdapter::health)
             .or_else(|| self.cached_camera_health.clone());
         let camera_connected = self.real_scan.is_some() || camera_health
             .as_ref()
@@ -2028,7 +2063,7 @@ impl Engine {
             json!({"stage":stage,"title":title,"message":message,"confirmLabel":confirm_label,"cancelLabel":"取消"})
         });
         let reconstruction_unlocked = !self.preview && self.real_scan.is_none()
-            && scan::completed_manifest_exists(&self.parameters);
+            && self.metadata_completed;
         let reconstruction_methods: Vec<Value> = reconstruction::available_methods().into_iter().map(|entry| {
             let id = entry.method.id();
             let projections_ok = self.parameters.projection_count >= 3;
@@ -2052,7 +2087,7 @@ impl Engine {
             "devices": [
                 {"id":"xray","name":"X-Ray Source","word":if beam_state == "on" {"EMITTING"} else if beam_state == "off" {"OFF VERIFIED"} else if xray_connected {"UNKNOWN"} else {"OFFLINE"},"tone":if beam_state == "on" {"danger"} else if beam_state == "off" {"accent"} else {"muted"},"spec":if let Some(health) = xray_health.as_ref() {format!("12 W · {} · PORT {} · SERIAL {}", xray_text, health.port.as_deref().unwrap_or("unknown"), health.serial.as_deref().unwrap_or("unknown"))} else {"Moxtek · 12 W · awaiting connection".to_owned()}},
                 {"id":"turntable","name":"Turntable-Nano","word":if nano_faulted {"FAULT"} else if self.phase == Phase::Running {"MOVING"} else if nano_connected {"ONLINE"} else if self.preview {"PREVIEW"} else {"OFFLINE"},"tone":device_tone,"spec":if nano_connected {format!("{identity} · POS {angle:.2}° · 60:1 · 8 µSTEP")} else {format!("POS {angle:.2}° · 60:1 · 8 µSTEP · {}", if self.preview {"PREVIEW"} else {"DISCONNECTED"})}},
-                {"id":"camera","name":"Camera","word":if camera_connected {"ONLINE"} else if self.preview {"PREVIEW"} else {"OFFLINE"},"tone":if camera_connected {"accent"} else if self.preview {device_tone} else {"muted"},"spec":if let Some(health) = camera_health.as_ref() {format!("D7100 · SERIAL {} · {}", health.serial.as_deref().unwrap_or("unknown"), health.transfer_policy.as_deref().unwrap_or("transfer unverified"))} else if self.preview {"D7100 · NO REAL CAMERA CONNECTION".to_owned()} else {"D7100 · CONNECT VIA DIGICAMCONTROL".to_owned()}}
+                {"id":"camera","name":"Camera","word":if camera_connected {"ONLINE"} else if self.preview {"PREVIEW"} else {"OFFLINE"},"tone":if camera_connected {"accent"} else if self.preview {device_tone} else {"muted"},"spec":if let Some(health) = camera_health.as_ref() {format!("{} · {} · SERIAL {} · {}", health.identity.as_ref().map(|i|i.model.as_str()).unwrap_or("Camera"), health.backend, health.serial.as_deref().unwrap_or("unknown"), health.transfer_policy.as_deref().unwrap_or("transfer unverified"))} else if self.preview {"D7100 · NO REAL CAMERA CONNECTION".to_owned()} else {"Native WPD · OPEN DEVICES / CAMERA".to_owned()}}
             ],
             "onlineSummary": if self.preview { "PREVIEW · 0 REAL DEVICES".to_owned() } else { let count = u8::from(nano_connected) + u8::from(camera_connected) + u8::from(xray_connected); if count == 0 { "LOCKED · 0 REAL DEVICES".to_owned() } else { format!("{count} REAL DEVICES · {xray_text}") } },
             "preflight": {
@@ -2063,7 +2098,7 @@ impl Engine {
             },
             "floats": [
                 {"key":"X-RAY","text":xray_text,"tone":if self.phase == Phase::Fault || self.beam_on {"danger"} else {"muted"}},
-                {"key":"CAMERA","text":if camera_connected {"D7100 ONLINE"} else if self.preview {"PREVIEW ONLY"} else {"OFFLINE"},"tone":if camera_connected {"accent"} else {"muted"}},
+                {"key":"CAMERA","text":if camera_connected {"CAMERA ONLINE"} else if self.preview {"PREVIEW ONLY"} else {"OFFLINE"},"tone":if camera_connected {"accent"} else {"muted"}},
                 {"key":"SAMPLE","text":if angle_known {format!("{angle:.2}°")} else {"UNKNOWN".to_owned()},"tone":if !angle_known {"muted"} else if self.phase == Phase::Fault {"danger"} else {"accent"}}
             ],
             "safetyBar":{"text":safety_text,"tone":if self.phase == Phase::Fault {"dangerBold"} else if self.beam_on {"danger"} else {"muted"}},
@@ -2097,7 +2132,7 @@ impl Engine {
             },
             "statusbar":{
                 "left":if configured {format!("{identity} · {} · {captured} / {total} · {angle:.2}°",self.phase_word())} else {format!("{identity} · SETUP REQUIRED")},
-                "right":if self.preview {"ct-engine · JSONL v1 · PREVIEW"} else if nano_connected {"ct-engine · JSONL v1 · NANO ONLINE"} else {"ct-engine · JSONL v1 · LOCKED"},
+                "right":if self.preview {"ct-engine · JSONL v1 · PREVIEW"} else if nano_connected {"ct-engine · JSONL v2 · NANO ONLINE"} else {"ct-engine · JSONL v1 · LOCKED"},
                 "dotTone":if self.phase == Phase::Fault {"danger"} else if self.phase == Phase::Running {"warn"} else if self.phase == Phase::Paused {"accent"} else {"muted"}
             },
             "dock":{
@@ -2122,7 +2157,7 @@ impl Engine {
                 "geometry":self.scan_geometry,
                 "checkpointPath":if self.preview || self.parameters.save_path.trim().is_empty()
                     || self.parameters.task_id.trim().is_empty() { None }
-                    else if scan::manifest_file_exists(&self.parameters) {
+                    else if self.metadata_manifest {
                         Some(Path::new(self.parameters.save_path.trim())
                             .join(self.parameters.task_id.trim()).join("manifest.json").display().to_string())
                     } else if scan::preparation_checkpoint_exists(&self.parameters) {
@@ -2154,7 +2189,7 @@ impl Engine {
             matches!(health.state, NanoConnectionState::Fault | NanoConnectionState::Lost)
                 || health.status.as_ref().is_some_and(|status| status.state == "FAULT")
         });
-        let camera_health = self.camera.as_ref().map(DigiCamControlAdapter::health)
+        let camera_health = self.camera.as_ref().map(CameraAdapter::health)
             .or_else(|| self.cached_camera_health.clone());
         let camera_connected = self.real_scan.is_some() || camera_health
             .as_ref()
@@ -2213,6 +2248,8 @@ impl Engine {
             }))
             .unwrap_or_else(|| mode_label.clone());
         json!({
+            "engineSessionId":self.engine_session_id,"snapshotSequence":self.sequence,"operationId":self.operations.last_id,
+            "operations":self.operations.history,"deviceControls":self.device_controls_snapshot(),
             "mode":mode,"modeLabel":mode_label,"connectionState":connection_state,"adapterLabel":"ct-engine · Nano CH340 · JSONL stdio",
             "phase":phase,"phaseLabel":label,"preflightPassed":self.preflight,"homed":self.homed,
             "requiresPreflight":!self.preflight,"requiresHome":!self.homed,
@@ -2223,7 +2260,7 @@ impl Engine {
             },
             "devices":[
                 {"id":"turntable","label":"Precision Turntable","state":device_state,"detail":nano_detail},
-                {"id":"camera","label":"Nikon D7100","state":if camera_connected {"connected"} else if self.preview {device_state} else {"offline"},"detail":if let Some(health) = camera_health.as_ref() {format!("digiCamControl · serial {} · {}", health.serial.as_deref().unwrap_or("unknown"), health.transfer_policy.as_deref().unwrap_or("transfer unverified"))} else if self.preview {mode_label.clone()} else {"Use Camera Retry to connect through digiCamControl".to_owned()}},
+                {"id":"camera","label":camera_health.as_ref().and_then(|h|h.identity.as_ref()).map(|i|i.model.as_str()).unwrap_or("Camera"),"state":if camera_connected {"connected"} else if self.preview {device_state} else {"offline"},"detail":if let Some(health) = camera_health.as_ref() {format!("{} · serial {} · {}", health.backend, health.serial.as_deref().unwrap_or("unknown"), health.transfer_policy.as_deref().unwrap_or("transfer unverified"))} else if self.preview {mode_label.clone()} else {"Open Devices / Camera, discover and explicitly select a native camera".to_owned()}},
                 {"id":"xray","label":"Moxtek 12 W","state":if xray_connected {"connected"} else {"locked"},"detail":if let Some(health) = xray_health.as_ref() {format!("Safe-OFF configuration session · port {} · beam OFF confirmed", health.port.as_deref().unwrap_or("unknown"))} else {"Fail-closed · connect confirms OFF before allowing setpoint tests".to_owned()}}
             ],
             "parameters":self.parameters,
@@ -2251,7 +2288,8 @@ mod tests {
 
     fn send(engine: &mut Engine, command: &str, extra: Value) -> Response {
         engine.handle(Request {
-            protocol_version: 1,
+            engine_session_id: Some(engine.engine_session_id.clone()),
+            protocol_version: PROTOCOL_VERSION,
             request_id: format!("test-{}", engine.request_sequence + 1),
             command: command.into(),
             payload: if command == "snapshot" { json!({}) } else { payload(command, extra) },
@@ -2444,7 +2482,8 @@ mod tests {
     fn command_and_payload_type_must_match() {
         let mut engine = Engine::new(true);
         let response = engine.handle(Request {
-            protocol_version: 1,
+            engine_session_id: Some(engine.engine_session_id.clone()),
+            protocol_version: PROTOCOL_VERSION,
             request_id: "mismatch".into(),
             command: "stop".into(),
             payload: json!({"type":"start_scan"}),
@@ -2797,7 +2836,8 @@ mod tests {
     fn malformed_protocol_and_replayed_sequence_are_rejected() {
         let mut engine = Engine::new(true);
         let request = || Request {
-            protocol_version: 1,
+            engine_session_id: None,
+            protocol_version: PROTOCOL_VERSION,
             request_id: "r-1".into(),
             command: "snapshot".into(),
             payload: json!({}),
@@ -2808,8 +2848,213 @@ mod tests {
         assert!(engine.handle(request()).error_code.is_none());
         assert_eq!(engine.handle(request()).error_code.as_deref(), Some("STALE_REQUEST"));
         let mut incompatible = request();
-        incompatible.protocol_version = 2;
+        incompatible.protocol_version = 1;
         incompatible.sequence = 2;
         assert_eq!(engine.handle(incompatible).error_code.as_deref(), Some("PROTOCOL_VERSION_MISMATCH"));
+    }
+
+    #[test]
+    fn queued_camera_transfer_cannot_block_snapshot_stop_or_moxtek_off() {
+        use devices::camera::{scripted_camera,ScriptedCameraConfig};
+        let mut engine=Engine::new(false);
+        engine.camera=Some(scripted_camera(ScriptedCameraConfig{transfer_delay:Duration::from_secs(2),..Default::default()}));
+        engine.cached_camera_health=engine.camera.as_ref().map(|camera|camera.health());
+        let (mut xray,probe)=devices::xray::test_worker(60.0,200.0);
+        xray.beam_on_shared(Arc::new(std::sync::atomic::AtomicBool::new(false)),Instant::now()+Duration::from_secs(10)).unwrap();
+        engine.xray=Some(xray);engine.beam_on=true;
+        let directory=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/tests/camera").join(format!("{}-domain-independent-capture",Utc::now().timestamp_nanos_opt().unwrap()));
+        let started=Instant::now();
+        let accepted=send(&mut engine,"camera_capture",json!({"directory":directory.to_string_lossy()}));
+        assert!(accepted.error_code.is_none());assert!(started.elapsed()<Duration::from_millis(250));
+        assert!(accepted.payload["operationId"].is_string());
+        thread::sleep(Duration::from_millis(80));
+        let queried=Instant::now();assert!(send(&mut engine,"snapshot",json!({})).error_code.is_none());assert!(queried.elapsed()<Duration::from_millis(250));
+        let stop_started=Instant::now();assert!(send(&mut engine,"stop",json!({})).error_code.is_none());
+        let stop_admission_ms=stop_started.elapsed().as_millis();
+        assert!(stop_admission_ms<250,"Stop admission must not wait for COM transfer");
+        let mut off_confirmed_ms=None;
+        let deadline=Instant::now()+Duration::from_secs(5);
+        while engine.operations.is_active()&&Instant::now()<deadline{engine.tick();if off_confirmed_ms.is_none()&&engine.xray.as_ref().is_some_and(|xray|xray.health().beam_off_confirmed){off_confirmed_ms=Some(stop_started.elapsed().as_millis());}thread::sleep(Duration::from_millis(10));}
+        let cleanup_ms=stop_started.elapsed().as_millis();let off_write_ms=probe.beam_transitions().iter().find(|(enabled,time)|!*enabled&&*time>=stop_started).map(|(_,time)|time.duration_since(stop_started).as_millis()).unwrap();
+        println!("OFFLINE STOP TIMING: admission={stop_admission_ms}ms; OFF write={off_write_ms}ms; OFF readback={}ms; all cleanup={cleanup_ms}ms",off_confirmed_ms.unwrap_or(cleanup_ms));
+        std::fs::write(directory.join("stop-timing.json"),serde_json::to_vec_pretty(&json!({"boundary":"offline scripted production workers; no physical OFF timing claim","stopAdmissionMs":stop_admission_ms,"offWriteMs":off_write_ms,"offReadbackConfirmationMs":off_confirmed_ms.unwrap_or(cleanup_ms),"allCleanupMs":cleanup_ms})).unwrap()).unwrap();
+        assert!(!probe.output_enabled());
+        assert!(probe.beam_transitions().iter().any(|(enabled,time)|!*enabled&&*time>=stop_started&&time.duration_since(stop_started)<Duration::from_secs(1)),"OFF write must be independent from camera transfer");
+        assert!(!engine.fault_latched,"ordinary Stop with confirmed cleanup must not latch emergency fault");
+        assert!(engine.operations.history.iter().any(|operation|operation.kind=="camera_capture"&&operation.status=="cancelled"));
+        assert_eq!(engine.current,0);assert!(engine.real_frames.is_empty());
+        if directory.exists(){assert!(std::fs::read_dir(directory).unwrap().all(|entry|entry.unwrap().path().extension().is_none_or(|extension|extension!="nef")),"late cancelled standalone image must not commit");}
+    }
+
+    #[test]
+    fn domain_rejects_live_view_capture_task_occupation_and_persistent_lock_bypass() {
+        use devices::camera::{scripted_camera,ScriptedCameraConfig};
+        let mut engine=Engine::new(false);let camera=scripted_camera(ScriptedCameraConfig::default());
+        camera.start_live_view().unwrap();engine.camera=Some(camera);
+        assert_eq!(send(&mut engine,"camera_capture",json!({"directory":"unused"})).error_code.as_deref(),Some("LIVE_VIEW_CAPTURE_FORBIDDEN"));
+        engine.phase=Phase::Paused;
+        assert_eq!(send(&mut engine,"camera_focus",json!({"step":1})).error_code.as_deref(),Some("DEVICE_CONTROL_LOCKED"));
+        assert_eq!(send(&mut engine,"turntable_relative",json!({"angleDeg":1.0})).error_code.as_deref(),Some("DEVICE_CONTROL_LOCKED"));
+        engine.phase=Phase::Idle;
+        let storage=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/tests/ct-engine").join(format!("{}-domain-invalid-register",Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&storage).unwrap();std::fs::write(storage.join("active-task.json"),b"broken registry").unwrap();
+        engine.task_registry=task_registry::TaskRegistry::load(storage.join("active-task.json"));
+        assert_eq!(send(&mut engine,"turntable_home",json!({})).error_code.as_deref(),Some("UNFINISHED_TASK_LOCKED"));
+        assert_eq!(send(&mut engine,"update_scan_setup",json!({"setup":{"taskId":"other"}})).error_code.as_deref(),Some("UNFINISHED_TASK_LOCKED"));
+        assert_eq!(send(&mut engine,"abandon_scan",json!({})).error_code.as_deref(),Some("TASK_REGISTRY_INVALID"));
+    }
+
+    #[test]
+    fn stop_invalidates_late_domain_completion_without_unlocking_or_beam_enable() {
+        let mut engine=Engine::new(false);
+        engine.operations.spawn(&engine.engine_session_id,"camera","delayed_result",|_|{thread::sleep(Duration::from_millis(80));Ok(Box::new(|engine|{engine.beam_on=true;engine.preflight=true;Ok(())}))}).unwrap();
+        assert!(send(&mut engine,"stop",json!({})).error_code.is_none());
+        let deadline=Instant::now()+Duration::from_secs(1);
+        while engine.operations.is_active()&&Instant::now()<deadline{engine.tick();thread::sleep(Duration::from_millis(5));}
+        assert!(!engine.beam_on);assert!(!engine.preflight);assert!(!engine.fault_latched);
+        assert_eq!(engine.operations.history.iter().find(|operation|operation.kind=="delayed_result").unwrap().status,"cancelled");
+    }
+
+    #[test]
+    fn protocol_requires_current_session_unique_ids_and_snapshot_evidence() {
+        let mut engine=Engine::new(true);
+        let handshake=engine.handle(Request{engine_session_id:None,protocol_version:PROTOCOL_VERSION,request_id:"handshake".into(),command:"snapshot".into(),payload:json!({}),timestamp:timestamp(),sequence:1,error_code:None});
+        assert!(handshake.error_code.is_none());assert_eq!(handshake.payload["engineSessionId"],handshake.engine_session_id);assert_eq!(handshake.payload["snapshotSequence"],handshake.sequence);
+        let wrong=engine.handle(Request{engine_session_id:Some("old-engine".into()),protocol_version:PROTOCOL_VERSION,request_id:"foreign".into(),command:"snapshot".into(),payload:json!({}),timestamp:timestamp(),sequence:2,error_code:None});
+        assert_eq!(wrong.error_code.as_deref(),Some("ENGINE_SESSION_MISMATCH"));
+        let duplicate=engine.handle(Request{engine_session_id:Some(engine.engine_session_id.clone()),protocol_version:PROTOCOL_VERSION,request_id:"handshake".into(),command:"snapshot".into(),payload:json!({}),timestamp:timestamp(),sequence:3,error_code:None});
+        assert_eq!(duplicate.error_code.as_deref(),Some("DUPLICATE_REQUEST_ID"));
+    }
+
+    #[test]
+    fn ordinary_stop_during_beam_enable_wait_retains_confirmed_off_without_fault() {
+        let mut engine=Engine::new(false);let (xray,probe)=devices::xray::test_worker(60.0,200.0);
+        engine.xray=Some(xray);engine.set_kv=60.0;engine.set_ua=200.0;engine.set_kv_confirmed=true;engine.set_ua_confirmed=true;
+        assert!(send(&mut engine,"xray_toggle",json!({})).error_code.is_none());
+        thread::sleep(Duration::from_millis(50));assert!(send(&mut engine,"stop",json!({})).error_code.is_none());
+        let deadline=Instant::now()+Duration::from_secs(2);while engine.operations.is_active()&&Instant::now()<deadline{engine.tick();thread::sleep(Duration::from_millis(1));}
+        assert!(!engine.fault_latched);assert!(!probe.output_enabled());assert!(engine.xray.as_ref().unwrap().health().beam_off_confirmed);
+        assert!(!probe.beam_transitions().iter().any(|(enabled,_)|*enabled));
+    }
+
+    #[test]
+    fn failed_off_confirmation_remains_unknown_and_latches_fault() {
+        let mut engine=Engine::new(false);let (xray,probe)=devices::xray::test_worker(60.0,200.0);
+        engine.xray=Some(xray);probe.fail_next_read();
+        assert!(send(&mut engine,"stop",json!({})).error_code.is_none());
+        let deadline=Instant::now()+Duration::from_secs(2);while engine.operations.is_active()&&Instant::now()<deadline{engine.tick();thread::sleep(Duration::from_millis(1));}
+        assert!(engine.fault_latched);assert_eq!(engine.workstation_view()["xray"]["beamState"],"unknown");
+        assert!(engine.operations.history.iter().any(|operation|operation.status=="cleanup_unconfirmed"));
+    }
+
+    #[test]
+    fn registered_task_without_checkpoint_can_be_explicitly_abandoned_after_restart() {
+        let storage=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/tests/ct-engine").join(format!("{}-abandon-missing-checkpoint",Utc::now().timestamp_nanos_opt().unwrap()));
+        let parameters=Parameters{task_id:"interrupted-before-checkpoint".into(),save_path:storage.to_string_lossy().into(),projection_count:2,angle_step_deg:180.0,exposure_ms:200.0};
+        let mut registry=task_registry::TaskRegistry::load(storage.join("active-task.json"));registry.register(&parameters).unwrap();
+        let scan_dir=storage.join(&parameters.task_id);std::fs::create_dir_all(&scan_dir).unwrap();let retained=scan_dir.join("original.nef");std::fs::write(&retained,b"untouched original").unwrap();
+        let mut engine=Engine::new_with_storage(false,&storage);assert!(engine.task_registry.error().is_some());assert!(engine.task_registry.can_abandon());
+        assert!(send(&mut engine,"abandon_scan",json!({})).error_code.is_none());
+        let deadline=Instant::now()+Duration::from_secs(1);while engine.operations.is_active()&&Instant::now()<deadline{engine.tick();thread::sleep(Duration::from_millis(5));}
+        assert!(!engine.task_registry.locked());assert_eq!(std::fs::read(retained).unwrap(),b"untouched original");
+        assert!(!task_registry::TaskRegistry::load(storage.join("active-task.json")).locked());
+        assert!(engine.task_registry.check_target_available(&parameters).is_err());
+    }
+
+    #[test]
+    fn idle_camera_stop_that_cleans_before_next_tick_is_expected_retirement() {
+        use devices::camera::{scripted_camera,ScriptedCameraConfig};
+        let mut engine=Engine::new(false);engine.camera=Some(scripted_camera(ScriptedCameraConfig::default()));
+        engine.cached_camera_health=engine.camera.as_ref().map(|camera|camera.health());
+        assert!(engine.device_command("stop",json!({})).unwrap().is_ok());
+        thread::sleep(Duration::from_millis(80));engine.tick();
+        assert!(!engine.fault_latched);assert_eq!(engine.phase,Phase::Stopped);
+        assert!(engine.camera.as_ref().unwrap().health().cleanup_confirmed);
+    }
+
+    #[test]
+    fn unfinished_task_restarts_connects_and_restores_only_through_confirmed_frozen_preflight() {
+        use devices::camera::{scripted_camera,ScriptedCameraConfig};
+        fn pump(engine:&mut Engine){
+            let expected=engine.operations.last_id.clone().expect("requested operation ID");
+            let deadline=Instant::now()+Duration::from_secs(8);
+            while engine.operations.is_active()&&Instant::now()<deadline{engine.tick();thread::sleep(Duration::from_millis(5));}
+            assert!(!engine.operations.is_active(),"operation timeout: {}",engine.snapshot());
+            assert!(engine.operations.history.iter().find(|operation|operation.operation_id==expected).is_some_and(|operation|operation.status=="completed"),"operation {expected} failed: {}",engine.snapshot());
+        }
+        let run=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/tests/ct-engine").join(format!("{}-unfinished-full-restart",Utc::now().timestamp_nanos_opt().unwrap()));
+        let storage=run.join("engine-data");
+        let parameters=Parameters{task_id:"resume-task".into(),save_path:run.to_string_lossy().into(),projection_count:3,angle_step_deg:120.0,exposure_ms:200.0};
+        let camera=scripted_camera(ScriptedCameraConfig{exposure_delay:Duration::from_millis(5),transfer_delay:Duration::from_millis(120),..Default::default()});
+        let nano=devices::turntable::test_homed_nano();let(xray,_)=devices::xray::test_worker(20.0,100.0);
+        let profile=capture_profile::CaptureProfile::from_readback(camera.health().identity.unwrap(),camera.profile_readback().unwrap(),None).unwrap();
+        let geometry=ScanGeometry{sod_mm:100.0,object_to_detector_mm:100.0,detector_width_mm:40.0,center_offset_x_mm:0.0,center_offset_y_mm:0.0,rotation_direction:"counterclockwise".into(),mirror_x:false,measurement:"measured".into()};
+        let mut original=Engine::new_with_storage(false,&storage);original.parameters=parameters.clone();original.max_xray_sec=120;original.connected=true;original.preflight=true;original.homed=true;original.phase=Phase::Running;
+        original.nano=Some(nano.clone());original.camera=Some(camera.clone());original.xray=Some(xray.clone());
+        original.task_registry.register(&parameters).unwrap();
+        original.real_scan=Some(RealScanHandle::start(nano,camera,xray,RealScanConfig{parameters:parameters.clone(),capture_profile:profile,max_xray_sec:120,voltage_kv:20.0,current_ua:100.0,geometry,resume:None}));
+        let deadline=Instant::now()+Duration::from_secs(20);
+        while original.current<1&&Instant::now()<deadline {
+            original.tick();
+            if let Some(stage)=original.scan_prompt {assert!(send(&mut original,"confirm_scan_stage",json!({"stage":stage})).error_code.is_none());}
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(original.current>=1,"first projection was not committed: {}",original.snapshot());
+        assert!(send(&mut original,"stop",json!({})).error_code.is_none());
+        let stopped=Instant::now()+Duration::from_secs(8);
+        while (original.real_scan.is_some()||original.operations.is_active())&&Instant::now()<stopped{original.tick();thread::sleep(Duration::from_millis(5));}
+        assert!(!original.fault_latched,"ordinary pipeline stop must be confirmed: {}",original.snapshot());assert!(original.task_registry.locked());
+        let committed=original.current;assert!((1..3).contains(&committed));original.shutdown();drop(original);
+        let mut restored=Engine::new_with_storage(false,&storage);assert!(restored.task_registry.locked());assert_eq!(restored.parameters,parameters);
+        restored.test_connections.nano=Some(Arc::new(||Ok(devices::turntable::test_homed_nano())));
+        restored.test_connections.camera=Some(Arc::new(||{let camera=scripted_camera(ScriptedCameraConfig::default());camera.disconnect_confirmed().map_err(|error|error.to_string())?;Ok(camera)}));
+        restored.test_connections.xray=Some(Arc::new(||Ok(devices::xray::test_worker(4.0,10.0).0)));
+        for (command,payload) in [("turntable_connect",json!({})),("camera_connect",json!({"deviceId":"fake-camera-1"})),("xray_connect",json!({}))] {
+            let response=send(&mut restored,command,payload);assert!(response.error_code.is_none(),"{command}: {:?}",response.error_code);assert!(response.payload["operationId"].is_string());pump(&mut restored);
+            assert!(restored.task_registry.locked(),"connection repair cannot unlock retained task");
+        }
+        assert!(send(&mut restored,"camera_read_properties",json!({})).error_code.is_none());pump(&mut restored);
+        for(command,payload)in[("send_voltage",json!({"kv":30.0})),("camera_focus",json!({"step":1})),("turntable_relative",json!({"angleDeg":1.0}))]{assert_eq!(send(&mut restored,command,payload).error_code.as_deref(),Some("UNFINISHED_TASK_LOCKED"));}
+        assert_eq!(send(&mut restored,"preflight",json!({})).error_code.as_deref(),Some("RESTORE_PREFLIGHT_CONFIRMATION_REQUIRED"));
+        assert!(send(&mut restored,"preflight",json!({"restore":true,"confirmUsbAutoShutdownRelease":true})).error_code.is_none());pump(&mut restored);
+        assert!(restored.preflight);assert_eq!(restored.max_xray_sec,120);assert!((restored.set_kv-20.0).abs()<0.01);assert!((restored.set_ua-100.0).abs()<0.01);assert!(!restored.usb_auto_shut_down);
+        assert!(send(&mut restored,"home",json!({})).error_code.is_none());pump(&mut restored);
+        assert!(restored.homed);assert!(restored.task_registry.locked());
+        assert!(send(&mut restored,"restore_previous",json!({})).error_code.is_none());pump(&mut restored);
+        assert_eq!(restored.current,committed);assert!(restored.restored_scan.is_some());assert_eq!(restored.max_xray_sec,120);
+        assert!(restored.task_registry.locked());assert_eq!(restored.phase,Phase::Ready);
+        std::fs::write(run.join("summary.md"),"PASS: same production scan coordinator and camera/Nano/Moxtek workers; committed partial acquisition survives restart; explicit device repair remains locked; controlled preflight restores frozen V/I/profile/max only after USB-release confirmation; required HOME and verified restore reach Ready without changing retained NEFs. Only offline validation.\n").unwrap();
+        restored.shutdown();
+    }
+
+    #[test]
+    fn unconfirmed_camera_disconnect_keeps_proxy_and_abandon_cannot_release_task_lock() {
+        use devices::camera::{scripted_camera,ScriptedCameraConfig};
+        let storage=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/tests/ct-engine").join(format!("{}-camera-close-failure",Utc::now().timestamp_nanos_opt().unwrap()));
+        let mut engine=Engine::new_with_storage(false,storage.join("engine-data"));
+        engine.parameters=Parameters{task_id:"retained-task".into(),save_path:storage.to_string_lossy().into(),projection_count:2,angle_step_deg:180.0,exposure_ms:200.0};
+        engine.task_registry.register(&engine.parameters).unwrap();
+        let retained=storage.join("retained-task/original.nef");std::fs::create_dir_all(retained.parent().unwrap()).unwrap();std::fs::write(&retained,b"retained original").unwrap();
+        engine.camera=Some(scripted_camera(ScriptedCameraConfig{close_failure:true,..Default::default()}));engine.cached_camera_health=engine.camera.as_ref().map(|camera|camera.health());
+        let response=send(&mut engine,"camera_disconnect",json!({}));assert!(response.error_code.is_none());let id=response.payload["operationId"].as_str().unwrap().to_owned();
+        let deadline=Instant::now()+Duration::from_secs(8);while engine.operations.is_active()&&Instant::now()<deadline{engine.tick();thread::sleep(Duration::from_millis(10));}
+        assert!(engine.camera.is_some());assert!(!engine.camera.as_ref().unwrap().health().cleanup_confirmed);
+        assert_eq!(engine.operations.history.iter().find(|operation|operation.operation_id==id).unwrap().status,"cleanup_unconfirmed");
+        assert!(send(&mut engine,"abandon_scan",json!({})).error_code.is_none());
+        // An OFF-only completion while full abandonment cleanup is pending cannot unlock it.
+        assert!(send(&mut engine,"xray_off",json!({})).error_code.is_none());
+        let deadline=Instant::now()+Duration::from_secs(8);while engine.operations.is_active()&&Instant::now()<deadline{engine.tick();thread::sleep(Duration::from_millis(10));}
+        assert!(engine.task_registry.locked());assert_eq!(std::fs::read(retained).unwrap(),b"retained original");assert!(engine.fault_latched);
+    }
+
+    #[test]
+    fn independent_capture_rejects_the_configured_scan_directory_before_io() {
+        use devices::camera::{scripted_camera,ScriptedCameraConfig};
+        let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/tests/camera").join(format!("{}-independent-directory-isolation",Utc::now().format("%Y%m%d-%H%M%S%3f")));
+        let mut engine=Engine::new(false);engine.camera=Some(scripted_camera(ScriptedCameraConfig::default()));
+        engine.parameters=Parameters{task_id:"selected-scan".into(),save_path:root.to_string_lossy().into(),projection_count:3,angle_step_deg:120.0,exposure_ms:200.0};
+        let directory=root.join("selected-scan");let before=engine.real_frames.len();
+        assert_eq!(send(&mut engine,"camera_capture",json!({"directory":directory.to_string_lossy()})).error_code.as_deref(),Some("CAPTURE_DIRECTORY_IS_SCAN_TASK"));
+        assert!(!directory.exists());assert_eq!(engine.real_frames.len(),before);assert_eq!(engine.current,0);assert!(engine.camera.as_ref().unwrap().health().last_capture.is_none());
     }
 }

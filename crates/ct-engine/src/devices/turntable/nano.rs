@@ -5,6 +5,7 @@
 //! command names are external device contracts and must not be changed without
 //! a matching active firmware implementation and parity tests.
 
+use super::planner::{self, MotionPlan};
 use serde::Serialize;
 use serialport::{SerialPort, SerialPortInfo, SerialPortType};
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -227,7 +228,11 @@ impl LineTransport for SerialLineTransport {
             match self.port.read(&mut buffer) {
                 Ok(count) if count > 0 => self.receive_buffer.extend_from_slice(&buffer[..count]),
                 Ok(_) => {}
-                Err(error) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -235,6 +240,7 @@ impl LineTransport for SerialLineTransport {
 }
 
 struct Session {
+    epoch: Arc<AtomicU64>,
     sender: mpsc::Sender<WorkerCommand>,
     emergency_sender: mpsc::Sender<mpsc::Sender<Result<(), NanoError>>>,
     worker: Option<JoinHandle<()>>,
@@ -248,12 +254,16 @@ impl Session {
         make_command: impl FnOnce(mpsc::Sender<Result<T, NanoError>>) -> WorkerCommand,
         timeout: Duration,
     ) -> Result<T, NanoError> {
+        self.call_cancelled(make_command,timeout,Arc::new(AtomicBool::new(false)))
+    }
+
+    fn call_cancelled<T>(&self,make_command:impl FnOnce(mpsc::Sender<Result<T,NanoError>>)->WorkerCommand,timeout:Duration,cancel:Arc<AtomicBool>)->Result<T,NanoError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(NanoError::NotConnected);
         }
         let (sender, receiver) = mpsc::channel();
         self.sender
-            .send(make_command(sender))
+            .send(WorkerCommand::Guarded(Box::new(make_command(sender)),self.epoch.load(Ordering::SeqCst),cancel))
             .map_err(|_| NanoError::NotConnected)?;
         receiver
             .recv_timeout(timeout)
@@ -265,6 +275,7 @@ impl Session {
     }
 
     fn stop_emergency(&self) -> Result<(), NanoError> {
+        self.epoch.fetch_add(1,Ordering::SeqCst);
         let (sender, receiver) = mpsc::channel();
         self.emergency_sender
             .send(sender)
@@ -296,7 +307,10 @@ impl NanoAdapter {
     }
 
     pub fn health(&self) -> NanoHealth {
-        self.health.lock().expect("Nano health mutex poisoned").clone()
+        self.health
+            .lock()
+            .expect("Nano health mutex poisoned")
+            .clone()
     }
 
     pub fn discover_and_connect(&mut self) -> Result<NanoIdentity, NanoError> {
@@ -314,9 +328,9 @@ impl NanoAdapter {
         let mut matches = Vec::new();
         let mut rejected = Vec::new();
         for port in ports {
-            match SerialLineTransport::open(&port.port_name)
-                .and_then(|transport| Self::probe_transport(port.port_name.clone(), Box::new(transport)))
-            {
+            match SerialLineTransport::open(&port.port_name).and_then(|transport| {
+                Self::probe_transport(port.port_name.clone(), Box::new(transport))
+            }) {
                 Ok(candidate) => matches.push(candidate),
                 Err(error) => rejected.push(format!("{}: {error}", port.port_name)),
             }
@@ -340,7 +354,10 @@ impl NanoAdapter {
                 Ok(identity)
             }
             _ => {
-                let names = matches.into_iter().map(|(port, _, _)| port).collect::<Vec<_>>();
+                let names = matches
+                    .into_iter()
+                    .map(|(port, _, _)| port)
+                    .collect::<Vec<_>>();
                 set_health(&self.health, |health| {
                     health.state = NanoConnectionState::Fault;
                     health.last_error = Some(format!("ambiguous devices: {}", names.join(", ")));
@@ -392,7 +409,9 @@ impl NanoAdapter {
         transport
             .write_line("HEARTBEAT 0")
             .map_err(|error| NanoError::Transport(error.to_string()))?;
-        wait_for_line(&mut *transport, heartbeat_deadline, |line| line == "HBACK 0")?;
+        wait_for_line(&mut *transport, heartbeat_deadline, |line| {
+            line == "HBACK 0"
+        })?;
         if heartbeat_started.elapsed() > HEARTBEAT_TIMEOUT {
             return Err(NanoError::Timeout(
                 "initial heartbeat acknowledgement was late".into(),
@@ -421,6 +440,7 @@ impl NanoAdapter {
         let closed = Arc::new(AtomicBool::new(false));
         let worker_closed = closed.clone();
         let worker_health = health.clone();
+        let epoch=Arc::new(AtomicU64::new(0));let worker_epoch=epoch.clone();
         let worker = thread::Builder::new()
             .name("rts9060-nano".into())
             .spawn(move || {
@@ -430,10 +450,12 @@ impl NanoAdapter {
                     emergency_receiver,
                     worker_health,
                     worker_closed,
+                    worker_epoch,
                 )
             })
             .map_err(|error| NanoError::Transport(error.to_string()))?;
         self.session = Some(Session {
+            epoch,
             sender,
             emergency_sender,
             worker: Some(worker),
@@ -460,14 +482,22 @@ impl NanoAdapter {
     }
 
     pub fn clear_fault(&self) -> Result<NanoStatus, NanoError> {
-        self.session()?.call(WorkerCommand::ClearFault, COMMAND_TIMEOUT * 2)
+        self.session()?
+            .call(WorkerCommand::ClearFault, COMMAND_TIMEOUT * 2)
     }
 
     pub fn home(&self) -> Result<NanoStatus, NanoError> {
-        self.session()?.call(WorkerCommand::Home, HOME_TIMEOUT + COMMAND_TIMEOUT)
+        self.session()?
+            .call(WorkerCommand::Home, HOME_TIMEOUT + COMMAND_TIMEOUT)
     }
+    pub fn rearm_cancelled(&self,cancel:Arc<AtomicBool>)->Result<NanoStatus,NanoError>{self.session()?.call_cancelled(WorkerCommand::Rearm,COMMAND_TIMEOUT,cancel)}
+    pub fn home_cancelled(&self,cancel:Arc<AtomicBool>)->Result<NanoStatus,NanoError>{self.session()?.call_cancelled(WorkerCommand::Home,HOME_TIMEOUT+COMMAND_TIMEOUT,cancel)}
+    pub fn clear_fault_cancelled(&self,cancel:Arc<AtomicBool>)->Result<NanoStatus,NanoError>{self.session()?.call_cancelled(WorkerCommand::ClearFault,COMMAND_TIMEOUT*2,cancel)}
+    pub fn execute_plan_cancelled(&self,plan:&MotionPlan,cancel:Arc<AtomicBool>)->Result<MoveTicket,NanoError>{plan.validate()?;self.session()?.call_cancelled(|reply|WorkerCommand::ExecutePlan(plan.clone(),reply),MOVE_TIMEOUT+COMMAND_TIMEOUT,cancel)}
+    pub fn capture_done_cancelled(&self,command_id:u32,cancel:Arc<AtomicBool>)->Result<NanoStatus,NanoError>{self.session()?.call_cancelled(|reply|WorkerCommand::CaptureDone(command_id,reply),COMMAND_TIMEOUT*2,cancel)}
 
     pub fn move_abs(&self, angle_mdeg: i32) -> Result<MoveTicket, NanoError> {
+        planner::require_delta(angle_mdeg)?;
         self.session()?.call(
             |reply| WorkerCommand::MoveAbs(angle_mdeg, reply),
             MOVE_TIMEOUT + COMMAND_TIMEOUT,
@@ -511,6 +541,23 @@ impl NanoAdapter {
             health.last_heartbeat_rtt_ms = None;
         });
     }
+
+    pub fn move_rel(&self, delta_mdeg: i32) -> Result<MoveTicket, NanoError> {
+        planner::require_delta(delta_mdeg)?;
+        self.session()?.call(
+            |reply| WorkerCommand::MoveRel(delta_mdeg, reply),
+            MOVE_TIMEOUT + COMMAND_TIMEOUT,
+        )
+    }
+
+    /// Rechecks the confirmed source and executes atomically on the serial owner.
+    pub fn execute_plan(&self, plan: &MotionPlan) -> Result<MoveTicket, NanoError> {
+        plan.validate()?;
+        self.session()?.call(
+            |reply| WorkerCommand::ExecutePlan(plan.clone(), reply),
+            MOVE_TIMEOUT + COMMAND_TIMEOUT,
+        )
+    }
 }
 
 impl Drop for NanoAdapter {
@@ -520,18 +567,22 @@ impl Drop for NanoAdapter {
 }
 
 enum WorkerCommand {
+    Guarded(Box<WorkerCommand>,u64,Arc<AtomicBool>),
     Ping(mpsc::Sender<Result<(), NanoError>>),
     Status(mpsc::Sender<Result<NanoStatus, NanoError>>),
     Rearm(mpsc::Sender<Result<NanoStatus, NanoError>>),
     ClearFault(mpsc::Sender<Result<NanoStatus, NanoError>>),
     Home(mpsc::Sender<Result<NanoStatus, NanoError>>),
     MoveAbs(i32, mpsc::Sender<Result<MoveTicket, NanoError>>),
+    MoveRel(i32, mpsc::Sender<Result<MoveTicket, NanoError>>),
+    ExecutePlan(MotionPlan, mpsc::Sender<Result<MoveTicket, NanoError>>),
     CaptureDone(u32, mpsc::Sender<Result<NanoStatus, NanoError>>),
     XrayWarning(bool, mpsc::Sender<Result<(), NanoError>>),
     Shutdown,
 }
 
 struct Worker {
+    epoch:Arc<AtomicU64>,operation_epoch:Option<u64>,operation_cancel:Option<Arc<AtomicBool>>,
     transport: Box<dyn LineTransport>,
     receiver: mpsc::Receiver<WorkerCommand>,
     emergency_receiver: mpsc::Receiver<mpsc::Sender<Result<(), NanoError>>>,
@@ -548,8 +599,10 @@ fn run_worker(
     emergency_receiver: mpsc::Receiver<mpsc::Sender<Result<(), NanoError>>>,
     health: Arc<Mutex<NanoHealth>>,
     closed: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
 ) {
     let mut worker = Worker {
+        epoch,operation_epoch:None,operation_cancel:None,
         transport,
         receiver,
         emergency_receiver,
@@ -579,16 +632,25 @@ impl Worker {
                 .next_heartbeat
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(50));
-            let command_error = match self.receiver.recv_timeout(timeout) {
+            let received=match self.receiver.recv_timeout(timeout){
+                Ok(WorkerCommand::Guarded(command,epoch,cancel))=>{self.operation_epoch=Some(epoch);self.operation_cancel=Some(cancel);Ok(*command)},
+                result=>{self.operation_epoch=None;self.operation_cancel=None;result}
+            };
+            let command_error = match received {
+                Ok(WorkerCommand::Guarded(_,_,_))=>Some(NanoError::Safety("Nested Nano admission envelope".into())),
                 Ok(WorkerCommand::Ping(reply)) => reply_and_error(reply, self.ping()),
                 Ok(WorkerCommand::Status(reply)) => reply_and_error(reply, self.status()),
                 Ok(WorkerCommand::Rearm(reply)) => reply_and_error(reply, self.rearm()),
-                Ok(WorkerCommand::ClearFault(reply)) => {
-                    reply_and_error(reply, self.clear_fault())
-                }
+                Ok(WorkerCommand::ClearFault(reply)) => reply_and_error(reply, self.clear_fault()),
                 Ok(WorkerCommand::Home(reply)) => reply_and_error(reply, self.home()),
                 Ok(WorkerCommand::MoveAbs(angle_mdeg, reply)) => {
                     reply_and_error(reply, self.move_abs(angle_mdeg))
+                }
+                Ok(WorkerCommand::MoveRel(delta_mdeg, reply)) => {
+                    reply_and_error(reply, self.move_rel(delta_mdeg))
+                }
+                Ok(WorkerCommand::ExecutePlan(plan, reply)) => {
+                    reply_and_error(reply, self.execute_plan(&plan))
                 }
                 Ok(WorkerCommand::CaptureDone(command_id, reply)) => {
                     reply_and_error(reply, self.capture_done(command_id))
@@ -599,6 +661,7 @@ impl Worker {
                 Ok(WorkerCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
             };
+            self.operation_epoch=None;self.operation_cancel=None;
             if let Some(error) = command_error {
                 self.fail(error);
                 break;
@@ -666,6 +729,7 @@ impl Worker {
         timeout: Duration,
         terminal: impl Fn(&str, u32) -> bool,
     ) -> Result<(u32, String), NanoError> {
+        self.require_active_operation(command,arguments)?;
         let request = if arguments.is_empty() {
             format!("{command} {id}")
         } else {
@@ -678,10 +742,26 @@ impl Worker {
         let mut acknowledged = false;
         let mut pending_heartbeat: Option<(u32, Instant)> = None;
         loop {
-            if let Ok(reply) = self.emergency_receiver.try_recv() {
+            self.require_active_operation(command,arguments)?;
+            // STOP confirmation itself is bounded and must not recurse into
+            // another STOP while multiple callers request the same safe action.
+            let priority_stop = if command == "STOP" {
+                None
+            } else {
+                self.emergency_receiver.try_recv().ok()
+            };
+            if let Some(reply) = priority_stop {
                 let stop_result = self.stop_protocol();
                 let stop_confirmed = stop_result.is_ok();
                 let _ = reply.send(stop_result);
+                if stop_confirmed && command=="XRAY_WARNING"&&arguments=="OFF" {
+                    // STOP may consume this command's earlier ACK. Reissue only
+                    // the safe OFF with the same bounded monotonic deadline.
+                    let remaining=deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero(){return Err(NanoError::Timeout("warning OFF confirmation deadline".into()));}
+                    let retry_id=self.command_id();
+                    return self.command_lines_with_id(retry_id,command,arguments,remaining,terminal);
+                }
                 return Err(NanoError::Safety(if stop_confirmed {
                     format!("{command} interrupted by confirmed STOP")
                 } else {
@@ -704,7 +784,8 @@ impl Worker {
                     .map_err(|error| NanoError::Transport(error.to_string()))?;
                 pending_heartbeat = Some((sequence, now));
             }
-            let line = self.read_line((deadline - Instant::now()).min(Duration::from_millis(100)))?;
+            let line =
+                self.read_line((deadline - Instant::now()).min(Duration::from_millis(100)))?;
             let Some(line) = line else {
                 continue;
             };
@@ -738,8 +819,15 @@ impl Worker {
         }
     }
 
+    fn require_active_operation(&self,command:&str,arguments:&str)->Result<(),NanoError> {
+        if command!="STOP" && !(command=="XRAY_WARNING"&&arguments=="OFF") && (self.operation_epoch.is_some_and(|epoch|epoch!=self.epoch.load(Ordering::SeqCst))||self.operation_cancel.as_ref().is_some_and(|cancel|cancel.load(Ordering::SeqCst))){return Err(NanoError::Safety(format!("{command} rejected: cancelled Nano operation generation")));}
+        Ok(())
+    }
+
     fn ping(&mut self) -> Result<(), NanoError> {
-        self.command_lines("PING", "", COMMAND_TIMEOUT, |line, id| line == format!("PONG {id}"))?;
+        self.command_lines("PING", "", COMMAND_TIMEOUT, |line, id| {
+            line == format!("PONG {id}")
+        })?;
         Ok(())
     }
 
@@ -766,15 +854,25 @@ impl Worker {
     }
 
     fn home(&mut self) -> Result<NanoStatus, NanoError> {
+        let before = self.status()?;
+        planner::verify_fixed_configuration(&before)?;
         self.command_lines("HOME", "", HOME_TIMEOUT, |line, id| {
             line == format!("HOME_DONE {id} POS=0")
         })?;
         let status = self.status()?;
-        if status.state != "IDLE" || !status.rearmed || !status.homed || !status.reference_valid {
+        if status.state != "IDLE"
+            || !status.rearmed
+            || !status.homed
+            || !status.reference_valid
+            || status.position_pulses != 0
+            || status.target_pulses != 0
+            || status.capture_id != 0
+        {
             return Err(NanoError::Safety(
                 "HOME completed without a valid idle reference".into(),
             ));
         }
+        planner::verify_fixed_configuration(&status)?;
         Ok(status)
     }
 
@@ -783,11 +881,7 @@ impl Worker {
             line == format!("OK {id} FAULT_CLEARED")
         })?;
         let status = self.status()?;
-        if status.state != "LOCKED"
-            || status.rearmed
-            || status.homed
-            || status.reference_valid
-        {
+        if status.state != "LOCKED" || status.rearmed || status.homed || status.reference_valid {
             return Err(NanoError::Safety(
                 "CLEAR_FAULT did not restore a locked invalid-reference state".into(),
             ));
@@ -796,8 +890,60 @@ impl Worker {
     }
 
     fn move_abs(&mut self, angle_mdeg: i32) -> Result<MoveTicket, NanoError> {
+        planner::require_delta(angle_mdeg)?;
+        let source = self.status()?;
+        planner::verify_ready(&source)?;
+        let target = -planner::pulses_for_forward_mdeg((-angle_mdeg) % 360_000);
+        if target > source.position_pulses {
+            return Err(NanoError::Safety("MOVE_ABS would reverse from the confirmed unwrapped position; use the phase planner".into()));
+        }
+        self.move_command("MOVE_ABS", angle_mdeg, target)
+    }
+
+    fn move_rel(&mut self, delta_mdeg: i32) -> Result<MoveTicket, NanoError> {
+        planner::require_delta(delta_mdeg)?;
+        let source = self.status()?;
+        planner::verify_ready(&source)?;
+        self.move_rel_from(&source, delta_mdeg)
+    }
+
+    fn move_rel_from(
+        &mut self,
+        source: &NanoStatus,
+        delta_mdeg: i32,
+    ) -> Result<MoveTicket, NanoError> {
+        let target = source.position_pulses - planner::pulses_for_forward_mdeg(-delta_mdeg);
+        if target < -planner::MAX_POSITION_PULSES {
+            return Err(NanoError::Safety(
+                "MOVE_REL exceeds the recovered candidate range".into(),
+            ));
+        }
+        self.move_command("MOVE_REL", delta_mdeg, target)
+    }
+
+    fn execute_plan(&mut self, plan: &MotionPlan) -> Result<MoveTicket, NanoError> {
+        plan.validate()?;
+        let source = self.status()?;
+        planner::verify_ready(&source)?;
+        if source.position_pulses != plan.from_pulses {
+            return Err(NanoError::Safety(
+                "confirmed Nano source changed after motion planning".into(),
+            ));
+        }
+        let ticket = self.move_rel_from(&source, plan.protocol_delta_mdeg)?;
+        let status = self.status()?;
+        planner::verify_plan_capture_hold(plan, &ticket, &status)?;
+        Ok(ticket)
+    }
+
+    fn move_command(
+        &mut self,
+        command: &str,
+        angle_mdeg: i32,
+        expected_target: i64,
+    ) -> Result<MoveTicket, NanoError> {
         let (command_id, line) = self.command_lines(
-            "MOVE_ABS",
+            command,
             &angle_mdeg.to_string(),
             MOVE_TIMEOUT,
             |line, id| line.starts_with(&format!("READY_TO_CAPTURE {id} POS=")),
@@ -810,14 +956,17 @@ impl Worker {
         if status.state != "CAPTURE_HOLD"
             || status.capture_id != command_id
             || status.position_pulses != position_pulses
+            || status.position_pulses != expected_target
+            || status.target_pulses != expected_target
             || !status.rearmed
             || !status.homed
             || !status.reference_valid
         {
-            return Err(NanoError::Safety(
-                "MOVE_ABS did not end in a verified CAPTURE_HOLD".into(),
-            ));
+            return Err(NanoError::Safety(format!(
+                "{command} did not end in a verified planned CAPTURE_HOLD"
+            )));
         }
+        planner::verify_fixed_configuration(&status)?;
         Ok(MoveTicket {
             command_id,
             angle_mdeg,
@@ -826,6 +975,13 @@ impl Worker {
     }
 
     fn capture_done(&mut self, command_id: u32) -> Result<NanoStatus, NanoError> {
+        let held = self.status()?;
+        planner::verify_fixed_configuration(&held)?;
+        if held.state != "CAPTURE_HOLD" || held.capture_id != command_id {
+            return Err(NanoError::Safety(
+                "CAPTURE_DONE requires the confirmed matching move ticket".into(),
+            ));
+        }
         self.command_lines_with_id(
             command_id,
             "CAPTURE_DONE",
@@ -839,11 +995,14 @@ impl Worker {
             || !status.rearmed
             || !status.homed
             || !status.reference_valid
+            || status.position_pulses != held.position_pulses
+            || status.target_pulses != held.target_pulses
         {
             return Err(NanoError::Safety(
                 "CAPTURE_DONE did not restore a verified IDLE state".into(),
             ));
         }
+        planner::verify_fixed_configuration(&status)?;
         Ok(status)
     }
 
@@ -872,12 +1031,22 @@ impl Worker {
             .map_err(|error| NanoError::Transport(error.to_string()))?;
         let deadline = started + HEARTBEAT_TIMEOUT;
         loop {
-            let line = self.read_line((deadline - Instant::now()).min(Duration::from_millis(100)))?;
+            if let Ok(reply) = self.emergency_receiver.try_recv() {
+                let result = self.stop_protocol();
+                let confirmed = result.is_ok();
+                let _ = reply.send(result);
+                if confirmed {
+                    return Ok(());
+                }
+                return Err(NanoError::Safety(
+                    "heartbeat wait interrupted; STOP unconfirmed".into(),
+                ));
+            }
+            let line =
+                self.read_line((deadline - Instant::now()).min(Duration::from_millis(100)))?;
             let Some(line) = line else {
                 if Instant::now() >= deadline {
-                    return Err(NanoError::Timeout(format!(
-                        "missing HBACK {sequence}"
-                    )));
+                    return Err(NanoError::Timeout(format!("missing HBACK {sequence}")));
                 }
                 continue;
             };
@@ -959,7 +1128,9 @@ fn reply_and_error<T>(
             let fatal = matches!(error, NanoError::Transport(_));
             let _ = reply.send(Err(error));
             if fatal {
-                Some(NanoError::Safety("session invalidated: transport failure".into()))
+                Some(NanoError::Safety(
+                    "session invalidated: transport failure".into(),
+                ))
             } else {
                 None
             }
@@ -999,7 +1170,9 @@ fn read_optional_ready(
             .read_line((deadline - Instant::now()).min(Duration::from_millis(50)))
             .map_err(|error| NanoError::Transport(error.to_string()))?
         {
-            Some(line) if line.starts_with("READY ") => return parse_identity(&line, None).map(Some),
+            Some(line) if line.starts_with("READY ") => {
+                return parse_identity(&line, None).map(Some)
+            }
             Some(_) => {}
             None => {}
         }
@@ -1079,13 +1252,18 @@ fn wait_for_line(
 ) -> Result<String, NanoError> {
     loop {
         if Instant::now() >= deadline {
-            return Err(NanoError::Timeout("expected response was not received".into()));
+            return Err(NanoError::Timeout(
+                "expected response was not received".into(),
+            ));
         }
         if let Some(line) = transport
             .read_line((deadline - Instant::now()).min(Duration::from_millis(100)))
             .map_err(|error| NanoError::Transport(error.to_string()))?
         {
-            if line.starts_with("ERR ") || line.starts_with("FAULT ") || line.starts_with("STOPPED ") {
+            if line.starts_with("ERR ")
+                || line.starts_with("FAULT ")
+                || line.starts_with("STOPPED ")
+            {
                 return Err(NanoError::Protocol(line));
             }
             if predicate(&line) {
@@ -1112,15 +1290,16 @@ fn parse_identity(line: &str, info_id: Option<u32>) -> Result<NanoIdentity, Nano
     let start = match info_id {
         Some(id)
             if tokens.first() == Some(&"INFO")
-                && tokens
-                    .get(1)
-                    .and_then(|token| token.parse::<u32>().ok())
-                    == Some(id) =>
+                && tokens.get(1).and_then(|token| token.parse::<u32>().ok()) == Some(id) =>
         {
             2
         }
         None if tokens.first() == Some(&"READY") => 1,
-        _ => return Err(NanoError::Protocol(format!("invalid identity line: {line}"))),
+        _ => {
+            return Err(NanoError::Protocol(format!(
+                "invalid identity line: {line}"
+            )))
+        }
     };
     let fields = parse_fields(&tokens[start..])?;
     let capabilities = required_field(&fields, "CAPS")?
@@ -1169,7 +1348,9 @@ fn parse_fields<'a>(tokens: &'a [&'a str]) -> Result<HashMap<&'a str, &'a str>, 
             .split_once('=')
             .ok_or_else(|| NanoError::Protocol(format!("invalid field {token}")))?;
         if key.is_empty() || value.is_empty() || fields.insert(key, value).is_some() {
-            return Err(NanoError::Protocol(format!("invalid duplicate field {token}")));
+            return Err(NanoError::Protocol(format!(
+                "invalid duplicate field {token}"
+            )));
         }
     }
     Ok(fields)
@@ -1200,7 +1381,7 @@ fn parse_bool_field(fields: &HashMap<&str, &str>, key: &str) -> Result<bool, Nan
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -1217,6 +1398,8 @@ mod tests {
         position_pulses: i64,
         capture_id: u32,
         hold_move: bool,
+        arrival_offset: i64,
+        wrong_pulse_scale: bool,
     }
 
     struct FakeTransport {
@@ -1225,7 +1408,11 @@ mod tests {
 
     impl FakeTransport {
         fn new(state: Arc<Mutex<FakeState>>) -> Self {
-            state.lock().unwrap().queue.push_back(identity_line("READY", false));
+            state
+                .lock()
+                .unwrap()
+                .queue
+                .push_back(identity_line("READY", false));
             Self { state }
         }
     }
@@ -1260,13 +1447,11 @@ mod tests {
                     let position = state.position_pulses;
                     let capture_id = state.capture_id;
                     state.queue.push_back(format!("ACK {id} STATUS"));
-                    state.queue.push_back(status_line(
-                        id,
-                        rearmed,
-                        homed,
-                        position,
-                        capture_id,
-                    ));
+                    let mut line = status_line(id, rearmed, homed, position, capture_id);
+                    if state.wrong_pulse_scale {
+                        line = line.replace("microsteps=8 ppr=96000", "microsteps=16 ppr=192000");
+                    }
+                    state.queue.push_back(line);
                 }
                 ["REARM", id] => {
                     state.rearmed = true;
@@ -1278,11 +1463,14 @@ mod tests {
                         state.queue.push_back(format!("ERR {id} NOT_REARMED"));
                     } else {
                         state.queue.push_back(format!("ACK {id} HOME"));
-                        state.queue.push_back("HOME_PHASE HOME_SEARCH_FAST limit=120000".into());
+                        state
+                            .queue
+                            .push_back("HOME_PHASE HOME_SEARCH_FAST limit=120000".into());
                         if state.delay_home_until_heartbeat {
                             state.pending_home_id = Some((*id).to_owned());
                         } else {
                             state.homed = true;
+                            state.position_pulses = 0;
                             state.queue.push_back(format!("HOME_DONE {id} POS=0"));
                         }
                     }
@@ -1300,19 +1488,39 @@ mod tests {
                     state.queue.push_back(format!("ACK {id} CLEAR_FAULT"));
                     state.queue.push_back(format!("OK {id} FAULT_CLEARED"));
                 }
-                ["MOVE_ABS", id, angle] => {
+                [command @ ("MOVE_ABS" | "MOVE_REL"), id, angle] => {
                     if !state.rearmed || !state.homed {
-                        state.queue.push_back(format!("ERR {id} REFERENCE_REQUIRED"));
+                        state
+                            .queue
+                            .push_back(format!("ERR {id} REFERENCE_REQUIRED"));
                     } else {
                         let angle = angle.parse::<i64>().unwrap();
-                        state.position_pulses = angle * 96_000 / 360_000;
+                        let magnitude = angle.unsigned_abs();
+                        let pulses = ((if *command == "MOVE_ABS" {
+                            magnitude % 360000
+                        } else {
+                            magnitude
+                        }) * 96000
+                            + 180000)
+                            / 360000;
+                        let signed = pulses as i64 * if angle < 0 { -1 } else { 1 };
+                        let target = if *command == "MOVE_REL" {
+                            state.position_pulses + signed
+                        } else {
+                            signed
+                        };
+                        if target > state.position_pulses {
+                            state.queue.push_back(format!("ERR {id} REVERSE_FORBIDDEN"));
+                            return Ok(());
+                        }
+                        state.position_pulses = target;
                         state.capture_id = id.parse().unwrap();
-                        let position = state.position_pulses;
-                        state.queue.push_back(format!("ACK {id} MOVE_ABS"));
+                        let position = state.position_pulses + state.arrival_offset;
+                        state.queue.push_back(format!("ACK {id} {command}"));
                         if !state.hold_move {
-                            state.queue.push_back(format!(
-                                "READY_TO_CAPTURE {id} POS={position}"
-                            ));
+                            state
+                                .queue
+                                .push_back(format!("READY_TO_CAPTURE {id} POS={position}"));
                         }
                     }
                 }
@@ -1324,18 +1532,17 @@ mod tests {
                     } else {
                         state.capture_id = 0;
                         state.queue.push_back(format!("ACK {id} CAPTURE_DONE"));
-                        state
-                            .queue
-                            .push_back(format!("IDLE {id} CAPTURE_RELEASED"));
+                        state.queue.push_back(format!("IDLE {id} CAPTURE_RELEASED"));
                     }
                 }
                 ["STOP", id] => {
                     state.rearmed = false;
                     state.homed = false;
+                    state.capture_id = 0;
                     state.queue.push_back(format!("ACK {id} STOP"));
-                    state.queue.push_back(format!(
-                        "STOPPED {id} POSITION_UNKNOWN reason=HOST_STOP"
-                    ));
+                    state
+                        .queue
+                        .push_back(format!("STOPPED {id} POSITION_UNKNOWN reason=HOST_STOP"));
                 }
                 _ => {}
             }
@@ -1500,7 +1707,10 @@ mod tests {
         // Device rejects CAPTURE_DONE outside CAPTURE_HOLD: the error is
         // returned to the caller but the session must survive.
         let error = adapter.capture_done(4_242).unwrap_err();
-        assert!(matches!(error, NanoError::Safety(_) | NanoError::Protocol(_)));
+        assert!(matches!(
+            error,
+            NanoError::Safety(_) | NanoError::Protocol(_)
+        ));
         assert_eq!(adapter.health().state, NanoConnectionState::Connected);
         // Full recovery path still works on the same session.
         adapter.rearm().unwrap();
@@ -1582,5 +1792,166 @@ mod tests {
         adapter.stop().unwrap();
         assert!(matches!(worker.join().unwrap(), Err(NanoError::Safety(_))));
         drop(adapter);
+    }
+
+    #[test]
+    fn stop_invalidates_queued_home_rearm_and_motion_admission() {
+        let state=Arc::new(Mutex::new(FakeState{hold_move:true,..FakeState::default()}));
+        let adapter=Arc::new(connected_homed_fake(state.clone()));
+        let plan=planner::plan_relative(&adapter.status().unwrap(),90_000).unwrap();
+        let cancel=Arc::new(AtomicBool::new(false));
+        let moving=adapter.clone();let moving_cancel=cancel.clone();
+        let worker=thread::spawn(move||moving.execute_plan_cancelled(&plan,moving_cancel));
+        let deadline=Instant::now()+Duration::from_secs(1);
+        while !state.lock().unwrap().writes.iter().any(|line|line.starts_with("MOVE_REL ")) && Instant::now()<deadline {thread::sleep(Duration::from_millis(1));}
+        let session=adapter.session().unwrap();let epoch=session.epoch.load(Ordering::SeqCst);
+        let (rearm_tx,rearm_rx)=mpsc::channel();let(home_tx,home_rx)=mpsc::channel();
+        session.sender.send(WorkerCommand::Guarded(Box::new(WorkerCommand::Rearm(rearm_tx)),epoch,cancel.clone())).unwrap();
+        session.sender.send(WorkerCommand::Guarded(Box::new(WorkerCommand::Home(home_tx)),epoch,cancel.clone())).unwrap();
+        cancel.store(true,Ordering::SeqCst);adapter.stop().unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert!(rearm_rx.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        assert!(home_rx.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        let writes=state.lock().unwrap().writes.clone();let stopped=writes.iter().position(|line|line.starts_with("STOP ")).unwrap();
+        assert!(writes[stopped+1..].iter().all(|line|!line.starts_with("REARM ")&&!line.starts_with("HOME ")&&!line.starts_with("MOVE_")),"old queued commands must not revive after STOP");
+    }
+
+    fn connected_homed_fake(state: Arc<Mutex<FakeState>>) -> NanoAdapter {
+        let mut adapter = NanoAdapter::new();
+        adapter
+            .connect_transport_for_test("OFFLINE", Box::new(FakeTransport::new(state)))
+            .unwrap();
+        adapter.rearm().unwrap();
+        adapter.home().unwrap();
+        adapter
+    }
+    pub(crate) fn test_homed_nano()->Arc<NanoAdapter>{Arc::new(connected_homed_fake(Arc::new(Mutex::new(FakeState::default()))))}
+
+    #[test]
+    fn relative_full_circle_and_phase_wrap_use_the_actual_serial_worker() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_homed_fake(state.clone());
+        let first = planner::plan_relative(&adapter.status().unwrap(), 342000).unwrap();
+        let ticket = adapter.execute_plan(&first).unwrap();
+        planner::verify_plan_capture_hold(&first, &ticket, &adapter.status().unwrap()).unwrap();
+        planner::verify_plan_released(&first, &adapter.capture_done(ticket.command_id).unwrap())
+            .unwrap();
+        let wrap = planner::plan_to_phase(&adapter.status().unwrap(), 18000).unwrap();
+        let ticket = adapter.execute_plan(&wrap).unwrap();
+        assert_eq!(ticket.position_pulses, -100800);
+        planner::verify_plan_released(&wrap, &adapter.capture_done(ticket.command_id).unwrap())
+            .unwrap();
+        let circle = planner::plan_relative(&adapter.status().unwrap(), 360000).unwrap();
+        let ticket = adapter.execute_plan(&circle).unwrap();
+        assert_eq!(ticket.position_pulses, -196800);
+        adapter.capture_done(ticket.command_id).unwrap();
+        adapter.disconnect();
+        assert!(state
+            .lock()
+            .unwrap()
+            .writes
+            .iter()
+            .any(|line| line.starts_with("MOVE_REL ") && line.ends_with(" -360000")));
+    }
+
+    #[test]
+    fn two_scan_sequences_preserve_unwrapped_position_and_release_every_ticket() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_homed_fake(state.clone());
+        for round in 0..2 {
+            for angle in [0, -72000, -144000, -216000, -288000] {
+                let plan = planner::plan_projection(&adapter.status().unwrap(), angle).unwrap();
+                let ticket = adapter.execute_plan(&plan).unwrap();
+                assert_eq!(
+                    ticket.position_pulses,
+                    -(round * 96000) + i64::from(angle) * 96000 / 360000
+                );
+                assert!(adapter
+                    .capture_done(ticket.command_id.wrapping_add(1000))
+                    .is_err());
+                planner::verify_plan_released(
+                    &plan,
+                    &adapter.capture_done(ticket.command_id).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(adapter.status().unwrap().position_pulses, -172800);
+        adapter.disconnect();
+        let writes = &state.lock().unwrap().writes;
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|line| line.starts_with("HOME "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|line| line.starts_with("MOVE_REL "))
+                .count(),
+            10
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|line| line.starts_with("CAPTURE_DONE "))
+                .count(),
+            10
+        );
+    }
+
+    #[test]
+    fn adapter_rejects_reverse_scale_mismatch_stale_plan_and_bad_arrival() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_homed_fake(state.clone());
+        assert!(adapter.move_rel(90000).is_err());
+        assert!(adapter.move_abs(90000).is_err());
+        assert!(adapter.move_rel(-360001).is_err());
+        let stale = planner::plan_relative(&adapter.status().unwrap(), 90000).unwrap();
+        let ticket = adapter.move_rel(-10000).unwrap();
+        adapter.capture_done(ticket.command_id).unwrap();
+        assert!(adapter.execute_plan(&stale).is_err());
+        assert!(adapter.move_abs(0).is_err());
+        state.lock().unwrap().wrong_pulse_scale = true;
+        assert!(adapter.move_rel(-10000).is_err());
+        state.lock().unwrap().wrong_pulse_scale = false;
+        state.lock().unwrap().arrival_offset = 1;
+        assert!(adapter.move_rel(-10000).is_err());
+        adapter.disconnect();
+        let writes = &state.lock().unwrap().writes;
+        assert!(!writes
+            .iter()
+            .any(|line| line.starts_with("MOVE_REL ") && line.ends_with(" 90000")));
+        assert!(!writes.iter().any(|line| line.starts_with("MOVE_ABS ")));
+    }
+
+    #[test]
+    fn emergency_stop_preempts_idle_missing_heartbeat_wait() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_homed_fake(state.clone());
+        let baseline = state.lock().unwrap().writes.len();
+        state.lock().unwrap().drop_heartbeats = true;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && !state.lock().unwrap().writes[baseline..]
+                .iter()
+                .any(|line| line.starts_with("HEARTBEAT "))
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(state.lock().unwrap().writes[baseline..]
+            .iter()
+            .any(|line| line.starts_with("HEARTBEAT ")));
+        let started = Instant::now();
+        adapter.stop().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "priority STOP waited for the full heartbeat deadline"
+        );
+        state.lock().unwrap().drop_heartbeats = false;
+        assert!(!adapter.status().unwrap().reference_valid);
+        adapter.disconnect();
     }
 }

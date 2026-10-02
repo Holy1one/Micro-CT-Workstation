@@ -9,8 +9,8 @@
 
 export const PULSES_PER_REV = 96000; // 1.8 deg motor x 60:1 gearbox x 8 microsteps
 export const MICROSTEPS = 8;
-export const FIRMWARE_VERSION = "1.0.0.30";
-export const LINK_LABEL = "USB COM4 · 115200 8N1";
+export const FIRMWARE_VERSION = "2.1.0 candidate semantics (preview only)";
+export const LINK_LABEL = "in-memory · 115200 protocol · NO HARDWARE";
 
 export function pulsesForDegrees(deg: number): number {
   return Math.round((deg / 360) * PULSES_PER_REV);
@@ -82,6 +82,7 @@ export interface NanoStatus {
   homed: boolean;
   rearmed: boolean;
   hall: boolean;
+  captureId: number;
 }
 
 export function parseStatus(line: ParsedLine): NanoStatus {
@@ -94,5 +95,6 @@ export function parseStatus(line: ParsedLine): NanoStatus {
     homed: line.fields.homed === "1",
     rearmed: line.fields.rearmed === "1",
     hall: line.fields.hall === "1",
+    captureId: Number(line.fields.capture_id ?? 0),
   };
 }

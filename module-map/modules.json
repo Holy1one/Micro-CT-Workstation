@@ -23,12 +23,12 @@
     },
     {
       "id": "device-camera",
-      "name": "Nikon D7100 camera",
+      "name": "Native WPD/PTP camera candidate",
       "owns": ["crates/ct-engine/src/devices/camera/**"],
       "publicApi": ["crates/ct-engine/src/devices/camera/mod.rs"],
       "risk": "critical",
       "description": "Owns camera discovery, exposure configuration, host-side capture, and image-file confirmation.",
-      "execution": "The engine calls DigiCamControl and accepts a projection only after the expected host file is confirmed.",
+      "execution": "A dedicated COM owner handles WPD/PTP, Nikon RAM capture and validated Live View; correlated ExposureEnded and complete NEF/hash evidence are distinct, and hardware certification remains blocked.",
       "gates": ["cargo test -p ct-engine devices::camera"]
     },
     {

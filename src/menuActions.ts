@@ -7,9 +7,11 @@
  * engine stays the single source of truth for state and safety.
  */
 
-export type TopMenu = "File" | "Edit" | "Tools" | "Help";
+export type TopMenu = "File" | "Edit" | "Tools" | "Devices" | "Help";
 
 export type MenuActionId =
+  | "devices.camera"
+  | "devices.turntable"
   | "file.newTask"
   | "file.openImageFolder"
   | "file.openLastResult"
@@ -66,6 +68,13 @@ export const MENU_GROUPS: readonly MenuGroup[] = [
       { id: "tools.homeAllAxes", label: "Home All Axes", icon: "crosshair" },
       { id: "tools.restorePrevious", label: "Restore Previous Scan", icon: "history" },
       { id: "tools.deviceDiagnostics", label: "Device Diagnostics…", icon: "pulse" },
+    ],
+  },
+  {
+    label: "Devices",
+    entries: [
+      { id: "devices.camera", label: "Camera…", icon: "camera" },
+      { id: "devices.turntable", label: "Turntable…", icon: "crosshair" },
     ],
   },
   {

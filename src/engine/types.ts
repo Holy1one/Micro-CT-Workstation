@@ -116,6 +116,11 @@ export interface LogEntry {
 }
 
 export interface EngineSnapshot {
+  engineSessionId: string;
+  snapshotSequence: number;
+  operationId: string | null;
+  operations: DeviceOperation[];
+  deviceControls: DeviceControls;
   mode: EngineMode;
   modeLabel: string;
   connectionState: ConnectionState;
@@ -149,9 +154,22 @@ export interface ScanSetup {
 export type ScanSetupUpdate = Partial<Omit<ScanSetup, "angleStepDeg">>;
 
 export type EngineCommand =
+  | { type: "camera_connect"; deviceId?: string }
+  | { type: "camera_disconnect" | "camera_status" | "camera_identity" | "camera_read_properties" | "camera_live_view_start" | "camera_live_view_stop" | "camera_autofocus" }
+  | { type: "camera_apply_properties"; properties: CameraProperties; presetId?: string }
+  | { type: "camera_capture"; directory?: string }
+  | { type: "camera_focus"; step: number }
+  | { type: "turntable_connect" | "turntable_disconnect" | "turntable_status" | "turntable_identity" | "turntable_home" }
+  | { type: "turntable_relative" | "turntable_to_angle"; angleDeg: number }
+  | { type: "turntable_bench_mode"; enabled: boolean; physicallyIsolated: boolean }
+  | { type: "preset_list" | "preset_export" | "abandon_scan" }
+  | { type: "preset_load" | "preset_compare" | "preset_delete"; id: string }
+  | { type: "preset_save"; name: string; description?: string; source?: string }
+  | { type: "preset_import"; jsonText: string }
+  | { type: "xray_connect" | "xray_status" | "xray_identity" | "xray_off" }
   | { type: "connect"; adapter: "developer_preview" | "real_hardware" }
   | { type: "disconnect" }
-  | { type: "preflight" }
+  | { type: "preflight"; restore?: boolean; confirmUsbAutoShutdownRelease?: boolean }
   | { type: "home" }
   | { type: "start_scan" }
   | { type: "confirm_scan_stage"; stage: ScanPromptStage; geometry?: ReconstructionGeometry }
@@ -180,6 +198,51 @@ export interface EngineAdapter {
   getSnapshot(): Promise<EngineSnapshot>;
   dispatch(command: EngineCommand): Promise<EngineSnapshot>;
   close?(): void;
+}
+
+/** Native WPD/PTP evidence; numeric values are exact integers, never display labels. */
+export type CameraValue = number | string;
+export type CameraProperties = Record<string, CameraValue>;
+export interface CameraIdentity { deviceId: string; manufacturer: string; model: string; serial: string | null; backend: string }
+export interface CameraProperty {
+  key: string; label: string; code: number; dataType: number; readable: boolean; writable: boolean;
+  supportedValues: CameraValue[]; range: [number, number, number] | null;
+  actual: CameraValue | null; target: CameraValue | null; confirmed: boolean; error: string | null;
+}
+export interface CameraCapabilities {
+  properties: boolean; hostCapture: boolean; liveView: boolean; autofocus: boolean; focusStep: boolean;
+  scanNef: boolean; hardwareCertified: boolean; disabledReasons: Record<string, string>;
+}
+export interface CameraLiveView {
+  active: boolean; sessionId: string | null; sequence: number; lastFrameAt: string | null;
+  fresh: boolean; width: number | null; height: number | null; fpsLimit: number; error: string | null;
+}
+export interface CameraHealth {
+  connected: boolean; backend: string; serial: string | null; transferPolicy: string | null;
+  lastCapture: string | null; lastError: string | null; exposureMinMs: number | null; exposureMaxMs: number | null;
+  identity: CameraIdentity | null; discovered: CameraIdentity[]; sessionId: string | null;
+  capabilities: CameraCapabilities; properties: Record<string, CameraProperty>; liveView: CameraLiveView;
+  isolated: boolean; cleanupConfirmed: boolean; busy: boolean; operationId: string | null;
+  phase: string; focusPosition: number | null;
+}
+export interface NanoStatus {
+  state: string; positionPulses: number; targetPulses: number; microsteps: number; pulsesPerRev: number;
+  referenceValid: boolean; homed: boolean; rearmed: boolean; hallActive: boolean; captureId: number;
+}
+export interface CameraPreset { id: string; name: string; description: string; models: string[]; parameters: CameraProperties; source: string; savedAt: string }
+export interface DeviceOperation {
+  operationId: string; deviceSessionId: string; device: string; kind: string; stage: string;
+  cancelRequested: boolean; status: "queued" | "running" | "cancelling" | "completed" | "cancelled" | "failed" | "cleanup_unconfirmed";
+  error: string | null; startedAt: string; updatedAt: string;
+}
+export interface DeviceControls {
+  camera: CameraHealth | null;
+  turntable: { connected: boolean; identity: { device: string; version: string; protocol: number; build: string; buzzerInstalled: boolean; capabilities: string[] } | null; status: NanoStatus | null; confirmedAngleDeg: number | null; benchMode: boolean; reason: string | null; hardwareCertified: false };
+  taskLock: { locked: boolean; reason: string | null; taskId: string | null; savePath: string | null; status: string; retained: boolean };
+  presets: { schemaVersion: number; presets: CameraPreset[]; error: string | null };
+  exportJson?: string | null;
+  cameraDraft?: CameraProperties | null;
+  presetComparison?: unknown;
 }
 
 /* ------------------------------------------------------------------ *

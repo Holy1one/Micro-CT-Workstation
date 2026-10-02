@@ -10,6 +10,8 @@ import { createPortal } from "react-dom";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
+import { DeviceConsole } from "./DeviceConsoles";
+import { manualControlReason } from "./engine/deviceControls";
 import { LineIcon, type LineIconName } from "./icons";
 import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } from "./scan-input";
 import { hasDeviceSessionEverEstablished, useEngine } from "./engine/useEngine";
@@ -317,6 +319,8 @@ function DevicePanel({
   dispatch,
   stale,
   setupInvalid,
+  onDeviceControl,
+  taskLocked,
 }: {
   ws: WorkstationView;
   busy: boolean;
@@ -325,6 +329,8 @@ function DevicePanel({
   dispatch: (c: EngineCommand) => Promise<void>;
   stale: boolean;
   setupInvalid: boolean;
+  onDeviceControl: (device: "camera" | "turntable") => void;
+  taskLocked: boolean;
 }) {
   const [pendingDevice, setPendingDevice] = useState<DeviceId | null>(null);
   const setup = ws.scanSetup;
@@ -341,13 +347,10 @@ function DevicePanel({
     setup.maxXraySec >= 1 &&
     setup.maxXraySec <= 600 && !setupInvalid;
   const runRetry = async (device: DeviceId): Promise<void> => {
+    if (device === "camera" || device === "turntable") { onDeviceControl(device); return; }
     setPendingDevice(device);
     try {
-      if (device === "turntable" && !hardwareConnected) {
-        await dispatch({ type: "connect", adapter: "real_hardware" });
-      } else {
-        await dispatch({ type: "retry_device", device });
-      }
+      await dispatch({ type: "retry_device", device });
     } finally {
       setPendingDevice(null);
     }
@@ -375,17 +378,17 @@ function DevicePanel({
                 <button
                   type="button"
                   className="retry-btn"
-                  disabled={busy || pendingDevice !== null}
+                  disabled={device.id === "xray" && (busy || pendingDevice !== null)}
                   aria-busy={retrying}
                   onClick={() => void runRetry(device.id as DeviceId)}
                 >
-                  {retrying ? "Connecting…" : (device.id === "turntable" && !hardwareConnected) || device.id === "camera" || device.id === "xray" ? "Connect" : "Retry"}
+                  {retrying ? "Connecting…" : device.id === "camera" || device.id === "turntable" ? "Controls" : "Connect"}
                 </button>
                 {device.id === "camera" && device.word === "ONLINE" && desktopRuntime ? (
                   <button
                     type="button"
                     className="retry-btn"
-                    disabled={busy || pendingDevice !== null || !setup.savePath.trim() || !setup.taskId.trim()}
+                    disabled={busy || pendingDevice !== null || stale}
                     title="Capture one dark test frame into Save Path / Task ID / frames"
                     onClick={() => void dispatch({ type: "camera_test_capture" })}
                   >
@@ -402,7 +405,8 @@ function DevicePanel({
           <button
             type="button"
             className="preflight-btn"
-            disabled={!setupComplete || busy || ws.dataState === "scanning" || ws.dataState === "paused"}
+            disabled={taskLocked || !setupComplete || busy || ws.dataState === "scanning" || ws.dataState === "paused"}
+            title={taskLocked ? "Use Devices → Camera or Turntable → confirmed Restore preflight for the retained task" : "Verify the configured scan"}
             aria-busy={ws.preflight.tone === "running"}
             onClick={() => void dispatch({ type: "preflight" })}
           >
@@ -692,6 +696,7 @@ function offlineFeedback(): ConsoleFeedback {
  * below by their value, type, or relationship to the other projection.
  */
 const FIRST_START_SNAPSHOT_KEYS = [
+  "engineSessionId", "snapshotSequence", "operationId", "operations", "deviceControls",
   "mode", "modeLabel", "connectionState", "adapterLabel", "phase", "phaseLabel",
   "preflightPassed", "homed", "requiresPreflight", "requiresHome", "safety", "devices",
   "parameters", "progress", "imageCount", "logs", "lastError", "updatedAt",
@@ -787,6 +792,20 @@ function hasCompleteFirstStartConsoleLogs(logs: unknown): boolean {
 }
 
 function hasCompleteFirstStartSnapshot(snapshot: EngineSnapshot): boolean {
+  if (!isString(snapshot.engineSessionId) || !snapshot.engineSessionId || !Number.isSafeInteger(snapshot.snapshotSequence)
+    || snapshot.snapshotSequence < 0 || snapshot.operationId !== null || !Array.isArray(snapshot.operations)
+    || snapshot.operations.length !== 0 || !snapshot.deviceControls
+    || snapshot.deviceControls.taskLock.locked || snapshot.deviceControls.turntable.connected
+    || snapshot.deviceControls.turntable.confirmedAngleDeg !== null
+    || snapshot.deviceControls.camera?.connected || snapshot.deviceControls.presets.error
+    || !hasExactOwnKeys(snapshot.deviceControls, ["camera", "turntable", "taskLock", "presets", "cameraDraft", "exportJson", "presetComparison"])
+    || !hasExactOwnKeys(snapshot.deviceControls.turntable, ["connected", "identity", "status", "confirmedAngleDeg", "benchMode", "hardwareCertified", "reason"])
+    || snapshot.deviceControls.turntable.identity !== null || snapshot.deviceControls.turntable.status !== null
+    || snapshot.deviceControls.turntable.benchMode || snapshot.deviceControls.turntable.hardwareCertified
+    || !hasExactOwnKeys(snapshot.deviceControls.taskLock, ["locked", "reason", "taskId", "savePath", "status", "retained"])
+    || snapshot.deviceControls.taskLock.status !== "unlocked"
+    || !hasExactOwnKeys(snapshot.deviceControls.presets, ["schemaVersion", "presets", "error"])
+    || snapshot.deviceControls.presets.schemaVersion !== 1 || !Array.isArray(snapshot.deviceControls.presets.presets)) return false;
   const hasWorkstation = Object.prototype.hasOwnProperty.call(snapshot, "workstation");
   const rootKeys = hasWorkstation ? [...FIRST_START_SNAPSHOT_KEYS, "workstation"] : FIRST_START_SNAPSHOT_KEYS;
   if (!hasExactOwnKeys(snapshot, rootKeys)) return false;
@@ -1053,6 +1072,17 @@ export function deriveConsoleFeedback(
   stale: boolean,
   sessionEverEstablished: unknown = "unknown",
 ): ConsoleFeedback {
+  const independentCamera = snapshot.deviceControls?.camera;
+  if (snapshot.connectionState === "disconnected" && !stale && snapshot.phase === "idle"
+    && snapshot.lastError === null && independentCamera?.connected === true
+    && independentCamera.identity?.deviceId && independentCamera.sessionId
+    && !independentCamera.isolated && independentCamera.cleanupConfirmed
+    && !snapshot.deviceControls.turntable.connected && !snapshot.deviceControls.taskLock.locked
+    && !ws.xray.beamOn && !ws.xray.latched && !snapshot.safety.xrayEnabled
+    && !["danger", "dangerBold"].includes(ws.safetyBar.tone)) {
+    return { state: "Stopped", tone: "muted", active: false,
+      detail: "Camera session connected · scan remains locked until turntable and X-ray evidence is verified · unconnected device states remain UNKNOWN" };
+  }
   // Exhaustive partition: disconnected is neutral only for a fully verified
   // initial snapshot. No disconnected combination can reach the phase switch or
   // its final ordinary Stopped fallback.
@@ -1440,8 +1470,8 @@ function ControlDock({
           variant="stop"
           icon="stop"
           label="Stop"
-          title={dock.stop ? "End the active scan; already saved projections are retained" : "No active scan to end"}
-          disabled={keysDisabled || !dock.stop}
+          title="Safety Stop · stop devices and confirm output OFF; saved files are retained"
+          disabled={false}
           onClick={() => void dispatch({ type: "stop" })}
         />
       </div>
@@ -1684,11 +1714,11 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
       <button
         type="button"
         className={`switch-btn switch-btn--block ${ws.xray.beamOn ? "switch-btn--on" : "switch-btn--idle"}`}
-        disabled={busy || ws.dataState === "fault" || !ws.xray.manualControlsEnabled}
+        disabled={beamState === "off" && (busy || ws.dataState === "fault" || !ws.xray.manualControlsEnabled)}
         title={faultLocked ? "Device fault latched · inspect the log, then repeat Preflight and HOME" : scanLocked ? "The scan owns X-ray output" : !ws.xray.connected ? "Connect the X-ray source first" : busy ? "Wait for the current command" : "Manual X-ray output control"}
-        onClick={() => void dispatch({ type: "xray_toggle" })}
+        onClick={() => void dispatch({ type: beamState === "off" ? "xray_toggle" : "stop" })}
       >
-        {ws.xray.beamOn ? "Xray Disable" : "Xray Enable"}
+        {beamState === "off" ? "Xray Enable" : "Xray OFF / Stop"}
       </button>
       <div className="panel__divider" />
       <div className="timer-row">
@@ -2153,8 +2183,8 @@ function InfoDialog({
           projections, exposure or Max X-ray resets preflight; a still valid Nano reference is checked again.
         </li>
         <li>
-          <strong>{snapshot.mode === "developer_preview" ? "This build drives no hardware." : "Stage 1 controls the Nano turntable only."}</strong>{" "}
-          {snapshot.modeLabel}. Camera and X-ray remain locked; never treat Nano preflight as a verified X-ray interlock.
+          <strong>{snapshot.mode === "developer_preview" ? "This preview drives no hardware." : "Native device controls are an offline candidate pending hardware acceptance."}</strong>{" "}
+          {snapshot.modeLabel}. Independent camera and turntable controls never enable X-ray output. Unknown readback is not OFF; complete acquisition requires engine preflight and verified device evidence.
         </li>
       </ul>
     );
@@ -2360,7 +2390,9 @@ function ScanStageDialog({ stage, recorded, beamState, busy, onConfirm, onCancel
 /* ------------------------------------------------------------------ */
 
 export function App() {
-  const { adapterKind, snapshot, busy, error, transportError, dispatch } = useEngine();
+  const { adapterKind, snapshot, busy, error, transportError, dispatch: engineDispatch } = useEngine();
+  const dispatch = useCallback(async (command: EngineCommand): Promise<void> => { await engineDispatch(command); }, [engineDispatch]);
+  const [deviceConsole, setDeviceConsole] = useState<"camera" | "turntable" | null>(null);
   const [theme, setTheme] = useTheme();
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -2393,10 +2425,12 @@ export function App() {
   useEffect(() => {
     if (setupSignature === lastSetupSignature.current) return;
     lastSetupSignature.current = setupSignature;
-    if (!setupPendingSync.current) return;
+    if (!setupPendingSync.current && ws?.scanSetup.exposureMs === lastExposure.current) return;
+    lastExposure.current = ws?.scanSetup.exposureMs;
     setupPendingSync.current = false;
     setSetupSync((value) => value + 1);
   }, [setupSignature]);
+  const lastExposure = useRef(ws?.scanSetup.exposureMs);
 
   useEffect(() => {
     const updateCanvasLayout = (): void => {
@@ -2473,7 +2507,9 @@ export function App() {
     const desktop = adapterKind === "tauri";
     const faulted = ws?.dataState === "fault";
     const entries: MenuAvailability = {
-      "file.newTask": running ? blocked("scan active") : ok,
+      "devices.camera": ok,
+      "devices.turntable": ok,
+      "file.newTask": running || snapshot?.deviceControls.taskLock.locked ? blocked("unfinished task or scan active") : ok,
       "file.openImageFolder": desktop
         ? running
           ? blocked("scan active")
@@ -2487,7 +2523,7 @@ export function App() {
       "edit.resetParameters": running ? blocked("scan active") : ok,
       "edit.preferences": ok,
       "tools.runPreflight": configured
-        ? ok
+        ? snapshot?.deviceControls.taskLock.locked ? blocked("Use the confirmed Restore preflight entry in Devices") : ok
         : blocked("setup incomplete"),
       "tools.homeAllAxes": faulted
         ? blocked("run Preflight to revalidate device safety")
@@ -2572,10 +2608,14 @@ export function App() {
             await dispatch({ type: "restore_previous" });
             break;
           case "tools.deviceDiagnostics":
-            for (const device of ["xray", "turntable", "camera"] as const) {
-              await dispatch({ type: "retry_device", device });
-            }
+            await Promise.all([dispatch({ type: "camera_status" }), dispatch({ type: "turntable_status" })]);
             setDialog("diagnostics");
+            break;
+          case "devices.camera":
+            setDeviceConsole("camera");
+            break;
+          case "devices.turntable":
+            setDeviceConsole("turntable");
             break;
           case "help.userGuide":
             setDialog("guide");
@@ -2653,10 +2693,12 @@ export function App() {
                 hardwareConnected={snapshot.connectionState === "connected"}
                 desktopRuntime={adapterKind === "tauri"}
                 dispatch={dispatch}
+                onDeviceControl={setDeviceConsole}
+                taskLocked={snapshot.deviceControls.taskLock.locked}
               />
               <ScanParamsPanel
                 ws={ws}
-                busy={busy || Boolean(transportError)}
+                busy={busy || Boolean(transportError) || Boolean(manualControlReason(snapshot))}
                 desktopRuntime={adapterKind === "tauri"}
                 dispatch={dispatch}
                 syncRevision={setupSync}
@@ -2705,6 +2747,7 @@ export function App() {
             onClose={() => setDialog(null)}
           />
         ) : null}
+        {deviceConsole && <DeviceConsole kind={deviceConsole} snapshot={snapshot} busy={busy} stale={Boolean(transportError)} dispatch={engineDispatch} onClose={() => setDeviceConsole(null)} />}
         {ws.scanFlow.prompt && <ScanStageDialog
           key={`${ws.scanSetup.taskId}:${ws.scanFlow.prompt.stage}`}
           stage={ws.scanFlow.prompt.stage}

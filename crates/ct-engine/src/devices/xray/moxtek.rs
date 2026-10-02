@@ -93,6 +93,7 @@ impl Default for XrayHealth {
 
 #[derive(Debug)]
 pub enum XrayError {
+    Cancelled,
     Discovery(String),
     Transport(String),
     Protocol(String),
@@ -103,6 +104,7 @@ pub enum XrayError {
 impl fmt::Display for XrayError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled=>write!(f,"Moxtek operation cancelled"),
             Self::Discovery(message) => write!(f, "discovery error: {message}"),
             Self::Transport(message) => write!(f, "transport error: {message}"),
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
@@ -193,31 +195,53 @@ struct Status {
     ua_enabled: bool,
 }
 
-pub struct MoxtekAdapter {
+pub struct RawMoxtekAdapter {
     transport: Option<SharedTransport>,
     health: XrayHealth,
     requested_setpoint: Option<(f64, f64)>,
     last_off: Option<Instant>,
+    operation_cancel: Option<std::sync::Arc<AtomicBool>>,
+    external_cancel: Option<std::sync::Arc<AtomicBool>>,
+    health_observer: Option<std::sync::Arc<std::sync::Mutex<XrayHealth>>>,
 }
 
-impl Default for MoxtekAdapter {
+impl Default for RawMoxtekAdapter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MoxtekAdapter {
+impl RawMoxtekAdapter {
     pub fn new() -> Self {
         Self {
             transport: None,
             health: XrayHealth::default(),
             requested_setpoint: None,
             last_off: None,
+            operation_cancel: None,
+            external_cancel: None,
+            health_observer: None,
         }
     }
 
     pub fn health(&self) -> XrayHealth {
         self.health.clone()
+    }
+
+    pub(super) fn set_operation_cancel(&mut self, cancel: Option<std::sync::Arc<AtomicBool>>) {
+        self.operation_cancel = cancel;
+    }
+    pub(super) fn set_external_cancel(&mut self,cancel:Option<std::sync::Arc<AtomicBool>>){self.external_cancel=cancel;}
+    pub(super) fn observe_health(&mut self,health:std::sync::Arc<std::sync::Mutex<XrayHealth>>){self.health_observer=Some(health);}
+    fn publish_transition(&self) {
+        if let Some(observer)=self.health_observer.as_ref(){
+            let mut cached=observer.lock().unwrap_or_else(|poison|poison.into_inner());
+            if cached.last_error.as_deref().is_some_and(|error|error.contains("owner exited unexpectedly")){return;}
+            let mut next=self.health.clone();if next.last_error.is_none(){next.last_error=cached.last_error.clone();}*cached=next;
+        }
+    }
+    fn operation_cancelled(&self)->bool {
+        self.operation_cancel.as_ref().is_some_and(|cancel|cancel.load(Ordering::SeqCst))||self.external_cancel.as_ref().is_some_and(|cancel|cancel.load(Ordering::SeqCst))
     }
 
     pub fn discover_and_connect(&mut self) -> Result<XrayHealth, XrayError> {
@@ -325,13 +349,16 @@ impl MoxtekAdapter {
         if self.health.beam_on {
             return Err(XrayError::Safety("Moxtek beam is already ON; duplicate enable is forbidden".into()));
         }
-        let result = self.beam_on_inner(cancel, output_deadline);
-        if let Err(error) = &result {
-            let _ = self.force_off_inner();
-            self.health.beam_off_confirmed = false;
-            self.health.last_error = Some(error.to_string());
+        match self.beam_on_inner(cancel, output_deadline) {
+            Ok(())=>Ok(self.health()),
+            Err(error)=>{
+                let cleanup=self.force_off_inner();
+                if matches!(error,XrayError::Cancelled)&&cleanup.is_ok(){self.health.last_error=None;return Err(XrayError::Cancelled);}
+                self.health.beam_off_confirmed=false;
+                let error=match cleanup {Ok(())=>error,Err(cleanup)=>XrayError::Safety(format!("{error}; OFF unconfirmed: {cleanup}"))};
+                self.health.last_error=Some(error.to_string());Err(error)
+            }
         }
-        result.map(|()| self.health())
     }
 
     pub fn refresh_off_status(&mut self) -> Result<XrayHealth, XrayError> {
@@ -600,6 +627,17 @@ impl MoxtekAdapter {
     }
 
     fn force_off_inner(&mut self) -> Result<(), XrayError> {
+        // Emergency OFF and its independent readbacks must bypass cancellation.
+        let saved_cancel = self.operation_cancel.take();
+        let saved_external=self.external_cancel.take();
+        let result = self.confirm_off_transaction();
+        self.operation_cancel = saved_cancel;
+        self.external_cancel=saved_external;
+        result
+    }
+
+    fn confirm_off_transaction(&mut self) -> Result<(), XrayError> {
+        self.health.beam_off_confirmed=false;self.health.beam_on=false;self.publish_transition();
         self.transact(CMD_SET_XRAY_ENABLE, &[0], 4)?;
         let setpoints = self.read_setpoints()?;
         let status = self.read_status()?;
@@ -610,6 +648,7 @@ impl MoxtekAdapter {
     }
 
     fn beam_on_inner(&mut self, cancel: &AtomicBool, output_deadline: Option<Instant>) -> Result<(), XrayError> {
+        if cancel.load(Ordering::SeqCst)||self.operation_cancelled(){return Err(XrayError::Cancelled);}
         if !self.health.beam_off_confirmed || self.last_off.is_none() {
             return Err(XrayError::Safety(
                 "beam enable requires confirmed OFF and a known OFF interval".into(),
@@ -642,17 +681,18 @@ impl MoxtekAdapter {
             .last_off
             .is_some_and(|off| off.elapsed() < MIN_REENABLE_INTERVAL)
         {
-            if cancel.load(Ordering::SeqCst) {
-                return Err(XrayError::Safety("beam enable cancelled".into()));
+            if cancel.load(Ordering::SeqCst)||self.operation_cancelled() {
+                return Err(XrayError::Cancelled);
             }
             thread::sleep(Duration::from_millis(25));
         }
-        if cancel.load(Ordering::SeqCst) {
-            return Err(XrayError::Safety("beam enable cancelled".into()));
+        if cancel.load(Ordering::SeqCst)||self.operation_cancelled() {
+            return Err(XrayError::Cancelled);
         }
         if output_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(XrayError::Safety("continuous X-ray limit reached before beam enable".into()));
         }
+        self.health.beam_off_confirmed=false;self.health.beam_on=false;self.publish_transition();
         let enable_ack_warning = match self.transact(CMD_SET_XRAY_ENABLE, &[1], 4) {
             Ok(_) => None,
             Err(error) if is_transport_timeout(&error) => Some(format!(
@@ -665,8 +705,8 @@ impl MoxtekAdapter {
         let deadline = output_deadline.map_or(stability_deadline, |limit| limit.min(stability_deadline));
         let mut stable_samples = 0_u8;
         loop {
-            if cancel.load(Ordering::SeqCst) {
-                return Err(XrayError::Safety("beam enable cancelled".into()));
+            if cancel.load(Ordering::SeqCst)||self.operation_cancelled() {
+                return Err(XrayError::Cancelled);
             }
             if Instant::now() >= deadline {
                 return Err(XrayError::Safety(
@@ -755,6 +795,7 @@ impl MoxtekAdapter {
         self.health.temperature_c = Some(status.temperature_c);
         self.health.telemetry_warning = None;
         self.health.last_error = None;
+        self.publish_transition();
     }
 
     fn read_setpoints(&mut self) -> Result<Setpoints, XrayError> {
@@ -847,11 +888,19 @@ impl MoxtekAdapter {
         expected_length: usize,
         read_timeout: Duration,
     ) -> Result<Vec<u8>, XrayError> {
+        if self.operation_cancelled() {
+            return Err(XrayError::Cancelled);
+        }
         let transport = self
             .transport
             .as_ref()
             .ok_or_else(|| XrayError::Transport("Moxtek adapter is not connected".into()))?;
-        transact_transport(transport, command, payload, expected_length, read_timeout)
+        let result = transact_transport(transport, command, payload, expected_length, read_timeout,||self.operation_cancelled());
+        if result.is_err(){return result;}
+        if self.operation_cancelled() {
+            return Err(XrayError::Cancelled);
+        }
+        result
     }
 }
 
@@ -861,10 +910,13 @@ fn transact_transport(
     payload: &[u8],
     expected_length: usize,
     read_timeout: Duration,
+    cancelled: impl Fn()->bool,
 ) -> Result<Vec<u8>, XrayError> {
+    if cancelled(){return Err(XrayError::Cancelled);}
     let mut transport = transport
         .lock()
         .map_err(|_| XrayError::Transport("Moxtek transport lock was poisoned".into()))?;
+    if cancelled(){return Err(XrayError::Cancelled);}
     let payload_length = u8::try_from(payload.len())
         .map_err(|_| XrayError::Protocol("payload is too long".into()))?;
     let mut packet = vec![PACKET_HEADER, command, payload_length];
@@ -872,6 +924,7 @@ fn transact_transport(
     transport
         .clear_input()
         .map_err(|error| XrayError::Transport(format!("input purge failed: {error}")))?;
+    if cancelled(){return Err(XrayError::Cancelled);}
     transport
         .write_all_bytes(&packet)
         .map_err(|error| XrayError::Transport(format!("write failed: {error}")))?;
@@ -890,9 +943,10 @@ fn transact_transport(
     }
     Ok(response)
 }
-impl Drop for MoxtekAdapter {
+impl Drop for RawMoxtekAdapter {
     fn drop(&mut self) {
-        let _ = self.disconnect();
+        // A panicking OS/fake transport cannot cause a second panic during unwind.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||self.disconnect()));
     }
 }
 
@@ -984,12 +1038,13 @@ fn raw_to_temp(raw: u16) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
     struct FakeState {
         writes: Vec<Vec<u8>>,
+        beam_transitions: Vec<(bool,Instant)>,
         beam_enable_times: Vec<Instant>,
         response: Option<Vec<u8>>,
         set_voltage_raw: u16,
@@ -1007,12 +1062,14 @@ mod tests {
         minimum_enabled_status_timeout: Option<Duration>,
         enabled_status_timeouts: Vec<Duration>,
         next_read_timeout: bool,
+        panic_next_read: bool,
     }
 
     impl Default for FakeState {
         fn default() -> Self {
             Self {
                 writes: Vec::new(),
+                beam_transitions: Vec::new(),
                 beam_enable_times: Vec::new(),
                 response: None,
                 set_voltage_raw: 0,
@@ -1030,6 +1087,7 @@ mod tests {
                 minimum_enabled_status_timeout: None,
                 enabled_status_timeouts: Vec::new(),
                 next_read_timeout: false,
+                panic_next_read: false,
             }
         }
     }
@@ -1065,6 +1123,7 @@ mod tests {
                 }
                 CMD_SET_XRAY_ENABLE => {
                     state.enabled = bytes[3] != 0;
+                    let enabled=state.enabled;state.beam_transitions.push((enabled,Instant::now()));
                     if state.enabled {
                         state.beam_enable_times.push(Instant::now());
                         state.kv_enabled = true;
@@ -1143,6 +1202,7 @@ mod tests {
         fn read_exact_bytes(&mut self, bytes: &mut [u8], timeout: Duration) -> io::Result<()> {
             {
                 let mut state = self.lock();
+                if state.panic_next_read {state.panic_next_read=false;panic!("scripted binary transport panic");}
                 if state.writes.last().is_some_and(|packet| packet[1] == CMD_GET_STATUS)
                     && state.enabled {
                     state.enabled_status_timeouts.push(timeout);
@@ -1173,8 +1233,8 @@ mod tests {
         }
     }
 
-    fn connected_adapter(state: Arc<Mutex<FakeState>>) -> MoxtekAdapter {
-        let mut adapter = MoxtekAdapter::new();
+    fn connected_adapter(state: Arc<Mutex<FakeState>>) -> RawMoxtekAdapter {
+        let mut adapter = RawMoxtekAdapter::new();
         adapter
             .connect_transport(
                 "COM-XRAY".into(),
@@ -1183,6 +1243,22 @@ mod tests {
             )
             .unwrap();
         adapter
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct TestXrayProbe {state:Arc<Mutex<FakeState>>}
+    impl TestXrayProbe {
+        pub(crate) fn beam_transitions(&self)->Vec<(bool,Instant)>{self.state.lock().unwrap().beam_transitions.clone()}
+        pub(crate) fn output_enabled(&self)->bool{self.state.lock().unwrap().enabled}
+        pub(crate) fn set_interlock(&self,locked:bool){self.state.lock().unwrap().locked=locked;}
+        pub(crate) fn fail_next_read(&self){self.state.lock().unwrap().next_read_timeout=true;}
+        pub(crate) fn panic_next_read(&self){self.state.lock().unwrap().panic_next_read=true;}
+    }
+    /// Exercises the production serial owner against scripted binary packets.
+    pub(crate) fn test_worker(kv:f64,ua:f64)->(super::super::worker::MoxtekAdapter,TestXrayProbe) {
+        let state=Arc::new(Mutex::new(FakeState::default()));
+        let mut raw=connected_adapter(state.clone());raw.set_parameters(kv,ua).unwrap();
+        (super::super::worker::MoxtekAdapter::from_raw(raw),TestXrayProbe{state})
     }
 
     #[test]
@@ -1574,5 +1650,120 @@ mod tests {
         ));
         assert!(!state.lock().unwrap().enabled);
         assert!(adapter.health().beam_off_confirmed);
+    }
+
+    #[test]
+    fn owner_monitors_interlock_without_snapshot_or_scan_polling() {
+        let state=Arc::new(Mutex::new(FakeState::default()));
+        let mut raw=connected_adapter(state.clone());
+        raw.set_parameters(60.0,200.0).unwrap();
+        raw.last_off=Some(Instant::now()-Duration::from_secs(3));
+        let mut owner=super::super::worker::MoxtekAdapter::from_raw(raw);
+        owner.beam_on(&AtomicBool::new(false)).unwrap();
+        state.lock().unwrap().locked=true;
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while state.lock().unwrap().enabled && Instant::now()<deadline {thread::sleep(Duration::from_millis(10));}
+        assert!(!state.lock().unwrap().enabled,"worker must force OFF without any UI request");
+        assert!(owner.health().last_error.is_some());
+        assert!(owner.beam_on(&AtomicBool::new(false)).is_err(),"faulted worker may not automatically re-enable");
+    }
+
+    #[test]
+    fn priority_off_cancels_on_wait_and_cached_health_stays_responsive() {
+        let state=Arc::new(Mutex::new(FakeState::default()));
+        let mut raw=connected_adapter(state.clone());raw.set_parameters(60.0,200.0).unwrap();
+        let owner=super::super::worker::MoxtekAdapter::from_raw(raw);
+        let mut pending=owner.clone();
+        let (tx,rx)=std::sync::mpsc::channel();
+        thread::spawn(move||{let _=tx.send(pending.beam_on(&AtomicBool::new(false)));});
+        thread::sleep(Duration::from_millis(50));
+        let started=Instant::now();let _=owner.health();let off=owner.request_off();
+        assert!(started.elapsed()<Duration::from_millis(250),"Stop admission cannot wait for two-second ON interval");
+        assert!(off.recv_timeout(Duration::from_secs(2)).unwrap().unwrap().beam_off_confirmed);
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+        assert!(state.lock().unwrap().beam_enable_times.is_empty(),"cancelled ON must never reach serial transport");
+    }
+
+    #[test]
+    fn owner_enforces_continuous_output_deadline_without_domain_polling() {
+        let state=Arc::new(Mutex::new(FakeState::default()));
+        let mut raw=connected_adapter(state.clone());raw.set_parameters(60.0,200.0).unwrap();raw.last_off=Some(Instant::now()-Duration::from_secs(3));
+        let mut owner=super::super::worker::MoxtekAdapter::from_raw(raw);
+        owner.beam_on_until(&AtomicBool::new(false),Instant::now()+Duration::from_millis(300)).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while state.lock().unwrap().enabled && Instant::now()<deadline{thread::sleep(Duration::from_millis(10));}
+        assert!(!state.lock().unwrap().enabled);
+        assert!(owner.health().last_error.as_deref().is_some_and(|error|error.contains("hard limit")));
+    }
+
+    #[test]
+    fn stop_during_input_purge_prevents_late_on_write() {
+        struct PurgeBarrier {
+            inner:FakeTransport,remaining:Arc<std::sync::atomic::AtomicUsize>,blocked:Arc<AtomicBool>,release:Arc<AtomicBool>,
+        }
+        impl BinaryTransport for PurgeBarrier {
+            fn clear_input(&mut self)->io::Result<()> {
+                if self.remaining.load(Ordering::SeqCst)>0 && self.remaining.fetch_sub(1,Ordering::SeqCst)==1 {
+                    self.blocked.store(true,Ordering::SeqCst);
+                    let deadline=Instant::now()+Duration::from_secs(2);
+                    while !self.release.load(Ordering::SeqCst)&&Instant::now()<deadline{thread::sleep(Duration::from_millis(1));}
+                }
+                self.inner.clear_input()
+            }
+            fn write_all_bytes(&mut self,bytes:&[u8])->io::Result<()>{self.inner.write_all_bytes(bytes)}
+            fn read_exact_bytes(&mut self,bytes:&mut[u8],timeout:Duration)->io::Result<()>{self.inner.read_exact_bytes(bytes,timeout)}
+        }
+        let state=Arc::new(Mutex::new(FakeState::default()));let remaining=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocked=Arc::new(AtomicBool::new(false));let release=Arc::new(AtomicBool::new(false));
+        let mut raw=RawMoxtekAdapter::new();
+        raw.connect_transport("FAKE".into(),MOXTEK_SERIAL.into(),Box::new(PurgeBarrier{inner:FakeTransport{state:state.clone()},remaining:remaining.clone(),blocked:blocked.clone(),release:release.clone()})).unwrap();
+        raw.set_parameters(60.0,200.0).unwrap();raw.last_off=Some(Instant::now()-Duration::from_secs(3));
+        remaining.store(3,Ordering::SeqCst);
+        let owner=super::super::worker::MoxtekAdapter::from_raw(raw);let mut on_owner=owner.clone();
+        let cancel=Arc::new(AtomicBool::new(false));let on_cancel=cancel.clone();
+        let on=thread::spawn(move||on_owner.beam_on_shared(on_cancel,Instant::now()+Duration::from_secs(5)));
+        let deadline=Instant::now()+Duration::from_secs(1);while !blocked.load(Ordering::SeqCst)&&Instant::now()<deadline{thread::sleep(Duration::from_millis(1));}
+        assert!(blocked.load(Ordering::SeqCst));cancel.store(true,Ordering::SeqCst);let off=owner.request_off();release.store(true,Ordering::SeqCst);
+        assert!(matches!(on.join().unwrap(),Err(XrayError::Cancelled)));
+        assert!(off.recv_timeout(Duration::from_secs(2)).unwrap().unwrap().beam_off_confirmed);
+        assert!(state.lock().unwrap().beam_enable_times.is_empty());
+        assert!(owner.health().last_error.is_none(),"confirmed cancellation cleanup must not masquerade as a real fault");
+    }
+
+    #[test]
+    fn owner_panic_retires_cached_health_without_waiting_for_a_client_command() {
+        let (owner,probe)=test_worker(60.0,200.0);probe.panic_next_read();
+        let deadline=Instant::now()+Duration::from_secs(3);
+        while owner.health().connected&&Instant::now()<deadline{thread::sleep(Duration::from_millis(10));}
+        let health=owner.health();assert!(!health.connected);assert!(!health.beam_off_confirmed);
+        assert!(health.last_error.as_deref().is_some_and(|error|error.contains("owner exited")));
+    }
+
+    #[test]
+    fn observed_transport_failure_survives_a_concurrent_stop_and_successful_off() {
+        struct FailureBarrier {inner:FakeTransport,armed:Arc<AtomicBool>,entered:Arc<AtomicBool>,release:Arc<AtomicBool>}
+        impl BinaryTransport for FailureBarrier {
+            fn clear_input(&mut self)->io::Result<()>{self.inner.clear_input()}
+            fn write_all_bytes(&mut self,bytes:&[u8])->io::Result<()>{self.inner.write_all_bytes(bytes)}
+            fn read_exact_bytes(&mut self,bytes:&mut[u8],timeout:Duration)->io::Result<()> {
+                let enabled_status={let state=self.inner.lock();state.enabled&&state.writes.last().is_some_and(|packet|packet[1]==CMD_GET_STATUS)};
+                if enabled_status&&self.armed.swap(false,Ordering::SeqCst){
+                    self.entered.store(true,Ordering::SeqCst);let deadline=Instant::now()+Duration::from_secs(2);
+                    while !self.release.load(Ordering::SeqCst)&&Instant::now()<deadline{thread::sleep(Duration::from_millis(1));}
+                    return Err(io::Error::new(io::ErrorKind::TimedOut,"observed transport failure concurrent with STOP"));
+                }
+                self.inner.read_exact_bytes(bytes,timeout)
+            }
+        }
+        let state=Arc::new(Mutex::new(FakeState::default()));let armed=Arc::new(AtomicBool::new(false));let entered=Arc::new(AtomicBool::new(false));let release=Arc::new(AtomicBool::new(false));
+        let mut raw=RawMoxtekAdapter::new();raw.connect_transport("FAKE".into(),MOXTEK_SERIAL.into(),Box::new(FailureBarrier{inner:FakeTransport{state:state.clone()},armed:armed.clone(),entered:entered.clone(),release:release.clone()})).unwrap();
+        raw.set_parameters(60.0,200.0).unwrap();raw.last_off=Some(Instant::now()-Duration::from_secs(3));armed.store(true,Ordering::SeqCst);
+        let owner=super::super::worker::MoxtekAdapter::from_raw(raw);let mut on_owner=owner.clone();let cancel=Arc::new(AtomicBool::new(false));let on_cancel=cancel.clone();
+        let on=thread::spawn(move||on_owner.beam_on_shared(on_cancel,Instant::now()+Duration::from_secs(5)));
+        let deadline=Instant::now()+Duration::from_secs(1);while !entered.load(Ordering::SeqCst)&&Instant::now()<deadline{thread::sleep(Duration::from_millis(1));}
+        assert!(entered.load(Ordering::SeqCst));cancel.store(true,Ordering::SeqCst);let off=owner.request_off();release.store(true,Ordering::SeqCst);
+        assert!(matches!(on.join().unwrap(),Err(XrayError::Transport(_))));assert!(off.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+        assert!(!state.lock().unwrap().enabled);assert!(owner.health().last_error.as_deref().is_some_and(|error|error.contains("observed transport failure")));
+        let mut engine=crate::Engine::new(false);engine.xray=Some(owner);engine.tick();assert!(engine.fault_latched,"observed real failure remains a domain fault even when Stop also succeeds");
     }
 }

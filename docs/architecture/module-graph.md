@@ -9,7 +9,7 @@ An arrow `A --> B` means module A depends on module B. Impact analysis walks the
 flowchart LR
   engine_core["Production engine and scan coordinator"]
   device_xray["Moxtek X-ray source"]
-  device_camera["Nikon D7100 camera"]
+  device_camera["Native WPD/PTP camera candidate"]
   device_turntable["RTS9060 Nano turntable"]
   turntable_firmware["Recovered RTS9060 Nano firmware candidate"]
   desktop_shell["Tauri desktop shell"]
@@ -33,6 +33,8 @@ flowchart LR
   developer_preview -->|consumes-contract| frontend_contract
   frontend_client -->|ipc-command| desktop_shell
   ui_shell -->|frame-preview-ipc| desktop_shell
+  desktop_shell -->|live-view-binary-pipe| device_camera
+  ui_shell -->|camera-preset-native-dialog| platform
   ui_shell -->|reconstruction-preview-ipc| desktop_shell
   desktop_shell -->|jsonl-protocol| engine_core
   engine_core -->|safety-device-contract| device_xray
@@ -78,8 +80,10 @@ flowchart LR
 | `developer-preview` | `frontend-contract` | consumes-contract | strong | Preview output must stay structurally and semantically compatible with production snapshots. |
 | `frontend-client` | `desktop-shell` | ipc-command | strong | Tauri invoke command names and payload fields are string-based runtime contracts. |
 | `ui-shell` | `desktop-shell` | frame-preview-ipc | strong | The frame_preview command accepts a committed frame index and returns an embedded JPEG from the engine-registered, hash-verified NEF. |
+| `desktop-shell` | `device-camera` | live-view-binary-pipe | strong | An internal engine-issued user-ACL endpoint carries bounded JPEG envelopes; the desktop validates session/sequence/codec/dimensions and the renderer can supply only afterSeq. |
+| `ui-shell` | `platform` | camera-preset-native-dialog | strong | Camera presets import/export through native JSON dialogs; the domain validates the entire schema and active capabilities before persistence or explicit Apply. |
 | `ui-shell` | `desktop-shell` | reconstruction-preview-ipc | strong | The reconstruction_preview command accepts only a method ID and returns an engine-registered, hash-verified preview volume for a completed reconstruction. |
-| `desktop-shell` | `engine-core` | jsonl-protocol | strong | Versioned JSONL carries fractional exposureMs, native camera exposure limits, projection counts up to 3600 and maxXraySec; UI minutes must convert without changing the seconds contract. |
+| `desktop-shell` | `engine-core` | jsonl-protocol | strong | JSONL v2 validates request ID/sequence/session and returns complete snapshots plus operation records; Stop/state remain available during background device work and stale generations cannot commit. |
 | `engine-core` | `device-xray` | safety-device-contract | strong | Every exposure transaction depends on verified X-ray readback and fail-closed shutdown. |
 | `engine-core` | `device-camera` | capture-contract | strong | Projection commit requires a confirmed host-side image file. |
 | `engine-core` | `device-turntable` | serial-protocol | strong | Motion, warning, emergency stop, and CAPTURE_DONE use the external Nano protocol. |

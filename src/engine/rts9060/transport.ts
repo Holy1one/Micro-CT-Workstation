@@ -17,7 +17,7 @@ export interface NanoTransport {
   close(): void;
 }
 
-type FirmwareState = "IDLE" | "HOMING" | "MOVING" | "CAPTURE_HOLD" | "STOPPED";
+type FirmwareState = "IDLE" | "HOMING" | "MOVING" | "SETTLING" | "CAPTURE_HOLD" | "STOPPED";
 
 interface PendingTimer {
   handle: ReturnType<typeof setTimeout>;
@@ -33,6 +33,7 @@ export class FirmwareTransport implements NanoTransport {
   private homed = false;
   private rearmed = false;
   private hall = false;
+  private captureId = 0;
   private timers: PendingTimer[] = [];
   private closed = false;
 
@@ -93,11 +94,13 @@ export class FirmwareTransport implements NanoTransport {
         this.handleMove(id, parsed, parsed.token === "MOVE_REL");
         return;
       case "CAPTURE_DONE":
-        if (this.state === "CAPTURE_HOLD") {
+        if (this.state === "CAPTURE_HOLD" && this.captureId === id) {
           this.state = "IDLE";
+          this.captureId = 0;
+          this.emit(`ACK ${id} CAPTURE_DONE`);
           this.emit(`IDLE ${id} CAPTURE_RELEASED`);
         } else {
-          this.emit(`ERR ${id} NOT_HOLDING`);
+          this.emit(`ERR ${id} CAPTURE_ID_MISMATCH`);
         }
         return;
       case "STOP":
@@ -116,12 +119,12 @@ export class FirmwareTransport implements NanoTransport {
     return (
       `STATUS ${id} state=${this.state} pos=${this.pos} target=${this.target} ` +
       `microsteps=${MICROSTEPS} ppr=${PULSES_PER_REV} reference=${this.homed ? 1 : 0} ` +
-      `homed=${this.homed ? 1 : 0} rearmed=${this.rearmed ? 1 : 0} hall=${this.hall ? 1 : 0}`
+      `homed=${this.homed ? 1 : 0} rearmed=${this.rearmed ? 1 : 0} hall=${this.hall ? 1 : 0} capture_id=${this.captureId}`
     );
   }
 
   private handleHome(id: number): void {
-    if (this.state === "MOVING" || this.state === "HOMING") {
+    if (["MOVING", "HOMING", "SETTLING", "CAPTURE_HOLD"].includes(this.state)) {
       this.emit(`ERR ${id} BUSY`);
       return;
     }
@@ -154,34 +157,24 @@ export class FirmwareTransport implements NanoTransport {
       this.emit(`ERR ${id} NOT_HOMED`);
       return;
     }
-    if (this.state !== "IDLE" && this.state !== "CAPTURE_HOLD") {
+    if (this.state !== "IDLE") {
       this.emit(`ERR ${id} BUSY`);
       return;
     }
     const mdeg = Number(parsed.rest[0] ?? parsed.fields.mdeg ?? 0);
-    if (!Number.isFinite(mdeg)) {
+    if (!Number.isSafeInteger(mdeg)) {
       this.emit(`ERR ${id} BAD_ARG`);
       return;
     }
-    const requestedPulses = Math.round((mdeg / 360_000) * PULSES_PER_REV);
+    const magnitude = Math.abs(mdeg);
+    const requestedPulses = Math.floor(((relative ? magnitude : magnitude % 360000) * PULSES_PER_REV + 180000) / 360000) * (mdeg < 0 ? -1 : 1);
     let destination: number;
     if (relative) {
       destination = this.pos + requestedPulses;
     } else {
-      if (requestedPulses < 0) {
-        this.emit(`ERR ${id} REVERSE_FORBIDDEN`);
-        return;
-      }
-      const targetWithinTurn = requestedPulses % PULSES_PER_REV;
-      const requestedTurn = Math.floor(requestedPulses / PULSES_PER_REV);
-      let targetTurn = Math.max(Math.floor(this.pos / PULSES_PER_REV), requestedTurn);
-      destination = targetTurn * PULSES_PER_REV + targetWithinTurn;
-      if (destination < this.pos) {
-        targetTurn += 1;
-        destination = targetTurn * PULSES_PER_REV + targetWithinTurn;
-      }
+      destination = requestedPulses;
     }
-    if (destination < this.pos) {
+    if (destination > this.pos) {
       this.emit(`ERR ${id} REVERSE_FORBIDDEN`);
       return;
     }
@@ -191,9 +184,9 @@ export class FirmwareTransport implements NanoTransport {
     const travel = Math.min(1400, 320 + Math.abs(destination - this.pos) / 40);
     this.later(travel, () => {
       this.pos = destination;
-      this.state = "CAPTURE_HOLD";
+      this.state = "SETTLING";
       // Firmware holds 500 ms for settle before releasing the capture ticket.
-      this.later(140, () => this.emit(`READY_TO_CAPTURE ${id} POS=${this.pos}`));
+      this.later(140, () => { this.state = "CAPTURE_HOLD"; this.captureId = id; this.emit(`READY_TO_CAPTURE ${id} POS=${this.pos}`); });
     });
   }
 
@@ -204,6 +197,7 @@ export class FirmwareTransport implements NanoTransport {
     this.homed = false;
     this.rearmed = false;
     this.hall = false;
+    this.captureId = 0;
     this.emit(`ACK ${id} STOP`);
     this.later(12, () => this.emit(`STOPPED ${id} POSITION_UNKNOWN reason=STOP`));
   }

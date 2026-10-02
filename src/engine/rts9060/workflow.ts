@@ -113,7 +113,8 @@ class NanoLink {
   }
 
   exec(line: string, terminals: string[], timeoutMs = 4000): Promise<ParsedLine> {
-    const id = this.nextId++;
+    const explicitId = parseLine(line).id;
+    const id = explicitId ?? this.nextId++;
     const wire = line.replace("{id}", String(id));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -142,6 +143,52 @@ function formatMmSs(totalSeconds: number): string {
 }
 
 export class ScanWorkflow {
+  get confirmedNanoStatus(): NanoStatus | null { return this.link.lastStatus; }
+  async readNanoStatus(): Promise<NanoStatus> {
+    return parseStatus(await this.link.exec(cmd.status("{id}"), ["STATUS"]));
+  }
+  async independentHome(): Promise<void> {
+    if (["scanning", "paused", "finishing", "stopping"].includes(this.phase)) throw new Error("Manual HOME is locked by the task");
+    this.source.disable();
+    await this.link.exec(cmd.xrayWarning("{id}", false), ["OK"]);
+    await this.link.exec(cmd.rearm("{id}"), ["OK"]);
+    await this.link.exec(cmd.home("{id}"), ["HOME_DONE"], 6000);
+    await this.readNanoStatus(); this.homed = true; this.angleDeg = 0; this.emit();
+  }
+  async independentMove(angleDeg: number, relative: boolean): Promise<void> {
+    if (["scanning", "paused", "finishing", "stopping"].includes(this.phase)) throw new Error("Manual motion is locked by the task");
+    if (!Number.isFinite(angleDeg) || (relative ? angleDeg <= 0 || angleDeg > 360 : angleDeg < 0 || angleDeg >= 360)
+      || Math.abs(angleDeg * 1000 - Math.round(angleDeg * 1000)) > 1e-6) throw new Error("Invalid prescribed-direction angle");
+    const before = await this.readNanoStatus();
+    if (!before.homed || !before.rearmed || before.state !== "IDLE") throw new Error("Confirmed HOME and IDLE required");
+    const arrived = relative ? await this.link.exec(cmd.moveRel("{id}", -milliDeg(angleDeg)), ["READY_TO_CAPTURE"], 8000) : await this.moveToPhase(angleDeg);
+    this.angleDeg = degreesForPulses(Number(arrived.fields.POS));
+    await this.link.exec(cmd.captureDone(arrived.id!), ["IDLE"]);
+    const after = await this.readNanoStatus();
+    if (after.state !== "IDLE" || after.pos !== Number(arrived.fields.POS)) throw new Error("Motion release not confirmed");
+    this.emit();
+  }
+  async abandonTask(): Promise<void> { await this.stop(); this.clearCheckpoint(); this.emit(); }
+  async independentStop(): Promise<void> {
+    this.source.disable();
+    await this.link.exec(cmd.stop("{id}"), ["STOPPED"]);
+    await this.link.exec(cmd.xrayWarning("{id}", false), ["OK"]);
+    this.homed = false; this.preflightPassed = false; await this.readNanoStatus();
+    if (this.phase !== "completed") this.phase = "stopped";
+    this.emit();
+  }
+  private async moveToPhase(phaseDeg: number): Promise<ParsedLine> {
+    const status = await this.readNanoStatus();
+    if (!status.homed || !status.rearmed || status.state !== "IDLE" || status.ppr !== 96000 || status.microsteps !== 8) throw new Error("Invalid motion source evidence");
+    const mod = (n: number) => ((n % PULSES_PER_REV) + PULSES_PER_REV) % PULSES_PER_REV;
+    const desired = mod(Math.floor((milliDeg(phaseDeg) * PULSES_PER_REV + 180000) / 360000));
+    const delta = mod(desired - mod(-status.pos));
+    const arrived = await this.link.exec(cmd.moveRel("{id}", -Math.floor((delta * 360000 + 48000) / PULSES_PER_REV)), ["READY_TO_CAPTURE"], 8000);
+    const held = await this.readNanoStatus();
+    if (Number(arrived.fields.POS) !== status.pos - delta || held.pos !== status.pos - delta || held.target !== held.pos
+      || held.state !== "CAPTURE_HOLD" || held.captureId !== arrived.id) throw new Error("Preview arrival, ticket and unwrapped STATUS mismatch");
+    return arrived;
+  }
   readonly source = new XraySource12W();
   readonly camera = new CameraD7100();
   private link: NanoLink;
@@ -456,13 +503,13 @@ export class ScanWorkflow {
     };
     this.camera.configure(this.params.savePath);
     if (!this.link.lastStatus?.rearmed) await this.link.exec(cmd.rearm("{id}"), ["OK"]);
-    await this.link.exec(cmd.moveAbs("{id}", milliDeg(checkpoint.angleDeg)), ["READY_TO_CAPTURE"], 8000);
-    await this.link.exec(cmd.captureDone("{id}"), ["IDLE"]);
+    const restored = await this.moveToPhase(Math.abs(checkpoint.angleDeg));
+    await this.link.exec(cmd.captureDone(restored.id!), ["IDLE"]);
     this.captured = checkpoint.view;
     this.angleDeg = checkpoint.angleDeg;
     this.frames = Array.from({ length: checkpoint.view }, (_, i) => ({
       index: i + 1,
-      angleDeg: i * this.angleStepDeg,
+      angleDeg: -i * this.angleStepDeg,
       exposureMs: this.params.exposureMs,
       fileName: `frame-${String(i + 1).padStart(4, "0")}.nef`,
       path: `${this.params.savePath}/frame-${String(i + 1).padStart(4, "0")}.nef`,
@@ -640,10 +687,10 @@ export class ScanWorkflow {
           this.emit();
         }
         const projectionStartedAt = Date.now();
-        const angle = (view - 1) * this.angleStepDeg;
-        await this.awaitOrStop(this.link.exec(cmd.moveAbs("{id}", milliDeg(angle)), ["READY_TO_CAPTURE"], 8000));
-        this.angleDeg = angle;
-        this.log("INFO", "nano", `MOVE_ABS view ${view} → ${angle.toFixed(2)}° · ACK`);
+        const angle = -(view - 1) * this.angleStepDeg;
+        const arrived = await this.awaitOrStop(this.moveToPhase(-angle));
+        this.angleDeg = degreesForPulses(Number(arrived.fields.POS));
+        this.log("INFO", "nano", `MOVE_REL view ${view} → ${angle.toFixed(2)}° · arrival confirmed`);
         this.emit();
         if (this.stopRequested) return;
         if (!this.source.beamOn) {
@@ -657,7 +704,9 @@ export class ScanWorkflow {
         const frame = await this.awaitOrStop(this.camera.capture(view, angle, this.params.exposureMs));
         if (this.stopRequested) return;
         if (!frame.shaOk) throw new Error(`frame ${frame.fileName} failed validation`);
-        await this.awaitOrStop(this.link.exec(cmd.captureDone("{id}"), ["IDLE"]));
+        await this.awaitOrStop(this.link.exec(cmd.captureDone(arrived.id!), ["IDLE"]));
+        const released = await this.awaitOrStop(this.readNanoStatus());
+        if (released.state !== "IDLE" || released.captureId !== 0 || released.pos !== Number(arrived.fields.POS)) throw new Error("Preview capture release mismatch");
         this.frames = [...this.frames, frame];
         this.captured = view;
         this.projectionSamplesMs.push(Math.max(1, Date.now() - projectionStartedAt));
@@ -705,23 +754,14 @@ export class ScanWorkflow {
     await this.closeOutputAtBoundary("All projections committed");
     if (this.stopRequested) return;
     this.phase = "finishing";
-    this.log("ACTION", "nano", "returning to zero through the simulated forward-only 360.000° target");
+    this.log("ACTION", "nano", "preserving the final confirmed projection angle");
     this.emit();
 
-    await this.awaitOrStop(this.link.exec(cmd.moveAbs("{id}", milliDeg(360)), ["READY_TO_CAPTURE"], 8000));
+    await this.awaitOrStop(delay(50));
     if (this.stopRequested) return;
-    const statusLine = await this.awaitOrStop(this.link.exec(cmd.status("{id}"), ["STATUS"]));
-    const status = parseStatus(statusLine);
-    const expectedPulses = pulsesForDegrees(360);
-    if (status.state !== "CAPTURE_HOLD" || status.pos !== expectedPulses || !status.homed || !status.rearmed) {
-      throw new Error(`preview final zero check failed: state=${status.state} pos=${status.pos} expected=${expectedPulses} homed=${status.homed} rearmed=${status.rearmed}`);
-    }
-    await this.awaitOrStop(this.link.exec(cmd.captureDone("{id}"), ["IDLE"]));
-    if (this.stopRequested) return;
-    this.angleDeg = 0;
     this.phase = "completed";
     this.clearCheckpoint();
-    this.log("PASS", "nano", "preview turntable returned to the zero orientation · full forward turn confirmed");
+    this.log("PASS", "nano", "preview final projection angle retained · no return move or HOME");
     this.log("PASS", "system", `scan complete · ${total} / ${total} views committed · ${this.params.savePath}`);
     this.emit();
   }

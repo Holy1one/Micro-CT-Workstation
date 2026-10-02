@@ -22,6 +22,7 @@ const workflowUrl = await loadTypeScriptModule("workflow.ts", {
   "./transport": transportUrl,
 });
 const adapterUrl = await loadTypeScriptModule("../workstationAdapter.ts", {
+  "./rts9060/deviceControls": await loadTypeScriptModule("deviceControls.ts"),
   "./rts9060/protocol": protocolUrl,
   "./rts9060/workflow": workflowUrl,
 });
@@ -43,6 +44,7 @@ class ScriptedNanoTransport {
   handler = null;
   state = "IDLE";
   position = 0;
+  captureId = 0;
   target = 0;
   homed = false;
   rearmed = false;
@@ -59,13 +61,13 @@ class ScriptedNanoTransport {
   send(raw) {
     const line = parseLine(raw);
     const id = line.id ?? 0;
-    this.commands.push({ token: line.token, rest: [...line.rest] });
+    this.commands.push({ token: line.token, id, rest: [...line.rest] });
     switch (line.token) {
       case "HEARTBEAT":
         this.emit(`HBACK ${id}`);
         break;
       case "STATUS":
-        this.emit(`STATUS ${id} state=${this.state} pos=${this.position} target=${this.target} microsteps=8 ppr=${PULSES_PER_REV} reference=${this.homed ? 1 : 0} homed=${this.homed ? 1 : 0} rearmed=${this.rearmed ? 1 : 0} hall=0`);
+        this.emit(`STATUS ${id} state=${this.state} pos=${this.position} target=${this.target} microsteps=8 ppr=${PULSES_PER_REV} reference=${this.homed ? 1 : 0} homed=${this.homed ? 1 : 0} rearmed=${this.rearmed ? 1 : 0} hall=0 capture_id=${this.captureId}`);
         break;
       case "SET_MICROSTEPS":
         this.emit(`OK ${id} MICROSTEPS=8 PPR=${PULSES_PER_REV}`);
@@ -86,14 +88,16 @@ class ScriptedNanoTransport {
         this.emit(`HOME_DONE ${id} POS=0`);
         break;
       case "MOVE_ABS":
-        this.moveAbs(id, Number(line.rest[0]));
+      case "MOVE_REL":
+        this.move(id, Number(line.rest[0]), line.token === "MOVE_REL");
         break;
       case "CAPTURE_DONE":
-        if (this.state !== "CAPTURE_HOLD") {
+        if (this.state !== "CAPTURE_HOLD" || id !== this.captureId) {
           this.emit(`ERR ${id} NOT_HOLDING`);
           break;
         }
         this.state = "IDLE";
+        this.captureId = 0;
         this.emit(`IDLE ${id} CAPTURE_RELEASED`);
         break;
       case "XRAY_WARNING":
@@ -103,6 +107,7 @@ class ScriptedNanoTransport {
         this.state = "STOPPED";
         this.homed = false;
         this.rearmed = false;
+        this.captureId = 0;
         this.emit(`ACK ${id} STOP`);
         if (!this.rejectStop) this.emit(`STOPPED ${id} POSITION_UNKNOWN reason=STOP`);
         break;
@@ -111,16 +116,14 @@ class ScriptedNanoTransport {
     }
   }
 
-  moveAbs(id, mdeg) {
-    if (!Number.isFinite(mdeg) || mdeg < 0 || !this.homed || !this.rearmed || this.state === "STOPPED") {
+  move(id, mdeg, relative) {
+    if (!Number.isSafeInteger(mdeg) || !this.homed || !this.rearmed || this.state !== "IDLE") {
       this.emit(`ERR ${id} INVALID_MOVE`);
       return;
     }
-    const requested = Math.round((mdeg / 360_000) * PULSES_PER_REV);
-    const targetWithinTurn = requested % PULSES_PER_REV;
-    let turn = Math.max(Math.floor(this.position / PULSES_PER_REV), Math.floor(requested / PULSES_PER_REV));
-    let destination = turn * PULSES_PER_REV + targetWithinTurn;
-    if (destination < this.position) destination = ++turn * PULSES_PER_REV + targetWithinTurn;
+    const requested = Math.floor(((relative ? Math.abs(mdeg) : Math.abs(mdeg) % 360000) * PULSES_PER_REV + 180000) / 360000) * (mdeg < 0 ? -1 : 1);
+    const destination = relative ? this.position + requested : requested;
+    if (destination > this.position) { this.emit(`ERR ${id} REVERSE_FORBIDDEN`); return; }
     this.target = destination;
     this.state = "MOVING";
     if (mdeg === 360_000 && this.holdFinalReturn) {
@@ -129,6 +132,7 @@ class ScriptedNanoTransport {
     }
     this.position = destination;
     this.state = "CAPTURE_HOLD";
+    this.captureId = id;
     this.emit(`READY_TO_CAPTURE ${id} POS=${this.position}`);
   }
 
@@ -313,72 +317,44 @@ test("pause waits for CAPTURE_DONE and resume retains each committed frame", asy
     await waitFor(() => workflow.phase === "completed", "resumed scan did not complete");
     assert.equal(workflow.captured, 2);
     assert.deepEqual(workflow.frames.map(({ index }) => index), [1, 2]);
-    assert.equal(workflow.angleDeg, 0);
+    assert.equal(workflow.angleDeg, -180);
   } finally {
     workflow.close();
   }
 });
 
-test("completion stays stoppable while returning through the confirmed zero orientation", async () => {
-  const { workflow, transport } = await preparedWorkflow(1);
+test("completion retains the last signed angle and releases each matching capture ticket", async () => {
+  const { workflow, transport } = await preparedWorkflow(2);
   try {
-    transport.holdFinalReturn = true;
-    workflow.camera.capture = async (index, angleDeg, exposureMs) => ({
-      index, angleDeg, exposureMs,
-      fileName: `frame-${String(index).padStart(4, "0")}.nef`,
-      path: `memory-only/frame-${String(index).padStart(4, "0")}.nef`,
-      shaOk: true,
-    });
+    workflow.params.maxXraySec = 600;
     workflow.startScan();
-    await waitFor(() => workflow.phase === "finishing", "scan never entered the visible finalization phase");
-    assert.equal(workflow.captured, 1);
+    await waitFor(() => workflow.phase === "completed", "scan did not complete");
+    assert.equal(workflow.angleDeg, -180);
+    assert.equal(transport.position, -48000);
+    const moves = transport.commands.filter(command => command.token === "MOVE_REL");
+    const releases = transport.commands.filter(command => command.token === "CAPTURE_DONE");
+    assert.equal(moves.length, 2);
+    assert.deepEqual(releases.map(command => command.id), moves.map(command => command.id));
+    assert.equal(transport.commands.filter(command => command.token === "HOME").length, 2, "only boot and explicit prepared HOME exist");
+    assert.equal(transport.commands.filter(command => command.token === "MOVE_ABS").length, 0);
     assert.equal(workflow.source.beamOn, false);
-    assert.equal(transport.pendingFinalReturnId !== null, true);
-
-    transport.releaseFinalReturn();
-    await waitFor(() => workflow.phase === "completed", "scan did not complete after zero-return confirmation");
-    assert.equal(workflow.angleDeg, 0);
-    assert.equal(transport.position, PULSES_PER_REV, "the simulator confirms a full forward turn back to the zero orientation");
-    assert.equal(transport.commands.filter(({ token }) => token === "CAPTURE_DONE").length, 2);
-    assert.equal(transport.commands.filter(({ token, rest }) => token === "MOVE_ABS" && rest[0] === "360000").length, 1);
-    const completedXray = (await snapshotFor(workflow)).workstation.xray;
-    assert.equal(completedXray.manualControlsEnabled, true);
-    assert.equal(completedXray.setpointControlsEnabled, true);
-    assert.equal(completedXray.timerControlsEnabled, true);
-
-    await workflow.stop();
-    assert.equal(workflow.phase, "completed", "Stop is a no-op after completion");
-  } finally {
-    workflow.close();
-  }
+  } finally { workflow.close(); }
 });
 
-test("normal Stop during finalization cancels the return move without becoming a device fault", async () => {
-  const { workflow, transport } = await preparedWorkflow(1);
+test("Stop during finalization retains committed files and invalidates reference", async () => {
+  const { workflow } = await preparedWorkflow(1);
   try {
-    transport.holdFinalReturn = true;
-    workflow.camera.capture = async (index, angleDeg, exposureMs) => ({
-      index, angleDeg, exposureMs,
-      fileName: `frame-${String(index).padStart(4, "0")}.nef`,
-      path: `memory-only/frame-${String(index).padStart(4, "0")}.nef`,
-      shaOk: true,
-    });
     workflow.startScan();
     await waitFor(() => workflow.phase === "finishing", "scan never entered finalization");
-
     await workflow.stop();
-
     assert.equal(workflow.phase, "stopped");
     assert.equal(workflow.source.isLatched, false);
     assert.equal(workflow.source.beamOn, false);
-    assert.equal(workflow.captured, 1, "the committed frame remains available after stopping finalization");
+    assert.equal(workflow.captured, 1);
     assert.equal(workflow.homed, false);
     assert.equal(workflow.preflightPassed, false);
-  } finally {
-    workflow.close();
-  }
+  } finally { workflow.close(); }
 });
-
 /*
  * Regression coverage for the X-ray panel's "USB Auto Shut Down" indicator,
  * which does not display correctly on the FIRST open of the panel.

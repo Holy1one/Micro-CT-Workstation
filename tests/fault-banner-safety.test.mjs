@@ -209,7 +209,7 @@ function workstation(overrides = {}) {
       barLabel: progress.barLabel ?? `${progress.captured ?? 0} / ${progress.total ?? 0} · ${progress.percent ?? 0}%`,
     },
     summary: { savePath: "", acquisition: "Scan setup not configured", output: beamState === "unknown" ? "OUTPUT UNKNOWN · READBACK REQUIRED" : "OUTPUT OFF", ...summary },
-    statusbar: { left: "PRODUCTION LOCKED · SETUP REQUIRED", right: "ct-engine · JSONL v1 · LOCKED", dotTone: "muted", ...statusbar },
+    statusbar: { left: "PRODUCTION LOCKED · SETUP REQUIRED", right: "ct-engine · JSONL v2 · LOCKED", dotTone: "muted", ...statusbar },
     dock: { home: false, play: false, restore: false, stop: false, playMode: "start", homeReason: "Connect the Nano first", restoreReason: "Connect the Nano first", playReason: "Connect the Nano first", ...dock },
     scanSetup: { savePath: "", taskId: "", projectionCount: 0, angleStepDeg: 0, exposureMs: 0, maxXraySec: 600, ...scanSetup },
     consoleLogs,
@@ -230,7 +230,8 @@ function workstation(overrides = {}) {
 function snapshot(overrides = {}) {
   const { safety = {}, ...rest } = overrides;
   return {
-    mode: "production_locked",
+    engineSessionId: "synthetic-engine", snapshotSequence: 1, operationId: null, operations: [],
+    deviceControls: { camera: null, turntable: { connected: false, identity: null, status: null, confirmedAngleDeg: null, benchMode: false, reason: null, hardwareCertified: false }, taskLock: { locked: false, reason: null, taskId: null, savePath: null, status: "unlocked", retained: false }, presets: { schemaVersion: 1, presets: [], error: null }, cameraDraft: {}, exportJson: null, presetComparison: null },    mode: "production_locked",
     modeLabel: "PRODUCTION LOCKED · NANO DISCONNECTED",
     connectionState: "disconnected",
     adapterLabel: "ct-engine · Nano CH340 · JSONL stdio",
@@ -286,6 +287,17 @@ test("a never-connected first `disconnected` renders neutral, not a red fault", 
   // Stated as a plain reading, never as preparation for a scan.
   assert.doesNotMatch(feedback.detail, /ready for (the next )?(scan|operation)/i);
   assert.ok(isNeutral(feedback));
+});
+
+test("an independently connected camera does not masquerade as a lost Nano link", () => {
+  const snap = snapshot();
+  snap.deviceControls.camera = { connected: true, identity: { deviceId: "wpd-camera" }, sessionId: "camera-session", isolated: false, cleanupConfirmed: true };
+  const reading = deriveConsoleFeedback(snap, workstation({ xray: { beamState: "unknown" } }), false, true);
+  assert.equal(reading.tone, "muted");
+  assert.match(reading.detail, /Camera session connected/);
+  assert.match(reading.detail, /UNKNOWN/);
+  snap.deviceControls.camera.isolated = true;
+  assert.equal(deriveConsoleFeedback(snap, workstation(), false, true).tone, "danger");
 });
 
 test("the neutral startup reading never claims a device or output state", () => {

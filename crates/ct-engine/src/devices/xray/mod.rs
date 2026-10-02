@@ -4,8 +4,12 @@
 //! readback as measured state and setpoints only as requested state.
 
 mod moxtek;
+mod worker;
 
 pub use moxtek::{
-    MoxtekAdapter, XrayError, XrayHealth, MAX_CURRENT_UA, MAX_SETPOINT_POWER_W,
+    XrayError, XrayHealth, MAX_CURRENT_UA, MAX_SETPOINT_POWER_W,
     MAX_VOLTAGE_KV, MIN_VOLTAGE_KV,
 };
+pub use worker::MoxtekAdapter;
+#[cfg(test)]
+pub(crate) use moxtek::tests::{test_worker, TestXrayProbe};

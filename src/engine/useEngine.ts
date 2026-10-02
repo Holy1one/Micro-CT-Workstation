@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createEngineAdapter } from "./adapter";
 import type { AdapterKind, EngineAdapter, EngineCommand, EngineSnapshot } from "./types";
+import { CommandScheduler, SnapshotOrder } from "./deviceControls";
 
 /**
  * Display-only evidence that a device session has been established in the
@@ -31,6 +32,7 @@ interface StoredDeviceSessionEvidence {
 }
 
 interface ParsedDeviceSessionSnapshot {
+  pendingCommandAck: boolean;
   connectionState: "disconnected" | "connected" | "degraded" | "lost";
   phase: string;
   lastError: string | null;
@@ -109,6 +111,8 @@ function parseSnapshot(snapshot: unknown): ParsedDeviceSessionSnapshot | null {
     .filter((sequence) => Number.isSafeInteger(sequence));
 
   return {
+    pendingCommandAck: typeof snapshot.operationId === "string" && Array.isArray(snapshot.operations)
+      && snapshot.operations.some(op => isRecord(op) && op.operationId === snapshot.operationId && op.status !== "completed"),
     connectionState: connectionState as ParsedDeviceSessionSnapshot["connectionState"],
     phase: snapshot.phase,
     lastError: snapshot.lastError,
@@ -117,7 +121,7 @@ function parseSnapshot(snapshot: unknown): ParsedDeviceSessionSnapshot | null {
     xrayState,
     xrayConnected: snapshot.workstation.xray.connected,
     logs,
-    engineSessionId: startupLog?.id ?? null,
+    engineSessionId: typeof snapshot.engineSessionId === "string" && snapshot.engineSessionId.length > 0 ? snapshot.engineSessionId : startupLog?.id ?? null,
     maxLogSequence: sequences.length ? Math.max(...sequences) : null,
   };
 }
@@ -172,6 +176,9 @@ function commandDeviceEvidence(
 ): DeviceEvidence | null {
   const result: DeviceEvidence = { nano: false, camera: false, xray: false };
   if (!command) return result;
+  // The command response acknowledges enqueue/cancellation. Device state and
+  // a completed operation may provide evidence later; an ACK alone cannot.
+  if (snapshot.pendingCommandAck) return result;
 
   switch (command.type) {
     case "connect":
@@ -190,6 +197,19 @@ function commandDeviceEvidence(
     case "camera_test_capture":
       if (!current.camera) return null;
       result.camera = true;
+      break;
+    case "camera_connect":
+    case "camera_capture":
+    case "camera_read_properties":
+    case "camera_apply_properties":
+      if (current.camera) result.camera = true;
+      break;
+    case "turntable_connect":
+    case "turntable_home":
+      if (current.nano) result.nano = true;
+      break;
+    case "xray_connect":
+      if (current.xray) result.xray = true;
       break;
     case "xray_disconnect":
       // In production this command can succeed only after an X-ray link was
@@ -355,105 +375,82 @@ function errorMessage(reason: unknown): string {
 
 export function useEngine() {
   const adapterRef = useRef<EngineAdapter | null>(null);
-  const requestRevisionRef = useRef(0);
-  const commandQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const commandActiveRef = useRef(false);
+  const orderRef = useRef(new SnapshotOrder());
+  const commandScheduler = useRef(new CommandScheduler());
+  const commandCountRef = useRef(0);
+  const generationRef = useRef(0);
   const refreshActiveRef = useRef(false);
-  const disposedRef = useRef(false);
   const [adapterKind, setAdapterKind] = useState<AdapterKind>("developer_preview");
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [transportError, setTransportError] = useState<string | null>(null);
 
-  const commitSnapshot = useCallback((revision: number, next: EngineSnapshot, successfulCommand?: EngineCommand): void => {
-    if (!disposedRef.current && revision === requestRevisionRef.current) {
+  const commitSnapshot = useCallback((generation: number, next: EngineSnapshot, successfulCommand?: EngineCommand): void => {
+    if (generation === generationRef.current && orderRef.current.accept(next)) {
       observeDeviceSessionSnapshot(next, successfulCommand);
       setSnapshot(next);
       setTransportError(null);
     }
   }, []);
 
+  const refresh = useCallback(async (): Promise<void> => {
+    const adapter = adapterRef.current;
+    if (!adapter || refreshActiveRef.current) return;
+    refreshActiveRef.current = true;
+    const generation = generationRef.current;
+    try { commitSnapshot(generation, await adapter.getSnapshot()); }
+    catch (reason) {
+      if (generation === generationRef.current) {
+        setError(errorMessage(reason)); setTransportError(errorMessage(reason));
+      }
+    } finally { refreshActiveRef.current = false; }
+  }, [commitSnapshot]);
+
   useEffect(() => {
     const adapter = createEngineAdapter();
     adapterRef.current = adapter;
-    disposedRef.current = false;
+    orderRef.current = new SnapshotOrder();
+    generationRef.current++;
     setAdapterKind(adapter.kind);
-
-    const refresh = async (): Promise<void> => {
-      if (disposedRef.current || commandActiveRef.current || refreshActiveRef.current) return;
-      refreshActiveRef.current = true;
-      const revision = ++requestRevisionRef.current;
-      try {
-        const next = await adapter.getSnapshot();
-        commitSnapshot(revision, next);
-      } catch (reason) {
-        if (!disposedRef.current && revision === requestRevisionRef.current) {
-          setError(errorMessage(reason));
-          setTransportError(errorMessage(reason));
-        }
-      } finally {
-        refreshActiveRef.current = false;
-      }
-    };
-
     void refresh();
-    const interval = window.setInterval(() => void refresh(), 850);
+    // Poll independently of command dispatch and hardware operation lifetime.
+    const interval = window.setInterval(() => void refresh(), 400);
     return () => {
-      disposedRef.current = true;
-      requestRevisionRef.current++;
-      window.clearInterval(interval);
-      adapter.close?.();
-      adapterRef.current = null;
+      generationRef.current++;
+      window.clearInterval(interval); adapter.close?.(); adapterRef.current = null;
     };
-  }, [commitSnapshot]);
+  }, [refresh]);
 
-  const refresh = useCallback(async (): Promise<void> => {
-    const adapter = adapterRef.current;
-    if (!adapter || commandActiveRef.current || refreshActiveRef.current) return;
-    refreshActiveRef.current = true;
-    const revision = ++requestRevisionRef.current;
-    try {
-      commitSnapshot(revision, await adapter.getSnapshot());
-    } catch (reason) {
-      if (revision === requestRevisionRef.current) {
-        setError(errorMessage(reason));
-        setTransportError(errorMessage(reason));
-      }
-    } finally {
-      refreshActiveRef.current = false;
-    }
-  }, [commitSnapshot]);
-
-  const dispatch = useCallback(
-    async (command: EngineCommand): Promise<void> => {
-      const run = async (): Promise<void> => {
-        const adapter = adapterRef.current;
-        if (!adapter) return;
-        commandActiveRef.current = true;
-        setBusy(true);
-        const revision = ++requestRevisionRef.current;
-        try {
-          const response = await adapter.dispatch(command);
-          commitSnapshot(revision, response, command);
-          setError(null);
-        } catch (reason) {
-          if (revision === requestRevisionRef.current) {
-            const message = errorMessage(reason);
-            setError(message);
-            if (!message.startsWith("ENGINE:")) setTransportError(message);
-          }
-        } finally {
-          commandActiveRef.current = false;
-          setBusy(false);
+  const dispatch = useCallback(async (command: EngineCommand): Promise<EngineSnapshot | undefined> => {
+    const generation = generationRef.current;
+    const run = async (): Promise<EngineSnapshot | undefined> => {
+      const adapter = adapterRef.current;
+      if (!adapter || generation !== generationRef.current) return;
+      commandCountRef.current++; setBusy(true);
+      try {
+        const response = await adapter.dispatch(command);
+        commitSnapshot(generation, response, command);
+        if (generation === generationRef.current) setError(null);
+        return response;
+      } catch (reason) {
+        if (generation === generationRef.current) {
+          const message = errorMessage(reason); setError(message);
+          if (!message.startsWith("ENGINE:")) setTransportError(message);
         }
-      };
-      const queued = commandQueueRef.current.then(run, run);
-      commandQueueRef.current = queued.catch(() => undefined);
-      await queued;
-    },
-    [commitSnapshot],
-  );
-
+        return undefined;
+      } finally {
+        commandCountRef.current--;
+        if (generation === generationRef.current) setBusy(commandCountRef.current > 0);
+      }
+    };
+    // Safety commands bypass pending ordinary calls. A queued ordinary request
+    // admitted before Stop is discarded; the engine separately invalidates workers.
+    if (command.type === "stop" || command.type === "xray_off" || command.type === "camera_live_view_stop"
+      || (command.type === "xray_toggle" && snapshot?.workstation?.xray.beamState !== "off")) {
+      return commandScheduler.current.submit(run, true);
+    }
+    return commandScheduler.current.submit(run);
+  }, [commitSnapshot, snapshot?.workstation?.xray.beamState]);
   return { adapterKind, snapshot, busy, error, transportError, refresh, dispatch };
 }

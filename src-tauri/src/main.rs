@@ -6,6 +6,7 @@
 //! or scan state from the production engine.
 
 mod engine_client;
+mod camera_forwarder;
 use engine_client::EngineClient;
 use serde_json::Value;
 #[cfg(debug_assertions)]
@@ -17,6 +18,73 @@ use std::sync::{
 use tauri::Manager;
 
 struct EngineState(Mutex<Option<EngineClient>>);
+
+/// A renderer can request only the next active-camera frame. Endpoint discovery,
+/// binary reading and complete session/codec validation stay in the thin host.
+#[tauri::command]
+async fn camera_live_view_frame(after_seq:u64,state:tauri::State<'_,EngineState>)->Result<Value,String> {
+    let client={
+        let guard=state.0.lock().map_err(|_|"Engine client unavailable")?;
+        guard.as_ref().ok_or("ct-engine is still starting")?.clone()
+    };
+    let metadata=client.request("camera_pipe_descriptor",serde_json::json!({"type":"camera_pipe_descriptor"}))?;
+    let descriptor:ct_engine::devices::camera::LiveViewPipeDescriptor=serde_json::from_value(metadata["liveViewPipeDescriptor"].clone()).map_err(|error|format!("No active Live View endpoint: {error}"))?;
+    let expected_session=descriptor.session_id.clone();
+    let frame=tauri::async_runtime::spawn_blocking(move||camera_forwarder::read_frame(&descriptor,after_seq)).await.map_err(|error|error.to_string())??;
+    // A close/disconnect/Stop may have happened while the local pipe was read.
+    let latest=client.request("snapshot",serde_json::json!({}))?;
+    let view=&latest["deviceControls"]["camera"]["liveView"];
+    if view["active"].as_bool()!=Some(true) || view["fresh"].as_bool()!=Some(true)
+        || view["sessionId"].as_str()!=Some(expected_session.as_str()) {
+        return Err("Live View session was revoked; discard the frame".into());
+    }
+    Ok(frame)
+}
+
+#[tauri::command]
+async fn camera_preset_import(app:tauri::AppHandle)->Result<Option<String>,String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move||{
+        let Some(file)=app.dialog().file().set_title("Import camera presets").add_filter("Camera presets",&["json"]).blocking_pick_file() else{return Ok(None);};
+        let path=file.into_path().map_err(|error|error.to_string())?;
+        if path.extension().and_then(|value|value.to_str()).is_none_or(|value|!value.eq_ignore_ascii_case("json")){return Err("Camera presets require a JSON file".into());}
+        let size=std::fs::metadata(&path).map_err(|error|error.to_string())?.len();
+        if size>ct_engine::presets::MAX_PRESET_BYTES as u64{return Err("Camera preset file exceeds the bounded import limit".into());}
+        let text=std::fs::read_to_string(path).map_err(|error|error.to_string())?;
+        ct_engine::presets::PresetStore::parse_import(&text)?;
+        Ok(Some(text))
+    }).await.map_err(|error|error.to_string())?
+}
+
+#[tauri::command]
+async fn camera_preset_export(contents:String,app:tauri::AppHandle)->Result<Option<String>,String> {
+    use tauri_plugin_dialog::DialogExt;
+    ct_engine::presets::PresetStore::parse_import(&contents)?;
+    tauri::async_runtime::spawn_blocking(move||{
+        let Some(file)=app.dialog().file().set_title("Export camera presets").set_file_name("microct-camera-presets.json").add_filter("Camera presets",&["json"]).blocking_save_file() else{return Ok(None);};
+        let path=file.into_path().map_err(|error|error.to_string())?;
+        if path.extension().and_then(|value|value.to_str()).is_none_or(|value|!value.eq_ignore_ascii_case("json")){return Err("Camera presets require a JSON target".into());}
+        // Same-directory staging preserves existing exports on a failed write.
+        let temporary=path.with_extension(format!("{}.{}.tmp",std::process::id(),chrono_safe_nonce()));
+        let result=(||{
+            use std::io::Write;
+            let mut output=std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|error|error.to_string())?;
+            output.write_all(contents.as_bytes()).and_then(|_|output.sync_all()).map_err(|error|error.to_string())?;drop(output);
+            std::fs::rename(&temporary,&path).map_err(|error|error.to_string())
+        })();
+        if result.is_err(){let _=std::fs::remove_file(&temporary);}
+        result?;Ok(Some(path.to_string_lossy().into_owned()))
+    }).await.map_err(|error|error.to_string())?
+}
+fn chrono_safe_nonce()->u128 {std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()}
+
+#[tauri::command]
+fn resolve_camera_capture_directory()->Result<String,String> {
+    #[cfg(windows)]
+    {return existing_known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Pictures).map(|directory|directory.join("MicroCT").join("CameraCaptures").to_string_lossy().into_owned());}
+    #[cfg(not(windows))]
+    {Err("Configured Windows Pictures directory is unavailable".into())}
+}
 
 const DESIGN_WIDTH: f64 = 1920.0;
 const DESIGN_HEIGHT: f64 = 1080.0;
@@ -348,7 +416,7 @@ fn write_startup_snapshot(snapshot: &Value) -> Result<(), String> {
 /// while it is bringing up its browser process. That shows up as a window whose
 /// content area goes black a few seconds after launch.
 fn connect_engine(app: &tauri::AppHandle) -> Result<(), String> {
-    let mut engine = EngineClient::spawn()
+    let engine = EngineClient::spawn()
         .map_err(|error| format!("Unable to start ct-engine: {error}"))?;
     let startup_snapshot = engine
         .request("snapshot", serde_json::json!({}))
@@ -396,11 +464,12 @@ fn bootstrap_engine(app: tauri::AppHandle) {
 /// blocking round-trip to `ct-engine` and the UI polls this every 850 ms.
 #[tauri::command]
 async fn engine_snapshot(state: tauri::State<'_, EngineState>) -> Result<Value, String> {
-    let mut guard = state.0.lock().map_err(|_| "Engine client unavailable")?;
-    guard
-        .as_mut()
+    let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+        .as_ref()
+        .cloned()
         .ok_or_else(|| "ct-engine is still starting".to_string())?
-        .request("snapshot", serde_json::json!({}))
+        ;
+    client.request("snapshot", serde_json::json!({}))
 }
 
 #[tauri::command]
@@ -412,11 +481,12 @@ async fn engine_command(
         .get("type")
         .and_then(Value::as_str)
         .ok_or("Command type is required")?;
-    let mut guard = state.0.lock().map_err(|_| "Engine client unavailable")?;
-    guard
-        .as_mut()
+    let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+        .as_ref()
+        .cloned()
         .ok_or_else(|| "ct-engine is still starting".to_string())?
-        .request(name, command.clone())
+        ;
+    client.request(name, command.clone())
 }
 
 /// Read a committed camera frame through the engine's snapshot. The renderer
@@ -424,9 +494,9 @@ async fn engine_command(
 #[tauri::command]
 async fn frame_preview(index: u32, state: tauri::State<'_, EngineState>) -> Result<Vec<u8>, String> {
     let snapshot = {
-        let mut guard = state.0.lock().map_err(|_| "Engine client unavailable")?;
-        guard.as_mut().ok_or("ct-engine is still starting")?
-            .request("snapshot", serde_json::json!({}))?
+        let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+            .as_ref().cloned().ok_or("ct-engine is still starting")?;
+        client.request("snapshot", serde_json::json!({}))?
     };
     let workstation = snapshot.get("workstation").ok_or("Workstation snapshot missing")?;
     let frame = workstation.get("frames").and_then(Value::as_array)
@@ -462,9 +532,9 @@ async fn reconstruction_preview(
         return Err("Unknown reconstruction method".into());
     }
     let snapshot = {
-        let mut guard = state.0.lock().map_err(|_| "Engine client unavailable")?;
-        guard.as_mut().ok_or("ct-engine is still starting")?
-            .request("snapshot", serde_json::json!({}))?
+        let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+            .as_ref().cloned().ok_or("ct-engine is still starting")?;
+        client.request("snapshot", serde_json::json!({}))?
     };
     let workstation = snapshot.get("workstation").ok_or("Workstation snapshot missing")?;
     let reconstruction = workstation.get("reconstruction").ok_or("Reconstruction state missing")?;
@@ -760,6 +830,10 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            camera_live_view_frame,
+            camera_preset_import,
+            camera_preset_export,
+            resolve_camera_capture_directory,
             engine_snapshot,
             engine_command,
             frame_preview,

@@ -1510,3 +1510,39 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
   .control-dock.is-reduced-motion::before,
   .control-dock.is-reduced-motion::after { display: none !important; animation: none !important; }
 }
+/* Independent device overlays. Only the overlay body scrolls; fixed console
+   tracks, the 39px branded title bar and the 306px log/status row stay intact. */
+.device-console-backdrop { position: absolute; inset: 0; z-index: 120; display: flex; justify-content: center; align-items: center; background: var(--glassShadow); }
+.device-console { width: min(1450px, 92%); height: min(900px, 90%); display: flex; flex-direction: column; border-radius: 18px; border: 1px solid var(--lineStrong); background: var(--panel); color: var(--textPrimary); box-shadow: var(--shadowFloat); overflow: hidden; }
+.device-console > header { display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; padding: 18px 24px; background: var(--panelHeader); border-bottom: 1px solid var(--line); }
+.device-console h2 { margin: 0 0 4px; font-size: 21px; }
+.device-console > header span { color: var(--textSecondary); font-size: 12px; }
+.device-console-body { overflow: auto; min-height: 0; padding: 8px 24px 24px; }
+.device-console-section { padding: 16px 0; border-bottom: 1px solid var(--line); }
+.device-console-section:last-child { border-bottom: 0; }
+.device-console-section h3 { margin: 0 0 12px; font-size: 15px; }
+.device-console small { display: block; font-size: 11px; font-weight: normal; color: var(--textSecondary); margin-top: 4px; overflow-wrap: anywhere; }
+.device-console h3 small { display: inline; margin-left: 8px; }
+.device-console p, .device-console label { font-size: 12px; line-height: 1.55; color: var(--textSecondary); }
+.device-console-actions, .live-view-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 9px 0; }
+.device-console button, .device-console select, .device-console input:not([type=checkbox]) { min-height: 32px; padding: 6px 10px; border-radius: 7px; border: 1px solid var(--lineField); background: var(--well); color: var(--textPrimary); font: inherit; font-size: 12px; }
+.device-console input:not([type=checkbox]) { min-width: 140px; }
+.device-console select { max-width: 480px; }
+.device-console button { cursor: pointer; background: var(--panelHeader); }
+.device-console button:hover:not(:disabled) { border-color: var(--textSecondary); }
+.device-console button:disabled, .device-console input:disabled, .device-console select:disabled { opacity: .5; cursor: default; }
+.device-console .device-safe-stop { background: var(--danger); color: var(--onAccent); font-weight: 700; min-width: 115px; }
+.device-control-reason { padding: 8px 10px; background: var(--well); border-left: 3px solid var(--warn); overflow-wrap: anywhere; }
+.device-evidence { display: grid; grid-template-columns: 170px minmax(0,1fr); gap: 8px 16px; font-size: 12px; }
+.device-evidence dt { color: var(--textSecondary); }
+.device-evidence dd { margin: 0; overflow-wrap: anywhere; }
+.camera-properties { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; margin-top: 12px; }
+.camera-properties th, .camera-properties td { text-align: left; border-bottom: 1px solid var(--line); padding: 9px 8px; vertical-align: top; overflow-wrap: anywhere; }
+.camera-properties th { color: var(--textSecondary); font-size: 11px; }
+.camera-properties select, .camera-properties input { width: 100%; min-width: 0 !important; }
+.camera-live-viewport { position: relative; background: var(--well); border-radius: 10px; height: 430px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+.camera-live-viewport img { max-width: 100%; max-height: 100%; object-fit: contain; transform-origin: center; }
+.camera-live-viewport > span { padding: 24px; text-align: center; font-size: 14px; color: var(--textSecondary); }
+.camera-live-viewport--grid::before { content: ''; pointer-events: none; position: absolute; z-index: 2; inset: 0; background-image: linear-gradient(to right, transparent 32.9%, var(--textMuted) 33%, transparent 33.1%, transparent 66.5%, var(--textMuted) 66.6%, transparent 66.7%), linear-gradient(to bottom, transparent 32.9%, var(--textMuted) 33%, transparent 33.1%, transparent 66.5%, var(--textMuted) 66.6%, transparent 66.7%); }
+.camera-live-viewport--crosshair::after { content: ''; pointer-events: none; position: absolute; z-index: 3; inset: 0; background-image: linear-gradient(to right, transparent calc(50% - .5px), var(--accent) 50%, transparent calc(50% + .5px)), linear-gradient(to bottom, transparent calc(50% - .5px), var(--accent) 50%, transparent calc(50% + .5px)); }
+.live-frame-label { position: absolute; bottom: 10px; left: 10px; font-size: 11px; padding: 4px 7px; background: var(--panel); border-radius: 4px; }

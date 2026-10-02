@@ -38,7 +38,7 @@ async function loadProductionFirstLaunchSnapshot() {
   const lines = contents.split(/\r?\n/).filter((line) => line.length > 0);
   assert.equal(lines.length, 1, "expected one real production ct-engine JSONL response");
   const response = JSON.parse(lines[0]);
-  assert.equal(response.protocol_version, 1);
+  assert.equal(response.protocol_version, 2);
   assert.equal(response.command, "snapshot");
   assert.equal(response.error_code, null);
   assert.ok(response.payload.workstation, "Tauri's forwarded snapshot payload must include the workstation projection");
@@ -115,8 +115,8 @@ test("production first-launch JSONL snapshot proves the engine startup marker is
   assert.deepEqual(stored(storage).devices, { nano: false, camera: false, xray: false });
   assert.equal(
     stored(storage).engineSessionId,
-    tauriSnapshot.logs.find(({ message }) => message === STARTUP_MESSAGE).id,
-    "the startup log identifies this engine process without setting device evidence",
+    tauriSnapshot.engineSessionId,
+    "the v2 engine session identifies this process without setting device evidence",
   );
 });
 

@@ -11,22 +11,22 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 const read = (relative) => readFileSync(new URL(relative, root), "utf8");
 
-const MENU_ID = /"(file\.[a-zA-Z]+|edit\.[a-zA-Z]+|tools\.[a-zA-Z]+|help\.[a-zA-Z]+)"/g;
+const MENU_ID = /"(file\.[a-zA-Z]+|edit\.[a-zA-Z]+|tools\.[a-zA-Z]+|devices\.[a-zA-Z]+|help\.[a-zA-Z]+)"/g;
 
 test("every menu entry id is handled in App.tsx", () => {
   const model = read("src/menuActions.ts");
   const app = read("src/App.tsx");
   const ids = [...new Set([...model.matchAll(MENU_ID)].map((match) => match[1]))];
 
-  assert.equal(ids.length, 15, "four menus, fifteen entries");
+  assert.equal(ids.length, 17, "existing menus plus two independent device consoles");
   for (const id of ids) {
     assert.match(app, new RegExp(`case "${id.replace(".", "\\.")}":`), `${id} needs a handler`);
   }
 });
 
-test("the four top menus keep their labels", () => {
+test("the original menus keep their labels and Devices opens the consoles", () => {
   const model = read("src/menuActions.ts");
-  for (const label of ["File", "Edit", "Tools", "Help"]) {
+  for (const label of ["File", "Edit", "Tools", "Devices", "Help"]) {
     assert.match(model, new RegExp(`label: "${label}"`), `${label} menu is missing`);
   }
 });

@@ -10,16 +10,18 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
 use std::time::Duration;
 
-pub struct EngineClient {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    responses: Receiver<Result<Response, String>>,
-    sequence: u64,
-    response_sequence: u64,
-    failed: bool,
+#[derive(Clone)]
+pub struct EngineClient { transport: Arc<Transport> }
+struct Pending { command: String, reply: mpsc::Sender<Result<Value,String>> }
+struct Transport {
+    child: Mutex<Child>, stdin: Mutex<Option<ChildStdin>>,
+    pending: Mutex<HashMap<String, Pending>>, session: Mutex<Option<String>>,
+    sequence: AtomicU64, response_sequence: AtomicU64, failed: AtomicBool,
 }
 
 const EMBEDDED_ENGINE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ct-engine.bin"));
@@ -62,11 +64,14 @@ fn embedded_engine_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     } else {
         format!("ct-engine-{version}")
     };
+    #[cfg(not(test))]
     let runtime_dir = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("MicroCTWorkstation")
         .join("runtime");
+    #[cfg(test)]
+    let runtime_dir=Path::new(env!("CARGO_MANIFEST_DIR")).join("../tmp/tests/desktop/20261002-embedded-runtime");
     fs::create_dir_all(&runtime_dir)?;
     let path = runtime_dir.join(filename);
 
@@ -74,19 +79,21 @@ fn embedded_engine_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         .map(|bytes| Sha256::digest(bytes) == digest)
         .unwrap_or(false);
     if !existing_is_current {
-        let temporary = runtime_dir.join(format!("ct-engine-{version}.tmp"));
+        let temporary = runtime_dir.join(format!("ct-engine-{version}-{}-{}.tmp",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
         let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .open(&temporary)?;
         file.write_all(EMBEDDED_ENGINE)?;
         file.sync_all()?;
         drop(file);
-        if path.exists() {
-            fs::remove_file(&path)?;
+        let concurrent_is_current=fs::read(&path).is_ok_and(|bytes|Sha256::digest(bytes)==digest);
+        if concurrent_is_current {fs::remove_file(&temporary)?;}
+        else if let Err(error)=fs::rename(&temporary,&path) {
+            let installed_is_current=fs::read(&path).is_ok_and(|bytes|Sha256::digest(bytes)==digest);
+            let _=fs::remove_file(&temporary);
+            if !installed_is_current {return Err(error.into());}
         }
-        fs::rename(&temporary, &path)?;
     }
 
     #[cfg(unix)]
@@ -102,154 +109,99 @@ fn embedded_engine_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 impl EngineClient {
     pub fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = embedded_engine_path()?;
-        let preview = std::env::var_os("MICRO_CT_ENGINE_PREVIEW").is_some();
-        Self::spawn_at(&path, preview)
+        let path=embedded_engine_path()?;
+        Self::spawn_at(&path,std::env::var_os("MICRO_CT_ENGINE_PREVIEW").is_some())
     }
-
-    fn spawn_at(path: &Path, preview: bool) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut command = Command::new(path);
-        // Keep JSONL pipes and shutdown ownership without creating a Windows console.
-        #[cfg(windows)]
-        {
+    fn spawn_at(path:&Path,preview:bool)->Result<Self,Box<dyn std::error::Error>> {
+        let mut command=Command::new(path);
+        #[cfg(test)]
+        command.env("MICRO_CT_ENGINE_DATA_DIR",Path::new(env!("CARGO_MANIFEST_DIR")).join("../tmp/tests/desktop").join(format!("20261002-client-session-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos())));
+        #[cfg(windows)] {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
+            command.creation_flags(0x0800_0000);
         }
-        if preview {
-            command.arg("--preview");
-        }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| {
-                format!(
-                    "failed to launch ct-engine sidecar at {}: {error}",
-                    path.display()
-                )
-            })?;
-        let stdin = child.stdin.take().ok_or("Missing engine stdin")?;
-        let stdout = child.stdout.take().ok_or("Missing engine stdout")?;
-        let (sender, responses) = mpsc::channel();
-        std::thread::spawn(move || {
+        if preview {command.arg("--preview");}
+        let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+            .map_err(|error|format!("failed to launch ct-engine sidecar at {}: {error}",path.display()))?;
+        let stdin=child.stdin.take().ok_or("Missing engine stdin")?;
+        let stdout=child.stdout.take().ok_or("Missing engine stdout")?;
+        let transport=Arc::new(Transport {child:Mutex::new(child),stdin:Mutex::new(Some(stdin)),pending:Mutex::new(HashMap::new()),session:Mutex::new(None),sequence:AtomicU64::new(0),response_sequence:AtomicU64::new(0),failed:AtomicBool::new(false)});
+        let weak=Arc::downgrade(&transport);
+        std::thread::spawn(move|| {
             for line in BufReader::new(stdout).lines() {
-                let response = line.map_err(|error| error.to_string()).and_then(|line| {
-                    serde_json::from_str(&line).map_err(|error| error.to_string())
-                });
-                if sender.send(response).is_err() {
-                    break;
-                }
+                let Some(transport)=weak.upgrade() else {return;};
+                let response=line.map_err(|e|e.to_string()).and_then(|line|serde_json::from_str::<Response>(&line).map_err(|e|e.to_string()));
+                if let Err(error)=transport.deliver(response) {transport.fail(&error);return;}
             }
+            if let Some(transport)=weak.upgrade() {transport.fail("Engine output closed");}
         });
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            responses,
-            sequence: 0,
-            response_sequence: 0,
-            failed: false,
-        })
+        Ok(Self{transport})
     }
-
-    pub fn request(&mut self, command: &str, payload: Value) -> Result<Value, String> {
-        if self.failed {
-            return Err("Engine transport failed; restart required".into());
-        }
-        let result = self.exchange(command, payload);
-        if let Err(error) = &result {
-            if !error.starts_with("ENGINE:") {
-                self.failed = true;
-                // EOF lets ct-engine run its shutdown path after a slow request.
-                // Killing it here would bypass the scan worker's beam-off cleanup.
-                drop(self.stdin.take());
-            }
-        }
-        result
-    }
-
-    fn exchange(&mut self, command: &str, payload: Value) -> Result<Value, String> {
-        self.sequence += 1;
-        let request_id = format!("desktop-{}", self.sequence);
-        let request = Request {
-            protocol_version: PROTOCOL_VERSION,
-            request_id: request_id.clone(),
-            command: command.into(),
-            payload,
-            timestamp: timestamp(),
-            sequence: self.sequence,
-            error_code: None,
-        };
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "Engine stdin is closed".to_string())?;
-        serde_json::to_writer(&mut *stdin, &request).map_err(|error| error.to_string())?;
-        writeln!(&mut *stdin)
-            .and_then(|_| stdin.flush())
-            .map_err(|error| error.to_string())?;
-        let timeout = match command {
-            "home" => Duration::from_secs(310),
-            "restore_previous" => Duration::from_secs(300),
-            "connect" => Duration::from_secs(30),
-            "camera_test_capture" => Duration::from_secs(75),
-            "preflight" | "retry_device" => Duration::from_secs(20),
-            "xray_toggle" => Duration::from_secs(20),
-            _ => Duration::from_secs(5),
-        };
-        let response = self
-            .responses
-            .recv_timeout(timeout)
-            .map_err(|error| format!("Engine unavailable while handling {command}: {error}"))??;
-        if response.protocol_version != PROTOCOL_VERSION
-            || response.request_id != request_id
-            || response.command != command
-            || response.sequence <= self.response_sequence
+    /// Writing is serialized; waiting never holds the client, stdin or pending-map lock.
+    pub fn request(&self,command:&str,payload:Value)->Result<Value,String> {
+        if self.transport.failed.load(Ordering::SeqCst){return Err("Engine transport failed; restart required".into());}
+        let (reply,receive)=mpsc::channel();
+        let request_id;
         {
-            return Err("Engine protocol mismatch".into());
+            let mut input=self.transport.stdin.lock().map_err(|_|"Engine stdin poisoned")?;
+            let stdin=input.as_mut().ok_or("Engine stdin is closed")?;
+            let sequence=self.transport.sequence.fetch_add(1,Ordering::SeqCst)+1;
+            request_id=format!("desktop-{sequence}");
+            let session=self.transport.session.lock().map_err(|_|"Engine session poisoned")?.clone();
+            if session.is_none()&&command!="snapshot" {return Err("Engine session handshake required".into());}
+            let request=Request {engine_session_id:session,protocol_version:PROTOCOL_VERSION,request_id:request_id.clone(),command:command.into(),payload,timestamp:timestamp(),sequence,error_code:None};
+            self.transport.pending.lock().map_err(|_|"Engine pending map poisoned")?.insert(request_id.clone(),Pending{command:command.into(),reply});
+            let result=serde_json::to_writer(&mut *stdin,&request).map_err(|e|e.to_string())
+                .and_then(|_|writeln!(&mut *stdin).and_then(|_|stdin.flush()).map_err(|e|e.to_string()));
+            if let Err(error)=result {drop(input);self.transport.fail(&error);return Err(error);}
         }
-        self.response_sequence = response.sequence;
-        if let Some(code) = response.error_code {
-            return Err(format!("ENGINE:{code}"));
+        match receive.recv_timeout(Duration::from_secs(5)) {
+            Ok(result)=>result,
+            Err(error)=>{self.transport.fail("Engine response deadline exceeded; EOF safety cleanup requested");Err(format!("Engine unavailable while handling {command}: {error}"))}
         }
-        Ok(response.payload)
     }
 }
-
-impl Drop for EngineClient {
+impl Transport {
+    fn deliver(&self,response:Result<Response,String>)->Result<(),String> {
+        let response=response?;
+        if response.protocol_version!=PROTOCOL_VERSION || response.engine_session_id.is_empty()
+            || response.sequence<=self.response_sequence.load(Ordering::SeqCst) {
+            return Err("Engine protocol, session or sequence mismatch".into());
+        }
+        let pending=self.pending.lock().map_err(|_|"Engine pending map poisoned")?.remove(&response.request_id)
+            .ok_or("Unexpected or duplicate engine response ID")?;
+        if pending.command!=response.command {let _=pending.reply.send(Err("Engine command mismatch".into()));return Err("Engine command mismatch".into());}
+        let mut session=self.session.lock().map_err(|_|"Engine session poisoned")?;
+        match session.as_ref() {
+            Some(expected) if expected!=&response.engine_session_id=> {let _=pending.reply.send(Err("Engine session changed".into()));return Err("Engine session changed".into());}
+            None if response.command=="snapshot" && response.error_code.is_none()=>*session=Some(response.engine_session_id.clone()),
+            None=>{let _=pending.reply.send(Err("Invalid session handshake".into()));return Err("Invalid session handshake".into());}
+            _=>{},
+        }
+        if response.payload["engineSessionId"].as_str()!=Some(response.engine_session_id.as_str())
+            || response.payload["snapshotSequence"].as_u64()!=Some(response.sequence) {
+            let _=pending.reply.send(Err("Engine snapshot evidence mismatch".into()));return Err("Engine snapshot evidence mismatch".into());
+        }
+        self.response_sequence.store(response.sequence,Ordering::SeqCst);
+        let result=match response.error_code {Some(code)=>Err(format!("ENGINE:{code}")),None=>Ok(response.payload)};
+        let _=pending.reply.send(result);
+        Ok(())
+    }
+    fn fail(&self,error:&str) {
+        self.failed.store(true,Ordering::SeqCst);
+        if let Ok(mut input)=self.stdin.lock(){drop(input.take());}
+        if let Ok(mut pending)=self.pending.lock(){for (_,entry) in pending.drain(){let _=entry.reply.send(Err(error.into()));}}
+    }
+}
+impl Drop for Transport {
     fn drop(&mut self) {
-        // 1. Ask the engine to latch a safe stop (it confirms Moxtek OFF).
-        let _ = self.request("stop", serde_json::json!({"type":"stop"}));
-        // 2. Closing stdin makes the engine run its deterministic shutdown
-        //    (scan stop + Moxtek OFF + device release) even if the stop
-        //    request itself failed.
-        drop(self.stdin.take());
-        // 3. ct-engine may wait up to 65 seconds for an active scan worker to
-        //    confirm cleanup after EOF. Keep the child alive through that
-        //    window and the subsequent device OFF/disconnect transactions.
-        let deadline = std::time::Instant::now() + Duration::from_secs(90);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Ok(None) => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    return;
-                }
-                Err(_) => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    return;
-                }
-            }
-        }
+        // EOF reaches the independent reader immediately; the engine owns all safety cleanup.
+        if let Ok(input)=self.stdin.get_mut(){drop(input.take());}
+        let Ok(child)=self.child.get_mut()else{return;};
+        let deadline=std::time::Instant::now()+Duration::from_secs(90);
+        loop {match child.try_wait(){Ok(Some(_))=>return,Ok(None)if std::time::Instant::now()<deadline=>std::thread::sleep(Duration::from_millis(50)),_=>{let _=child.kill();let _=child.wait();return;}}}
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,9 +249,33 @@ mod tests {
         let mut engine = EngineClient::spawn_at(&path, true).expect("preview engine must start");
         let snapshot = engine.request("snapshot", serde_json::json!({})).expect("JSONL must work");
         assert!(snapshot.is_object());
-        assert!(engine.child.try_wait().unwrap().is_none());
+        assert!(engine.transport.child.lock().unwrap().try_wait().unwrap().is_none());
         let started = std::time::Instant::now();
         drop(engine);
         assert!(started.elapsed() < Duration::from_secs(8), "engine must shut down without kill timeout");
+    }
+
+    #[test]
+    fn sidecar_eof_cleanup_cannot_be_blocked_by_an_unread_stdout_pipe() {
+        let path=embedded_engine_path().unwrap();
+        let mut command=Command::new(path);
+        #[cfg(windows)]{use std::os::windows::process::CommandExt;command.creation_flags(0x0800_0000);}
+        let mut child=command.arg("--preview")
+            .env("MICRO_CT_ENGINE_DATA_DIR",Path::new(env!("CARGO_MANIFEST_DIR")).join("../tmp/tests/desktop/20261002-stdout-backpressure"))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut input=child.stdin.take().unwrap();
+        for sequence in 1..=24 {
+            let request=Request{engine_session_id:None,protocol_version:PROTOCOL_VERSION,request_id:format!("backpressure-{sequence}"),command:"snapshot".into(),payload:serde_json::json!({}),timestamp:timestamp(),sequence,error_code:None};
+            if serde_json::to_writer(&mut input,&request).is_err(){break;}if writeln!(&mut input).is_err(){break;}
+            if sequence==1{let _=input.flush();std::thread::sleep(Duration::from_millis(100));}
+        }
+        let _=input.flush();std::thread::sleep(Duration::from_millis(100));drop(input);
+        // Deliberately keep ChildStdout open without reading its bytes.
+        let deadline=std::time::Instant::now()+Duration::from_secs(3);
+        loop {
+            if child.try_wait().unwrap().is_some(){break;}
+            if std::time::Instant::now()>=deadline{let _=child.kill();let _=child.wait();panic!("EOF must reach the domain while stdout consumer is stalled");}
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
