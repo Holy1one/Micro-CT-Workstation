@@ -41,19 +41,31 @@ crates/ct-engine/
     ├── main.rs                JSONL sidecar process entry and EOF shutdown
     ├── lib.rs                 domain commands, safety state, snapshots, API DTOs
     ├── scan.rs                transactional projection coordinator
+    ├── operations.rs          background operation records and cancellation
+    ├── device_controls.rs     independent device commands and safety decisions
+    ├── capture_profile.rs     schema-3 frozen native acquisition evidence
+    ├── presets.rs             versioned camera-only multi-preset storage
+    ├── task_registry.rs       persistent unfinished-task lock
     ├── reconstruction.rs      offline correction and volume reconstruction
     ├── reconstruction_preprocess.rs reference noise, support and axis estimation
     └── devices/
         ├── mod.rs             device namespace and topology boundary
         ├── xray/
         │   ├── mod.rs         stable X-ray module surface
-        │   └── moxtek.rs      current Moxtek PC-direct driver
+        │   ├── moxtek.rs      bounded raw Moxtek protocol
+        │   └── worker.rs      unique serial owner/watchdog/priority OFF
         ├── camera/
         │   ├── mod.rs         stable camera module surface
-        │   └── digicam_control.rs  current D7100 host-control driver
+        │   ├── actor.rs       Send message proxy; COM/thread ownership
+        │   ├── wpd.rs         independent Windows WPD MTP transport
+        │   ├── ptp.rs         bounded standard PTP data parser
+        │   ├── nikon.rs       necessary MIT Nikon protocol
+        │   ├── capture.rs     correlated SDRAM events and atomic NEF
+        │   └── live_view.rs   validated latest-only JPEG and user-ACL pipe
         └── turntable/
             ├── mod.rs         stable turntable module surface
-            └── nano.rs        current RTS9060 Nano serial driver
+            ├── nano.rs        serial worker/heartbeat/STOP/epoch admission
+            └── planner.rs     fixed-direction unwrapped pulse plans
 ```
 
 三类设备目录可以独立分支深入开发，但公开 surface、扫描协调器消费方式和跨设备安全事务发生变化时，必须同步检查 `engine-core` 及所有强依赖边。设备模块不互相调用；跨设备顺序只存在于 `scan.rs` 和领域引擎。

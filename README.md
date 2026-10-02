@@ -22,13 +22,11 @@ Micro-CT-App 是 Windows 工业上位机工程：React 提供操作界面，Taur
 - `src/engine/`：前端契约、生产 adapter 和浏览器预览。
 - `module-map/`：机器可读模块归属与隐藏依赖。
 
-相机模块当前仍通过外部 `CameraControlRemoteCmd.exe` 控制 D7100。原生 Rust
-WPD/PTP、能力协商与设备自主控制已在 [ADR 0003](docs/decisions/0003-native-wpd-camera-and-device-control.md)
-接受，尚待实现和硬件验收；禁止额外相机桥进程与算法插件的决定继续有效。
+相机模块使用原生 Rust Windows WPD/PTP、能力协商和设备自主控制；实现边界见 [ADR 0003](docs/decisions/0003-native-wpd-camera-and-device-control.md)。当前交付离线候选，真实事件、方向、flash 和联动扫描认证仍为 BLOCKED。
 
 ## Windows 入口
 
-Windows 11 x64 是真实设备集成与最终发布平台。安装 MSVC Build Tools、WebView2、Rust `x86_64-pc-windows-msvc`、Node 与 .NET 后运行 `npm.cmd run tauri:dev`。真实相机、串口和射线操作必须取得本次明确授权，详见 `docs/WINDOWS-INTEGRATION.md`。
+Windows 11 x64 是真实设备集成与最终发布平台。安装 MSVC Build Tools、WebView2、Rust `x86_64-pc-windows-msvc`、Node 后运行 `npm.cmd run tauri:dev`。真实相机、串口和射线操作必须取得本次明确授权，详见 `docs/WINDOWS-INTEGRATION.md`。
 
 ## 免安装版发布与启动
 
@@ -73,3 +71,7 @@ cargo test --workspace
 ```
 
 运行 `npm.cmd run impact` 可根据当前 Git 工作区列出所属模块、受影响模块、强依赖和必跑门禁。
+
+## 原生设备控制候选
+
+运行 npm.cmd run candidate:build 生成 release/native-device-controls-offline/micro-ct-native-device-controls-offline.exe 及来源、哈希、许可；正式 portable-release/ 保留旧任务处理版本。顶部 Devices 打开 Camera/Turntable 浮层，主布局保持 39px 标题栏和 306px 底栏。原始 NEF 只读，schema 2 数据与合法重构缓存保留；原生 backend 只向完整 schema 3 任务续扫。所有离线通过均不等于设备认证。

@@ -1,11 +1,10 @@
 # ADR 0003：原生 WPD 相机与设备自主控制
 
-状态：已接受，待实现。
+状态：已实现离线候选，待硬件验收。
 
 本决定替代 [ADR 0002](0002-no-out-of-process-camera-bridge-or-algorithm-plugins.md)
 中的相机传输技术选择；禁止额外相机桥进程和算法插件的决定继续有效。本文记录
-已确认的目标契约，不表示原生后端已经上线或设备已经获得硬件认证。实施前的
-活动相机实现仍为 `digicam_control.rs` 调用外部 `CameraControlRemoteCmd.exe`。
+已确认的契约。原生源码与离线测试已实现；设备认证仍为 BLOCKED。迁移前相机实现为 `digicam_control.rs` 调用外部 RemoteCmd，保留正式旧版本处理既有任务。
 
 ## 背景
 

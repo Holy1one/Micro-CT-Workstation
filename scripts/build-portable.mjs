@@ -45,4 +45,5 @@ const manifest = {
 };
 if (offlineCandidate && sha256(formalExecutable) !== retainedFormalHash) throw new Error("Formal portable executable changed during candidate build");
 writeFileSync(join(destinationDirectory, "build-info.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+if (offlineCandidate) execFileSync(process.execPath,[join(root,"scripts/collect-candidate-licenses.mjs")],{cwd:root,stdio:"inherit"});
 console.log(`Published ${destination}\nSHA256 ${digest}`);

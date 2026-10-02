@@ -8,16 +8,13 @@ Windows 11 x64 是真实硬件、GPU 与发布验收平台。其他平台构建�
 - `ct-workstation.exe`：Tauri 2 + WebView2；正式启动副本为
   `portable-release/micro-ct-workstation-portable.exe`。
 - `ct-engine.exe`：Rust，拥有设备、安全门控、采集状态机与离线重构。
-- 当前相机模块 `digicam_control.rs` 由 Rust adapter 启动外部
-  DigiCamControl `CameraControlRemoteCmd.exe`，并在主机侧确认文件。adapter 位于
-  引擎内不代表相机通信原生运行于引擎内。
+- 相机模块 `camera/{actor,wpd,ptp,nikon,capture,live_view}.rs` 使用原生 Windows WPD/PTP，COM 在专用线程创建、使用和释放，RAM NEF 由本次曝光/对象/传输事件及完整文件确认。
 - 重构方法编译进 `ct-engine`，通过 `ReconstructionMethod` 声明；FDK 使用 CPU 或
   兼容的 wgpu GPU 路径，受限规模 CPU SIRT 可用。未采用独立算法插件运行时。
 - 控制与快照沿用 sidecar stdio 和版本化 JSONL envelope，不开放 localhost
   设备控制服务。前端生产路径只能通过 Tauri 进入引擎。
 
-[ADR 0003](decisions/0003-native-wpd-camera-and-device-control.md) 已接受原生 Rust
-WPD/PTP 相机与设备自主控制，状态为待实现；当前说明不得据此声称原生已上线。
+[ADR 0003](decisions/0003-native-wpd-camera-and-device-control.md) 记录原生 Rust WPD/PTP 与自主控制契约；当前源码已实现离线候选，硬件验收仍 BLOCKED。
 迁移后不再调用 DigiCamControl，不自动回退旧工具或模拟。禁止额外相机桥进程和
 算法插件的 [ADR 0002](decisions/0002-no-out-of-process-camera-bridge-or-algorithm-plugins.md)
 继续有效。
@@ -28,9 +25,7 @@ WPD/PTP 相机与设备自主控制，状态为待实现；当前说明不得据
 
 - `crates/ct-engine/src/devices/turntable/nano.rs`：串口、身份/能力、心跳、运动确认、
   警告和 STOP。
-- `crates/ct-engine/src/devices/camera/digicam_control.rs`：当前 D7100 发现、精确曝光
-  档位、外部捕获与主机文件确认。原生迁移仍在已有 camera 模块内拆分公共接口、
-  WPD/PTP、Nikon、capture 和 Live View；不并入厂商完整外部框架。
+- `crates/ct-engine/src/devices/camera/`：身份和能力、精确参数读回、原生 COM actor/WPD/PTP、必要 Nikon 协议、RAM capture 与 Live View。
 - `crates/ct-engine/src/devices/xray/moxtek.rs`：Moxtek 命令、实测回读、两秒重开
   门控和 fail-closed 关束。
 
@@ -39,7 +34,7 @@ WPD/PTP 相机与设备自主控制，状态为待实现；当前说明不得据
 不调用设备。PC 直控与未来 Arduino 主控的稳定边界见
 [dual-control-topology.md](architecture/dual-control-topology.md)。
 
-## 已接受的原生目标契约
+## 原生离线候选契约
 
 - 相机和转台独立连接、自检；多相机明确选中一个活动身份。完整厂商适配和正式
   扫描首期仅 D7100 NEF，其他型号仅开放有证据的标准能力，不能证明 host-only

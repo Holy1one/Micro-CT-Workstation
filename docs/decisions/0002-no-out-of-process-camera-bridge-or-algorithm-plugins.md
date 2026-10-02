@@ -2,7 +2,7 @@
 
 Status: implemented for the bridge/plugin decision. The camera transport choice is
 superseded by [ADR 0003](0003-native-wpd-camera-and-device-control.md), accepted and
-pending implementation.
+implemented as an offline candidate; hardware acceptance is pending.
 
 ## Problem
 
@@ -22,8 +22,8 @@ in-process camera transport. Reconstruction methods are implemented inside
 Neither seam is adopted. Both draft directories and their module-map ownership
 were removed, and the replacement facts are recorded here.
 
-- Camera ownership remains in `crates/ct-engine/src/devices/camera/`. The existing
-  adapter invokes DigiCamControl RemoteCmd externally; no additional managed
+- Camera ownership remains in `crates/ct-engine/src/devices/camera/`. The pre-migration
+  adapter invoked DigiCamControl RemoteCmd externally; no additional managed
   camera bridge, bridge handshake, or bridge-side scan state was adopted. ADR
   0003 replaces this transport choice with native Rust Windows WPD/PTP while
   preserving the prohibition on an additional camera bridge process.
