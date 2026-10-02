@@ -1,6 +1,8 @@
 # Agent Note: No out-of-process camera bridge or algorithm plugin system
 
-Status: implemented
+Status: implemented for the bridge/plugin decision. The camera transport choice is
+superseded by [ADR 0003](0003-native-wpd-camera-and-device-control.md), accepted and
+pending implementation.
 
 ## Problem
 
@@ -9,8 +11,10 @@ and module-map ownership: a Windows-only .NET `digicam-bridge.exe` process for
 the Nikon D7100 (`bridges/digicam/README.md`, protocol `digicam.bridge.v1`) and a
 Python algorithm plugin system with four package contracts and an
 `AlgorithmSupervisor` running `python -m ct_worker` (`algorithm-plugins/README.md`).
-No build, test, or release path produced either one. In reality the camera was
-implemented in-process and reconstruction methods were implemented inside
+No build, test, or release path produced either one. The Rust camera adapter lives
+inside `ct-engine`, but the existing implementation launches the external
+DigiCamControl `CameraControlRemoteCmd.exe` executable. It is not a native
+in-process camera transport. Reconstruction methods are implemented inside
 `ct-engine`.
 
 ## Decision
@@ -18,9 +22,11 @@ implemented in-process and reconstruction methods were implemented inside
 Neither seam is adopted. Both draft directories and their module-map ownership
 were removed, and the replacement facts are recorded here.
 
-- The camera is driven in-process from `crates/ct-engine/src/devices/camera/`
-  against DigiCamControl on Windows. There is no second camera process, no bridge
-  handshake, and no bridge-side scan state.
+- Camera ownership remains in `crates/ct-engine/src/devices/camera/`. The existing
+  adapter invokes DigiCamControl RemoteCmd externally; no additional managed
+  camera bridge, bridge handshake, or bridge-side scan state was adopted. ADR
+  0003 replaces this transport choice with native Rust Windows WPD/PTP while
+  preserving the prohibition on an additional camera bridge process.
 - Reconstruction algorithms are compiled into `ct-engine` and declared by
   `ReconstructionMethod`. Adding a method means adding a Rust implementation,
   offline tests, and a versioned release.
@@ -62,7 +68,7 @@ and a release tag keep one truth source.
   experiment with external algorithms outside the application.
 - Historical documents that still describe the two seams as options
   (`docs/ARCHITECTURE.md` selection rationale, `CURRENT-PROGRESS.md`,
-  `WINDOWS-INTEGRATION.md`, `WINDOWS-CODEX-PROMPT.md`,
+  `WINDOWS-CODEX-PROMPT.md`,
   `PHASE-1-3-IMPLEMENTATION-PLAN.md`) keep their text as history; they are not
   authority for current paths or behavior.
 - Revisit only when several external authors must add algorithms without a

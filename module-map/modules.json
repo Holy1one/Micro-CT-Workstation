@@ -144,11 +144,11 @@
     {
       "id": "release-artifacts",
       "name": "Generated release artifacts",
-      "owns": ["portable-release/**"],
+      "owns": ["portable-release/**", "release/**"],
       "publicApi": [],
       "risk": "low",
       "description": "Contains replaceable packaged binaries and is never a source of design truth.",
-      "execution": "npm.cmd run portable:build publishes the current Tauri release EXE and build-info.json here; target/release remains compiler output only.",
+      "execution": "The formal portable-release entry and offline candidates or rollback copies under release are generated local artifacts; target/release remains compiler output only.",
       "gates": []
     }
   ]

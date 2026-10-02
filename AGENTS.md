@@ -43,11 +43,11 @@ React / TypeScript
 
 1. UI 把操作转换为领域命令，生产模式只通过 Tauri 发送给 `ct-engine`。
 2. `ct-engine` 分别连接三类设备，验证身份与能力后才允许预检和扫描。
-3. 每个投影视为事务：转台到位并确认、持续出束状态确认、相机拍摄及文件确认、`CAPTURE_DONE`、提交进度。正常投影之间保持出束，仅在连续出束达到上限、暂停、停止、故障或最后一张完成后关束。
+3. 每个投影视为事务：转台到位并确认、持续出束状态确认、相机拍摄、主机完整文件与哈希确认、同一运动 ID 的 `CAPTURE_DONE`、提交进度。正常投影之间保持出束；正常末张投影及暂停按本次会话、操作关联的可靠 `ExposureEnded` 关束，继续完成文件确认、转台释放和提交后才报告 Completed/Paused。曝光结束与文件完成是不同证据，禁止按曝光计时、临时文件出现或工具退出猜测曝光完成。
 4. 暂停只在安全提交边界生效；界面 Stop 结束当前扫描并等待关束确认，不锁存软件急停。真实设备故障、掉线、超时和未知状态一律 fail-closed；Nano STOP 和硬件急停保护继续有效。
 5. 恢复不得伪造旧安全条件；按当前状态重新建立设备连接、预检和 HOME 等必要条件。
 
-Nano 串口协议为外部设备契约，当前核心命令/响应包括 `HEARTBEAT/HBACK`、`PING`、`INFO`、`STATUS`、`SET_MICROSTEPS`、`REARM`、`HOME`、`MOVE_ABS`、`MOVE_REL`、`CAPTURE_DONE`、`STOP`、`GET_HALL` 和 `XRAY_WARNING`。当前工作区没有活动 Nano 固件源码；不得读取封存源码或靠猜测改变协议。确需升级时，先建立新的活动固件来源，再同步设备固件、Rust adapter、预览实现与测试。
+Nano 串口协议为外部设备契约，当前核心命令/响应包括 `HEARTBEAT/HBACK`、`PING`、`INFO`、`STATUS`、`SET_MICROSTEPS`、`REARM`、`HOME`、`MOVE_ABS`、`MOVE_REL`、`CAPTURE_DONE`、`STOP`、`GET_HALL` 和 `XRAY_WARNING`。不得读取封存源码或靠猜测改变协议；固件候选只有经活动来源核验后才能纳入维护，离线重建和 VERSION/BUILD 字符串均不能证明与设备 flash 一致。协议升级必须同步活动固件、Rust adapter、预览实现与测试。
 
 ## 不变量
 
@@ -58,6 +58,14 @@ Nano 串口协议为外部设备契约，当前核心命令/响应包括 `HEARTB
 - 射线设定值不得冒充实测值；关束未确认时不得报告安全完成。
 - Moxtek 每次关束后至少 2 秒才允许再次开束；扫描前空场只允许一次开束和一次结束关束，不得逐张开关。扫描结束后不再采集后空场或后暗场。投影跨角度连续出束，仅 `maxXraySec` 上限触发关束和 300 秒休息；Stop/故障立即关束。空场无法在单次连续出束上限内完成时关束报故障，不自动循环开束。全部开束入口必须通过设备层时序门控，断线重连不得绕过。
 - D7100 使用主机侧保存与文件确认，不得静默回退到相机存储卡。
+- 相机模块负责原生传输、身份/能力发现、属性读写、Live View、关联拍摄事件与主机文件确认；原生技术选择见 `docs/decisions/0003-native-wpd-camera-and-device-control.md`，实际实现状态仍以源码为准。其他品牌只开放设备描述和安全语义均有证据的标准能力，正式扫描首期仅支持 D7100 NEF。
+- 相机、转台独立连接和检查自身，不要求完整扫描参数或其他设备已连接。独立单拍使用独立保存目录与操作 ID，不写入扫描帧数、manifest 或断点。单拍、Live View 和手动旋转不自动开束；引擎仍处理真实故障。Live View 开启时拒绝拍摄，不自动停预览再拍摄。
+- 相机参数先进入草稿，明确 Apply 才串行写入并读回；部分失败返回实际或未知状态并失效预检，不伪造回滚。相机快门和扫描 Exposure 共用目标值，保留原生档位精确匹配；扫描前必须写入并读回一致。预设仅保存已确认的相机参数，不包含射线、扫描路径、转台动作或未知物理焦点位置。
+- 普通转台运动固定沿现有生产方向；UI 正数表示沿该方向前进，协议保持现有负符号，前后端均拒绝普通逆向。HOME 保留固件内部有界反向退让例外；UI 不提供反向、任意多圈、速度、微步或以 ZERO 代替 HOME 的入口。
+- HOME 在连接射线源时先关束读回确认，完成后不自动开束。仅转台台架模式要求操作员确认射线物理隔离，射线仍为 UNKNOWN/未监测并禁止开束；连接射线后重新验证，曾连接而 OFF 未知时不得以台架确认覆盖。
+- 扫描、暂停、收尾、停止清理和重构期间锁定手动控制，安全停止和状态读取始终可用。持久未完成任务锁跨重启与 taskId 切换生效；锁定手动参数、对焦和运动，受控恢复 HOME 是例外。放弃任务必须先停止/清理并确认必要关束，再持久标记后解锁，保留全部文件且不得标记 Completed 或覆盖原目录。
+- 新后端仅向包含完整冻结采集 profile 的 schema 3 任务追加投影；schema 2 保持原文件、可离线读取和重构，但不得续扫。原始 NEF 只读，数值重构算法不因设备迁移而改变，合法缓存继续按原版本和哈希验证。
+- 设备 worker 是单一通信所有者；监测、Stop/OFF 和退出清理不依赖 UI 轮询，也不等待相机或运动长操作。停止使旧操作代次失效，迟到结果不得提交、开束、恢复 Live View 或解锁；取消已请求与硬件完成必须分别表达，清理未确认不得报告完成。
 - 真实设备动作遵循根 `AGENTS.md` 的授权要求；测试和开发预览不得访问真实设备。
 - `target/`、`dist/`、`node_modules/`、`src-tauri/binaries/`、`portable-release/` 中的打包产物、日志、崩溃转储和会话记忆都是可再生成内容，不进入版本控制，也不进入设计事实源。
 
@@ -86,7 +94,7 @@ Nano 串口协议为外部设备契约，当前核心命令/响应包括 `HEARTB
 
 1. 非平凡改动先运行 `npm.cmd run impact`；已有基线时使用 `node scripts/impact.mjs --base <verified-ref>`。
 2. 新增或移动路径时，同一改动更新 `module-map/modules.json`；新增字符串协议、跨进程或语义依赖时更新 `module-map/edges.json`。
-3. X 射线、相机、转台分别在 `crates/ct-engine/src/devices/` 下独立开发；设备模块不得互相调用，跨设备顺序只由扫描协调器持有。
+3. X 射线、相机、转台分别在 `crates/ct-engine/src/devices/` 下独立开发；设备模块不得互相调用。扫描跨设备顺序由扫描协调器持有，独立 HOME 等跨设备安全裁决由 `ct-engine` 领域入口持有。
 4. 未来 Arduino 主控作为新的 device backend 接入，必须保留 PC 直控实现和同一领域契约；两条路径不得静默回退，Arduino 不得成为第二个未经对账的生产扫描状态源。
 5. 运行影响模块列出的门禁；未运行项明确报告 `BLOCKED`。
 
@@ -147,7 +155,7 @@ Verification: <新增后需要运行的门禁>
 | 发布候选中间产物 | `release/` | 忽略 |
 | 免安装交付包（EXE、`build-info.json`） | `portable-release/` | 忽略；只跟踪说明文件 `README.md` |
 
-免安装版的唯一交付入口为 `portable-release/micro-ct-workstation-portable.exe`，使用 `npm.cmd run portable:build` 同步编译前端、桌面壳和内嵌引擎，并生成同目录 `build-info.json`。这两个文件都是可再生成的打包产物，只在本机构建与分发，不进入版本控制：`.gitignore` 忽略 `portable-release/*`，目录中只跟踪说明用 `README.md`。发布留档用 tag 记录源码提交，由接收方按 tag 在本机重新构建，而不是从仓库下载二进制。`target/release/` 只承担编译输出与缓存职责，不作为日常启动入口。涉及免安装版交付的任务必须在本机构建并验证正式 EXE；仅运行 `vite build` 或浏览器截图不能证明桌面版本已更新。
+免安装正式版的唯一交付入口为 `portable-release/micro-ct-workstation-portable.exe`，使用 `npm.cmd run portable:build` 同步编译前端、桌面壳和内嵌引擎，并生成同目录 `build-info.json`。这两个文件都是可再生成的打包产物，只在本机构建与分发，不进入版本控制：`.gitignore` 忽略 `portable-release/*`，目录中只跟踪说明用 `README.md`。发布留档用 tag 记录源码提交，由接收方按 tag 在本机重新构建，而不是从仓库下载二进制。`target/release/` 只承担编译输出与缓存职责，不作为日常启动入口。未经硬件验收的设备重大迁移必须交付 `release/` 下明确标记的离线候选 EXE，保留现用正式入口及其来源/哈希；离线通过不得标记设备认证完成。涉及桌面交付必须在本机构建并验证所交付 EXE；仅运行 `vite build` 或浏览器截图不能证明桌面版本可用。
 
 `<module>` 使用稳定短名：`ct-engine`、`xray`、`camera`、`turntable`、`frontend`、`preview`、`scene`、`desktop`、`tooling`。`<run-id>` 使用 `YYYYMMDD-HHmmss-<short-topic>`，不得使用“final”“new”等无法追溯的名称。
 
