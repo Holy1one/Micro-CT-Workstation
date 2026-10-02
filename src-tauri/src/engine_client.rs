@@ -108,6 +108,17 @@ fn embedded_engine_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 impl EngineClient {
+    /// Shutdown ownership is explicit: retained request/preview clones cannot keep stdin open.
+    pub fn begin_shutdown(&self){self.transport.fail("Engine is shutting down; stdin closed for safety cleanup");}
+    pub fn wait_for_exit(&self,timeout:Duration)->Result<(),String>{
+        let deadline=std::time::Instant::now()+timeout;
+        loop{
+            let status=self.transport.child.lock().map_err(|_|"Engine process handle poisoned")?.try_wait().map_err(|error|error.to_string())?;
+            if let Some(status)=status{return if status.success(){Ok(())}else{Err(format!("Engine exited with {status}; cleanup may be unconfirmed"))};}
+            if std::time::Instant::now()>=deadline{return Err("Engine cleanup exit remains unconfirmed; process was not killed".into());}
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     pub fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
         let path=embedded_engine_path()?;
         Self::spawn_at(&path,std::env::var_os("MICRO_CT_ENGINE_PREVIEW").is_some())
@@ -163,6 +174,9 @@ impl EngineClient {
 }
 impl Transport {
     fn deliver(&self,response:Result<Response,String>)->Result<(),String> {
+        // Drain responses after explicit shutdown so closing pending requests
+        // cannot turn a deliberate EOF cleanup into a broken stdout transport.
+        if self.failed.load(Ordering::SeqCst){return Ok(());}
         let response=response?;
         if response.protocol_version!=PROTOCOL_VERSION || response.engine_session_id.is_empty()
             || response.sequence<=self.response_sequence.load(Ordering::SeqCst) {
@@ -199,7 +213,7 @@ impl Drop for Transport {
         if let Ok(input)=self.stdin.get_mut(){drop(input.take());}
         let Ok(child)=self.child.get_mut()else{return;};
         let deadline=std::time::Instant::now()+Duration::from_secs(90);
-        loop {match child.try_wait(){Ok(Some(_))=>return,Ok(None)if std::time::Instant::now()<deadline=>std::thread::sleep(Duration::from_millis(50)),_=>{let _=child.kill();let _=child.wait();return;}}}
+        loop {match child.try_wait(){Ok(Some(_))=>return,Ok(None)if std::time::Instant::now()<deadline=>std::thread::sleep(Duration::from_millis(50)),_=>{eprintln!("Engine cleanup exit unconfirmed; process was not killed");return;}}}
     }
 }
 #[cfg(test)]
@@ -253,6 +267,17 @@ mod tests {
         let started = std::time::Instant::now();
         drop(engine);
         assert!(started.elapsed() < Duration::from_secs(8), "engine must shut down without kill timeout");
+    }
+
+    #[test]
+    fn explicit_shutdown_closes_stdin_and_wakes_pending_requests_with_live_client_clones(){
+        let path=embedded_engine_path().unwrap();let engine=EngineClient::spawn_at(&path,true).unwrap();
+        engine.request("snapshot",serde_json::json!({})).unwrap();let retained=engine.clone();
+        let (reply,receive)=mpsc::channel();engine.transport.pending.lock().unwrap().insert("held-request".into(),Pending{command:"snapshot".into(),reply});
+        engine.begin_shutdown();assert!(receive.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        assert!(retained.request("snapshot",serde_json::json!({})).is_err());
+        engine.wait_for_exit(Duration::from_secs(3)).expect("retained clones must not prevent EOF cleanup exit");
+        assert!(retained.transport.child.lock().unwrap().try_wait().unwrap().is_some());
     }
 
     #[test]

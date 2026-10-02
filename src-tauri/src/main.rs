@@ -17,7 +17,37 @@ use std::sync::{
 };
 use tauri::Manager;
 
-struct EngineState(Mutex<Option<EngineClient>>);
+struct EngineState(Mutex<Option<EngineClient>>,std::sync::atomic::AtomicBool,std::sync::atomic::AtomicBool,std::sync::atomic::AtomicBool);
+
+fn begin_shutdown(app:&tauri::AppHandle){
+    let state=app.state::<EngineState>();
+    if state.1.swap(true,Ordering::SeqCst){return;}
+    if let Ok(guard)=state.0.lock(){if let Some(client)=guard.as_ref(){client.begin_shutdown();}}
+    let app=app.clone();
+    std::thread::spawn(move||{
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(90);
+        loop{
+            let state=app.state::<EngineState>();
+            let client=state.0.lock().ok().and_then(|guard|guard.as_ref().cloned());
+            let result=if let Some(client)=client{
+                client.begin_shutdown();Some(client.wait_for_exit(deadline.saturating_duration_since(std::time::Instant::now())))
+            }else if state.2.load(Ordering::SeqCst){Some(Ok(()))}else{None};
+            if let Some(result)=result{
+                match result{
+                    Ok(())=>{state.3.store(true,Ordering::SeqCst);app.exit(0);},
+                    Err(error)=>{
+                        eprintln!("Desktop close waits for unconfirmed engine cleanup: {error}");
+                        state.1.store(false,Ordering::SeqCst);
+                        if let Some(window)=app.get_webview_window("main"){let _=window.show();let _=window.set_focus();}
+                    }
+                }
+                return;
+            }
+            if std::time::Instant::now()>=deadline{eprintln!("Engine bootstrap cleanup remains unconfirmed");state.1.store(false,Ordering::SeqCst);return;}
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+}
 
 /// A renderer can request only the next active-camera frame. Endpoint discovery,
 /// binary reading and complete session/codec validation stay in the thin host.
@@ -416,6 +446,7 @@ fn write_startup_snapshot(snapshot: &Value) -> Result<(), String> {
 /// while it is bringing up its browser process. That shows up as a window whose
 /// content area goes black a few seconds after launch.
 fn connect_engine(app: &tauri::AppHandle) -> Result<(), String> {
+    if app.state::<EngineState>().1.load(Ordering::SeqCst){return Err("Window closed before engine bootstrap".into());}
     let engine = EngineClient::spawn()
         .map_err(|error| format!("Unable to start ct-engine: {error}"))?;
     let startup_snapshot = engine
@@ -434,6 +465,7 @@ fn connect_engine(app: &tauri::AppHandle) -> Result<(), String> {
         .0
         .lock()
         .map_err(|_| "Engine client unavailable".to_string())?;
+    if state.1.load(Ordering::SeqCst){drop(guard);engine.begin_shutdown();return engine.wait_for_exit(std::time::Duration::from_secs(90));}
     *guard = Some(engine);
     Ok(())
 }
@@ -457,6 +489,7 @@ fn bootstrap_engine(app: tauri::AppHandle) {
                 append_diagnostic(&format!("ENGINE_BOOTSTRAP_FAILED {error}"));
             }
         }
+        app.state::<EngineState>().2.store(true,Ordering::SeqCst);
     });
 }
 
@@ -808,6 +841,10 @@ fn main() {
             if window.label() != "main" {
                 return;
             }
+            if let tauri::WindowEvent::CloseRequested{api,..}=event{
+                api.prevent_close();begin_shutdown(window.app_handle());return;
+            }
+            if matches!(event,tauri::WindowEvent::Destroyed){begin_shutdown(window.app_handle());return;}
             if matches!(
                 event,
                 tauri::WindowEvent::Moved(_)
@@ -821,7 +858,7 @@ fn main() {
                 }
             }
         })
-        .manage(EngineState(Mutex::new(None)))
+        .manage(EngineState(Mutex::new(None),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false)))
         .setup(|app| {
             bootstrap_engine(app.app_handle().clone());
             if let Some(window) = app.get_webview_window("main") {
@@ -845,9 +882,12 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("Unable to initialize Micro-CT Workstation")
         .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested{api,..}=&event{
+                if !app.state::<EngineState>().3.load(Ordering::SeqCst){api.prevent_exit();begin_shutdown(app);}
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 if let Ok(mut guard) = app.state::<EngineState>().0.lock() {
-                    guard.take();
+                    if let Some(client)=guard.take(){client.begin_shutdown();}
                 }
             }
         });
