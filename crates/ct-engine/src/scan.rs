@@ -872,11 +872,21 @@ fn run_scan(
         let _ = nano.stop();
     }
 
-    let completion = finish_scan_result(
+    // An operator Stop and a device fault both cancel the inner loop, so the cancel flag
+    // alone cannot label the outcome. Reporting a fault as "Scan ended by operator" would
+    // hide the real cause from the operator and from the record; the worker owns the live
+    // device evidence here, so it decides which of the two actually happened.
+    let completion = match finish_scan_result(
         result,
         off.map(|_| ()).map_err(|e| e.to_string()),
         warning_off.map_err(|e| e.to_string()),
-    );
+    ) {
+        Ok(ScanCompletion::Stopped) => match device_fault_evidence(camera, xray) {
+            Some(reason) => Err(reason),
+            None => Ok(ScanCompletion::Stopped),
+        },
+        other => other,
+    };
     let root = Path::new(config.parameters.save_path.trim()).join(config.parameters.task_id.trim());
     let owned = progress
         .lock()
@@ -923,6 +933,38 @@ fn run_scan(
         );
     }
     completion
+}
+
+/// The device evidence that a stop was caused by a fault instead of by the operator.
+///
+/// A confirmed OFF plus a healthy, non-isolated camera leaves an operator Stop a stop. A
+/// latched X-ray error, output that is still on or no longer confirmed off, or a camera
+/// session left isolated with unconfirmed cleanup is a fault: it must be reported as one so
+/// the operator and the retained record see the real cause.
+fn device_fault_evidence(camera: &CameraAdapter, xray: &MoxtekAdapter) -> Option<String> {
+    let xray_health = xray.health();
+    if let Some(error) = xray_health
+        .last_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        return Some(format!("device fault ended the scan · X-ray: {error}"));
+    }
+    if xray_health.beam_on {
+        return Some("device fault ended the scan · Moxtek output is still ON".to_owned());
+    }
+    if !xray_health.beam_off_confirmed {
+        return Some("device fault ended the scan · Moxtek OFF was not confirmed".to_owned());
+    }
+    let camera_health = camera.health();
+    if camera_health.isolated && !camera_health.cleanup_confirmed {
+        return Some(
+            "device fault ended the scan · camera session isolated with unconfirmed cleanup"
+                .to_owned(),
+        );
+    }
+    None
 }
 
 fn finish_scan_result(
@@ -1022,18 +1064,13 @@ fn run_scan_inner(
             )
         },
     );
-    let shutter = camera
-        .set_exposure_ms(parameters.exposure_ms)
-        .map_err(|error| format!("camera exposure configuration failed: {error}"))?;
+    if camera.health().live_view.active { return Err("LIVE_VIEW_CAPTURE_FORBIDDEN: explicitly stop Live View".into()); }
+    config.capture_profile.require_current_policy()?;
     camera
         .read_properties()
         .map_err(|error| format!("Camera profile readback failed: {error}"))?;
-    let identity = camera
-        .health()
-        .identity
-        .ok_or("Camera identity is unknown")?;
-    let actual_profile = CaptureProfile::from_readback(
-        identity,
+    let actual_profile = CaptureProfile::from_camera_readback(
+        &camera.health(),
         camera
             .profile_readback()
             .map_err(|error| error.to_string())?,
@@ -1049,7 +1086,7 @@ fn run_scan_inner(
         progress,
         "PASS",
         "camera",
-        format!("D7100 shutter set to {shutter}"),
+        format!("D7100 native shutter verified at {:.6} ms",parameters.exposure_ms),
     );
     xray.set_parameters(config.voltage_kv, config.current_ua)
         .map_err(|error| format!("Moxtek setpoint configuration failed: {error}"))?;
@@ -2580,7 +2617,7 @@ mod tests {
             "shutter".into(),
             crate::devices::camera::CameraValue::Integer(0x00010001),
         );
-        CaptureProfile::from_readback(profile.identity, readback, None).unwrap()
+        CaptureProfile::from_readback(profile.identity, readback, None, 0xd100).unwrap()
     }
 
     fn test_reference_series(root: &Path, group: &str) -> Vec<ReferenceFrame> {
@@ -2912,6 +2949,7 @@ mod tests {
         capture_id: u32,
         rearmed: bool,
         homed: bool,
+        on_capture_done: Option<Box<dyn FnOnce() + Send>>,
     }
     struct PipelineNano(Arc<Mutex<PipelineNanoState>>);
     impl LineTransport for PipelineNano {
@@ -2962,6 +3000,9 @@ mod tests {
                             .lines
                             .push_back(format!("ERR {id} CAPTURE_ID_MISMATCH"));
                     } else {
+                        if let Some(inject) = state.on_capture_done.take() {
+                            inject();
+                        }
                         state.capture_id = 0;
                         state.lines.push_back(format!("ACK {id} CAPTURE_DONE"));
                         state.lines.push_back(format!("IDLE {id} CAPTURE_RELEASED"));
@@ -3013,8 +3054,8 @@ mod tests {
         (Arc::new(adapter), state)
     }
     fn pipeline_config(run: &Path, task: &str, camera: &CameraAdapter) -> RealScanConfig {
-        let profile = CaptureProfile::from_readback(
-            camera.health().identity.unwrap(),
+        let profile = CaptureProfile::from_camera_readback(
+            &camera.health(),
             camera.profile_readback().unwrap(),
             None,
         )
@@ -3107,7 +3148,29 @@ mod tests {
             omit_exposure_end: false,
             truncate_raw: false,
             close_failure: false,
+            native_exposure_ms: None,
+            capture_started_signal: None,
+            discovered: 1,
+            // Production-shaped D7100: the machine state is unobservable, so the
+            // coordinator must run on a session-bound operator attestation.
+            multiple_exposure_unknown: true,
         });
+        {
+            let health = camera.health();
+            let identity = health.identity.clone().expect("scripted D7100 identity");
+            camera.set_operator_multiple_exposure(Some(
+                crate::devices::camera::OperatorMultipleExposureConfirmation {
+                    confirmed: true,
+                    confirmed_at: "2026-10-08T00:00:00.000Z".into(),
+                    operator: "scripted-test".into(),
+                    device_id: identity.device_id,
+                    session_id: health.session_id.clone().expect("scripted session"),
+                    evidence_fingerprint: crate::capture_profile::camera_evidence_fingerprint(&health)
+                        .expect("scripted evidence fingerprint"),
+                    policy_version: crate::devices::camera::OPERATOR_MULTIPLE_EXPOSURE_POLICY_VERSION,
+                },
+            ));
+        }
         let (xray, probe) = crate::devices::xray::test_worker(20.0, 100.0);
         let initial = probe.beam_transitions().len();
         for (task, expected_position) in [("round-a", -64000), ("round-b", -160000)] {
@@ -3168,6 +3231,306 @@ mod tests {
             6
         );
         fs::write(run.join("summary.md"),"PASS: same production scan coordinator and all three production workers; two rounds, 10+10 front references, 3 projections, continuous blocks, ExposureEnded before file commit, matching hold release, no terminal HOME, original synthetic NEF retained. Only offline verification.\n").unwrap();
+    }
+
+    // R0 exercises the production coordinator and all three device owners.
+    // Only their physical transports are scripted; UNKNOWN and file outcomes
+    // are asserted after the complete cleanup path, never inferred from ACKs.
+    fn r0_run(topic: &str) -> std::path::PathBuf {
+        let run = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/tests/ct-engine")
+            .join(format!("{}-system-coordinator-{topic}-{}",
+                chrono::Local::now().format("%Y%m%d-%H%M%S"),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join("command.txt"), "cargo test -p ct-engine scan::tests::r0_ -- --nocapture\n").unwrap();
+        println!("R0 EVIDENCE: {}", run.display());
+        run
+    }
+
+    fn r0_reference_hashes(root: &Path) -> Vec<(String, u64, String)> {
+        let references = root.join("references");
+        let mut files: Vec<_> = ["pre-dark", "pre-flat"].into_iter()
+            .flat_map(|group| {
+                let files: Vec<_> = fs::read_dir(references.join(group).join("frames")).unwrap()
+                    .map(|entry| entry.unwrap().path()).collect();
+                assert_eq!(files.len(), REFERENCE_COUNT);
+                files
+            }).collect();
+        files.sort();
+        assert_eq!(files.len(), 20, "complete pre-dark and pre-flat groups exist before fault injection");
+        files.into_iter().map(|path| {
+            let (bytes, hash) = hash_file(&path).unwrap();
+            (path.strip_prefix(&references).unwrap().to_string_lossy().into_owned(), bytes, hash)
+        }).collect()
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum R0ProjectionFault { CameraLoss, Interlock, StopTransfer, UnknownOff }
+
+    fn r0_projection_fault(case: R0ProjectionFault) {
+        use crate::devices::camera::{scripted_camera_with_probe, ScriptedCameraConfig};
+        let topic = match case {
+            R0ProjectionFault::CameraLoss => "camera-loss",
+            R0ProjectionFault::Interlock => "interlock",
+            R0ProjectionFault::StopTransfer => "stop-transfer",
+            R0ProjectionFault::UnknownOff => "off-unconfirmed",
+        };
+        let run = r0_run(topic);
+        let task = "fault-task";
+        let root = run.join(task);
+        let (nano, nano_state) = pipeline_nano();
+        let (trigger_sender, trigger_receiver) = mpsc::channel();
+        let (camera, camera_probe) = scripted_camera_with_probe(ScriptedCameraConfig {
+            exposure_delay: Duration::from_millis(5),
+            capture_started_signal: Some(trigger_sender),
+            ..Default::default()
+        });
+        let (xray, xray_probe) = crate::devices::xray::test_worker(20.0, 100.0);
+        let config = pipeline_config(&run, task, &camera);
+        let parameters = config.parameters.clone();
+        let mut handle = RealScanHandle::start(nano.clone(), camera.clone(), xray, config);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut references = None;
+        let mut transfer_count = 0;
+        let mut armed = false;
+        let mut injected_at = None;
+        let outcome = loop {
+            let progress = handle.progress();
+            if progress.prompt == Some("preReferences") {
+                let _ = handle.confirm_stage("preReferences");
+            }
+            if progress.prompt == Some("placeSample") && !armed {
+                references = Some(r0_reference_hashes(&root));
+                trigger_receiver.try_iter().for_each(drop);
+                transfer_count = camera_probe.operation_count(0x1009); // GetObject
+                if case == R0ProjectionFault::StopTransfer {
+                    camera_probe.set_transfer_delay(Duration::from_secs(2));
+                } else {
+                    camera_probe.set_exposure_delay(Duration::from_secs(2));
+                }
+                armed = true;
+                handle.confirm_stage("placeSample").unwrap();
+            }
+            let accepted = armed && trigger_receiver.try_iter().count() > 0;
+            let transfer_pending = armed && camera_probe.operation_count(0x1009) > transfer_count;
+            if injected_at.is_none() && (if case == R0ProjectionFault::StopTransfer { transfer_pending } else { accepted }) {
+                assert!(xray_probe.output_enabled(), "fault must occur in an actual scripted beam block");
+                assert!(camera.health().operation_id.as_deref().is_some_and(|id| id.starts_with("scan-fault-task-1-")));
+                injected_at = Some(Instant::now());
+                match case {
+                    R0ProjectionFault::CameraLoss => camera_probe.fail_transport_operation(0x90c7),
+                    R0ProjectionFault::Interlock => xray_probe.set_interlock(true),
+                    R0ProjectionFault::StopTransfer => handle.request_stop().unwrap(),
+                    R0ProjectionFault::UnknownOff => {
+                        xray_probe.ignore_off(true);
+                        handle.request_pause(); // First projection's associated C102 must request OFF.
+                    }
+                }
+            }
+            if let Some(outcome) = handle.try_finish() { break outcome.unwrap(); }
+            if Instant::now() >= deadline {
+                handle.cancel_only();
+                panic!("R0 {case:?} did not terminate: {:?}", handle.progress());
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        let injected_at = injected_at.expect("the intended fault boundary was reached");
+        let progress = handle.progress();
+        assert_eq!(progress.captured, 0);
+        assert!(progress.frames.is_empty(), "failed/cancelled projection cannot advance progress");
+        assert!(!completed_manifest_exists(&parameters));
+        let manifest: serde_json::Value = serde_json::from_reader(File::open(root.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["completed"], false);
+        assert_eq!(manifest["frames"].as_array().unwrap().len(), 0);
+        assert_eq!(r0_reference_hashes(&root), references.unwrap(), "original reference files are retained byte-for-byte");
+        let writes = nano_state.lock().unwrap().writes.clone();
+        assert!(writes.iter().any(|line| line.starts_with("STOP ")));
+        assert!(!writes.iter().any(|line| line.starts_with("CAPTURE_DONE ")), "failed first projection cannot release a completed capture ticket");
+        let camera_health = outcome.camera.health();
+        let xray_health = outcome.xray.health();
+        if case == R0ProjectionFault::StopTransfer {
+            assert_eq!(outcome.result.as_ref().unwrap(), &ScanCompletion::Stopped);
+            assert_eq!(progress.phase, "stopped");
+            assert!(camera_health.cleanup_confirmed);
+        } else {
+            assert!(outcome.result.is_err());
+            assert_eq!(progress.phase, "fault");
+        }
+        if case == R0ProjectionFault::CameraLoss {
+            assert!(camera_health.isolated && !camera_health.cleanup_confirmed);
+            assert!(camera_health.last_error.as_deref().is_some_and(|error| error.contains("scripted camera disconnected")));
+        }
+        if case == R0ProjectionFault::UnknownOff {
+            assert!(!xray_health.beam_off_confirmed);
+            assert!(xray_probe.output_enabled(), "fake OFF ACK alone cannot prove output is off");
+            assert!(outcome.result.as_ref().unwrap_err().contains("OFF"));
+            let last_warning = writes.iter().rev().find(|line| line.starts_with("XRAY_WARNING ")).unwrap();
+            assert_eq!(last_warning.split_whitespace().last(), Some("ON"),
+                "unknown output must retain warning ON; writes={writes:?}");
+            xray_probe.ignore_off(false);
+        } else {
+            assert!(xray_health.beam_off_confirmed && !xray_probe.output_enabled());
+            if case == R0ProjectionFault::StopTransfer {
+                assert!(xray_probe.beam_transitions().iter().any(|(on, at)| !*on && *at >= injected_at && at.duration_since(injected_at) < Duration::from_secs(1)),
+                    "OFF must precede the two-second stalled transfer deadline; this is an offline timing assertion");
+            }
+            assert_eq!(fs::read_dir(root.join("frames")).unwrap().count(), 0, "no late NEF commit after cancellation/fault");
+        }
+        fs::write(run.join("result.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "status":"PASS", "boundary":"offline production coordinator and scripted device owners", "case":topic,
+            "outcome":format!("{:?}",outcome.result), "phase":progress.phase, "captured":progress.captured,
+            "cameraCleanupConfirmed":camera_health.cleanup_confirmed, "cameraIsolated":camera_health.isolated,
+            "xrayOffConfirmed":xray_health.beam_off_confirmed, "referenceFilesRetained":20, "nanoWrites":writes,
+            "fullLinkedHardwareCertified":false
+        })).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn r0_camera_loss_during_projection_isolates_camera_and_never_commits() {
+        r0_projection_fault(R0ProjectionFault::CameraLoss);
+    }
+
+    #[test]
+    fn r0_interlock_during_projection_confirms_off_and_never_commits() {
+        r0_projection_fault(R0ProjectionFault::Interlock);
+    }
+
+    #[test]
+    fn r0_stop_during_projection_transfer_confirms_off_before_transfer_and_never_commits() {
+        r0_projection_fault(R0ProjectionFault::StopTransfer);
+    }
+
+    #[test]
+    fn r0_unconfirmed_off_retains_warning_and_cannot_report_safe_completion() {
+        r0_projection_fault(R0ProjectionFault::UnknownOff);
+    }
+
+    #[test]
+    fn r0_manifest_write_failure_retains_nef_and_refuses_projection_progress() {
+        use crate::devices::camera::{scripted_camera, ScriptedCameraConfig};
+        let run = r0_run("manifest-failure");
+        let root = run.join("commit-task");
+        let (nano, nano_state) = pipeline_nano();
+        let camera = scripted_camera(ScriptedCameraConfig { exposure_delay:Duration::from_millis(5), ..Default::default() });
+        let (xray, xray_probe) = crate::devices::xray::test_worker(20.0, 100.0);
+        let config = pipeline_config(&run, "commit-task", &camera);
+        let parameters = config.parameters.clone();
+        let mut handle = RealScanHandle::start(nano, camera, xray, config);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut references = None;
+        let mut armed = false;
+        let outcome = loop {
+            let progress = handle.progress();
+            if progress.prompt == Some("preReferences") { let _ = handle.confirm_stage("preReferences"); }
+            if progress.prompt == Some("placeSample") && !armed {
+                references = Some(r0_reference_hashes(&root));
+                let fault_root = root.clone();
+                nano_state.lock().unwrap().on_capture_done = Some(Box::new(move || {
+                    assert!(fault_root.join("frames/frame-0001.nef").is_file());
+                    // Fail persistence after the matching device release, before
+                    // the sole domain owner can publish committed frame progress.
+                    fs::rename(fault_root.join("acquisition.csv"), fault_root.join("acquisition-before-fault.csv")).unwrap();
+                    fs::create_dir(fault_root.join("acquisition.csv")).unwrap();
+                }));
+                armed = true;
+                handle.confirm_stage("placeSample").unwrap();
+            }
+            if let Some(outcome) = handle.try_finish() { break outcome.unwrap(); }
+            if Instant::now() >= deadline { handle.cancel_only(); panic!("R0 manifest fault did not finish: {:?}", handle.progress()); }
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(armed && root.join("acquisition.csv").is_dir(), "the commit fault was actually injected");
+        assert!(outcome.result.is_err());
+        let progress = handle.progress();
+        assert_eq!(progress.phase, "fault");
+        assert_eq!(progress.captured, 0);
+        assert!(progress.frames.is_empty());
+        assert!(!completed_manifest_exists(&parameters));
+        let manifest:serde_json::Value = serde_json::from_reader(File::open(root.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["completed"], false);
+        assert_eq!(manifest["frames"].as_array().unwrap().len(), 0);
+        let (bytes, sha256) = hash_file(&root.join("frames/frame-0001.nef")).unwrap();
+        assert!(bytes > 0 && sha256.len() == 64, "captured NEF survives failed manifest commit");
+        assert_eq!(r0_reference_hashes(&root), references.unwrap());
+        assert!(!xray_probe.output_enabled() && outcome.xray.health().beam_off_confirmed);
+        let writes=nano_state.lock().unwrap().writes.clone();
+        assert_eq!(writes.iter().filter(|line|line.starts_with("CAPTURE_DONE ")).count(),1);
+        assert!(writes.iter().any(|line|line.starts_with("STOP ")));
+        fs::write(run.join("result.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "status":"PASS", "boundary":"offline production coordinator and scripted device owners", "case":"manifest-failure",
+            "phase":progress.phase, "captured":progress.captured, "nefBytes":bytes, "nefSha256":sha256,
+            "referenceFilesRetained":20, "manifestCompleted":false, "fullLinkedHardwareCertified":false
+        })).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn r0_pause_commits_current_projection_before_resume_without_repeating_files() {
+        use crate::devices::camera::{scripted_camera_with_probe, ScriptedCameraConfig};
+        let run = r0_run("pause-resume");
+        let root = run.join("pause-task");
+        let (nano, nano_state) = pipeline_nano();
+        let (trigger_sender, trigger_receiver) = mpsc::channel();
+        let (camera, camera_probe) = scripted_camera_with_probe(ScriptedCameraConfig {
+            exposure_delay:Duration::from_millis(5), capture_started_signal:Some(trigger_sender), ..Default::default()
+        });
+        let (xray, xray_probe) = crate::devices::xray::test_worker(20.0, 100.0);
+        let config=pipeline_config(&run,"pause-task",&camera);
+        let parameters=config.parameters.clone();
+        let mut handle=RealScanHandle::start(nano,camera,xray,config);
+        let deadline=Instant::now()+Duration::from_secs(30);
+        let mut armed=false;
+        let mut pause_requested=false;
+        let mut pause_verified=false;
+        let mut reference_hashes=None;
+        let outcome=loop {
+            let progress=handle.progress();
+            if progress.prompt==Some("preReferences"){let _=handle.confirm_stage("preReferences");}
+            if progress.prompt==Some("placeSample")&&!armed {
+                reference_hashes=Some(r0_reference_hashes(&root));
+                trigger_receiver.try_iter().for_each(drop);
+                camera_probe.set_exposure_delay(Duration::from_millis(200));
+                camera_probe.set_transfer_delay(Duration::from_millis(100));
+                armed=true;handle.confirm_stage("placeSample").unwrap();
+            }
+            if armed&&!pause_requested&&trigger_receiver.try_iter().count()>0 {
+                assert!(xray_probe.output_enabled());
+                handle.request_pause();pause_requested=true;
+            }
+            if progress.phase=="paused"&&!pause_verified {
+                assert_eq!(progress.captured,1);
+                assert_eq!(progress.frames.len(),1);
+                assert!(!xray_probe.output_enabled());
+                let manifest:serde_json::Value=serde_json::from_reader(File::open(root.join("manifest.json")).unwrap()).unwrap();
+                assert_eq!(manifest["frames"].as_array().unwrap().len(),1);
+                assert_eq!(manifest["completed"],false);
+                assert_eq!(nano_state.lock().unwrap().writes.iter().filter(|line|line.starts_with("CAPTURE_DONE ")).count(),1);
+                pause_verified=true;handle.resume();
+            }
+            if let Some(outcome)=handle.try_finish(){break outcome.unwrap();}
+            if Instant::now()>=deadline{handle.cancel_only();panic!("R0 pause/resume did not finish: {:?}",handle.progress());}
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(pause_requested&&pause_verified);
+        assert_eq!(outcome.result.as_ref().unwrap(),&ScanCompletion::Completed);
+        assert!(completed_manifest_exists(&parameters));
+        assert_eq!(handle.progress().captured,3);
+        assert_eq!(camera_probe.operation_count(0x90c0),23,"20 references plus exactly three projections");
+        assert_eq!(fs::read_dir(root.join("frames")).unwrap().count(),3);
+        assert_eq!(r0_reference_hashes(&root),reference_hashes.unwrap());
+        let transitions=xray_probe.beam_transitions();
+        assert_eq!(transitions.iter().filter(|(on,_)|*on).count(),3,"one flat group and two projection blocks separated by pause");
+        let mut last_off=None;
+        for (on,at) in &transitions {
+            if *on {assert!(last_off.is_some_and(|off|at.duration_since(off)>=Duration::from_secs(2)),"pause/resume cannot bypass the adapter OFF-to-ON gate");}
+            else {last_off=Some(*at);}
+        }
+        assert!(!xray_probe.output_enabled()&&outcome.xray.health().beam_off_confirmed);
+        fs::write(run.join("result.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "status":"PASS", "boundary":"offline production coordinator and scripted device owners", "case":"pause-resume",
+            "pauseCaptured":1, "completedCaptured":3, "totalCaptureCommands":23, "beamOnBlocks":3,
+            "referenceFilesRetained":20, "fullLinkedHardwareCertified":false
+        })).unwrap()).unwrap();
     }
 
     struct DeferredMoveTransport {

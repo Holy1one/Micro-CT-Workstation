@@ -7,6 +7,7 @@
 
 import { FIRMWARE_VERSION, LINK_LABEL } from "./rts9060/protocol";
 import { PreviewDeviceControls } from "./rts9060/deviceControls";
+import { shutterExposureMs } from "./deviceControls";
 import { ScanWorkflow, type ConsoleLogEntry, type WorkflowPhase } from "./rts9060/workflow";
 import type {
   ConsoleDataState,
@@ -21,6 +22,7 @@ import type {
   ReconstructionGeometry,
   ScanFlowView,
   WorkstationView,
+  SoftwareUpdatePreparation,
 } from "./types";
 
 const phaseToEngine: Record<WorkflowPhase, EnginePhase> = {
@@ -44,13 +46,16 @@ const logLevelToBase: Record<ConsoleLogEntry["level"], LogEntry["level"]> = {
   ACTION: "info",
 };
 
+// The preview uses the engine's own source literals so the console tabs filter the
+// same way in both adapters and no localized source label can reach the log rail.
 const logSourceToBase: Record<ConsoleLogEntry["source"], LogEntry["source"]> = {
-  system: "系统",
-  preflight: "系统",
-  operator: "系统",
-  xray: "射线",
-  nano: "转台",
-  camera: "相机",
+  system: "system",
+  preflight: "preflight",
+  operator: "operator",
+  xray: "xray",
+  nano: "nano",
+  camera: "camera",
+  reconstruction:"reconstruction",
 };
 
 function fixed1(value: number): string {
@@ -76,11 +81,15 @@ export class WorkstationAdapter implements EngineAdapter {
     checkpointPath: null,
   };
   private referenceRun = 0;
+  private prepared = false;
+  private frozenCamera:string|null=null;
+  private restoreAuthorized=false;
+  private updateCancelRequested=false;
+  private updatePreparation: SoftwareUpdatePreparation | null = null;
 
   constructor() {
-    this.workflow = new ScanWorkflow(() => {
-      this.revision++;
-    });
+    this.workflow = new ScanWorkflow(() => { this.revision++; });
+    this.workflow.acquisitionGuard=()=>this.requireFixedCamera(false);
   }
 
   async getSnapshot(): Promise<EngineSnapshot> {
@@ -93,39 +102,105 @@ export class WorkstationAdapter implements EngineAdapter {
 
   async dispatch(command: EngineCommand): Promise<EngineSnapshot> {
     const wf = this.workflow;
+    if (this.updatePreparation?.maintenanceLocked && !["stop", "xray_off", "camera_status", "camera_identity", "turntable_status", "turntable_identity", "xray_status", "xray_identity", "cancel_software_update_prepare"].includes(command.type)) throw new Error("SOFTWARE_UPDATE_MAINTENANCE_LOCKED");
     if (["set_parameters", "update_scan_setup"].includes(command.type) && this.nativeControls.snapshot().taskLock.locked) throw new Error("UNFINISHED_TASK_MANUAL_LOCK · retain the frozen task parameters");
-    if (await this.nativeControls.dispatch(command)) return this.buildSnapshot();
+    if(command.type==="home"&&this.nativeControls.snapshot().taskLock.locked&&!this.restoreAuthorized)throw new Error("UNFINISHED_TASK_LOCKED");
+    if (/^(camera_|turntable_|preset_|abandon_scan)/.test(command.type) && command.type!=="camera_capture_descriptor" && await this.nativeControls.dispatch(command)) return this.buildSnapshot();
     switch (command.type) {
+      case "set_capture_root": {
+        this.requirePreparationAccess();
+        if (!/^(?:[a-z]:[\\/]|[\\/])/i.test(command.savePath.trim()) || command.savePath.includes("\0")) throw new Error("INVALID_CAPTURE_ROOT");
+        wf.setParams({ savePath: command.savePath.trim() });
+        this.prepared = false;this.scanFlow.geometry=null;this.scanFlow.prompt=null;this.frozenCamera=null;
+        break;
+      }
+      case "prepare_scan": {
+        this.requirePreparationAccess();
+        const task = command.taskId.trim();
+        if (!task || task.length > 128 || /[<>:"/\\|?*\x00-\x1f]/.test(task)
+          || /[. ]$/.test(task) || /^(?:cameracaptures|con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(task)
+          || !wf.params.savePath.trim() || !Number.isInteger(command.projectionCount)
+          || command.projectionCount < 1 || command.projectionCount > 3600
+          || !Number.isInteger(command.maxXraySec) || command.maxXraySec < 1 || command.maxXraySec > 600) throw new Error("INVALID_SCAN_PREPARATION");
+        const geometry = this.validGeometry(command.geometry);
+        const shutter = this.nativeControls.camera.properties.shutter;
+        const exposure = this.nativeControls.camera.connected && shutter?.readable && shutter.dataType===6 && shutter.confirmed && !shutter.error && shutter.actual !== null && (shutter.target===null||shutter.target===shutter.actual) ?  shutterExposureMs(shutter.actual, shutter.code) : null;
+        if (exposure === null || exposure < 0.125 || exposure > 30000) throw new Error("CONFIRMED_NATIVE_SHUTTER_REQUIRED");
+        wf.setParams({ taskId: task, projectionCount: command.projectionCount, maxXraySec: command.maxXraySec, exposureMs: exposure });
+        wf.camera.configure(`${wf.params.savePath}/${task}`);
+        this.scanFlow.geometry = geometry;
+        this.scanFlow.prompt = null;
+        this.scanFlow.stage = "idle";
+        this.prepared = true;this.frozenCamera=null;this.restoreAuthorized=false;
+        this.scanFlow.references={preDark:0,preFlat:0,postFlat:0,postDark:0,required:10};
+        break;
+      }
+      case "prepare_software_update": {
+        this.requirePreparationAccess();
+        if(this.nativeControls.camera.liveView.active)throw new Error("SOFTWARE_UPDATE_LIVE_VIEW_ACTIVE");
+        if(!this.nativeControls.camera.cleanupConfirmed||this.nativeControls.camera.isolated)throw new Error("DEVICE_CLEANUP_UNCONFIRMED");
+        this.updateCancelRequested=false;
+        const op=this.nativeControls.beginOperation("prepare_software_update","software_update");const now=new Date().toISOString();
+        this.updatePreparation={sessionId:this.nativeControls.session,operationId:op.operationId,status:"preparing",ready:false,maintenanceLocked:true,createdAt:now,completedAt:null,turntableStop:"unknown",cameraCleanup:"unknown",xrayOff:"unknown",noActiveTransactions:false,error:null};
+        try{
+          await wf.independentStop();this.nativeControls.stop();this.nativeControls.camera.connected=false;this.nativeControls.camera.sessionId=null;
+          if(this.updatePreparation.status==="preparing")this.updatePreparation={...this.updatePreparation,status:this.updateCancelRequested?"cancelled":"ready",ready:!this.updateCancelRequested,maintenanceLocked:!this.updateCancelRequested,completedAt:new Date().toISOString(),turntableStop:"never-owned",cameraCleanup:"never-owned",xrayOff:"never-owned",noActiveTransactions:true,error:null};
+          op.status="completed";op.stage="SIMULATED cleanup · NO HARDWARE";wf.recordEvent("INFO","system","NO HARDWARE · simulated update cleanup; not a production safety authority report");
+        }catch(error){this.updatePreparation={...this.updatePreparation,status:"blocked",ready:false,error:String(error),completedAt:new Date().toISOString()};op.status="failed";op.error=String(error);throw error;}
+        finally{op.updatedAt=new Date().toISOString();}
+        break;
+      }
+      case "cancel_software_update_prepare": {
+        if (!this.updatePreparation || this.updatePreparation.operationId !== command.operationId) throw new Error("SOFTWARE_UPDATE_OPERATION_MISMATCH");
+        if(this.updatePreparation.status==="preparing"){this.updateCancelRequested=true;break;}
+        if(this.updatePreparation.status==="blocked")throw new Error("DEVICE_CLEANUP_UNCONFIRMED");
+        this.updatePreparation = { ...this.updatePreparation, status: "cancelled", ready: false, maintenanceLocked: false,completedAt:new Date().toISOString() };
+        break;
+      }
+      case "camera_capture_descriptor":
+        throw new Error("Browser preview has no registered NEF file");
       case "connect":
       case "disconnect":
         // The workstation link is established at boot and stays up.
         break;
       case "preflight":
         if (this.nativeControls.snapshot().taskLock.locked && (!command.restore || !command.confirmUsbAutoShutdownRelease)) throw new Error("Use the confirmed Restore preflight entry in the device console");
+        if (!this.prepared && !command.restore) throw new Error("SCAN_PREPARATION_REQUIRED");
+        if(command.restore){const evidence=wf.captureEvidence;if(!evidence||evidence.schemaVersion!==5||evidence.profile!==this.nativeControls.profileEvidence())throw new Error("CAPTURE_POLICY_LEGACY_READ_ONLY_OR_MISMATCH");this.frozenCamera=evidence.profile;this.scanFlow.geometry=this.validGeometry(evidence.geometry as ReconstructionGeometry);this.restoreAuthorized=true;}
+        this.requireFixedCamera(false);
+        const profile=this.nativeControls.profileEvidence();
         await wf.runPreflight();
+        if(profile!==this.nativeControls.profileEvidence()){wf.preflightPassed=false;throw new Error("CAPTURE_PROFILE_MISMATCH");}
+        this.frozenCamera=profile;
+        wf.captureEvidence={schemaVersion:5,profile,geometry:this.scanFlow.geometry};
         if (wf.preflightPassed && this.scanFlow.stage !== "projections") {
-          this.scanFlow.stage = "geometry";
-          this.scanFlow.prompt = this.prompt("geometry");
+          this.scanFlow.stage = "idle";
+          this.scanFlow.prompt = null;
         }
         break;
       case "home":
         await wf.home();
         break;
       case "start_scan":
-        if (!this.scanFlow.geometry) throw new Error("Enter reconstruction geometry first");
+        if(!wf.preflightPassed)throw new Error("PREFLIGHT_REQUIRED");if(!wf.homed)throw new Error("HOME_REQUIRED");
+        if (!this.scanFlow.geometry) throw new Error("SCAN_PREPARATION_REQUIRED");
+        this.requireFixedCamera(true);
         if (this.scanFlow.stage === "projections" && wf.phase === "paused") {
           void wf.startScan();
           break;
         }
-        if (this.scanFlow.stage !== "geometry" || this.scanFlow.prompt) {
+        if (this.scanFlow.stage !== "idle" || this.scanFlow.prompt) {
           throw new Error("Confirm the current scan step first");
         }
+        wf.preparationOccupied=true;
         this.scanFlow.prompt = this.prompt("preReferences");
         break;
       case "resume":
+        this.requireFixedCamera(true);
         void wf.startScan();
         break;
       case "confirm_scan_stage":
+        this.requireFixedCamera(true);
         if (this.scanFlow.prompt?.stage !== command.stage) throw new Error("Scan prompt is no longer active");
         if (command.stage === "geometry") {
           if (!command.geometry) throw new Error("Geometry is required");
@@ -137,27 +212,32 @@ export class WorkstationAdapter implements EngineAdapter {
         } else if (command.stage === "placeSample") {
           this.scanFlow.prompt = null;
           this.scanFlow.stage = "projections";
+          wf.preparationOccupied=false;
           void wf.startScan();
         }
         break;
       case "cancel_scan_stage":
         if (this.scanFlow.prompt?.stage !== command.stage) throw new Error("Scan prompt is no longer active");
-        this.referenceRun++;
+        this.referenceRun++;wf.preparationOccupied=false;
         this.scanFlow.prompt = null;
         this.scanFlow.stage = "stopped";
         if (["scanning", "paused", "finishing"].includes(wf.phase)) await wf.stop();
         break;
       case "start_reconstruction":
+        wf.recordEvent("ERR","reconstruction","NO HARDWARE · browser preview has no acquired NEF dataset to reconstruct");
         throw new Error("Browser preview has no acquired NEF files to reconstruct");
       case "pause":
         wf.pause();
         break;
       case "restore_previous":
-        void wf.restore();
+        this.requireFixedCamera(true);
+        if(!this.restoreAuthorized)throw new Error("RESTORE_PREFLIGHT_CONFIRMATION_REQUIRED");
+        await wf.restore();
         break;
       case "stop":
+        if(this.updatePreparation?.maintenanceLocked)this.updatePreparation={...this.updatePreparation,status:"blocked",ready:false,error:"New simulated safety operation invalidated update preparation"};
         this.nativeControls.stop();
-        this.referenceRun++;
+        this.referenceRun++;wf.preparationOccupied=false;
         this.scanFlow.prompt = null;
         this.scanFlow.stage = "stopped";
         if (["ready", "completed", "booting"].includes(wf.phase)) await wf.independentStop(); else await wf.stop();
@@ -175,6 +255,7 @@ export class WorkstationAdapter implements EngineAdapter {
       case "xray_identity":
         break;
       case "xray_off":
+        if(this.updatePreparation?.maintenanceLocked)this.updatePreparation={...this.updatePreparation,status:"blocked",ready:false,error:"New simulated OFF invalidated update preparation"};
         wf.source.disable();
         if (["scanning", "paused", "finishing", "stopping"].includes(wf.phase)) await wf.stop();
         break;
@@ -199,6 +280,7 @@ export class WorkstationAdapter implements EngineAdapter {
         wf.sendCurrent(command.ua);
         break;
       case "set_parameters":
+        if (command.parameters.exposureMs !== wf.params.exposureMs) throw new Error("EXPOSURE_EDIT_REQUIRES_CAMERA_APPLY");
         wf.setParams({
           taskId: command.parameters.taskId,
           savePath: command.parameters.savePath,
@@ -207,10 +289,25 @@ export class WorkstationAdapter implements EngineAdapter {
         });
         break;
       case "update_scan_setup":
+        if (command.setup.exposureMs !== undefined) throw new Error("EXPOSURE_EDIT_REQUIRES_CAMERA_APPLY");
         wf.setParams(command.setup);
+        this.prepared = false;
         break;
     }
     return this.buildSnapshot();
+  }
+
+  private requireFixedCamera(compare:boolean):void{
+    if(!this.nativeControls.turntableConnected)throw new Error("NANO_NOT_CONNECTED");
+    if(!this.nativeControls.scanReadiness().ready){this.workflow.preflightPassed=false;throw new Error("CAMERA_FIXED_SCAN_CONFIGURATION_REQUIRED");}
+    const shutter=this.nativeControls.camera.properties.shutter;
+    if(shutterExposureMs(shutter.actual!,shutter.code)!==this.workflow.params.exposureMs){this.workflow.preflightPassed=false;throw new Error("CAPTURE_PROFILE_MISMATCH");}
+    if(compare&&(!this.frozenCamera||this.frozenCamera!==this.nativeControls.profileEvidence())){this.workflow.preflightPassed=false;throw new Error("CAPTURE_PROFILE_MISMATCH");}
+  }
+  private requirePreparationAccess(): void {
+    if(this.nativeControls.busy||this.workflow.preflightRunning||this.workflow.preparationOccupied||["preDark","preFlat"].includes(this.scanFlow.stage))throw new Error("DEVICE_CONTROL_LOCKED");
+    if (["scanning", "paused", "finishing", "stopping"].includes(this.workflow.phase)
+        || this.nativeControls.snapshot().taskLock.locked) throw new Error("TASK_OCCUPIES_PREPARATION");
   }
 
   private prompt(stage: NonNullable<ScanFlowView["prompt"]>["stage"]): NonNullable<ScanFlowView["prompt"]> {
@@ -264,13 +361,16 @@ export class WorkstationAdapter implements EngineAdapter {
     const wf = this.workflow;
     const ws = this.buildWorkstationView();
     const rb = wf.source.readback();
-    const dataStateToPhase = phaseToEngine[wf.phase];
+    const dataStateToPhase = wf.preparationOccupied?"running":phaseToEngine[wf.phase];
     return {
       engineSessionId: this.nativeControls.session,
       snapshotSequence: this.snapshotSequence = (this.snapshotSequence ?? 0) + 1,
       operationId: this.nativeControls.lastOperationId,
       operations: structuredClone(this.nativeControls.operations),
       deviceControls: this.nativeControls.snapshot(),
+      cameraScanReadiness: this.nativeControls.scanReadiness(),
+      softwareUpdatePreparation: this.updatePreparation ? { ...this.updatePreparation } : null,
+      cameraCaptureDescriptor: null,
       mode: "developer_preview",
       modeLabel: "DEVELOPER PREVIEW · NO REAL HARDWARE",
       connectionState: "connected",
@@ -290,7 +390,7 @@ export class WorkstationAdapter implements EngineAdapter {
       devices: ws.devices.map((device) => ({
         id: device.id,
         label: device.name,
-        state: device.tone === "danger" ? "fault" : device.tone === "warn" ? "busy" : "ready",
+        state: device.word === "OFFLINE"?"offline":device.tone === "danger" ? "fault" : device.tone === "warn" ? "busy" : "ready",
         detail: device.spec,
       })),
       parameters: {
@@ -337,7 +437,8 @@ export class WorkstationAdapter implements EngineAdapter {
       wf.params.exposureMs > 0 &&
       wf.params.maxXraySec > 0;
 
-    const activePhase = ["scanning", "finishing", "stopping"].includes(phase);
+    const activePhase = wf.preparationOccupied || ["scanning", "finishing", "stopping"].includes(phase);
+    const maintenance=this.updatePreparation?.maintenanceLocked===true;
     const dataState: ConsoleDataState =
       activePhase ? "scanning" : phase === "paused" ? "paused" : phase === "fault" ? "fault" : "ready";
 
@@ -358,10 +459,10 @@ export class WorkstationAdapter implements EngineAdapter {
     const xrayConnected = wf.source.isConnected;
     const xrayWord = !xrayConnected ? "OFFLINE" : phase === "fault" ? "FAILED" : rb.beamOn ? "EMITTING" : phase === "paused" ? "STANDBY" : "READY";
     const xrayTone: ConsoleTone = phase === "fault" ? "danger" : rb.beamOn || phase === "paused" ? "warn" : "ok";
-    const tableWord = phase === "fault" ? "HOME LOST" : activePhase ? "MOVING" : phase === "paused" ? "HOLD" : "READY";
-    const tableTone: ConsoleTone = phase === "fault" ? "danger" : activePhase || phase === "paused" ? "warn" : "ok";
-    const cameraWord = activePhase || phase === "paused" || phase === "fault" ? "ARMED" : "READY";
-    const cameraTone: ConsoleTone = cameraWord === "ARMED" ? "accent" : "ok";
+    const tableWord = !this.nativeControls.turntableConnected ? "OFFLINE" : phase === "fault" ? "HOME LOST" : activePhase ? "MOVING" : phase === "paused" ? "HOLD" : "READY";
+    const tableTone: ConsoleTone = !this.nativeControls.turntableConnected ? "muted" : phase === "fault" ? "danger" : activePhase || phase === "paused" ? "warn" : "ok";
+    const cameraWord = !this.nativeControls.camera.connected ? "OFFLINE" : activePhase || phase === "paused" || phase === "fault" ? "ARMED" : "READY";
+    const cameraTone: ConsoleTone = cameraWord === "OFFLINE"?"muted":cameraWord === "ARMED" ? "accent" : "ok";
 
     const xraySpec =
       phase === "fault"
@@ -436,15 +537,15 @@ export class WorkstationAdapter implements EngineAdapter {
           };
 
     const dock: WorkstationView["dock"] = {
-      home: wf.preflightPassed && !activePhase && phase !== "fault" && phase !== "booting",
+      home: !maintenance && wf.preflightPassed && !activePhase && phase !== "fault" && phase !== "booting",
       play:
-        phase === "scanning" || phase === "paused"
+        !maintenance && (phase === "scanning" || phase === "paused")
           ? true
           : phase === "ready" || phase === "completed"
-            ? wf.preflightPassed && wf.homed
+            ? !maintenance && wf.preflightPassed && wf.homed
             : false,
       restore:
-        (phase === "ready" || phase === "completed") &&
+        !maintenance && (phase === "ready" || phase === "completed") &&
         wf.preflightPassed &&
         wf.homed &&
         wf.checkpointAvailable,
@@ -470,7 +571,7 @@ export class WorkstationAdapter implements EngineAdapter {
         : phase === "stopped"
               ? `STANDBY  scan ended · ${wf.preflightPassed ? "HOME required" : "preflight then HOME required"}`
               : phase === "completed"
-                ? `COMPLETE  ${total} / ${total} captured · ${fixed2(angle)}° · projections on disk`
+                ? `COMPLETE  ${total} / ${total} captured · ${fixed2(angle)}° · simulated projections only · NO FILES WRITTEN`
                 : `READY  ${total} views · ${fixed2(step)}°/view · ${captured} / ${total} captured · queue idle · awaiting operator`;
 
     return {
@@ -496,7 +597,7 @@ export class WorkstationAdapter implements EngineAdapter {
       preflight,
       floats,
       safetyBar,
-      scene: { angleDeg: angle, rotated: !(dataState === "ready" && angle === 0), angleKnown: phase !== "fault" && phase !== "stopped" && phase !== "stopping", rotationDirection: -1 },
+      scene: { angleDeg: angle, rotated: !(dataState === "ready" && angle === 0), angleKnown: this.nativeControls.turntableConnected && phase !== "fault" && phase !== "stopped" && phase !== "stopping", rotationDirection: -1 },
       xray: {
         connected: xrayConnected,
         setKv: rb.setKv,
@@ -514,9 +615,9 @@ export class WorkstationAdapter implements EngineAdapter {
         usbAutoShutDown: wf.usbAutoShutDown,
         usbAutoShutDownKnown: true,
         usbShutdownDelay: wf.usbShutdownDelay,
-        manualControlsEnabled: wf.manualControlsEnabled,
-        timerControlsEnabled: wf.timerControlsEnabled,
-        setpointControlsEnabled: wf.setpointControlsEnabled,
+        manualControlsEnabled: !maintenance && wf.manualControlsEnabled,
+        timerControlsEnabled: !maintenance && wf.timerControlsEnabled,
+        setpointControlsEnabled: !maintenance && wf.setpointControlsEnabled,
         voltageConfirmed: true,
         currentConfirmed: true,
         setpointConfirmed: true,
@@ -548,7 +649,7 @@ export class WorkstationAdapter implements EngineAdapter {
         index: frame.index,
         angleDeg: frame.angleDeg,
         exposureMs: frame.exposureMs,
-        fileName: frame.fileName,
+        fileName: `preview-${frame.index}.frame`,
       })),
       checkpointAvailable: wf.checkpointAvailable,
     };

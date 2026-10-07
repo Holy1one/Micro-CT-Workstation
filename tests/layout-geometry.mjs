@@ -7,15 +7,15 @@
  * never grade a different formula than the one the stylesheet actually uses.
  *
  * Everything here is derived from the stylesheet text: no geometry literal is
- * duplicated; the 306px bottom panel height is the published design spec.
+ * duplicated; the 209.375px bottom panel height is the published design spec.
  */
 
 /** The console's design baseline, shared with canvas-layout.ts. */
 export const DESIGN_WIDTH = 1920;
 export const DESIGN_HEIGHT = 1080;
 
-/** Both bottom panels have the same published 306px design height. */
-export const BOTTOM_ROW_PX = 306;
+/** Both bottom panels have the same published 209.375px design height. */
+export const BOTTOM_ROW_PX = 209.375;
 
 const ruleBody = (css, selector) => {
   const pattern = new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`);
@@ -85,6 +85,8 @@ export const trackShape = (tracks) => {
  * so deleting a rule fails the gate instead of silently skipping an assertion.
  */
 export function readGeometry(css) {
+  const variables = new Map([...css.matchAll(/(--[a-zA-Z0-9-]+)\s*:\s*([\d.]+px)\s*;/g)].map(match => [match[1],match[2]]));
+  css = css.replace(/var\((--[a-zA-Z0-9-]+)\)/g,(match,name) => variables.get(name) || match);
   const canvasBody = ruleBody(css, ".design-canvas");
   const workspaceBody = ruleBody(css, ".workspace-body");
   const rightBody = ruleBody(css, ".col--right");
@@ -150,9 +152,11 @@ export function readGeometry(css) {
       minHeight: pxDeclaration(opBody, "min-height", ".operation-panel"),
     },
     // The only surfaces allowed to scroll inside the console: the log list, the
-    // image strip and the overlay dialog. The tab rail is clipped, not
-    // scrollable, and is recorded here so a change is visible.
-    allowedScrollers: [".log-lines", ".image-strip", ".console__tabs", ".modal-card__body"]
+    // image strip, the overlay dialog body, and the two bounded regions inside a
+    // dialog (the preparation readiness report and the Advanced parameter pane).
+    // The tab rail is clipped, not scrollable, and is recorded here so a change is
+    // visible.
+    allowedScrollers: [".log-lines", ".image-strip", ".console__tabs", ".modal-card__body", ".scan-readiness-report__table", ".camera-advanced__pane"]
       .filter((selector) => scrolls(selector)),
   };
 }
@@ -222,7 +226,7 @@ export function assertAlignmentInvariants(assert, geometry) {
   assert.equal(canvas.width, DESIGN_WIDTH, "the console keeps its 1920px design width");
   assert.equal(canvas.height, DESIGN_HEIGHT, "the console keeps its 1080px design height");
 
-  assert.equal(workspace.bottom, BOTTOM_ROW_PX, "the bottom console keeps its 306px design height");
+  assert.equal(workspace.bottom, BOTTOM_ROW_PX, "the bottom console keeps its 209.375px design height");
   assert.equal(workspace.divider, workspace.columnGap, "the gap above the log matches the 12px panel rhythm");
   assert.equal(operationPanel.height, workspace.bottom, "the bottom panels share one height");
   assert.equal(operationPanel.minHeight, workspace.bottom, "Operation Status has no taller minimum height");
@@ -232,7 +236,7 @@ export function assertAlignmentInvariants(assert, geometry) {
 
   // The flexible upper row must remain at the previously verified height:
   // the earlier 1px divider + 317px log occupied the same 318px in total.
-  assert.equal(workspace.divider + workspace.bottom, 318, "the upper panels keep their prior height");
+  assert.equal(workspace.divider + workspace.bottom, 221.375, "the bottom removal increases the upper content by the measured96.625px");
   assert.equal(workspace.trackCount, 3, "the workspace grid keeps upper / gap / bottom tracks");
   assert.ok(workspace.upperIsFlexible, "the upper row stays flexible");
   assert.equal(workspace.flexibleTracks, 1, "exactly one workspace row may be flexible");
@@ -249,12 +253,13 @@ export function assertAlignmentInvariants(assert, geometry) {
   assert.equal(facts.operationTop, facts.logTop, "the two bottom panels start on the same line");
   assert.equal(facts.operationBottom, facts.logBottom, "the two bottom panels finish on the same line");
 
-  // 6. No scrollbar may be added anywhere. The only surfaces allowed to scroll
-  //    are the log list, the image strip and the overlay dialog; the tab rail is
-  //    clipped rather than scrollable, so it must not appear here.
+  // 6. No scrollbar may be added anywhere. The only surfaces allowed to scroll are
+  //    the log list, the image strip, the overlay dialog body and the two bounded
+  //    dialog regions (the preparation readiness report and the Advanced pane); the
+  //    tab rail is clipped rather than scrollable, so it must not appear here.
   assert.deepEqual(
     geometry.allowedScrollers,
-    [".log-lines", ".image-strip", ".modal-card__body"],
-    "only the log list, the image strip and the overlay dialog may scroll",
+    [".log-lines", ".image-strip", ".modal-card__body", ".scan-readiness-report__table", ".camera-advanced__pane"],
+    "only the log list, the image strip, the dialog body and the two bounded dialog regions may scroll",
   );
 }

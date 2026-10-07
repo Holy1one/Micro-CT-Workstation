@@ -11,5 +11,6 @@ pub use moxtek::{
     MAX_VOLTAGE_KV, MIN_VOLTAGE_KV,
 };
 pub use worker::MoxtekAdapter;
+pub(crate) use moxtek::nominal_voltage;
 #[cfg(test)]
 pub(crate) use moxtek::tests::{test_worker, TestXrayProbe};

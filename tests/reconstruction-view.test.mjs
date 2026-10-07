@@ -1,52 +1,25 @@
-/** Regression guards for independent display navigation and deferred result loading. */
-import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import test from 'node:test';
-const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
-const between = (start,end) => source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
-
-test('equipment canvas stays mounted and full-sized behind the result view', () => {
-  const layer = between('<div className="equipment-scene-layer"', '{centerView === "equipment" && <>');
-  assert.match(layer, /visibility: centerView === "equipment" \? "visible" : "hidden"/);
-  assert.match(layer, /pointerEvents: centerView === "equipment" \? "auto" : "none"/);
-  assert.match(layer, /aria-hidden=\{centerView !== "equipment"\}/);
-  assert.ok(layer.indexOf('<LiveSceneCanvas') < layer.indexOf('{centerView === "reconstruction" &&'));
-  assert.doesNotMatch(layer, /display:|key=\{centerView/);
-  const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
-  assert.match(css, /\.equipment-scene-layer \{ position: absolute; inset: 0; \}/);
+/** Display navigation is independent from device work and validated result loading. */
+import assert from 'node:assert/strict';import{readFileSync}from'node:fs';import test from'node:test';
+const read=path=>readFileSync(new URL('../'+path,import.meta.url),'utf8');const app=read('src/App.tsx');const recon=read('src/ReconstructionConsole.tsx');
+test('equipment canvas remains mounted behind every central media layer',()=>{
+  const scene=app.slice(app.indexOf('function LiveScene('),app.indexOf('function XrayPanel('));
+  assert.match(scene,/<LiveSceneCanvas/);assert.match(scene,/visibility: centerView === "equipment" \? "visible" : "hidden"/);
+  assert.match(scene,/<WorkstationMedia/);assert.match(scene,/<ControlDock/);assert.doesNotMatch(scene,/key=\{centerView/);
 });
-
-test('equipment context-loss listener is removed before renderer disposal', () => {
-  const canvas = readFileSync(new URL('../src/scene/LiveSceneCanvas.tsx', import.meta.url), 'utf8');
-  assert.match(canvas, /canvas.addEventListener\("webglcontextlost", handleContextLost\)/);
-  assert.match(canvas, /return \(\) => canvas.removeEventListener\("webglcontextlost", handleContextLost\)/);
-  assert.doesNotMatch(canvas.slice(canvas.indexOf('onCreated=')), /addEventListener/);
+test('equipment context listener retires before renderer disposal',()=>{
+  const source=read('src/scene/LiveSceneCanvas.tsx');assert.match(source,/return \(\) => canvas.removeEventListener\("webglcontextlost", handleContextLost\)/);
 });
-
-test('starting reconstruction keeps equipment visible and submits only the requested method', () => {
-  const start=between('const startReconstruction =','const availability:');
-  assert.match(start,/setCenterView\("equipment"\)/);
-  assert.doesNotMatch(start,/setCenterView\("reconstruction"\)/);
-  assert.match(start,/dispatch\(\{ type: "start_reconstruction", method \}\)/);
+test('reconstruction starts a requested method and keeps equipment visible',()=>{
+  const source=app.slice(app.indexOf('const startReconstruction'),app.indexOf('const onPhoto'));
+  assert.match(source,/navigate\("equipment"\)/);assert.match(source,/type:\s*"start_reconstruction"/);
 });
-
-test('completed preview loads in background and auto-switches only after validation', () => {
-  const loader=between('if (!previewKey || adapterKind', 'const openReconstruction');
-  assert.doesNotMatch(loader,/centerView !== "reconstruction"/);
-  assert.ok(loader.indexOf('Invalid preview volume data') < loader.indexOf('setPreviewData'));
-  assert.ok(loader.indexOf('setPreviewData') < loader.indexOf('setCenterView("reconstruction")'));
-  assert.match(loader,/previewData\?\.key === previewKey/);
-  assert.match(loader,/if \(!active\) return/);
+test('late result loading validates bytes and cannot steal a later user view',()=>{
+  const loader=app.slice(app.indexOf('if (!previewKey || adapterKind'),app.indexOf('const openReconstruction'));
+  assert.ok(loader.indexOf('Invalid preview volume data')<loader.indexOf('setPreviewData'));
+  assert.match(loader,/revision === presentation.current/);assert.match(loader,/if \(!active\) return/);
 });
-
-test('display navigation never dispatches a reconstruction and does not depend on live IPC', () => {
-  const open=between('const openReconstruction =','const startReconstruction =');
-  assert.match(open,/if \(activeVolume\)/);
-  assert.doesNotMatch(open,/dispatch|transportError|running/);
-  assert.match(source,/onClick=\{onShowEquipment\}>Equipment/);
-  assert.match(source,/disabled=\{!completed\}.*onClick=\{onOpenReconstruction\}>Result/);
-  assert.match(open,/setPreviewRetry/);
-  const primary=between('const activatePrimary =', 'return <div className="recon-workspace">');
-  assert.match(primary,/start\(\)/);
-  assert.doesNotMatch(primary,/onShowEquipment|onOpenReconstruction/);
+test('view buttons never start reconstruction and events are backend-owned',()=>{
+  const open=app.slice(app.indexOf('const openReconstruction'),app.indexOf('const startReconstruction'));
+  assert.doesNotMatch(open,/actions.run|dispatch/);assert.match(recon,/onClick=\{onShowEquipment\}/);assert.match(recon,/onClick=\{onOpenReconstruction\}/);
+  assert.doesNotMatch(recon,/setEvents|eventSequence|recon-workspace__events/);
 });

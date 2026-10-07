@@ -231,6 +231,8 @@ function snapshot(overrides = {}) {
   const { safety = {}, ...rest } = overrides;
   return {
     engineSessionId: "synthetic-engine", snapshotSequence: 1, operationId: null, operations: [],
+    cameraScanReadiness: { ready: false, issues: [{ key: "session", actual: null, requirement: "Confirmed native D7100 NEF session", remedy: "Connect and explicitly select the camera" }] },
+    softwareUpdatePreparation: null, cameraCaptureDescriptor: null,
     deviceControls: { camera: null, turntable: { connected: false, identity: null, status: null, confirmedAngleDeg: null, benchMode: false, reason: null, hardwareCertified: false }, taskLock: { locked: false, reason: null, taskId: null, savePath: null, status: "unlocked", retained: false }, presets: { schemaVersion: 1, presets: [], error: null }, cameraDraft: {}, exportJson: null, presetComparison: null },    mode: "production_locked",
     modeLabel: "PRODUCTION LOCKED · NANO DISCONNECTED",
     connectionState: "disconnected",

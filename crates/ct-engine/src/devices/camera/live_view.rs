@@ -8,10 +8,12 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const LIVE_VIEW_PIPE_VERSION: u16 = 1;
+pub const LIVE_VIEW_PIPE_VERSION: u16 = 2;
 pub const LIVE_VIEW_HEADER_BYTES: usize = 64;
+pub const LIVE_VIEW_ACK_BYTES: usize = 32;
 pub const MAX_LIVE_VIEW_BYTES: usize = 4 * 1024 * 1024;
 pub const LIVE_VIEW_MAGIC: &[u8; 8] = b"MCTLV001";
+const LIVE_VIEW_ACK_MAGIC: &[u8; 8] = b"MCTACK02";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +50,27 @@ fn session_bytes(session: &str) -> Result<[u8; 16], CameraError> {
     }
     Ok(bytes)
 }
+/// Confirm receipt only after the complete frame has passed JPEG/session/seq
+/// validation. Closing without this acknowledgement may discard pipe buffers.
+pub fn encode_live_view_ack(
+    session_id: &str,
+    sequence: u64,
+) -> Result<[u8; LIVE_VIEW_ACK_BYTES], CameraError> {
+    if sequence == 0 {
+        return Err(invalid("Live View ACK sequence must be positive"));
+    }
+    let mut bytes = [0; LIVE_VIEW_ACK_BYTES];
+    bytes[..8].copy_from_slice(LIVE_VIEW_ACK_MAGIC);
+    bytes[8..24].copy_from_slice(&session_bytes(session_id)?);
+    bytes[24..].copy_from_slice(&sequence.to_le_bytes());
+    Ok(bytes)
+}
+fn validate_live_view_ack(bytes: &[u8], frame: &LiveViewFrame) -> Result<(), CameraError> {
+    if bytes != encode_live_view_ack(&frame.session_id, frame.sequence)? {
+        return Err(invalid("Live View ACK magic/session/sequence mismatch"));
+    }
+    Ok(())
+}
 pub fn validate_jpeg(jpeg: &[u8], expected: Option<(u32, u32)>) -> Result<(u32, u32), CameraError> {
     if !(4..=MAX_LIVE_VIEW_BYTES).contains(&jpeg.len())
         || !jpeg.starts_with(&[0xff, 0xd8])
@@ -66,7 +89,13 @@ pub fn validate_jpeg(jpeg: &[u8], expected: Option<(u32, u32)>) -> Result<(u32, 
         .map_err(|e| CameraError::Safety(format!("Live View JPEG decode: {e}")))?;
     let dimensions = (decoded.width(), decoded.height());
     if dimensions.0 == 0 || dimensions.1 == 0 || expected.is_some_and(|pair| pair != dimensions) {
-        return Err(invalid("Live View JPEG/header dimensions differ"));
+        let header = expected
+            .map(|(width, height)| format!("{width}x{height}"))
+            .unwrap_or_else(|| "unspecified".into());
+        return Err(invalid(&format!(
+            "Live View JPEG/header dimensions differ: header={header}, JPEG={}x{}",
+            dimensions.0, dimensions.1
+        )));
     }
     Ok(dimensions)
 }
@@ -80,8 +109,11 @@ pub(crate) fn d7100_frame(
             "D7100 Live View requires bounded 384-byte header plus JPEG",
         ));
     }
-    let width = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
-    let height = u16::from_le_bytes([bytes[10], bytes[11]]) as u32;
+    // MIT NikonD7100.GetAdditionalLiveViewData uses BaseMTPCamera.ToInt16,
+    // which reads high byte first. This vendor header is BE independently of
+    // the LE standard PTP datasets and our LE desktop pipe envelope.
+    let width = u16::from_be_bytes([bytes[8], bytes[9]]) as u32;
+    let height = u16::from_be_bytes([bytes[10], bytes[11]]) as u32;
     validate_jpeg(&bytes[384..], Some((width, height)))?;
     Ok(LiveViewFrame {
         session_id: session.into(),
@@ -152,6 +184,86 @@ pub fn decode_live_view_frame(
         captured_at_ms: u64_at(56),
         jpeg: bytes[LIVE_VIEW_HEADER_BYTES..].to_vec(),
     })
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    const SESSION: &str = "0123456789abcdef0123456789abcdef";
+
+    fn packet(jpeg_width: u16, jpeg_height: u16) -> Vec<u8> {
+        let mut bytes = vec![0; 384];
+        bytes[8..10].copy_from_slice(&jpeg_width.to_be_bytes());
+        bytes[10..12].copy_from_slice(&jpeg_height.to_be_bytes());
+        // Sensor/image geometry at 12/14 is distinct from Live View JPEG size.
+        bytes[12..14].copy_from_slice(&6000u16.to_be_bytes());
+        bytes[14..16].copy_from_slice(&4000u16.to_be_bytes());
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(
+                &vec![80; usize::from(jpeg_width) * usize::from(jpeg_height) * 3],
+                u32::from(jpeg_width),
+                u32::from(jpeg_height),
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn d7100_big_endian_header_decodes_and_pipe_envelope_remains_little_endian() {
+        // 640/424 have different high/low bytes; LE parsing produced 32770/43009.
+        let bytes = packet(640, 424);
+        assert_eq!(&bytes[8..12], &[0x02, 0x80, 0x01, 0xa8]);
+        assert!(bytes[384..].starts_with(&[0xff, 0xd8]));
+        let frame = d7100_frame(&bytes, SESSION, 7).unwrap();
+        assert_eq!((frame.width, frame.height), (640, 424));
+        let encoded = encode_live_view_frame(&frame).unwrap();
+        assert_eq!(&encoded[40..44], &640u32.to_le_bytes());
+        let forwarded = decode_live_view_frame(&encoded, SESSION, 6).unwrap();
+        assert_eq!((forwarded.width, forwarded.height), (640, 424));
+    }
+
+    #[test]
+    fn wrong_byte_order_and_real_header_mismatch_still_fail_with_both_sizes() {
+        let mut wrong_order = packet(640, 424);
+        wrong_order[8..10].copy_from_slice(&640u16.to_le_bytes());
+        wrong_order[10..12].copy_from_slice(&424u16.to_le_bytes());
+        let error = d7100_frame(&wrong_order, SESSION, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("header=32770x43009"), "{error}");
+        assert!(error.contains("JPEG=640x424"), "{error}");
+        let mut mismatch = packet(640, 424);
+        mismatch[8..10].copy_from_slice(&639u16.to_be_bytes());
+        let error = d7100_frame(&mismatch, SESSION, 1).unwrap_err().to_string();
+        assert!(error.contains("header=639x424"), "{error}");
+        assert!(error.contains("JPEG=640x424"), "{error}");
+    }
+
+    #[test]
+    fn corrected_header_keeps_zero_truncation_and_frame_size_checks() {
+        let mut zero = packet(640, 424);
+        zero[8..10].fill(0);
+        assert!(d7100_frame(&zero, SESSION, 1).is_err());
+        let mut truncated = packet(640, 424);
+        truncated.pop();
+        assert!(d7100_frame(&truncated, SESSION, 1).is_err());
+        assert!(d7100_frame(&vec![0; 384], SESSION, 1).is_err());
+        assert!(d7100_frame(&vec![0; MAX_LIVE_VIEW_BYTES + 385], SESSION, 1).is_err());
+    }
+    #[test]
+    fn acknowledgement_requires_exact_version_session_sequence_and_length() {
+        let frame = d7100_frame(&packet(8, 6), SESSION, 7).unwrap();
+        let ack = encode_live_view_ack(SESSION, 7).unwrap();
+        assert!(validate_live_view_ack(&ack, &frame).is_ok());
+        for at in [0, 8, 24] {
+            let mut bad = ack;
+            bad[at] ^= 1;
+            assert!(validate_live_view_ack(&bad, &frame).is_err());
+        }
+        assert!(validate_live_view_ack(&ack[..31], &frame).is_err());
+    }
 }
 
 #[derive(Default)]
@@ -230,9 +342,15 @@ pub(crate) fn start_frame_pipe(
             while slot.descriptor().is_some_and(|d| d.endpoint == endpoint) {
                 if let Some(p) = pipe.take() {
                     if p.connect(Duration::from_millis(50)).is_ok() {
+                        let deadline = Instant::now() + Duration::from_millis(250);
                         if let Some(frame) = slot.latest() {
                             if let Ok(bytes) = encode_live_view_frame(&frame) {
-                                let _ = p.write(&bytes, Duration::from_millis(50));
+                                // Successful kernel write does not mean the client
+                                // consumed it. Keep this instance until exact ACK
+                                // or the shared finite write/receipt deadline.
+                                let _ = p
+                                    .write_until(&bytes, deadline)
+                                    .and_then(|_| p.receive_ack(&frame, deadline));
                             }
                         }
                     }
@@ -342,11 +460,11 @@ mod pipe_windows {
             let handle = unsafe {
                 CreateNamedPipeW(
                     PCWSTR(path.as_ptr()),
-                    PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     1,
                     (MAX_LIVE_VIEW_BYTES + LIVE_VIEW_HEADER_BYTES) as u32,
-                    0,
+                    LIVE_VIEW_ACK_BYTES as u32,
                     100,
                     Some(&sa),
                 )
@@ -396,8 +514,14 @@ mod pipe_windows {
                 result
             }
         }
-        pub fn write(&self, bytes: &[u8], timeout: Duration) -> Result<(), CameraError> {
+        pub fn write_until(&self, bytes: &[u8], deadline: Instant) -> Result<(), CameraError> {
             unsafe {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                if timeout.is_zero() {
+                    return Err(CameraError::Timeout(
+                        "Live View write/ACK deadline expired".into(),
+                    ));
+                }
                 let event = CreateEventW(None, true, false, None).map_err(err)?;
                 let mut overlapped = OVERLAPPED {
                     hEvent: event,
@@ -426,6 +550,54 @@ mod pipe_windows {
                 let _ = CloseHandle(event);
                 result
             }
+        }
+        pub fn receive_ack(
+            &self,
+            frame: &LiveViewFrame,
+            deadline: Instant,
+        ) -> Result<(), CameraError> {
+            let mut ack = [0; LIVE_VIEW_ACK_BYTES];
+            let mut offset = 0;
+            while offset < ack.len() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(CameraError::Timeout(
+                        "Live View client ACK deadline expired".into(),
+                    ));
+                }
+                unsafe {
+                    let event = CreateEventW(None, true, false, None).map_err(err)?;
+                    let mut overlapped = OVERLAPPED {
+                        hEvent: event,
+                        ..Default::default()
+                    };
+                    let mut received = 0;
+                    let result = match ReadFile(
+                        self.handle(),
+                        Some(&mut ack[offset..]),
+                        Some(&mut received),
+                        Some(&mut overlapped),
+                    ) {
+                        Ok(()) => Ok(received),
+                        Err(e) if e.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
+                            self.wait(&mut overlapped, remaining)
+                        }
+                        Err(e) => Err(err(e)),
+                    };
+                    let _ = CloseHandle(event);
+                    let count = result? as usize;
+                    if count == 0 || count > ack.len() - offset {
+                        return Err(invalid("incomplete Live View client ACK"));
+                    }
+                    offset += count;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(CameraError::Timeout(
+                    "Live View client ACK deadline expired".into(),
+                ));
+            }
+            validate_live_view_ack(&ack, frame)
         }
     }
     impl Drop for Pipe {

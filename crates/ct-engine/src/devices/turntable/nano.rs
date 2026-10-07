@@ -8,9 +8,7 @@
 use super::planner::{self, MotionPlan};
 use serde::Serialize;
 use serialport::{SerialPort, SerialPortInfo, SerialPortType};
-use std::collections::HashMap;
-#[cfg(test)]
-use std::collections::VecDeque;
+use std::collections::{HashMap,VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -287,6 +285,8 @@ impl Session {
 }
 
 pub struct NanoAdapter {
+    #[cfg(test)]
+    test_stop_start_delay:Duration,
     session: Option<Session>,
     health: Arc<Mutex<NanoHealth>>,
 }
@@ -301,6 +301,8 @@ impl NanoAdapter {
     pub fn new() -> Self {
         let health = Arc::new(Mutex::new(NanoHealth::default()));
         Self {
+            #[cfg(test)]
+            test_stop_start_delay:Duration::ZERO,
             session: None,
             health,
         }
@@ -512,6 +514,8 @@ impl NanoAdapter {
     }
 
     pub fn stop(&self) -> Result<(), NanoError> {
+        #[cfg(test)]
+        if !self.test_stop_start_delay.is_zero(){thread::sleep(self.test_stop_start_delay);}
         self.session()?.stop_emergency()
     }
 
@@ -582,6 +586,7 @@ enum WorkerCommand {
 }
 
 struct Worker {
+    confirmed_stop_lines:VecDeque<String>,
     epoch:Arc<AtomicU64>,operation_epoch:Option<u64>,operation_cancel:Option<Arc<AtomicBool>>,
     transport: Box<dyn LineTransport>,
     receiver: mpsc::Receiver<WorkerCommand>,
@@ -602,6 +607,7 @@ fn run_worker(
     epoch: Arc<AtomicU64>,
 ) {
     let mut worker = Worker {
+        confirmed_stop_lines:VecDeque::new(),
         epoch,operation_epoch:None,operation_cancel:None,
         transport,
         receiver,
@@ -812,7 +818,13 @@ impl Worker {
                 }
                 return Ok((id, line));
             }
+            // A duplicate of this session's ACK-verified STOP is historical
+            // evidence. It cannot become a new fault or rewind a later HOME.
+            if self.confirmed_stop_lines.contains(&line){continue;}
             if let Some(error) = command_failure(&line, id) {
+                if line.starts_with("FAULT ")||line.starts_with("STOPPED ")||line=="BUTTON_STOP"{
+                    let _=self.handle_async(line);
+                }
                 return Err(error);
             }
             self.handle_async(line)?;
@@ -1010,6 +1022,7 @@ impl Worker {
         let result = self.command_lines("STOP", "", STOP_TIMEOUT, |line, id| {
             line.starts_with(&format!("STOPPED {id} "))
         });
+        if let Ok((_,line))=result.as_ref(){self.confirmed_stop_lines.push_back(line.clone());if self.confirmed_stop_lines.len()>32{self.confirmed_stop_lines.pop_front();}}
         set_health(&self.health, |health| health.status = None);
         result.map(|_| ())
     }
@@ -1081,6 +1094,7 @@ impl Worker {
     }
 
     fn handle_async(&mut self, line: String) -> Result<(), NanoError> {
+        if self.confirmed_stop_lines.contains(&line){return Ok(());}
         if line
             .strip_prefix("HBACK ")
             .is_some_and(|value| value.parse::<u32>().is_ok())
@@ -1387,6 +1401,10 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        protocol_events:Vec<String>,
+        warning_response_delay:Duration,
+        delayed_host_stop:Option<String>,
+        replay_stop_on_warning:bool,
         queue: VecDeque<String>,
         writes: Vec<String>,
         rearmed: bool,
@@ -1420,6 +1438,7 @@ pub(crate) mod tests {
     impl LineTransport for FakeTransport {
         fn write_line(&mut self, line: &str) -> io::Result<()> {
             let mut state = self.state.lock().unwrap();
+            state.protocol_events.push(format!("TX {line}"));
             state.writes.push(line.into());
             let parts = line.split_whitespace().collect::<Vec<_>>();
             match parts.as_slice() {
@@ -1476,7 +1495,9 @@ pub(crate) mod tests {
                     }
                 }
                 ["XRAY_WARNING", id, state_value] => {
+                    if !state.warning_response_delay.is_zero(){thread::sleep(state.warning_response_delay);}
                     state.queue.push_back(format!("ACK {id} XRAY_WARNING"));
+                    if state.replay_stop_on_warning{if let Some(stopped)=state.delayed_host_stop.clone(){state.queue.push_back(stopped.clone());state.queue.push_back(stopped);}}
                     state
                         .queue
                         .push_back(format!("OK {id} XRAY_WARNING={state_value}"));
@@ -1540,9 +1561,7 @@ pub(crate) mod tests {
                     state.homed = false;
                     state.capture_id = 0;
                     state.queue.push_back(format!("ACK {id} STOP"));
-                    state
-                        .queue
-                        .push_back(format!("STOPPED {id} POSITION_UNKNOWN reason=HOST_STOP"));
+                    let stopped=format!("STOPPED {id} POSITION_UNKNOWN reason=HOST_STOP");state.delayed_host_stop=Some(stopped.clone());state.queue.push_back(stopped);
                 }
                 _ => {}
             }
@@ -1552,9 +1571,7 @@ pub(crate) mod tests {
         fn read_line(&mut self, timeout: Duration) -> io::Result<Option<String>> {
             let deadline = Instant::now() + timeout;
             loop {
-                if let Some(line) = self.state.lock().unwrap().queue.pop_front() {
-                    return Ok(Some(line));
-                }
+                {let mut state=self.state.lock().unwrap();if let Some(line)=state.queue.pop_front(){state.protocol_events.push(format!("RX {line}"));return Ok(Some(line));}}
                 if Instant::now() >= deadline {
                     return Ok(None);
                 }
@@ -1826,6 +1843,38 @@ pub(crate) mod tests {
         adapter
     }
     pub(crate) fn test_homed_nano()->Arc<NanoAdapter>{Arc::new(connected_homed_fake(Arc::new(Mutex::new(FakeState::default()))))}
+    pub(crate) fn test_delayed_stop_nano()->(Arc<NanoAdapter>,Arc<Mutex<Vec<String>>>) {
+        struct Recorder {inner:FakeTransport,events:Arc<Mutex<Vec<String>>>}
+        impl LineTransport for Recorder{
+            fn write_line(&mut self,line:&str)->io::Result<()>{self.events.lock().unwrap().push(format!("TX {line}"));self.inner.write_line(line)}
+            fn read_line(&mut self,timeout:Duration)->io::Result<Option<String>>{let line=self.inner.read_line(timeout)?;if let Some(line)=line.as_ref(){self.events.lock().unwrap().push(format!("RX {line}"));}Ok(line)}
+        }
+        let state=Arc::new(Mutex::new(FakeState{warning_response_delay:Duration::from_millis(120),..Default::default()}));
+        let events=Arc::new(Mutex::new(Vec::new()));let mut adapter=NanoAdapter::new();adapter.test_stop_start_delay=Duration::from_millis(40);
+        adapter.connect_transport_for_test("MEMORY-DELAYED-STOP",Box::new(Recorder{inner:FakeTransport::new(state),events:events.clone()})).unwrap();
+        (Arc::new(adapter),events)
+    }
+
+    #[test]
+    fn confirmed_host_stop_duplicates_cannot_fault_subsequent_warning_commands(){
+        let state=Arc::new(Mutex::new(FakeState{replay_stop_on_warning:true,..Default::default()}));
+        let mut adapter=NanoAdapter::new();adapter.connect_transport_for_test("MEMORY-STOP-WARNING",Box::new(FakeTransport::new(state.clone()))).unwrap();
+        // No REARM/HOME/MOVE: this is the same stopped session as the hardware trace.
+        adapter.stop().unwrap();adapter.stop().unwrap();
+        adapter.set_xray_warning(true).unwrap();adapter.set_xray_warning(false).unwrap();
+        let status=adapter.status().unwrap();assert!(!status.homed);assert!(!status.reference_valid);assert!(!status.rearmed);
+        assert_eq!(adapter.health().state,NanoConnectionState::Connected);
+        assert!(!state.lock().unwrap().writes.iter().any(|line|line.starts_with("HOME ")||line.starts_with("MOVE_")));
+        adapter.disconnect();
+    }
+
+    #[test]
+    fn uncorrelated_stop_notification_still_fails_closed(){
+        let state=Arc::new(Mutex::new(FakeState::default()));let mut adapter=NanoAdapter::new();
+        adapter.connect_transport_for_test("MEMORY-UNKNOWN-STOP",Box::new(FakeTransport::new(state.clone()))).unwrap();
+        state.lock().unwrap().queue.push_back("STOPPED 0 POSITION_UNKNOWN reason=BUTTON_STOP".into());
+        assert!(adapter.set_xray_warning(false).is_err());assert_eq!(adapter.health().state,NanoConnectionState::Fault);
+    }
 
     #[test]
     fn relative_full_circle_and_phase_wrap_use_the_actual_serial_worker() {

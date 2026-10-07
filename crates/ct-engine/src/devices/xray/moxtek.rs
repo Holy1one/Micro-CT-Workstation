@@ -295,6 +295,7 @@ impl RawMoxtekAdapter {
         voltage_kv: f64,
         current_ua: f64,
     ) -> Result<XrayHealth, XrayError> {
+        let voltage_kv = nominal_voltage(voltage_kv);
         validate_setpoint(voltage_kv, current_ua)?;
         if self.transport.is_none() {
             return Err(XrayError::Transport("Moxtek adapter is not connected".into()));
@@ -950,6 +951,23 @@ impl Drop for RawMoxtekAdapter {
     }
 }
 
+/// A verified readback of a valid request can sit a few counts below the nominal
+/// minimum: hardware reported 3.99971 kV after an accepted 4.000 kV request.
+/// Preflight re-applies the confirmed setpoint, so that verified value must be
+/// restored to the nominal bound instead of failing validation. The clamp can
+/// only raise a sub-minimum value up to `MIN_VOLTAGE_KV`, never above it, and
+/// only inside the same readback tolerance used to verify an applied setpoint.
+pub(crate) fn nominal_voltage(voltage_kv: f64) -> f64 {
+    if voltage_kv.is_finite()
+        && voltage_kv < MIN_VOLTAGE_KV
+        && MIN_VOLTAGE_KV - voltage_kv <= VOLTAGE_READBACK_TOLERANCE_KV
+    {
+        MIN_VOLTAGE_KV
+    } else {
+        voltage_kv
+    }
+}
+
 fn validate_setpoint(voltage_kv: f64, current_ua: f64) -> Result<(), XrayError> {
     if !voltage_kv.is_finite()
         || !current_ua.is_finite()
@@ -1050,6 +1068,7 @@ pub(crate) mod tests {
         set_voltage_raw: u16,
         set_current_raw: u16,
         enabled: bool,
+        ignore_off: bool,
         measured_voltage_raw: u16,
         measured_current_raw: u16,
         temperature_raw: u16,
@@ -1075,6 +1094,7 @@ pub(crate) mod tests {
                 set_voltage_raw: 0,
                 set_current_raw: 0,
                 enabled: false,
+                ignore_off: false,
                 measured_voltage_raw: 0,
                 measured_current_raw: 0,
                 temperature_raw: 175,
@@ -1122,7 +1142,9 @@ pub(crate) mod tests {
                     vec![PACKET_HEADER, command, 2, bytes[3], bytes[4]]
                 }
                 CMD_SET_XRAY_ENABLE => {
-                    state.enabled = bytes[3] != 0;
+                    if bytes[3] != 0 || !state.ignore_off {
+                        state.enabled = bytes[3] != 0;
+                    }
                     let enabled=state.enabled;state.beam_transitions.push((enabled,Instant::now()));
                     if state.enabled {
                         state.beam_enable_times.push(Instant::now());
@@ -1253,6 +1275,9 @@ pub(crate) mod tests {
         pub(crate) fn set_interlock(&self,locked:bool){self.state.lock().unwrap().locked=locked;}
         pub(crate) fn fail_next_read(&self){self.state.lock().unwrap().next_read_timeout=true;}
         pub(crate) fn panic_next_read(&self){self.state.lock().unwrap().panic_next_read=true;}
+        /// The fake acknowledges OFF but keeps output asserted. Production
+        /// readback must reject this instead of reporting safe completion.
+        pub(crate) fn ignore_off(&self,ignored:bool){self.state.lock().unwrap().ignore_off=ignored;}
     }
     /// Exercises the production serial owner against scripted binary packets.
     pub(crate) fn test_worker(kv:f64,ua:f64)->(super::super::worker::MoxtekAdapter,TestXrayProbe) {
@@ -1342,6 +1367,16 @@ pub(crate) mod tests {
         assert!(validate_setpoint(60.0, 200.1).is_err());
         assert!(validate_setpoint(70.1, 100.0).is_err());
         assert!(validate_setpoint(70.0, 1_000.1).is_err());
+        // Hardware: an accepted 4.000 kV request read back as 3.99971 kV. Preflight
+        // re-applies that verified value, so the nominal bound must be restored.
+        assert_eq!(nominal_voltage(3.999710083007813), MIN_VOLTAGE_KV);
+        assert_eq!(nominal_voltage(MIN_VOLTAGE_KV), MIN_VOLTAGE_KV);
+        assert_eq!(nominal_voltage(5.0), 5.0);
+        assert!(validate_setpoint(nominal_voltage(3.999710083007813), 10.0).is_ok());
+        // A genuinely lower setpoint is never silently raised to the minimum.
+        assert_eq!(nominal_voltage(3.0), 3.0);
+        assert!(validate_setpoint(nominal_voltage(3.0), 10.0).is_err());
+        assert!(validate_setpoint(nominal_voltage(f64::NAN), 10.0).is_err());
 
         let state = Arc::new(Mutex::new(FakeState::default()));
         let mut adapter = connected_adapter(state.clone());
@@ -1661,8 +1696,11 @@ pub(crate) mod tests {
         let mut owner=super::super::worker::MoxtekAdapter::from_raw(raw);
         owner.beam_on(&AtomicBool::new(false)).unwrap();
         state.lock().unwrap().locked=true;
+        // Force-OFF and the fault publication are separate steps of the same monitor pass:
+        // wait for both so the assertion cannot race a scheduling delay. A worker that never
+        // publishes the error still fails closed and still times out into a red assertion.
         let deadline=Instant::now()+Duration::from_secs(2);
-        while state.lock().unwrap().enabled && Instant::now()<deadline {thread::sleep(Duration::from_millis(10));}
+        while (state.lock().unwrap().enabled || owner.health().last_error.is_none()) && Instant::now()<deadline {thread::sleep(Duration::from_millis(10));}
         assert!(!state.lock().unwrap().enabled,"worker must force OFF without any UI request");
         assert!(owner.health().last_error.is_some());
         assert!(owner.beam_on(&AtomicBool::new(false)).is_err(),"faulted worker may not automatically re-enable");
@@ -1691,7 +1729,10 @@ pub(crate) mod tests {
         let mut owner=super::super::worker::MoxtekAdapter::from_raw(raw);
         owner.beam_on_until(&AtomicBool::new(false),Instant::now()+Duration::from_millis(300)).unwrap();
         let deadline=Instant::now()+Duration::from_secs(2);
-        while state.lock().unwrap().enabled && Instant::now()<deadline{thread::sleep(Duration::from_millis(10));}
+        // The worker clears `enabled` inside force_off() before it publishes the
+        // fault/hard-limit error, so wait for the evidence the assertion needs
+        // instead of the first observable flag. Bounded by the same deadline.
+        while Instant::now()<deadline&&(state.lock().unwrap().enabled||!owner.health().last_error.as_deref().is_some_and(|error|error.contains("hard limit"))){thread::sleep(Duration::from_millis(10));}
         assert!(!state.lock().unwrap().enabled);
         assert!(owner.health().last_error.as_deref().is_some_and(|error|error.contains("hard limit")));
     }

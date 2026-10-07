@@ -7,6 +7,7 @@
 
 mod engine_client;
 mod camera_forwarder;
+mod updater;
 use engine_client::EngineClient;
 use serde_json::Value;
 #[cfg(debug_assertions)]
@@ -18,6 +19,162 @@ use std::sync::{
 use tauri::Manager;
 
 struct EngineState(Mutex<Option<EngineClient>>,std::sync::atomic::AtomicBool,std::sync::atomic::AtomicBool,std::sync::atomic::AtomicBool);
+struct SoftwareUpdateHost(Result<updater::UpdaterService, String>);
+
+fn engine_data_directory() -> Result<std::path::PathBuf, String> {
+    let path = if let Some(path) = std::env::var_os("MICRO_CT_ENGINE_DATA_DIR") {
+        std::path::PathBuf::from(path)
+    } else {
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA unavailable")?).join("MicroCTWorkstation")
+    };
+    if !path.is_absolute() {return Err("Engine data directory must be absolute".into());}
+    Ok(path)
+}
+
+fn update_service(state: &SoftwareUpdateHost) -> Result<updater::UpdaterService, String> {
+    state.0.as_ref().cloned().map_err(Clone::clone)
+}
+
+#[tauri::command]
+async fn software_update_check(channel: String, state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    update_service(&state)?.check(channel).await
+}
+#[tauri::command]
+fn software_update_status(state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    update_service(&state)?.status()
+}
+#[tauri::command]
+fn software_update_cancel(update_id: String, state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    update_service(&state)?.cancel(update_id)
+}
+#[tauri::command]
+async fn software_update_import(app: tauri::AppHandle, state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let service = update_service(&state)?;
+    service.clear_feedback()?;
+    let chosen = tauri::async_runtime::spawn_blocking(move || app.dialog().file()
+        .add_filter("Signed offline update", &["zip"]).blocking_pick_file())
+        .await.map_err(|error| error.to_string())?;
+    match chosen {
+        Some(path) => service.import_zip(path.into_path().map_err(|error| error.to_string())?).await,
+        None => service.status(),
+    }
+}
+
+fn validate_update_authority(snapshot: &Value, expected_session: &str, expected_operation: &str) -> Result<updater::UpdateAuthority, String> {
+    if snapshot.get("engineSessionId").and_then(Value::as_str) != Some(expected_session)
+        || snapshot.get("mode").and_then(Value::as_str) != Some("production_locked") {
+        return Err("Maintenance authority came from an unrelated or preview engine".into());
+    }
+    let report: updater::UpdateAuthority = serde_json::from_value(snapshot.get("softwareUpdatePreparation")
+        .cloned().ok_or("Maintenance authority missing")?).map_err(|error| error.to_string())?;
+    if report.session_id != expected_session || report.operation_id != expected_operation {
+        return Err("Maintenance authority operation changed".into());
+    }
+    report.validate()?;
+    let completed = snapshot.get("operations").and_then(Value::as_array).is_some_and(|operations| operations.iter().any(|operation|
+        operation.get("operationId").and_then(Value::as_str) == Some(expected_operation)
+        && operation.get("kind").and_then(Value::as_str) == Some("prepare_software_update")
+        && operation.get("status").and_then(Value::as_str) == Some("completed")));
+    if !completed {return Err("Matching maintenance operation has not completed".into());}
+    Ok(report)
+}
+
+fn prepare_update_engine(app: &tauri::AppHandle) -> Result<(updater::UpdateAuthority, updater::ProcessIdentity), String> {
+    let state = app.state::<EngineState>();
+    if state.1.load(Ordering::SeqCst) {return Err("Desktop is already shutting down".into());}
+    let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+        .as_ref().cloned().ok_or("ct-engine is unavailable")?;
+    let first = client.prepare_software_update()?;
+    let session = first.get("engineSessionId").and_then(Value::as_str).ok_or("Engine session missing")?.to_owned();
+    let operation = first.get("softwareUpdatePreparation").and_then(|report| report.get("operationId"))
+        .and_then(Value::as_str).filter(|value| !value.is_empty()).ok_or("Maintenance operation missing")?.to_owned();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut snapshot = first;
+    loop {
+        let status = snapshot.get("softwareUpdatePreparation").and_then(|report| report.get("status")).and_then(Value::as_str);
+        if status == Some("ready") {break;}
+        if matches!(status, Some("blocked" | "cancelled")) {
+            return Err(snapshot["softwareUpdatePreparation"]["error"].as_str().unwrap_or("Maintenance preparation was blocked or cancelled").to_owned());
+        }
+        if std::time::Instant::now() >= deadline {return Err("Maintenance preparation timed out; installer was not started".into());}
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        snapshot = client.request("snapshot", serde_json::json!({}))?;
+    }
+    // Re-read this locked authority immediately before closing the owned stdin.
+    snapshot = client.request("snapshot", serde_json::json!({}))?;
+    let authority = validate_update_authority(&snapshot, &session, &operation)?;
+    if state.1.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("Desktop close superseded software update preparation".into());
+    }
+    client.begin_shutdown();
+    client.wait_for_exit(std::time::Duration::from_secs(90))?;
+    let (pid, creation_time, exit_code) = client.exited_process_identity()?;
+    Ok((authority, updater::ProcessIdentity {pid, creation_time, exit_code}))
+}
+
+#[cfg(test)]
+mod maintenance_authority_tests {
+    use super::*;
+    fn ready_snapshot() -> Value {
+        serde_json::json!({"engineSessionId":"current-session","mode":"production_locked",
+            "operations":[{"operationId":"fresh-maintenance","kind":"prepare_software_update","status":"completed"}],
+            "softwareUpdatePreparation":{"sessionId":"current-session","operationId":"fresh-maintenance",
+                "status":"ready","ready":true,"maintenanceLocked":true,"createdAt":"2026-10-05T00:00:00Z",
+                "completedAt":"2026-10-05T00:00:01Z","turntableStop":"confirmed","xrayOff":"never-owned",
+                "cameraCleanup":"confirmed","noActiveTransactions":true,"error":null}})
+    }
+    #[test]
+    fn ready_report_requires_real_session_locked_cleanup_and_matching_completed_operation() {
+        let source = ready_snapshot();
+        assert!(validate_update_authority(&source,"current-session","fresh-maintenance").is_ok());
+        for field in ["turntableStop","xrayOff","cameraCleanup"] {
+            let mut changed = source.clone();changed["softwareUpdatePreparation"][field]=serde_json::json!("unknown");
+            assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        }
+        for field in ["maintenanceLocked","noActiveTransactions"] {
+            let mut changed = source.clone();changed["softwareUpdatePreparation"][field]=serde_json::json!(false);
+            assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        }
+        for status in ["queued","running","failed","cleanup_unconfirmed","cancelled"] {
+            let mut changed = source.clone();changed["operations"][0]["status"]=serde_json::json!(status);
+            assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        }
+    }
+    #[test]
+    fn missing_old_or_preview_authority_never_grants_install_permission() {
+        let source = ready_snapshot();
+        assert!(validate_update_authority(&source,"old-session","fresh-maintenance").is_err());
+        assert!(validate_update_authority(&source,"current-session","old-maintenance").is_err());
+        let mut changed = source.clone();changed["mode"]=serde_json::json!("developer_preview");
+        assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        changed=source.clone();changed.as_object_mut().unwrap().remove("softwareUpdatePreparation");
+        assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        changed=source;changed["softwareUpdatePreparation"].as_object_mut().unwrap().remove("maintenanceLocked");
+        assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+    }
+}
+
+#[tauri::command]
+async fn software_update_confirm_apply(update_id: String, expected_version: String, app: tauri::AppHandle,
+    state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    let service = update_service(&state)?;
+    let verified = service.prepare_apply(&update_id, &expected_version)?;
+    let application = app.clone();
+    let preparation = tauri::async_runtime::spawn_blocking(move || prepare_update_engine(&application))
+        .await.map_err(|error| error.to_string())?;
+    let (authority, engine) = match preparation {
+        Ok(value) => value,
+        Err(error) => {app.state::<EngineState>().1.store(false, Ordering::SeqCst);service.apply_failed(error.clone()); return Err(error);}
+    };
+    if let Err(error) = service.spawn_helper(verified, authority, engine) {
+        app.state::<EngineState>().1.store(false, Ordering::SeqCst);service.apply_failed(error.clone());return Err(error);
+    }
+    let current = service.status()?;
+    app.state::<EngineState>().3.store(true, Ordering::SeqCst);
+    app.exit(0);
+    Ok(current)
+}
 
 fn begin_shutdown(app:&tauri::AppHandle){
     let state=app.state::<EngineState>();
@@ -60,14 +217,29 @@ async fn camera_live_view_frame(after_seq:u64,state:tauri::State<'_,EngineState>
     let metadata=client.request("camera_pipe_descriptor",serde_json::json!({"type":"camera_pipe_descriptor"}))?;
     let descriptor:ct_engine::devices::camera::LiveViewPipeDescriptor=serde_json::from_value(metadata["liveViewPipeDescriptor"].clone()).map_err(|error|format!("No active Live View endpoint: {error}"))?;
     let expected_session=descriptor.session_id.clone();
+    let current_view=&metadata["deviceControls"]["camera"]["liveView"];
+    if current_view["active"].as_bool()!=Some(true) || current_view["sessionId"].as_str()!=Some(expected_session.as_str()) {
+        return Err("Live View session was revoked; discard the frame".into());
+    }
+    // The latest-only slot may still contain the frame already presented. Avoid
+    // opening the pipe until the engine has announced newer, fresh evidence.
+    if current_view["fresh"].as_bool()!=Some(true) || current_view["sequence"].as_u64().is_none_or(|seq|seq<=after_seq) {
+        return Ok(Value::Null);
+    }
     let frame=tauri::async_runtime::spawn_blocking(move||camera_forwarder::read_frame(&descriptor,after_seq)).await.map_err(|error|error.to_string())??;
     // A close/disconnect/Stop may have happened while the local pipe was read.
     let latest=client.request("snapshot",serde_json::json!({}))?;
     let view=&latest["deviceControls"]["camera"]["liveView"];
-    if view["active"].as_bool()!=Some(true) || view["fresh"].as_bool()!=Some(true)
-        || view["sessionId"].as_str()!=Some(expected_session.as_str()) {
+    confirm_live_view_delivery(frame, view, &expected_session)
+}
+
+fn confirm_live_view_delivery(frame: Value, view: &Value, expected_session: &str) -> Result<Value,String> {
+    if view["active"].as_bool()!=Some(true)
+        || view["sessionId"].as_str()!=Some(expected_session) {
         return Err("Live View session was revoked; discard the frame".into());
     }
+    if frame.is_null() { return Ok(Value::Null); }
+    if view["fresh"].as_bool()!=Some(true) { return Err("Live View frame is stale; discard the frame".into()); }
     Ok(frame)
 }
 
@@ -109,11 +281,19 @@ async fn camera_preset_export(contents:String,app:tauri::AppHandle)->Result<Opti
 fn chrono_safe_nonce()->u128 {std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()}
 
 #[tauri::command]
-fn resolve_camera_capture_directory()->Result<String,String> {
-    #[cfg(windows)]
-    {return existing_known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Pictures).map(|directory|directory.join("MicroCT").join("CameraCaptures").to_string_lossy().into_owned());}
-    #[cfg(not(windows))]
-    {Err("Configured Windows Pictures directory is unavailable".into())}
+async fn resolve_camera_capture_directory(state: tauri::State<'_, EngineState>)->Result<String,String> {
+    let snapshot = engine_snapshot(state).await?;
+    camera_capture_directory_from_snapshot(&snapshot)
+}
+
+/// This query derives from the unique engine root; it does not authorize capture or create directories.
+fn camera_capture_directory_from_snapshot(snapshot: &Value)->Result<String,String> {
+    let configured = snapshot.get("parameters").and_then(|parameters|parameters.get("savePath"))
+        .and_then(Value::as_str).filter(|value|!value.trim().is_empty())
+        .ok_or("Camera capture root unavailable; configure Parameters.savePath first")?;
+    let root = std::path::PathBuf::from(configured.trim());
+    if !root.is_absolute() || configured.contains('\0') {return Err("Engine camera capture root is not a valid absolute path".into());}
+    Ok(root.join("CameraCaptures").to_string_lossy().into_owned())
 }
 
 const DESIGN_WIDTH: f64 = 1920.0;
@@ -535,15 +715,26 @@ async fn frame_preview(index: u32, state: tauri::State<'_, EngineState>) -> Resu
     let frame = workstation.get("frames").and_then(Value::as_array)
         .and_then(|frames| frames.iter().find(|frame| frame.get("index").and_then(Value::as_u64) == Some(u64::from(index))))
         .ok_or("Committed frame unavailable")?;
+    registered_nef_preview(frame)
+}
+
+fn registered_nef_preview(frame: &Value) -> Result<Vec<u8>, String> {
     let path = frame.get("path").and_then(Value::as_str).ok_or("Camera file path missing")?;
     let expected_size = frame.get("bytes").and_then(Value::as_u64).ok_or("Camera file size missing")?;
     let expected_hash = frame.get("sha256").and_then(Value::as_str).ok_or("Camera file hash missing")?;
     let file = std::path::Path::new(path);
     if file.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("nef")) != Some(true)
-        || expected_size == 0 || expected_size > 150 * 1024 * 1024 {
+        || expected_size == 0 || expected_size > 128 * 1024 * 1024
+        || expected_hash.len() != 64 || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("Unsupported camera frame".into());
     }
-    let bytes = std::fs::read(file).map_err(|error| format!("Camera file read failed: {error}"))?;
+    use std::io::Read;
+    let input = std::fs::File::open(file).map_err(|error| format!("Camera file read failed: {error}"))?;
+    if input.metadata().map_err(|error| error.to_string())?.len() != expected_size {
+        return Err("Camera file changed since capture commit".into());
+    }
+    let mut bytes = Vec::with_capacity(expected_size as usize);
+    input.take(expected_size + 1).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
     if bytes.len() as u64 != expected_size {
         return Err("Camera file changed since scan commit".into());
     }
@@ -551,7 +742,40 @@ async fn frame_preview(index: u32, state: tauri::State<'_, EngineState>) -> Resu
     if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
         return Err("Camera file hash changed since scan commit".into());
     }
-    embedded_jpeg(&bytes).ok_or_else(|| "NEF contains no displayable embedded JPEG".into())
+    let jpeg = embedded_jpeg(&bytes).ok_or_else(|| "NEF contains no displayable embedded JPEG".to_string())?;
+    if jpeg.len() > 16 * 1024 * 1024 {return Err("Embedded preview exceeds the display size bound".into());}
+    Ok(jpeg)
+}
+
+/// A completed independent photo remains addressable by its registered ID.
+/// Camera reconnects do not turn a renderer path into a preview capability.
+#[tauri::command]
+async fn camera_capture_preview(capture_id: String, state: tauri::State<'_, EngineState>) -> Result<Value, String> {
+    if capture_id.is_empty() || capture_id.len() > 256 || capture_id.contains('\0') {
+        return Err("Invalid capture ID".into());
+    }
+    if state.1.load(Ordering::SeqCst) {return Err("Desktop is shutting down".into());}
+    let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+        .as_ref().cloned().ok_or("ct-engine is still starting")?;
+    let first = client.camera_capture_descriptor(&capture_id)?;
+    let descriptor = first.get("cameraCaptureDescriptor").ok_or("Capture descriptor unavailable")?.clone();
+    if descriptor.get("captureId").and_then(Value::as_str) != Some(capture_id.as_str())
+        || descriptor.get("format").and_then(Value::as_str) != Some("NEF")
+        || descriptor.get("exposureEnded").and_then(Value::as_bool) != Some(true)
+        || descriptor.get("sessionId").and_then(Value::as_str).is_none_or(str::is_empty)
+        || descriptor.get("operationId").and_then(Value::as_str).is_none_or(str::is_empty) {
+        return Err("Capture is not registered as complete".into());
+    }
+    let read_descriptor = descriptor.clone();
+    let jpeg = tauri::async_runtime::spawn_blocking(move || registered_nef_preview(&read_descriptor))
+        .await.map_err(|error| error.to_string())??;
+    let current = client.camera_capture_descriptor(&capture_id)?;
+    if state.1.load(Ordering::SeqCst) || first.get("engineSessionId") != current.get("engineSessionId")
+        || current.get("cameraCaptureDescriptor") != Some(&descriptor) {
+        return Err("Capture preview became stale during read".into());
+    }
+    Ok(serde_json::json!({"captureId":capture_id,"sessionId":descriptor["sessionId"],
+        "operationId":descriptor["operationId"],"jpeg":jpeg}))
 }
 
 /// Return only the completed, engine-registered preview volume. The renderer
@@ -663,6 +887,39 @@ fn embedded_jpeg(nef: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
+    #[test]
+    fn capture_directory_query_uses_the_configured_engine_root() {
+        let configured = r"E:\NO_HARDWARE\custom image root";
+        let snapshot = serde_json::json!({"parameters":{"savePath":configured}});
+        assert_eq!(super::camera_capture_directory_from_snapshot(&snapshot).unwrap(),
+            std::path::PathBuf::from(configured).join("CameraCaptures").to_string_lossy());
+    }
+
+    #[test]
+    fn capture_directory_query_rejects_unknown_empty_and_relative_roots() {
+        for snapshot in [serde_json::json!({}),serde_json::json!({"parameters":{}}),
+            serde_json::json!({"parameters":{"savePath":null}}),serde_json::json!({"parameters":{"savePath":42}}),
+            serde_json::json!({"parameters":{"savePath":""}}),serde_json::json!({"parameters":{"savePath":"  \t"}}),
+            serde_json::json!({"parameters":{"savePath":"E:/NO_HARDWARE/nul\u{0}root"}}),
+            serde_json::json!({"parameters":{"savePath":"relative/capture-root"}})] {
+            assert!(super::camera_capture_directory_from_snapshot(&snapshot).is_err(), "unknown roots cannot fall back to Pictures");
+        }
+    }
+
+    #[test]
+    fn missing_live_frame_stays_pending_only_in_the_same_active_session() {
+        let pending = serde_json::json!({"active":true,"fresh":false,"sessionId":"A"});
+        assert!(super::confirm_live_view_delivery(serde_json::Value::Null, &pending, "A").unwrap().is_null());
+        for view in [serde_json::json!({"active":false,"fresh":false,"sessionId":"A"}),
+            serde_json::json!({"active":true,"fresh":true,"sessionId":"B"}),
+            serde_json::json!({"active":"true","fresh":true,"sessionId":"A"})] {
+            assert!(super::confirm_live_view_delivery(serde_json::Value::Null, &view, "A").is_err());
+        }
+        let frame = serde_json::json!({"sequence":2});
+        assert!(super::confirm_live_view_delivery(frame.clone(), &pending, "A").is_err());
+        let current = serde_json::json!({"active":true,"fresh":true,"sessionId":"A"});
+        assert_eq!(super::confirm_live_view_delivery(frame.clone(), &current, "A").unwrap(), frame);
+    }
     use super::{calculate_min_inner_size, requires_maximized_window, export_session_log, open_directory_in_shell,
                 select_image_directory, embedded_jpeg};
     use std::path::PathBuf;
@@ -824,6 +1081,10 @@ mod tests {
 }
 
 fn main() {
+    if let Some(result) = updater::early_helper() {
+        if let Err(error) = result {eprintln!("Software update helper failed: {error}");std::process::exit(1);}
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .on_page_load(|webview, payload| {
@@ -860,6 +1121,12 @@ fn main() {
         })
         .manage(EngineState(Mutex::new(None),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false)))
         .setup(|app| {
+            // Acquire the shared instance lease before any engine can start.
+            // An applying helper holds it exclusively; a failed lease cannot
+            // become a second live device-control process during replacement.
+            let updater = engine_data_directory().and_then(updater::UpdaterService::new)
+                .map_err(std::io::Error::other)?;
+            app.manage(SoftwareUpdateHost(Ok(updater)));
             bootstrap_engine(app.app_handle().clone());
             if let Some(window) = app.get_webview_window("main") {
                 configure_window(&window)?;
@@ -867,6 +1134,11 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            software_update_check,
+            software_update_status,
+            software_update_cancel,
+            software_update_import,
+            software_update_confirm_apply,
             camera_live_view_frame,
             camera_preset_import,
             camera_preset_export,
@@ -874,6 +1146,7 @@ fn main() {
             engine_snapshot,
             engine_command,
             frame_preview,
+            camera_capture_preview,
             reconstruction_preview,
             resolve_default_image_directory,
             open_directory_in_shell,

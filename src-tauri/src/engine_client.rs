@@ -108,6 +108,32 @@ fn embedded_engine_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 impl EngineClient {
+    /// Query the original child handle after confirmed exit. A recycled PID is
+    /// not accepted as proof that this owned process shut down normally.
+    pub fn exited_process_identity(&self) -> Result<(u32, u64, u32), String> {
+        let mut child = self.transport.child.lock().map_err(|_| "Engine process handle poisoned")?;
+        let status = child.try_wait().map_err(|error| error.to_string())?
+            .ok_or("Owned engine has not exited")?;
+        if !status.success() {return Err(format!("Engine exited with {status}; update refused"));}
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::System::Threading::GetProcessTimes;
+            let mut creation: FILETIME = unsafe {std::mem::zeroed()};
+            let mut exit: FILETIME = unsafe {std::mem::zeroed()};
+            let mut kernel: FILETIME = unsafe {std::mem::zeroed()};
+            let mut user: FILETIME = unsafe {std::mem::zeroed()};
+            if unsafe {GetProcessTimes(child.as_raw_handle(), &mut creation, &mut exit, &mut kernel, &mut user)} == 0 {
+                return Err(format!("Owned engine creation time unavailable: {}", std::io::Error::last_os_error()));
+            }
+            let created = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+            if created == 0 {return Err("Owned engine creation time is unknown".into());}
+            Ok((child.id(), created, status.code().unwrap_or(0) as u32))
+        }
+        #[cfg(not(windows))]
+        {Err("Verified Windows process identity is required for software installation".into())}
+    }
     /// Shutdown ownership is explicit: retained request/preview clones cannot keep stdin open.
     pub fn begin_shutdown(&self){self.transport.fail("Engine is shutting down; stdin closed for safety cleanup");}
     pub fn wait_for_exit(&self,timeout:Duration)->Result<(),String>{
@@ -149,6 +175,14 @@ impl EngineClient {
         Ok(Self{transport})
     }
     /// Writing is serialized; waiting never holds the client, stdin or pending-map lock.
+    pub fn prepare_software_update(&self) -> Result<Value,String> {
+        self.request("prepare_software_update", serde_json::json!({"type":"prepare_software_update"}))
+    }
+
+    pub fn camera_capture_descriptor(&self, capture_id: &str) -> Result<Value,String> {
+        self.request("camera_capture_descriptor", serde_json::json!({"type":"camera_capture_descriptor","captureId":capture_id}))
+    }
+
     pub fn request(&self,command:&str,payload:Value)->Result<Value,String> {
         if self.transport.failed.load(Ordering::SeqCst){return Err("Engine transport failed; restart required".into());}
         let (reply,receive)=mpsc::channel();
@@ -267,6 +301,46 @@ mod tests {
         let started = std::time::Instant::now();
         drop(engine);
         assert!(started.elapsed() < Duration::from_secs(8), "engine must shut down without kill timeout");
+    }
+
+    #[test]
+    fn update_preparation_uses_the_real_versioned_command_envelope() {
+        let path = embedded_engine_path().unwrap();
+        let engine = EngineClient::spawn_at(&path, true).unwrap();
+        engine.request("snapshot", serde_json::json!({})).unwrap();
+        let first = engine.prepare_software_update().expect("maintenance command must satisfy the sidecar's strict payload type gate");
+        let operation = first["softwareUpdatePreparation"]["operationId"].as_str().unwrap().to_owned();
+        let session = first["engineSessionId"].as_str().unwrap().to_owned();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = engine.request("snapshot", serde_json::json!({})).unwrap();
+            assert_eq!(snapshot["engineSessionId"], session);
+            let report = &snapshot["softwareUpdatePreparation"];
+            assert_eq!(report["operationId"], operation);
+            if report["status"] == "ready" {
+                assert_eq!(report["maintenanceLocked"], true);
+                assert_eq!(report["noActiveTransactions"], true);
+                assert!(snapshot["operations"].as_array().unwrap().iter().any(|op|op["operationId"] == operation && op["status"] == "completed"));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "real sidecar did not confirm maintenance readiness");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        engine.begin_shutdown();
+        engine.wait_for_exit(Duration::from_secs(10)).unwrap();
+        assert_eq!(engine.exited_process_identity().unwrap().2, 0);
+    }
+
+    #[test]
+    fn capture_descriptor_uses_the_real_versioned_command_envelope() {
+        let path = embedded_engine_path().unwrap();
+        let engine = EngineClient::spawn_at(&path, true).unwrap();
+        engine.request("snapshot", serde_json::json!({})).unwrap();
+        let error = engine.camera_capture_descriptor("unregistered-output").expect_err("lookup cannot invent a registered file");
+        assert_eq!(error, "ENGINE:CAPTURE_NOT_REGISTERED", "typed lookup must reach the real registration gate, not fail the command envelope gate");
+        engine.begin_shutdown();
+        engine.wait_for_exit(Duration::from_secs(10)).unwrap();
+        assert_eq!(engine.exited_process_identity().unwrap().2, 0);
     }
 
     #[test]

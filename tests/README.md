@@ -18,3 +18,8 @@ npm.cmd test
 ```
 
 These tests do not connect to the Nano, D7100, or Moxtek source and cannot establish real-hardware acceptance.
+
+System-level production-coordinator scenarios live in the Rust `scan::tests::r0_` group,
+not the browser-preview tests. Run `cargo test --workspace` for the complete offline gate.
+Their scoped results and remaining hardware requirements are recorded in
+[the R0 coverage matrix](../docs/system-reliability-coverage-2026-10-07.md).

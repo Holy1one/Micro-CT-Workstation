@@ -27,8 +27,8 @@ import {
 const STYLESHEET = new URL("../src/styles.css", import.meta.url);
 const stylesheet = readFileSync(STYLESHEET, "utf8");
 
-test("the bottom panels use the published 306px design height", () => {
-  assert.equal(BOTTOM_ROW_PX, 306);
+test("the bottom panels use the published 209.375px design height", () => {
+  assert.equal(BOTTOM_ROW_PX, 209.375);
 });
 
 test("the stylesheet numbers satisfy every alignment invariant", () => {
@@ -36,7 +36,7 @@ test("the stylesheet numbers satisfy every alignment invariant", () => {
   assertAlignmentInvariants(assert, geometry);
 });
 
-test("the log alone moves down to align with Operation Status", () => {
+test("the centre log and shortened Operation Status share top and bottom", () => {
   const geometry = readGeometry(stylesheet);
   const facts = deriveAlignment(geometry);
   assert.equal(geometry.operationPanel.height, geometry.workspace.bottom);
@@ -52,7 +52,7 @@ test("the right panel gap matches the shared 12px panel rhythm", () => {
   assert.equal(rightColumn.spacer, workspace.columnGap);
   assert.equal(workspace.divider, workspace.columnGap);
   assert.equal(rightColumn.bottomTrack, operationPanel.height);
-  assert.match(rightColumn.tracks, /^minmax\(0, 1fr\) \d+px$/);
+  assert.match(rightColumn.tracks, /^minmax\(0, 1fr\) \d+(?:\.\d+)?px$/);
 });
 
 test("the three upper columns and the bottom console stay inside the canvas", () => {
@@ -74,7 +74,7 @@ test("the three upper columns and the bottom console stay inside the canvas", ()
 
 test("upper panels and log are separated by empty space, not an overlay line", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  const workspace = app.slice(app.indexOf('<section className="workspace-body">'), app.indexOf('<BottomConsole ws={ws}'));
+  const workspace = app.slice(app.indexOf('<section className="workspace-body">'), app.indexOf('<BottomConsole '));
   assert.ok(workspace.length > 0);
   assert.doesNotMatch(workspace, /<div className="app-divider"\s*\/>/);
   assert.doesNotMatch(stylesheet, /\.workspace-body\s*>\s*\.app-divider\s*\{/);
@@ -91,9 +91,11 @@ test("the 3D viewport joins the toolbar and follows the outer bottom curve", () 
 
 test("no column or panel gained an in-column scrollbar", () => {
   const { allowedScrollers } = readGeometry(stylesheet);
-  // Exactly three surfaces may scroll: the log list, the image strip and the
-  // overlay dialog. The tab rail is clipped, not scrollable.
-  assert.deepEqual(allowedScrollers, [".log-lines", ".image-strip", ".modal-card__body"]);
+  // Exactly five surfaces may scroll: the log list, the image strip, the overlay
+  // dialog body, and the two bounded regions inside a dialog (the preparation
+  // readiness report and the Advanced parameter pane). The tab rail is clipped,
+  // not scrollable. A fixed console column never appears here.
+  assert.deepEqual(allowedScrollers, [".log-lines", ".image-strip", ".modal-card__body", ".scan-readiness-report__table", ".camera-advanced__pane"]);
   assert.match(stylesheet, /\.console__tabs \{[^}]*overflow: hidden;/);
   assert.match(stylesheet, /\.col \{[^}]*overflow: hidden;/);
   assert.doesNotMatch(stylesheet, /\.col \{[^}]*overflow-y: auto/);

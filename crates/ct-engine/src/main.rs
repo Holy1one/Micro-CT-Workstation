@@ -74,6 +74,37 @@ fn main()->io::Result<()> {
         if response_send.try_send(response).is_err(){failed=true;break;}
     }
     // A blocked stdout writer is never joined; the process exits after the domain owns cleanup.
-    engine.shutdown();drop(response_send);
-    if failed {Err(io::Error::other("Control transport unavailable or bounded queue exhausted; safety cleanup attempted"))}else{Ok(())}
+    let shutdown=engine.shutdown();drop(response_send);
+    shutdown_exit_result(failed,shutdown)
+}
+
+fn shutdown_exit_result(transport_failed:bool,shutdown:Result<(),String>)->io::Result<()> {
+    match (transport_failed,shutdown) {
+        (false,Ok(()))=>Ok(()),
+        (true,Ok(()))=>Err(io::Error::other("Control transport unavailable or bounded queue exhausted; safety cleanup confirmed")),
+        (false,Err(error))=>Err(io::Error::other(format!("EOF safety cleanup unconfirmed: {error}"))),
+        (true,Err(error))=>Err(io::Error::other(format!("Control transport unavailable or bounded queue exhausted; safety cleanup unconfirmed: {error}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{ExitCode,Termination};
+    #[test]
+    fn normal_eof_cannot_hide_unconfirmed_shutdown() {
+        let result=shutdown_exit_result(false,Err("Camera cleanup unconfirmed; Nano STOP unconfirmed".into()));
+        let error=result.as_ref().expect_err("an EOF shutdown failure must remain a process failure").to_string();
+        assert!(error.contains("EOF safety cleanup unconfirmed"));
+        assert!(error.contains("Camera cleanup unconfirmed"));
+        assert!(error.contains("Nano STOP unconfirmed"));
+        assert_eq!(result.report(),ExitCode::FAILURE);
+    }
+    #[test]
+    fn confirmed_shutdown_preserves_normal_and_failed_transport_exit_results() {
+        assert_eq!(shutdown_exit_result(false,Ok(())).report(),ExitCode::SUCCESS);
+        assert!(shutdown_exit_result(true,Ok(())).unwrap_err().to_string().contains("cleanup confirmed"));
+        let error=shutdown_exit_result(true,Err("OFF unconfirmed".into())).unwrap_err().to_string();
+        assert!(error.contains("Control transport unavailable"));assert!(error.contains("OFF unconfirmed"));
+    }
 }

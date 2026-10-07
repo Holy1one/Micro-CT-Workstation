@@ -24,6 +24,7 @@ impl Default for Operations {
     fn default() -> Self { let (sender,receiver)=mpsc::channel(); Self { history:vec![], generation:0,last_id:None,counter:0,sender,receiver,active:HashMap::new() } }
 }
 impl Operations {
+    pub(crate) fn next_id(&self,session:&str)->String{format!("{session}-op-{}",self.counter+1)}
     pub fn is_active(&self) -> bool { !self.active.is_empty() }
     pub fn blocks_controls(&self)->bool{self.history.iter().any(|operation|self.active.contains_key(&operation.operation_id)&&operation.kind!="metadata_probe")}
     pub fn device_active(&self, device:&str) -> bool { self.history.iter().any(|op| op.device==device && self.active.contains_key(&op.operation_id)) }
@@ -44,6 +45,21 @@ impl Operations {
             let _=sender.send(Event{id:operation_id,generation,result:Some(result)});
         });
         Ok(id)
+    }
+    /// Continue the same receipt after an owner-only admission stage. No
+    /// completed snapshot escapes between validation and persistence/start.
+    pub(crate) fn continue_job(&mut self,id:&str,job:impl FnOnce(Arc<AtomicBool>)->JobResult+Send+'static)->Result<(),&'static str>{
+        if self.active.contains_key(id){return Err("DEVICE_OPERATION_ACTIVE");}
+        let operation=self.history.iter_mut().find(|operation|operation.operation_id==id).ok_or("OPERATION_RECEIPT_MISSING")?;
+        if operation.status!="completed"||operation.cancel_requested{return Err("OPERATION_CONTINUATION_CANCELLED");}
+        operation.status="queued".into();operation.stage="registry_persistence".into();operation.updated_at=timestamp();
+        let cancel=Arc::new(AtomicBool::new(false));self.active.insert(id.into(),cancel.clone());self.last_id=Some(id.into());
+        let sender=self.sender.clone();let operation_id=id.to_owned();let generation=self.generation;
+        std::thread::spawn(move||{
+            let _=sender.send(Event{id:operation_id.clone(),generation,result:None});
+            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||if cancel.load(Ordering::SeqCst){Err("Device operation cancelled before continuation I/O".into())}else{job(cancel)})).unwrap_or_else(|_|Err("Device operation continuation panicked; cleanup required".into()));
+            let _=sender.send(Event{id:operation_id,generation,result:Some(result)});
+        });Ok(())
     }
     pub fn cancel(&mut self) {
         self.generation+=1;

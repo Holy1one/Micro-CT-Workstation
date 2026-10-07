@@ -11,6 +11,8 @@ mod planner;
 pub(crate) use nano::LineTransport;
 #[cfg(test)]
 pub(crate) use nano::tests::test_homed_nano;
+#[cfg(test)]
+pub(crate) use nano::tests::test_delayed_stop_nano;
 
 pub use nano::{
     MoveTicket, NanoAdapter, NanoConnectionState, NanoError, NanoHealth, NanoIdentity, NanoStatus,

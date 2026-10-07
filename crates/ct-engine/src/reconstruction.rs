@@ -77,7 +77,11 @@ pub struct ReconstructionProgress {
     pub status: &'static str,
     pub percent: u8,
     pub message: String,
+    pub events: Vec<ReconstructionEvent>,
 }
+
+#[derive(Clone,Debug)]
+pub struct ReconstructionEvent { pub sequence:u64,pub timestamp:String,pub status:&'static str,pub percent:u8,pub message:String }
 
 #[derive(Clone, Debug)]
 pub struct ReconstructionResult {
@@ -100,6 +104,7 @@ impl ReconstructionHandle {
         }
         let progress = Arc::new(Mutex::new(ReconstructionProgress {
             status: "running", percent: 0, message: "准备重构".into(),
+            events:vec![ReconstructionEvent{sequence:1,timestamp:crate::timestamp(),status:"running",percent:0,message:"准备重构".into()}],
         }));
         let worker_progress = Arc::clone(&progress);
         let (sender, outcome) = mpsc::channel();
@@ -143,6 +148,11 @@ impl ReconstructionHandle {
 
 fn set_progress(progress: &Mutex<ReconstructionProgress>, status: &'static str, percent: u8, message: &str) {
     let mut state = progress.lock().expect("reconstruction progress mutex poisoned");
+    if state.status!=status||state.percent!=percent||state.message!=message {
+        let sequence=state.events.last().map(|event|event.sequence+1).unwrap_or(1);
+        state.events.push(ReconstructionEvent{sequence,timestamp:crate::timestamp(),status,percent,message:message.into()});
+        if state.events.len()>256{state.events.remove(0);}
+    }
     state.status = status;
     state.percent = percent;
     state.message = message.into();
@@ -1451,7 +1461,7 @@ mod tests {
             bytes.extend(image.pixels.iter().map(|v| (v / image.white * 255.0).clamp(0.0,255.0) as u8));
             write_bytes_durable(&out.join(format!("{name}.pgm")), &bytes).unwrap();
         }
-        let p = Mutex::new(ReconstructionProgress {status:"running",percent:0,message:String::new()});
+        let p = Mutex::new(ReconstructionProgress {status:"running",percent:0,message:String::new(),events:vec![]});
         let mut done = 0;
         let d = mean_reference(&scan,&manifest.references.pre_dark,&map,false,&p,&mut done).unwrap();
         let f = mean_reference(&scan,&manifest.references.pre_flat,&map,false,&p,&mut done).unwrap();
@@ -1563,7 +1573,7 @@ mod tests {
             .map(|v| (*v as f64).powi(2)).sum();
         assert!(initial_residual > 0.0);
         let progress = Mutex::new(ReconstructionProgress {
-            status: "running", percent: 0, message: String::new(),
+            status: "running", percent: 0, message: String::new(),events:vec![],
         });
         let (volume, _, _) = reconstruct_sirt(&frames, sod, sdd, width, 0.0, 0.0, &progress).unwrap();
         let mut final_residual = 0.0f64;

@@ -43,6 +43,11 @@ flowchart LR
   ui_shell -->|ui-contract| scene
   scene -->|design-token-contract| ui_shell
   ui_shell -->|platform-service| platform
+  ui_shell -->|independent-capture-preview| desktop_shell
+  desktop_shell -->|software-update-maintenance-authority| engine_core
+  ui_shell -->|signed-software-update-ipc| desktop_shell
+  release_artifacts -->|signed-release-manifest| desktop_shell
+  platform -->|signed-software-update-ipc| desktop_shell
 ```
 
 ## Modules
@@ -76,11 +81,11 @@ flowchart LR
 | `release-artifacts` | `desktop-shell` | embedded-release | strong | The portable executable contains the desktop host, frontend assets and verified engine payload. |
 | `desktop-shell` | `ui-shell` | embedded-assets | strong | Tauri embeds current frontend assets and shares its 1920x1080 design baseline; DPI-aware window limits and edge-to-edge client filling must stay aligned. |
 | `ui-shell` | `frontend-client` | consumes-contract | strong | UI actions and rendering depend on the client hook and complete engine snapshots. |
-| `frontend-client` | `frontend-contract` | consumes-contract | strong | Both adapters implement the snapshot contract, including nullable measured telemetry and on/off/unknown beamState; failed IPC invalidates displayed readings. |
+| `frontend-client` | `frontend-contract` | consumes-contract | strong | Both adapters implement the snapshot contract, including nullable measured telemetry, on/off/unknown beamState and engine-issued camera property/option support and effective write permissions; failed IPC invalidates displayed readings. |
 | `developer-preview` | `frontend-contract` | consumes-contract | strong | Preview output must stay structurally and semantically compatible with production snapshots. |
 | `frontend-client` | `desktop-shell` | ipc-command | strong | Tauri invoke command names and payload fields are string-based runtime contracts. |
 | `ui-shell` | `desktop-shell` | frame-preview-ipc | strong | The frame_preview command accepts a committed frame index and returns an embedded JPEG from the engine-registered, hash-verified NEF. |
-| `desktop-shell` | `device-camera` | live-view-binary-pipe | strong | An internal engine-issued user-ACL endpoint carries bounded JPEG envelopes; the desktop validates session/sequence/codec/dimensions and the renderer can supply only afterSeq. |
+| `desktop-shell` | `device-camera` | live-view-binary-pipe | strong | An internal engine-issued user-ACL endpoint carries bounded JPEG envelopes and a version-2 session/sequence delivery acknowledgement; the desktop retries transient instance gaps only within the existing deadline, validates session/sequence/codec/dimensions before acknowledging, and the renderer can supply only afterSeq. |
 | `ui-shell` | `platform` | camera-preset-native-dialog | strong | Camera presets import/export through native JSON dialogs; the domain validates the entire schema and active capabilities before persistence or explicit Apply. |
 | `ui-shell` | `desktop-shell` | reconstruction-preview-ipc | strong | The reconstruction_preview command accepts only a method ID and returns an engine-registered, hash-verified preview volume for a completed reconstruction. |
 | `desktop-shell` | `engine-core` | jsonl-protocol | strong | JSONL v2 validates request ID/sequence/session and returns complete snapshots plus operation records; Stop/state remain available during background device work and stale generations cannot commit. |
@@ -90,3 +95,8 @@ flowchart LR
 | `ui-shell` | `scene` | ui-contract | strong | The application supplies angleKnown, signed rotationDirection, task identity and feedback freshness; scene interpolation must never predict device motion or update scan state. |
 | `scene` | `ui-shell` | design-token-contract | medium | Scene colors and visibility semantics must follow the shared theme and safety state. |
 | `ui-shell` | `platform` | platform-service | medium | Directory selection and log export cross the browser-to-desktop boundary. |
+| `ui-shell` | `desktop-shell` | independent-capture-preview | strong | Capture-ID-only IPC resolves engine registration, rechecks byte bounds/hash and rejects stale descriptors without renderer paths. |
+| `desktop-shell` | `engine-core` | software-update-maintenance-authority | strong | Install/replace requires matching session/operation maintenanceLocked ready report with device cleanup and no transactions before EOF and owned-process exit zero. |
+| `ui-shell` | `desktop-shell` | signed-software-update-ipc | strong | Restricted update check/status/cancel/native-import/confirm actions share verified state and never accept renderer endpoints, keys or package paths. |
+| `release-artifacts` | `desktop-shell` | signed-release-manifest | strong | NSIS/MSI/portable assets and offline ZIP share version/target/kind/size/hash and data/global signature validation with a fixed public key. |
+| `platform` | `desktop-shell` | signed-software-update-ipc | strong | Platform updater functions bind check/status/cancel/native ZIP import/confirmed apply to restricted desktop IPC; browser preview cannot invoke installation. |

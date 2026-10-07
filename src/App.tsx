@@ -10,8 +10,20 @@ import { createPortal } from "react-dom";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { computeCanvasLayout, type CanvasLayout } from "./canvas-layout";
-import { DeviceConsole } from "./DeviceConsoles";
-import { manualControlReason } from "./engine/deviceControls";
+import { TurntableBenchDialog } from "./DeviceConsoles";
+import { CameraPanel } from "./CameraPanel";
+import { TurntablePanel } from "./TurntablePanel";
+import { CameraSettingsDialog } from "./CameraSettingsDialog";
+import { FailureBanner } from "./FailureBanner";
+import { TroubleshootingPane } from "./TroubleshootingPane";
+import { createPreparationRequestScope, runScanPreparationRequest, ScanPreparationDialog, type PreparationStage } from "./ScanPreparationDialog";
+import { TaskRecoveryDialog } from "./TaskRecoveryDialog";
+import { WorkstationMedia, type WorkstationMediaMode } from "./WorkstationMedia";
+import { ReconstructionConsole } from "./ReconstructionConsole";
+import { useCameraDraft, useDeviceActions } from "./camera-draft";
+import { UpdateDialog } from "./UpdateDialog";
+import { getApplicationVersion } from "./platform/updater";
+import { deriveFailureReport, deviceConnectionReason, manualControlReason } from "./engine/deviceControls";
 import { LineIcon, type LineIconName } from "./icons";
 import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } from "./scan-input";
 import { hasDeviceSessionEverEstablished, useEngine } from "./engine/useEngine";
@@ -22,7 +34,6 @@ import {
   revealDirectory,
 } from "./platform/desktopPaths";
 import {
-  DEFAULT_SCAN_SETUP,
   MENU_GROUPS,
   type MenuActionId,
   type MenuAvailability,
@@ -43,11 +54,20 @@ import type {
   ReconstructionMethodId,
   ScanPromptStage,
   WorkstationView,
+  IndependentCapturedImage,
+  CameraHealth,
+  ScanPreparation,
 } from "./engine/types";
 
 type Theme = "light" | "dark";
 type BottomTab = "aggregate" | "xray" | "nano" | "camera" | "images" | "reconstruction";
-type CenterView = "equipment" | "reconstruction";
+type CenterView = WorkstationMediaMode;
+
+/** The control dock is anchored 18px below the top of the live scene and expands to an
+ *  82px key row, so its lane ends at roughly 200 design px. The failure surface starts
+ *  below that lane, which keeps the safety Stop reachable while the notice is open; the
+ *  layer is portalled outside the canvas, so App scales the lane by the canvas zoom. */
+const FAILURE_TOP_LANE_DESIGN_PX = 208;
 
 const THEME_KEY = "micro-ct-workstation.theme";
 
@@ -172,7 +192,9 @@ function sessionLogText(ws: WorkstationView, adapterKind: "developer_preview" | 
 function MenuBar({
   availability,
   onAction,
+  version,
 }: {
+  version: string;
   availability: MenuAvailability;
   onAction: (id: MenuActionId) => void;
 }) {
@@ -237,7 +259,7 @@ function MenuBar({
       <div className="workstation-brand" data-tauri-drag-region>
         <img src="/assets/micro-ct-logo.png" alt="" draggable={false} />
         <strong>Micro-CT Workstation</strong>
-        <span>v0.8.2</span>
+        <span>{version}</span>
       </div>
       <nav className="sys-menu" aria-label="Application menu">
         {MENU_GROUPS.map((group) => {
@@ -275,7 +297,7 @@ function MenuBar({
                         }}
                       >
                         <LineIcon name={entry.icon} size={13} className="menu-dropdown__icon" />
-                        <span>{entry.label}</span>
+                        <span>{state.label || entry.label}</span>
                       </button>
                     );
                   })}
@@ -309,296 +331,6 @@ function MenuBar({
 
 /* ------------------------------------------------------------------ */
 /* Left column                                                         */
-/* ------------------------------------------------------------------ */
-
-function DevicePanel({
-  ws,
-  busy,
-  hardwareConnected,
-  desktopRuntime,
-  dispatch,
-  stale,
-  setupInvalid,
-  onDeviceControl,
-  taskLocked,
-}: {
-  ws: WorkstationView;
-  busy: boolean;
-  hardwareConnected: boolean;
-  desktopRuntime: boolean;
-  dispatch: (c: EngineCommand) => Promise<void>;
-  stale: boolean;
-  setupInvalid: boolean;
-  onDeviceControl: (device: "camera" | "turntable") => void;
-  taskLocked: boolean;
-}) {
-  const [pendingDevice, setPendingDevice] = useState<DeviceId | null>(null);
-  const setup = ws.scanSetup;
-  const setupComplete =
-    setup.taskId.trim().length > 0 &&
-    setup.savePath.trim().length > 0 &&
-    Number.isInteger(setup.projectionCount) &&
-    setup.projectionCount >= 1 &&
-    setup.projectionCount <= 3600 &&
-    Number.isFinite(setup.exposureMs) &&
-    setup.exposureMs >= ws.cameraExposure.minMs &&
-    setup.exposureMs <= ws.cameraExposure.maxMs &&
-    Number.isInteger(setup.maxXraySec) &&
-    setup.maxXraySec >= 1 &&
-    setup.maxXraySec <= 600 && !setupInvalid;
-  const runRetry = async (device: DeviceId): Promise<void> => {
-    if (device === "camera" || device === "turntable") { onDeviceControl(device); return; }
-    setPendingDevice(device);
-    try {
-      await dispatch({ type: "retry_device", device });
-    } finally {
-      setPendingDevice(null);
-    }
-  };
-
-  return (
-    <section className="panel device-panel">
-      <div className="panel__header">
-        <LineIcon name="link" size={15} className="panel__icon" />
-        <h2>Device Connection Status</h2>
-        <HelpTip text={`Preflight: ${ws.preflight.subline}`} />
-      </div>
-      <div className="device-list">
-        {ws.devices.map((device) => {
-          const retrying = pendingDevice === device.id;
-          const deviceIcon: LineIconName =
-            device.id === "xray" ? "radiation" : device.id === "camera" ? "camera" : "rotate";
-          return (
-            <div className="device-row" key={device.id}>
-              <div className="device-row__top">
-                <LineIcon name={deviceIcon} size={15} className="device-row__icon" />
-                <strong>{device.name}</strong>
-                <HelpTip text={stale ? "Device status unavailable" : device.spec} />
-                <span className={`device-row__word ${toneClass(stale ? "muted" : device.tone)}`}>{stale ? "UNKNOWN" : device.word}</span>
-                <button
-                  type="button"
-                  className="retry-btn"
-                  disabled={device.id === "xray" && (busy || pendingDevice !== null)}
-                  aria-busy={retrying}
-                  onClick={() => void runRetry(device.id as DeviceId)}
-                >
-                  {retrying ? "Connecting…" : device.id === "camera" || device.id === "turntable" ? "Controls" : "Connect"}
-                </button>
-                {device.id === "camera" && device.word === "ONLINE" && desktopRuntime ? (
-                  <button
-                    type="button"
-                    className="retry-btn"
-                    disabled={busy || pendingDevice !== null || stale}
-                    title="Capture one dark test frame into Save Path / Task ID / frames"
-                    onClick={() => void dispatch({ type: "camera_test_capture" })}
-                  >
-                    Test capture
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-      <div className="preflight-block">
-        <div className="preflight-block__top">
-          <button
-            type="button"
-            className="preflight-btn"
-            disabled={taskLocked || !setupComplete || busy || ws.dataState === "scanning" || ws.dataState === "paused"}
-            title={taskLocked ? "Use Devices → Camera or Turntable → confirmed Restore preflight for the retained task" : "Verify the configured scan"}
-            aria-busy={ws.preflight.tone === "running"}
-            onClick={() => void dispatch({ type: "preflight" })}
-          >
-            {ws.preflight.tone === "running" ? "Inspecting…" : "Run Preflight"}
-          </button>
-          <strong className={ws.preflight.tone === "pass" ? "tone-ok" : ws.preflight.tone === "fail" ? "tone-danger" : "tone-warn"}>
-            {ws.preflight.word}
-          </strong>
-        </div>
-        <div className={`preflight preflight--${ws.preflight.tone === "running" ? "pass" : ws.preflight.tone}`} role="progressbar" aria-valuenow={ws.preflight.percent} aria-valuemin={0} aria-valuemax={100}>
-          <span className="preflight__fill" style={{ width: `${ws.preflight.percent}%` }} />
-        </div>
-      </div>
-      <div className="device-online-summary">
-        <span>LINK SUMMARY</span>
-        <strong>{ws.onlineSummary}</strong>
-      </div>
-    </section>
-  );
-}
-
-function ScanParamsPanel({
-  ws,
-  busy,
-  desktopRuntime,
-  dispatch,
-  syncRevision,
-  onInvalidChange,
-  onValidationError,
-}: {
-  ws: WorkstationView;
-  busy: boolean;
-  desktopRuntime: boolean;
-  dispatch: (c: EngineCommand) => Promise<void>;
-  /** Bumped when a menu command changed the setup, so drafts refill from the engine. */
-  syncRevision: number;
-  onInvalidChange: (invalid: boolean) => void;
-  onValidationError: (message: string | null) => void;
-}) {
-  const setup = ws.scanSetup;
-  const locked = busy || ws.dataState === "scanning" || ws.dataState === "paused";
-  const defaultPathRequested = useRef(false);
-  const taskIdRef = useRef<HTMLInputElement | null>(null);
-  const [savePath, setSavePath] = useState("");
-  const [taskId, setTaskId] = useState("");
-  const [views, setViews] = useState("");
-  const [exposure, setExposure] = useState("");
-  const [maxXray, setMaxXray] = useState(() => secondsToMinutes(setup.maxXraySec || 600));
-  const [pathError, setPathError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!desktopRuntime || defaultPathRequested.current || savePath.trim()) return;
-    defaultPathRequested.current = true;
-    void resolveDefaultImageDirectory()
-      .then((path) => {
-        setSavePath(path);
-        setPathError(null);
-        return dispatch({ type: "update_scan_setup", setup: { savePath: path } });
-      })
-      .catch((reason: unknown) => {
-        setSavePath("");
-        setPathError(reason instanceof Error ? reason.message : String(reason));
-      });
-  }, [desktopRuntime, dispatch, savePath]);
-
-  const commitText = (field: "savePath" | "taskId", value: string): void => {
-    const trimmed = value.trim();
-    if (trimmed) void dispatch({ type: "update_scan_setup", setup: { [field]: trimmed } });
-  };
-
-  const commitNumber = (field: "projectionCount" | "exposureMs", value: string): void => {
-    const invalid = field === "projectionCount" ? projectionError(value)
-      : exposureError(value, ws.cameraExposure.minMs, ws.cameraExposure.maxMs);
-    if (invalid) return;
-    const parsed = Number(value);
-    void dispatch({ type: "update_scan_setup", setup: { [field]: parsed } });
-  };
-
-  const commitDuration = (): void => {
-    const seconds = minutesToSeconds(maxXray);
-    if (seconds !== null && seconds >= 1 && seconds <= 600) {
-      void dispatch({ type: "update_scan_setup", setup: { maxXraySec: seconds } });
-    }
-  };
-
-  const chooseDirectory = async (): Promise<void> => {
-    try {
-      const selected = await chooseImageDirectory(savePath);
-      if (!selected) return;
-      setSavePath(selected);
-      setPathError(null);
-      await dispatch({ type: "update_scan_setup", setup: { savePath: selected } });
-    } catch (reason: unknown) {
-      setPathError(reason instanceof Error ? reason.message : String(reason));
-    }
-  };
-
-  const viewsIssue = views === "" ? null : projectionError(views);
-  const exposureIssue = exposure === "" ? null : exposureError(exposure, ws.cameraExposure.minMs, ws.cameraExposure.maxMs);
-  const durationSeconds = minutesToSeconds(maxXray);
-  const durationIssue = maxXray !== "" && durationSeconds === null ? "Max X-ray time must be 0–10 min, positive and in whole-second increments." : null;
-  const viewsInvalid = Boolean(viewsIssue);
-  const exposureInvalid = Boolean(exposureIssue);
-  const durationInvalid = Boolean(durationIssue);
-  const invalidDraft = !taskId.trim() || !savePath.trim() || !views || !exposure || !maxXray || viewsInvalid || exposureInvalid || durationInvalid;
-  useEffect(() => { onInvalidChange(invalidDraft); }, [invalidDraft, onInvalidChange]);
-  useEffect(() => {
-    onValidationError([viewsIssue, exposureIssue, durationIssue].filter(Boolean).join(" ") || null);
-  }, [viewsIssue, exposureIssue, durationIssue, onValidationError]);
-
-  // New Scan Task / Reset Parameters go through the engine, so the drafts are
-  // refilled from the engine snapshot once the next poll lands.
-  useEffect(() => {
-    if (syncRevision === 0) return;
-    setTaskId(setup.taskId);
-    setSavePath(setup.savePath);
-    setViews(setup.projectionCount > 0 ? String(setup.projectionCount) : "");
-    setExposure(setup.exposureMs > 0 ? String(setup.exposureMs) : "");
-    setMaxXray(secondsToMinutes(setup.maxXraySec || 600));
-    taskIdRef.current?.focus();
-  }, [syncRevision]);
-
-  return (
-    <section className="panel scan-panel">
-      <div className="panel__header">
-        <LineIcon name="sliders" size={15} className="panel__icon" />
-        <h2>Scan Parameters</h2>
-        <span className="chip chip--accent">
-          {setup.projectionCount > 0 ? `${setup.projectionCount} PROJECTIONS` : "NOT CONFIGURED"}
-        </span>
-      </div>
-      <div className="param-stack">
-        <label className="param-field param-field--full">
-          <span>Task ID</span>
-          <input
-            ref={taskIdRef}
-            placeholder="Enter a task name"
-            value={taskId}
-            disabled={locked}
-            onChange={(event) => setTaskId(event.target.value)}
-            onBlur={() => commitText("taskId", taskId)}
-          />
-        </label>
-        <label className="param-field param-field--full">
-          <span>Save Path</span>
-          <div className={`path-control ${pathError ? "is-invalid" : ""}`}>
-            <input
-              value={savePath}
-              title={savePath}
-              disabled={locked}
-              aria-invalid={Boolean(pathError)}
-              placeholder={desktopRuntime ? "Windows image directory unavailable" : "Unavailable in developer preview"}
-              onChange={(event) => {
-                setSavePath(event.target.value);
-                setPathError(null);
-              }}
-              onBlur={() => commitText("savePath", savePath)}
-            />
-            <button
-              type="button"
-              className="folder-btn"
-              disabled={locked || !desktopRuntime}
-              title={desktopRuntime ? "Select image directory" : "Native directory selection is unavailable in developer preview"}
-              aria-label="Select image directory"
-              onClick={() => void chooseDirectory()}
-            >
-              <LineIcon name="folder" size={15} />
-            </button>
-          </div>
-          {pathError ? <small className="field-error">{pathError}</small> : null}
-        </label>
-        <div className="scan-input-grid">
-          <label className={`numeric-field ${viewsInvalid ? "is-invalid" : ""}`}>
-            <span>Total projections <HelpTip align="end" text="Any positive integer up to 3600. The engine calculates the angular step." /></span>
-            <input value={views} disabled={locked} inputMode="numeric" aria-label="Total projections" aria-invalid={viewsInvalid} onChange={(event) => setViews(event.target.value)} onBlur={() => commitNumber("projectionCount", views)} />
-          </label>
-          <label className={`numeric-field ${exposureInvalid ? "is-invalid" : ""}`}>
-            <span>Exposure · ms <HelpTip align="end" text={`${ws.cameraExposure.known ? "Connected camera" : "Nikon D7100 timed shutter"}: ${ws.cameraExposure.minMs}–${ws.cameraExposure.maxMs} ms. The value must match a supported camera shutter setting; unsupported values are rejected.`} /></span>
-            <input value={exposure} disabled={locked} inputMode="decimal" aria-label="Exposure in milliseconds" aria-invalid={exposureInvalid} onChange={(event) => setExposure(event.target.value)} onBlur={() => commitNumber("exposureMs", exposure)} />
-          </label>
-          <label className={`numeric-field ${durationInvalid ? "is-invalid" : ""}`}>
-            <span>Max X-ray · min <HelpTip align="end" text="Default 10 min. Maximum continuous output is limited to 10 min, followed by 5 min cooldown. Fractional minutes such as 0.5 are allowed." /></span>
-            <input value={maxXray} disabled={locked} inputMode="decimal" aria-label="Maximum X-ray time in minutes" aria-invalid={durationInvalid} onChange={(event) => setMaxXray(event.target.value)} onBlur={commitDuration} />
-          </label>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Center: live scene                                                  */
 /* ------------------------------------------------------------------ */
 
 function DockKey({
@@ -697,6 +429,7 @@ function offlineFeedback(): ConsoleFeedback {
  */
 const FIRST_START_SNAPSHOT_KEYS = [
   "engineSessionId", "snapshotSequence", "operationId", "operations", "deviceControls",
+  "cameraScanReadiness", "softwareUpdatePreparation", "cameraCaptureDescriptor",
   "mode", "modeLabel", "connectionState", "adapterLabel", "phase", "phaseLabel",
   "preflightPassed", "homed", "requiresPreflight", "requiresHome", "safety", "devices",
   "parameters", "progress", "imageCount", "logs", "lastError", "updatedAt",
@@ -792,6 +525,26 @@ function hasCompleteFirstStartConsoleLogs(logs: unknown): boolean {
 }
 
 function hasCompleteFirstStartSnapshot(snapshot: EngineSnapshot): boolean {
+  // A disconnected startup has no capture or maintenance transaction. The
+  // camera gate explicitly reports the missing session, never readiness.
+  if (snapshot.softwareUpdatePreparation !== null || snapshot.cameraCaptureDescriptor !== null
+    || !hasExactOwnKeys(snapshot.cameraScanReadiness, ["ready", "issues"])
+    || snapshot.cameraScanReadiness.ready !== false
+    || !hasExactArrayEntries(snapshot.cameraScanReadiness.issues)
+    || snapshot.cameraScanReadiness.issues.length !== 1) return false;
+  const sessionIssue = snapshot.cameraScanReadiness.issues[0];
+  if (!hasExactOwnKeys(sessionIssue, ["key", "actual", "requirement", "remedy"])
+    || sessionIssue.key !== "session" || sessionIssue.actual !== null
+    || !isString(sessionIssue.requirement) || !sessionIssue.requirement.trim()
+    || !isString(sessionIssue.remedy) || !sessionIssue.remedy.trim()
+    || snapshot.deviceControls?.camera?.lastCapturedImage != null) return false;
+  if (snapshot.deviceControls?.camera) {
+    const multiple = snapshot.deviceControls.camera.multipleExposureEvidence;
+    if (!hasExactOwnKeys(multiple, ["physicalApplicable", "observable", "status", "source", "reason"])
+      || multiple.physicalApplicable !== false || multiple.observable !== false
+      || multiple.status !== "unknown" || multiple.source !== "none"
+      || !(multiple.reason === null || isString(multiple.reason))) return false;
+  }
   if (!isString(snapshot.engineSessionId) || !snapshot.engineSessionId || !Number.isSafeInteger(snapshot.snapshotSequence)
     || snapshot.snapshotSequence < 0 || snapshot.operationId !== null || !Array.isArray(snapshot.operations)
     || snapshot.operations.length !== 0 || !snapshot.deviceControls
@@ -1517,7 +1270,7 @@ function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: 
   );
 }
 
-function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbackId, centerView, volume, previewError, volumeMode, volumeResetRevision, onVolumeAvailable }: { snapshot: EngineSnapshot; ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string; centerView: CenterView; volume: PreviewVolume | null; previewError: string | null; volumeMode: "mip" | "opacity"; volumeResetRevision: number; onVolumeAvailable: (available: boolean) => void }) {
+function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbackId, centerView, volume, previewError, volumeMode, volumeResetRevision, onVolumeAvailable, camera, photo, requestRevision, onCloseMedia, runDevice, pending }: { snapshot: EngineSnapshot; ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string; centerView: CenterView; volume: PreviewVolume | null; previewError: string | null; volumeMode: "mip" | "opacity"; volumeResetRevision: number; onVolumeAvailable: (available: boolean) => void; camera: CameraHealth | null; photo: IndependentCapturedImage | null; requestRevision: number; onCloseMedia: () => void; runDevice: (c: EngineCommand) => Promise<EngineSnapshot>; pending: boolean }) {
   const [viewPreset, setViewPreset] = useState<ViewPreset>("iso");
   const [presetRevision, setPresetRevision] = useState(0);
   const fallback = useSceneFallback();
@@ -1538,7 +1291,7 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
       <div className="scene-toolbar">
         <span className="chip chip--accent">3D RENDER</span>
         <LineIcon name="cube" size={15} className="panel__icon" />
-        <h2>{centerView === "equipment" ? "Equipment View" : "Reconstruction Preview"}</h2>
+        <h2>{centerView === "equipment" ? "Equipment View" : centerView === "photo" ? "Independent Photo" : centerView === "live" ? "Live View" : "Reconstruction Preview"}</h2>
         <HelpTip text={centerView === "equipment" ? `Read-only geometry view. ${setupInvalid ? "Complete valid scan parameters first." : ws.dock.playReason || "Ready for the next operation."}` : "Three linked slices and a rotatable volume from the saved reconstruction."} />
         <span className="menu-spacer" />
         {centerView === "equipment" && (["iso", "front", "top"] as const).map((preset) => (
@@ -1576,6 +1329,8 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
             {stale ? "Control service unavailable · readings are unknown" : ws.safetyBar.text}
           </span>
         </div>
+        </>}
+        <WorkstationMedia mode={centerView} camera={camera} photo={photo} requestRevision={requestRevision} onClose={onCloseMedia} run={runDevice} controlReason={manualControlReason(snapshot, stale) || (pending ? "Operation pending" : null)} readReason={deviceConnectionReason(snapshot, stale) || (pending ? "Operation pending" : null)} />
         <ControlDock
           snapshot={snapshot}
           ws={ws}
@@ -1583,7 +1338,6 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
           stale={stale}
           setupInvalid={setupInvalid}
         />
-        </>}
       </div>
     </section>
   );
@@ -1631,7 +1385,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
               : "Released by operator · confirm both setpoints before standalone Xray Enable";
 
   return (
-    <section className="panel xray-panel">
+    <section className="panel xray-panel" id="xray-panel">
       <div className="panel__header">
         <LineIcon name="radiation" size={15} className="panel__icon" />
         <h2>12 Watt Controller</h2>
@@ -1829,17 +1583,6 @@ function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws:
           <span style={{ width: `${ws.progress.percent}%` }} />
         </div>
       </div>
-      <div className="op-summary">
-        <span className="op-summary__title">PROCESS SUMMARY</span>
-        <div>
-          <span>Acquisition</span>
-          <strong>{ws.summary.acquisition}</strong>
-        </div>
-        <div>
-          <span>Output</span>
-          <strong title={ws.summary.output}>{stale ? "UNKNOWN · service unavailable" : ws.summary.output}</strong>
-        </div>
-      </div>
     </section>
   );
 }
@@ -1923,7 +1666,6 @@ function FrameThumbnail({ frame, production }: { frame: ConsoleFrame; production
   </div>;
 }
 
-type ReconstructionEvent = { key: string; time: string; level: "INFO" | "ERR"; message: string };
 
 function reconstructionMessageEn(message: string, status: WorkstationView["reconstruction"]["status"]): string {
   const known: Record<string, string> = {
@@ -1943,119 +1685,8 @@ function reconstructionMessageEn(message: string, status: WorkstationView["recon
   return message;
 }
 
-function ReconstructionConsole({ ws, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, follow, onFollow, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction }: { ws: WorkstationView; centerView: CenterView; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; follow: boolean; onFollow: (value: boolean) => void; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId) => void }) {
-  const reconstruction = ws.reconstruction;
-  const [method, setMethod] = useState<ReconstructionMethodId>("fdk");
-  const [changingMethod, setChangingMethod] = useState(false);
-  const [showError, setShowError] = useState(false);
-  const [events, setEvents] = useState<ReconstructionEvent[]>([]);
-  const lastEvent = useRef("");
-  const eventSequence = useRef(0);
-  const eventList = useRef<HTMLDivElement>(null);
-  const running = reconstruction.status === "running";
-  const completed = reconstruction.status === "completed";
-  const failed = reconstruction.status === "failed";
-  const canChooseMethod = reconstruction.unlocked && !running && (!completed || changingMethod);
-  const selectedMethod = reconstruction.methods.find(entry => entry.id === method);
-  const canStart = canChooseMethod && selectedMethod?.enabled === true && !busy && !stale;
-  const showVolumeControls = completed && centerView === "reconstruction" && volumeReady && volume3DAvailable;
-  const percent = completed ? 100 : Math.max(0, Math.min(100, reconstruction.percent));
-  const captured = reconstruction.unlocked ? ws.scanSetup.projectionCount : ws.progress.captured;
+function BottomConsole({ tab, onTab, ws, production, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction }: { tab: BottomTab; onTab: (tab: BottomTab) => void; ws: WorkstationView; production: boolean; centerView: CenterView; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId) => void }) {
 
-  useEffect(() => {
-    if (reconstruction.selectedMethod) setMethod(reconstruction.selectedMethod);
-    if (reconstruction.status !== "completed") setChangingMethod(false);
-  }, [reconstruction.selectedMethod, reconstruction.status]);
-  // This list records snapshot changes observed by this UI session; the engine remains authoritative.
-  useEffect(() => {
-    const key = `${ws.scanSetup.taskId}|${reconstruction.unlocked}|${reconstruction.status}|${reconstruction.message}`;
-    if (lastEvent.current === key) return;
-    lastEvent.current = key;
-    if (!reconstruction.unlocked && reconstruction.status === "idle") { setEvents([]); return; }
-    const message = reconstruction.message ? reconstructionMessageEn(reconstruction.message, reconstruction.status)
-      : failed ? "Reconstruction failed" : completed ? "Result cached"
-      : running ? "Computing volume" : "Scan dataset sealed; select a method";
-    const now = new Date();
-    const time = `${now.toLocaleTimeString("en-GB", { hour12: false })}.${String(now.getMilliseconds()).padStart(3, "0")}`;
-    const event: ReconstructionEvent = { key: `${key}|${++eventSequence.current}`, time, level: failed ? "ERR" : "INFO", message };
-    setEvents(previous => [...previous, event].slice(-40));
-  }, [ws.scanSetup.taskId, reconstruction.unlocked, reconstruction.status, reconstruction.message, failed, completed, running]);
-  useEffect(() => { if (follow && eventList.current) eventList.current.scrollTop = eventList.current.scrollHeight; }, [events, follow]);
-
-  const currentStatus = failed ? "Reconstruction failed" : running ? `Reconstructing · ${percent}%`
-    : completed ? centerView === "reconstruction" ? "Viewing result" : "Complete · Result cached"
-    : reconstruction.unlocked ? "Ready to reconstruct"
-    : ws.dataState === "scanning" || ws.dataState === "paused" ? "Scan in progress" : "Awaiting scan";
-  const dataset = reconstruction.unlocked ? `${ws.scanSetup.projectionCount} projections · Sealed`
-    : captured > 0 ? `${captured} / ${ws.scanSetup.projectionCount} projections captured` : "No sealed dataset";
-  const compute = !reconstruction.unlocked ? "Available after scan sealing"
-    : method === "sirt" ? "SIRT · CPU"
-    : "Auto · GPU only if at least 15% faster";
-  const primaryLabel = !reconstruction.unlocked ? "Available after scan"
-    : changingMethod ? "Start Reconstruction"
-    : running ? "Reconstructing…"
-    : completed ? "Reconstruction Complete"
-    : failed ? "Retry Reconstruction" : "Start Reconstruction";
-  const primaryDisabled = !reconstruction.unlocked || stale || busy || running || (completed && !changingMethod) || !canStart;
-  const start = () => { setChangingMethod(false); setShowError(false); onStartReconstruction(method); };
-  const activatePrimary = () => {
-    start();
-  };
-
-  return <div className="recon-workspace">
-    <section className="recon-workspace__control" aria-label="Reconstruction controls">
-      <div className="recon-workspace__status"><span>CURRENT STATUS</span><strong className={failed ? "recon-workspace__error" : ""}>{currentStatus}</strong></div>
-      <div className="recon-workspace__facts">
-        <div><span>DATASET</span><strong>{dataset}</strong></div>
-        <div><span>REFERENCES</span><strong>Dark {ws.scanFlow.references.preDark} · Flat {ws.scanFlow.references.preFlat}</strong></div>
-        <div><span>COMPUTE</span><strong title={compute}>{compute}</strong></div>
-      </div>
-      <div className="recon-workspace__method-title">METHOD</div>
-      <div className="recon-workspace__methods" role="radiogroup" aria-label="Reconstruction method" tabIndex={0}>
-        {reconstruction.methods.map(entry => {
-          const enabled = canChooseMethod && entry.enabled && !busy && !stale;
-          const selected = method === entry.id;
-          const hint = entry.id === "cgls" ? "Backend unavailable"
-            : !reconstruction.unlocked ? "Available after scan"
-            : ws.scanSetup.projectionCount < 3 ? "At least 3 projections required"
-            : !entry.enabled ? "Runtime limit" : entry.id === "fdk" ? "Recommended" : "";
-          return <button key={entry.id} type="button" role="radio" aria-checked={selected} disabled={!enabled} className={`recon-workspace__method${selected ? " is-selected" : ""}${selected && reconstruction.unlocked ? " is-active" : ""}`} title={hint || entry.label} onClick={() => setMethod(entry.id)}>
-            <span className="recon-workspace__radio" aria-hidden="true" /><strong>{entry.label}</strong><small>{hint}</small>
-          </button>;
-        })}
-      </div>
-      <div className={`recon-workspace__progress${running ? " is-running" : completed ? " is-complete" : failed ? " is-failed" : ""}`} role="progressbar" aria-label="Reconstruction progress" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
-        <span className="recon-workspace__progress-track"><i style={{ width: `${percent}%` }} /></span><strong>{running ? `${percent}%` : completed ? "100% · Cached" : failed ? `Stopped at ${percent}%` : "0% · Waiting"}</strong>
-      </div>
-      <div className="recon-workspace__view-controls" role="group" aria-label="3D display mode">
-        <button type="button" aria-pressed={centerView === "equipment"} onClick={onShowEquipment}>Equipment</button>
-        <button type="button" disabled={!completed} aria-pressed={centerView === "reconstruction"} onClick={onOpenReconstruction}>Result</button>
-        <button type="button" disabled={!showVolumeControls} aria-pressed={showVolumeControls && volumeMode === "mip"} onClick={() => onVolumeMode("mip")}>MIP</button>
-        <button type="button" disabled={!showVolumeControls} aria-pressed={showVolumeControls && volumeMode === "opacity"} onClick={() => onVolumeMode("opacity")}>Opacity</button>
-        <button type="button" disabled={!showVolumeControls} onClick={onResetVolume}>Reset View</button>
-      </div>
-      <div className="recon-workspace__actions">
-        <button type="button" className="recon-workspace__primary" disabled={primaryDisabled} onClick={activatePrimary}>{primaryLabel}</button>
-        <button type="button" className="recon-workspace__secondary" disabled={(!completed && !failed) || busy || stale} onClick={() => {
-          if (failed) setShowError(value => !value);
-          else if (changingMethod) { setChangingMethod(false); setMethod(reconstruction.selectedMethod || "fdk"); }
-          else setChangingMethod(true);
-        }}>{failed ? "Error Details" : changingMethod ? "Cancel Change" : "Change Method"}</button>
-      </div>
-    </section>
-    <section className="recon-workspace__events" aria-label="Reconstruction events">
-      <header><span title="Status changes observed in this UI session">RECONSTRUCTION EVENTS</span><button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => onFollow(!follow)}>{follow ? "Following latest" : "Resume follow"}</button></header>
-      <div className="recon-workspace__event-list" ref={eventList} onScroll={event => { const node = event.currentTarget; onFollow(node.scrollHeight - node.scrollTop - node.clientHeight < 8); }}>
-        {events.length === 0 ? <p className="recon-workspace__empty">No reconstruction events yet</p> : events.map(event => <div className={`recon-workspace__event${event.level === "ERR" ? " is-error" : ""}`} key={event.key}><time>[{event.time}]</time><span>{event.level} · recon</span><strong>{event.message}</strong></div>)}
-        {running && <p className="recon-workspace__note">The first calculation may take longer. Later openings use the cache.</p>}
-        {showError && failed && <p className="recon-workspace__error-detail" role="alert">{reconstructionMessageEn(reconstruction.message || "Reconstruction failed; check the scan data and compute environment", "failed")}</p>}
-      </div>
-    </section>
-  </div>;
-}
-
-function BottomConsole({ ws, production, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction }: { ws: WorkstationView; production: boolean; centerView: CenterView; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId) => void }) {
-  const [tab, setTab] = useState<BottomTab>("aggregate");
   const [follow, setFollow] = useState(true);
   const logs = ws.consoleLogs;
   const frames = useMemo(() => [...ws.frames].sort((a, b) => a.index - b.index), [ws.frames]);
@@ -2078,12 +1709,12 @@ function BottomConsole({ ws, production, centerView, volumeReady, volume3DAvaila
 
   return <section className="console">
     <div className="console__tabs" role="tablist" aria-label="Logs and image preview">
-      {bottomTabs.map(item => <button key={item.id} type="button" role="tab" aria-selected={tab === item.id} className="console__tab" onClick={() => setTab(item.id)}>
+      {bottomTabs.map(item => <button key={item.id} type="button" role="tab" aria-selected={tab === item.id} className="console__tab" onClick={() => onTab(item.id)}>
         <LineIcon name={item.icon} size={13} className="console__tab-icon" /><em>{item.label}</em><span>{counts[item.id]}</span>
       </button>)}
     </div>
     <div className="console__body" role="tabpanel">
-      <div className="recon-workspace-mount" hidden={tab !== "reconstruction"}><ReconstructionConsole ws={ws} centerView={centerView} volumeReady={volumeReady} volume3DAvailable={volume3DAvailable} busy={busy} stale={stale} volumeMode={volumeMode} follow={follow} onFollow={setFollow} onVolumeMode={onVolumeMode} onResetVolume={onResetVolume} onOpenReconstruction={onOpenReconstruction} onShowEquipment={onShowEquipment} onStartReconstruction={onStartReconstruction} /></div>
+      <div className="recon-workspace-mount" hidden={tab !== "reconstruction"}><ReconstructionConsole ws={ws} centerView={centerView} volumeReady={volumeReady} volume3DAvailable={volume3DAvailable} busy={busy} stale={stale} volumeMode={volumeMode} onVolumeMode={onVolumeMode} onResetVolume={onResetVolume} onOpenReconstruction={onOpenReconstruction} onShowEquipment={onShowEquipment} onStartReconstruction={onStartReconstruction} /></div>
       {tab !== "reconstruction" && <>
         <div className="console__head"><span>{header}</span>{tab !== "images" && <button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => setFollow(!follow)}>{follow ? "Following latest" : "Resume live log"}</button>}</div>
         {tab === "images" ? <div className="image-strip">
@@ -2099,11 +1730,12 @@ function BottomConsole({ ws, production, centerView, volumeReady, volume3DAvaila
 /* Menu dialogs (overlay on the fixed design canvas, layout unchanged) */
 /* ------------------------------------------------------------------ */
 
-type DialogKind = "guide" | "safety" | "about" | "preferences" | "diagnostics";
+type DialogKind = "guide" | "safety" | "troubleshooting" | "about" | "preferences" | "diagnostics";
 
 const DIALOG_TITLES: Record<DialogKind, string> = {
   guide: "User Guide",
   safety: "Safety Notes",
+  troubleshooting: "Troubleshooting",
   about: "About Micro-CT Workstation",
   preferences: "Preferences",
   diagnostics: "Device Diagnostics",
@@ -2112,27 +1744,32 @@ const DIALOG_TITLES: Record<DialogKind, string> = {
 const DIALOG_ICONS: Record<DialogKind, LineIconName> = {
   guide: "book",
   safety: "warning",
+  troubleshooting: "pulse",
   about: "info",
   preferences: "sliders",
   diagnostics: "pulse",
 };
 
-const APP_VERSION = "0.8.2";
+
 
 function InfoDialog({
   kind,
+  version,
   ws,
   snapshot,
   adapterKind,
   theme,
+  troubleshootingGroup,
   onTheme,
   onClose,
 }: {
   kind: DialogKind;
-  ws: WorkstationView;
-  snapshot: EngineSnapshot;
+  version: string;
+  ws: WorkstationView | null;
+  snapshot: EngineSnapshot | null;
   adapterKind: "developer_preview" | "tauri";
   theme: Theme;
+  troubleshootingGroup?: string;
   onTheme: (theme: Theme) => void;
   onClose: () => void;
 }) {
@@ -2140,31 +1777,14 @@ function InfoDialog({
   if (kind === "guide") {
     body = (
       <ol className="modal-list">
-        <li>
-          <strong>Configure the scan.</strong> Task ID, Save Path, Total Projections, Exposure and Max X-ray
-          (minutes, default 10) must be valid. Projections accept 1–3600; exposure follows the camera's timed shutter limits.
-        </li>
-        <li>
-          <strong>Run preflight</strong> (Tools → Run Preflight). Eight checks run over the link; the engine
-          rejects exposure until they pass.
-        </li>
-        <li>
-          <strong>Establish a turntable reference.</strong> Run HOME once. Later scans in the same valid Nano
-          session may reuse it after live STATUS and Preflight confirm the controller is idle and referenced.
-        </li>
-        <li>
-          <strong>Start the scan.</strong> Pause takes effect after a safe projection boundary, Resume continues,
-          and Stop ends the active scan while retaining committed images.
-        </li>
-        <li>
-          <strong>After Stop</strong> run Preflight and HOME again before starting a new scan.
-        </li>
-        <li>
-          <strong>Continue an unfinished scan.</strong> Keep the same task ID, save path, projection count,
-          exposure and X-ray setpoints. Run Preflight; HOME is needed if Nano reports an invalid reference.
-          Restore verifies the manifest and each saved image. Start continues at the next missing
-          view without replacing previously committed images.
-        </li>
+        <li><strong>Connect each device independently.</strong> Use its permanent panel. Choose the camera explicitly; read actual parameters and set the common image root.</li>
+        <li><strong>Apply camera targets explicitly.</strong> Basic and Advanced Settings share one draft. Apply and verify finishes only after its engine operation and readback.</li>
+        <li><strong>Independent photo / Live View.</strong> Neither starts X-ray output. Stop Live View explicitly before a photo. Confirmed photos stay visible until Close; preview errors do not delete the saved NEF.</li>
+        <li><strong>Prepare a fixed scan.</strong> Task → Scan Preparation / Preflight opens task ID, projection count, continuous-output limit and all geometry in one window. Resolve every fixed-configuration issue and rerun preflight.</li>
+        <li><strong>Acquire.</strong> Establish the required HOME reference, follow dark/flat and sample confirmations, then Start. Pause commits a safe boundary; Stop waits for confirmed cleanup.</li>
+        <li><strong>Recover or abandon.</strong> Task → Restore uses frozen settings and verified retained files. Explicit abandonment preserves every file and unlocks only after cleanup confirmation.</li>
+        <li><strong>Reconstruct and view.</strong> Reconstruction remains in the bottom tab. Equipment/Result only change display; a result appears after validated data loading.</li>
+        <li><strong>Update.</strong> Help → Check Update or Import Signed Offline Update verifies packages. Installation requires separate confirmation and an engine-issued maintenance-ready state.</li>
       </ol>
     );
   } else if (kind === "safety") {
@@ -2183,8 +1803,8 @@ function InfoDialog({
           projections, exposure or Max X-ray resets preflight; a still valid Nano reference is checked again.
         </li>
         <li>
-          <strong>{snapshot.mode === "developer_preview" ? "This preview drives no hardware." : "Native device controls are an offline candidate pending hardware acceptance."}</strong>{" "}
-          {snapshot.modeLabel}. Independent camera and turntable controls never enable X-ray output. Unknown readback is not OFF; complete acquisition requires engine preflight and verified device evidence.
+          <strong>{snapshot?.mode === "developer_preview" ? "This preview drives no hardware." : "Native device controls are an offline candidate pending hardware acceptance."}</strong>{" "}
+          {snapshot?.modeLabel || "Control service unavailable"}. Independent camera and turntable controls never enable X-ray output. Unknown readback is not OFF; complete acquisition requires engine preflight and verified device evidence.
         </li>
       </ul>
     );
@@ -2197,11 +1817,11 @@ function InfoDialog({
         </div>
         <div>
           <dt>Version</dt>
-          <dd>{APP_VERSION}</dd>
+          <dd>{version}</dd>
         </div>
         <div>
           <dt>Engine</dt>
-          <dd>{snapshot.modeLabel}</dd>
+          <dd>{snapshot?.modeLabel || "Control service unavailable"}</dd>
         </div>
         <div>
           <dt>Control chain</dt>
@@ -2213,11 +1833,11 @@ function InfoDialog({
         </div>
         <div>
           <dt>Connection</dt>
-          <dd>{snapshot.connectionState.toUpperCase()}</dd>
+          <dd>{snapshot?.connectionState.toUpperCase() || "UNKNOWN"}</dd>
         </div>
         <div>
           <dt>Devices</dt>
-          <dd>{ws.onlineSummary}</dd>
+          <dd>{ws?.onlineSummary || "UNKNOWN"}</dd>
         </div>
       </dl>
     );
@@ -2247,7 +1867,7 @@ function InfoDialog({
           </div>
           <div>
             <dt>Canvas</dt>
-            <dd>Fixed 1920 × 1080 design canvas, scaled as one unit</dd>
+            <dd>1920 × 1080 design baseline; fills the actual client with one control scale</dd>
           </div>
           <div>
             <dt>Safety model</dt>
@@ -2256,14 +1876,16 @@ function InfoDialog({
         </dl>
       </div>
     );
+  } else if (kind === "troubleshooting") {
+    body = <TroubleshootingPane snapshot={snapshot} initialGroup={troubleshootingGroup} />;
   } else {
     body = (
       <div className="modal-stack">
         <p className="modal-note">
-          Reconnect requested for every device; the engine reports the result in the log stream below.
+          Read-only device and operation evidence. Opening this dialog does not reconnect devices.
         </p>
         <dl className="modal-facts">
-          {ws.devices.map((device) => (
+          {ws?.devices.map((device) => (
             <div key={device.id}>
               <dt>{device.name}</dt>
               <dd>
@@ -2273,7 +1895,7 @@ function InfoDialog({
           ))}
           <div>
             <dt>Link summary</dt>
-            <dd>{ws.onlineSummary}</dd>
+            <dd>{ws?.onlineSummary || "UNKNOWN"}</dd>
           </div>
         </dl>
       </div>
@@ -2391,375 +2013,187 @@ function ScanStageDialog({ stage, recorded, beamState, busy, onConfirm, onCancel
 
 export function App() {
   const { adapterKind, snapshot, busy, error, transportError, dispatch: engineDispatch } = useEngine();
+  const actions = useDeviceActions(snapshot, engineDispatch);
+  const model = useCameraDraft(snapshot);
   const dispatch = useCallback(async (command: EngineCommand): Promise<void> => { await engineDispatch(command); }, [engineDispatch]);
-  const [deviceConsole, setDeviceConsole] = useState<"camera" | "turntable" | null>(null);
   const [theme, setTheme] = useTheme();
+  const [version, setVersion] = useState("Version unavailable");
   const [dialog, setDialog] = useState<DialogKind | null>(null);
+  const [auxiliary, updateAuxiliary] = useState<"camera" | "bench" | "prepare" | "recovery" | null>(null);
+  const preparationScope = useRef(createPreparationRequestScope());
+  const [preparationStage, setPreparationStage] = useState<PreparationStage>(null);
+  const auxiliaryCurrent = useRef(auxiliary); auxiliaryCurrent.current = auxiliary;
+  const setAuxiliary = (next: typeof auxiliary, expectedRevision?: number) => {
+    if (!preparationScope.current.replace(expectedRevision)) return;
+    auxiliaryCurrent.current = next;
+    updateAuxiliary(next);
+  };
+  const auxiliaryRevision = preparationScope.current.revision;
+  const [update, setUpdate] = useState<"check" | "import" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [troubleshootingGroup, setTroubleshootingGroup] = useState<string | undefined>(undefined);
+  // Dismissal is keyed, never a state wipe: the 400 ms poll cannot re-open a hidden
+  // notice, while a new attempt or a new operation produces a new key and re-arms it.
+  const [dismissedFailures, setDismissedFailures] = useState<ReadonlySet<string>>(() => new Set());
   const [centerView, setCenterView] = useState<CenterView>("equipment");
+  const [photo, setPhoto] = useState<IndependentCapturedImage | null>(null);
+  const [bottomTab, setBottomTab] = useState<BottomTab>("aggregate");
   const [volumeMode, setVolumeMode] = useState<"mip" | "opacity">("mip");
   const [volumeResetRevision, setVolumeResetRevision] = useState(0);
   const [volume3DAvailable, setVolume3DAvailable] = useState(false);
   const [previewData, setPreviewData] = useState<{ key: string; volume: PreviewVolume } | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewRetry, setPreviewRetry] = useState(0);
-  const [setupDraftInvalid, setSetupDraftInvalid] = useState(true);
-  const [setupDraftError, setSetupDraftError] = useState<string | null>(null);
-  const [canvasLayout, setCanvasLayout] = useState<CanvasLayout>(() =>
-    computeCanvasLayout(window.innerWidth, window.innerHeight),
+  const [preparationRevision, setPreparationRevision] = useState(0);
+  const [requestRevision, setRequestRevision] = useState(0);
+  const presentation = useRef(0);
+  const latest = useRef(snapshot); latest.current = snapshot;
+  const [canvasLayout, setCanvasLayout] = useState<CanvasLayout>(() => computeCanvasLayout(window.innerWidth, window.innerHeight));
+  const ws = snapshot?.workstation;
+  const stale = Boolean(transportError);
+  const failure = useMemo(
+    () => deriveFailureReport(snapshot, error, actionError, actions.errorAttempt),
+    [snapshot, error, actionError, actions.errorAttempt],
   );
-  const ws: WorkstationView | undefined = snapshot?.workstation;
-  const previewKey = ws?.reconstruction.status === "completed" && ws.reconstruction.cachePath && ws.reconstruction.selectedMethod
-    ? `${ws.reconstruction.selectedMethod}|${ws.reconstruction.cachePath}` : null;
-  const activeVolume = previewKey && previewData?.key === previewKey ? previewData.volume : null;
-  const [setupSync, setSetupSync] = useState(0);
-  const setupPendingSync = useRef(false);
-  const setupSignature = ws
-    ? [ws.scanSetup.taskId, ws.scanSetup.savePath, ws.scanSetup.projectionCount,
-       ws.scanSetup.exposureMs, ws.scanSetup.maxXraySec].join("|")
-    : "";
-  const lastSetupSignature = useRef(setupSignature);
-
-  // Menu commands mutate the setup through the engine; refill the panel drafts
-  // only once the engine snapshot actually changed.
-  useEffect(() => {
-    if (setupSignature === lastSetupSignature.current) return;
-    lastSetupSignature.current = setupSignature;
-    if (!setupPendingSync.current && ws?.scanSetup.exposureMs === lastExposure.current) return;
-    lastExposure.current = ws?.scanSetup.exposureMs;
-    setupPendingSync.current = false;
-    setSetupSync((value) => value + 1);
-  }, [setupSignature]);
-  const lastExposure = useRef(ws?.scanSetup.exposureMs);
-
-  useEffect(() => {
-    const updateCanvasLayout = (): void => {
-      setCanvasLayout(computeCanvasLayout(window.innerWidth, window.innerHeight));
-    };
-    updateCanvasLayout();
-    window.addEventListener("resize", updateCanvasLayout);
-    return () => window.removeEventListener("resize", updateCanvasLayout);
+  const visibleFailure = failure && !dismissedFailures.has(failure.key) ? failure : null;
+  const dismissFailure = useCallback((key: string) => {
+    setDismissedFailures(previous => { const next = new Set(previous); next.add(key); return next; });
+    setActionError(null);
   }, []);
-
+  const openTroubleshooting = useCallback((group: string) => { setTroubleshootingGroup(group); setDialog("troubleshooting"); }, []);
+  const pending = busy || actions.pending || preparationStage !== null;
+  const preparationContext = useRef<{ engineSessionId: string; taskId: string } | null>(null);
+  preparationContext.current = snapshot && ws && !stale ? { engineSessionId: snapshot.engineSessionId, taskId: ws.scanSetup.taskId } : null;
+  const previewKey = ws?.reconstruction.status === "completed" && ws.reconstruction.cachePath && ws.reconstruction.selectedMethod ? `${ws.reconstruction.selectedMethod}|${ws.reconstruction.cachePath}` : null;
+  const activeVolume = previewKey && previewData?.key === previewKey ? previewData.volume : null;
+  const setupInvalid = model.dirty || !snapshot?.cameraScanReadiness?.ready;
+  const navigate = (view: CenterView) => { presentation.current += 1; setRequestRevision(presentation.current); setCenterView(view); };
+  useEffect(() => { let active = true; void getApplicationVersion().then(value => { if (active) setVersion(value); }).catch(() => {}); return () => { active = false; }; }, []);
+  useEffect(() => { const resize = () => setCanvasLayout(computeCanvasLayout(window.innerWidth, window.innerHeight)); resize(); window.addEventListener("resize", resize); return () => window.removeEventListener("resize", resize); }, []);
+  useEffect(() => { if (ws) document.documentElement.dataset.state = ws.dataState; }, [ws?.dataState]);
+  const context = `${snapshot?.engineSessionId || "none"}/${ws?.scanSetup.taskId || "none"}`;
+  const previousContext = useRef(context);
+  const previousPreparationContext = useRef(preparationContext.current);
   useEffect(() => {
-    if (ws) document.documentElement.dataset.state = ws.dataState;
-  }, [ws]);
-
+    if (previousContext.current === context) return;
+    const previous = previousPreparationContext.current;
+    previousPreparationContext.current = preparationContext.current;
+    previousContext.current = context; navigate("equipment"); setPhoto(null);
+    if (preparationScope.current.acceptsTaskTransition(previous, preparationContext.current)) return;
+    if (preparationScope.current.acceptsContext(preparationContext.current)) return;
+    preparationScope.current.invalidate(); setPreparationStage(null); setAuxiliary(null);
+  }, [context]);
   useEffect(() => {
-    if (ws && !ws.reconstruction.unlocked) {
-      setCenterView("equipment");
-    }
-  }, [ws?.reconstruction.unlocked]);
-
+    if (!stale) return;
+    preparationScope.current.invalidate(); setPreparationStage(null); setAuxiliary(null);
+  }, [stale]);
+  useEffect(() => () => { preparationScope.current.invalidate(); }, []);
+  useEffect(() => {
+    if (centerView === "live" && (!snapshot?.deviceControls.camera?.liveView.active || !snapshot.deviceControls.camera.connected || snapshot.deviceControls.camera.isolated || !snapshot.deviceControls.camera.cleanupConfirmed || stale)) navigate("equipment");
+  }, [snapshot?.deviceControls.camera?.liveView.active, snapshot?.deviceControls.camera?.connected, snapshot?.deviceControls.camera?.isolated, snapshot?.deviceControls.camera?.cleanupConfirmed, stale]);
   useEffect(() => {
     if (!previewKey || adapterKind !== "tauri" || previewData?.key === previewKey) return;
-    let active = true;
-    setPreviewError(null);
+    let active = true; const revision = presentation.current; setPreviewError(null);
     void invoke<PreviewVolume>("reconstruction_preview", { method: ws?.reconstruction.selectedMethod }).then(data => {
       if (!active) return;
-      const [z, y, x] = data.shape ?? [];
-      if (![z, y, x].every(value => Number.isSafeInteger(value) && value > 0 && value <= 256)
-        || z * y * x > 256 ** 3 || !Array.isArray(data.voxels) || data.voxels.length !== z * y * x
-        || !Array.isArray(data.spacingMm) || data.spacingMm.length !== 3 || data.spacingMm.some(value => !Number.isFinite(value) || value <= 0)
-        || !Number.isFinite(data.windowMin) || !Number.isFinite(data.windowMax) || data.windowMax <= data.windowMin
-        || data.voxels.some(value => !Number.isInteger(value) || value < 0 || value > 255)) throw new Error("Invalid preview volume data");
+      const [z,y,x] = data.shape ?? [];
+      if (![z,y,x].every(value => Number.isSafeInteger(value) && value > 0 && value <= 256) || z*y*x > 256 ** 3 || !Array.isArray(data.voxels) || data.voxels.length !== z*y*x || !Array.isArray(data.spacingMm) || data.spacingMm.length !== 3 || data.spacingMm.some(value => !Number.isFinite(value) || value <= 0) || !Number.isFinite(data.windowMin) || !Number.isFinite(data.windowMax) || data.windowMax <= data.windowMin || data.voxels.some(value => !Number.isInteger(value) || value < 0 || value > 255)) throw new Error("Invalid preview volume data");
       setPreviewData({ key: previewKey, volume: data });
-      setCenterView("reconstruction");
-    }).catch(reason => {
-      if (active) {
-        const message = reason instanceof Error ? reason.message : String(reason);
-        setPreviewError(message);
-        setActionError(`Reconstruction preview: ${message}. Use Result to retry loading.`);
-      }
-    });
+      if (revision === presentation.current) setCenterView("reconstruction");
+    }).catch(reason => { if (active) { setPreviewError(String(reason)); setActionError(`Reconstruction preview: ${String(reason)}`); } });
     return () => { active = false; };
   }, [adapterKind, previewData?.key, previewKey, previewRetry, ws?.reconstruction.selectedMethod]);
-
-  const openReconstruction = useCallback(() => {
-    if (activeVolume) {
-      setCenterView("reconstruction");
-    } else if (previewKey) {
-      setActionError(null);
-      setPreviewRetry(value => value + 1);
-    }
-  }, [activeVolume, previewKey]);
-
-  const startReconstruction = useCallback((method: ReconstructionMethodId) => {
-    setPreviewError(null);
-    setPreviewData(null);
-    setCenterView("equipment");
-    void dispatch({ type: "start_reconstruction", method });
-  }, [dispatch]);
-
+  const openReconstruction = () => { if (activeVolume) navigate("reconstruction"); else if (previewKey) { presentation.current += 1; setRequestRevision(presentation.current); setPreviewRetry(value => value + 1); } };
+  const startReconstruction = (method: ReconstructionMethodId) => { setPreviewError(null); setPreviewData(null); navigate("equipment"); void actions.run({ type: "start_reconstruction", method }).catch(reason => setActionError(String(reason))); };
+  const onPhoto = (result: EngineSnapshot, revision: number) => {
+    if (revision !== presentation.current || result.engineSessionId !== latest.current?.engineSessionId) return;
+    const record = result.deviceControls.camera?.lastCapturedImage;
+    if (!record || !record.exposureEnded || !record.captureId || !record.bytes || !/^[a-f0-9]{64}$/i.test(record.sha256)) throw new Error("Capture file registration is unconfirmed");
+    setPhoto(record); navigate("photo");
+  };
+  const closeMedia = () => { if (centerView === "live") void actions.run({ type: "camera_live_view_stop" }).catch(reason => setActionError(String(reason))); navigate("equipment"); };
+  const stop = () => { preparationScope.current.invalidate(true); setPreparationStage(null); navigate("equipment"); void actions.run({ type: "stop" }).catch(reason => setActionError(String(reason))); };
+  const focusPanel = (id: string) => document.querySelector<HTMLElement>(`#${id} button:not(:disabled)`)?.focus();
+  const openPreparation = () => { if (snapshot?.deviceControls.taskLock.locked) setAuxiliary("recovery"); else setAuxiliary("prepare"); };
   const availability: MenuAvailability = useMemo(() => {
-    const ok = { available: true, reason: null };
-    const blocked = (reason: string) => ({ available: false, reason });
-    const setup = ws?.scanSetup;
-    const running = ws?.dataState === "scanning" || ws?.dataState === "paused";
-    const configured = Boolean(
-      setup &&
-        setup.taskId.trim() &&
-        setup.savePath.trim() &&
-        setup.projectionCount > 0 &&
-        setup.exposureMs > 0 &&
-        setup.maxXraySec > 0,
-    );
-    const desktop = adapterKind === "tauri";
-    const faulted = ws?.dataState === "fault";
-    const entries: MenuAvailability = {
-      "devices.camera": ok,
-      "devices.turntable": ok,
-      "file.newTask": running || snapshot?.deviceControls.taskLock.locked ? blocked("unfinished task or scan active") : ok,
-      "file.openImageFolder": desktop
-        ? running
-          ? blocked("scan active")
-          : ok
-        : blocked("desktop only"),
-      "file.openLastResult": setup?.savePath.trim() ? ok : blocked("no save path"),
-      "file.exportLog": desktop ? ok : blocked("desktop only"),
-      // The engine owns scan state; it has no undo history to walk back.
-      "edit.undo": blocked("engine has no undo stack"),
-      "edit.redo": blocked("engine has no undo stack"),
-      "edit.resetParameters": running ? blocked("scan active") : ok,
-      "edit.preferences": ok,
-      "tools.runPreflight": configured
-        ? snapshot?.deviceControls.taskLock.locked ? blocked("Use the confirmed Restore preflight entry in Devices") : ok
-        : blocked("setup incomplete"),
-      "tools.homeAllAxes": faulted
-        ? blocked("run Preflight to revalidate device safety")
-        : snapshot?.preflightPassed
-          ? ok
-          : blocked("preflight required"),
-      "tools.restorePrevious": ws?.dock.restore
-        ? ok
-        : blocked(ws?.dock.restoreReason || "no checkpoint"),
-      "tools.deviceDiagnostics": ok,
-      "help.userGuide": ok,
-      "help.safetyNotes": ok,
-      "help.about": ok,
-    };
-    if (transportError || busy) {
-      for (const id of ["file.newTask", "file.openImageFolder", "edit.resetParameters", "tools.runPreflight", "tools.homeAllAxes", "tools.restorePrevious"] as const) {
-        entries[id] = blocked(transportError ? "control service unavailable" : "command in progress");
+    const result = Object.fromEntries(MENU_GROUPS.flatMap(group => group.entries.map(entry => [entry.id,{ available:true,reason:null }]))) as MenuAvailability;
+    const block = (id: MenuActionId, reason: string) => { result[id] = { available:false,reason }; };
+    const unavailable = !snapshot || !ws || stale;
+    const occupied = pending || Boolean(snapshot && manualControlReason(snapshot,stale));
+    for (const id of ["task.new","task.prepare","task.resetDraft","devices.turntableHome"] as const) if (unavailable || occupied) block(id,unavailable ? "Control service unavailable" : "Task or device operation occupied");
+    if (snapshot?.deviceControls.taskLock.locked) { block("task.new","Retained task locked"); block("task.resetDraft","Retained task locked"); }
+    for (const id of ["task.play","task.stop","task.restore","task.abandon","devices.camera","devices.cameraSettings","devices.turntable","devices.turntableBench","devices.xray"] as const) if (unavailable) block(id,"Control service unavailable");
+    if (!ws?.dock.play || model.dirty || !snapshot?.cameraScanReadiness?.ready) block("task.play",ws?.dock.playReason || "Confirmed scan readiness required");
+    if (ws) result["task.play"].label = ws.dock.playMode === "pause" ? "Pause Scan" : ws.dock.playMode === "resume" ? "Resume Scan" : "Start Scan";
+    if (!snapshot?.deviceControls.taskLock.locked && !ws?.checkpointAvailable) block("task.restore","No retained task/checkpoint");
+    if (!snapshot?.deviceControls.taskLock.locked) block("task.abandon","No retained task");
+    if (!snapshot?.deviceControls.turntable.connected || occupied) block("devices.turntableHome","Confirmed turntable safety conditions required");
+    if (!ws?.scanSetup.savePath || !ws.scanSetup.taskId || adapterKind !== "tauri") block("task.openFolder","No desktop task folder");
+    if (!previewKey) block("view.result","No verified completed result");
+    if (!photo && !snapshot?.deviceControls.camera?.lastCapturedImage) block("view.photo","No confirmed independent capture");
+    if (!snapshot?.deviceControls.camera?.liveView.active) block("view.live","Live View is stopped");
+    if (!ws) for (const id of ["view.images","view.reconstruction","view.logs","tools.exportLog","tools.deviceDiagnostics"] as const) block(id,"No engine data available");
+    if (adapterKind !== "tauri") for (const id of ["tools.exportLog","help.checkUpdate","help.importUpdate"] as const) block(id,"Desktop platform required");
+    if (preparationStage !== null) for (const group of MENU_GROUPS) for (const entry of group.entries) if (entry.id !== "task.stop") block(entry.id,"Preparation pending · use Stop before changing the current request");
+    return result;
+  }, [snapshot,ws,pending,stale,model.dirty,adapterKind,previewKey,photo,preparationStage]);
+  const handleMenuAction = async (id: MenuActionId): Promise<void> => {
+    if (preparationScope.current.pending && id !== "task.stop") return;
+    setActionError(null);
+    try {
+      switch(id) {
+        case "help.userGuide": setDialog("guide"); break;
+        case "help.safetyNotes": setDialog("safety"); break;
+        case "help.troubleshooting": setDialog("troubleshooting"); break;
+        case "help.about": setDialog("about"); break;
+        case "help.checkUpdate": setUpdate("check"); break;
+        case "help.importUpdate": setUpdate("import"); break;
+        case "tools.preferences": setDialog("preferences"); break;
+        case "task.new": case "task.resetDraft": setPreparationRevision(value => value + 1); setAuxiliary("prepare"); break;
+        case "task.prepare": openPreparation(); break;
+        case "task.restore": case "task.abandon": setAuxiliary("recovery"); break;
+        case "task.stop": stop(); break;
+        case "task.play": if (ws) await actions.run({ type:ws.dock.playMode === "pause" ? "pause" : ws.dock.playMode === "resume" ? "resume" : "start_scan" }); break;
+        case "task.openFolder": if (ws) await revealDirectory(`${ws.scanSetup.savePath}/${ws.scanSetup.taskId}`); break;
+        case "devices.camera": focusPanel("camera-panel"); break;
+        case "devices.cameraSettings": setAuxiliary("camera"); break;
+        case "devices.turntable": focusPanel("turntable-panel"); break;
+        case "devices.turntableHome": await actions.run({ type:"turntable_home" }); break;
+        case "devices.turntableBench": setAuxiliary("bench"); break;
+        case "devices.xray": focusPanel("xray-panel"); break;
+        case "view.equipment": navigate("equipment"); break;
+        case "view.result": openReconstruction(); break;
+        case "view.photo": { const registered = photo || snapshot?.deviceControls.camera?.lastCapturedImage; if (registered) { setPhoto(registered); navigate("photo"); } break; }
+        case "view.live": navigate("live"); break;
+        case "view.images": setBottomTab("images"); break;
+        case "view.reconstruction": setBottomTab("reconstruction"); break;
+        case "view.logs": setBottomTab("aggregate"); break;
+        case "tools.exportLog": if(ws) await exportSessionLog(`session-${ws.scanSetup.taskId || "log"}.log`,sessionLogText(ws,adapterKind)); break;
+        case "tools.deviceDiagnostics": setDialog("diagnostics"); break;
       }
-    }
-    if (setupDraftInvalid) {
-      for (const id of ["tools.runPreflight", "tools.homeAllAxes", "tools.restorePrevious"] as const) {
-        entries[id] = blocked("complete valid scan parameters");
-      }
-    }
-    return entries;
-  }, [adapterKind, snapshot?.preflightPassed, ws, transportError, busy, setupDraftInvalid]);
-
-  const handleMenuAction = useCallback(
-    async (id: MenuActionId): Promise<void> => {
-      if (!ws) return;
-      setActionError(null);
-      try {
-        switch (id) {
-          case "file.newTask": {
-            const now = new Date();
-            const p = (value: number): string => String(value).padStart(2, "0");
-            const stamp =
-              `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}` +
-              `-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
-            setupPendingSync.current = true;
-            // The engine invalidates preflight and HOME on every setup change.
-            await dispatch({ type: "update_scan_setup", setup: { taskId: `scan-${stamp}` } });
-            break;
-          }
-          case "file.openImageFolder": {
-            const selected = await chooseImageDirectory(ws.scanSetup.savePath);
-            if (!selected) break;
-            // Refill the Scan Parameters drafts from the engine so the Save Path
-            // field shows the folder the picker returned.
-            setupPendingSync.current = true;
-            await dispatch({ type: "update_scan_setup", setup: { savePath: selected } });
-            await revealDirectory(selected);
-            break;
-          }
-          case "file.openLastResult":
-            await revealDirectory(ws.scanSetup.savePath);
-            break;
-          case "file.exportLog": {
-            const name = `session-${ws.scanSetup.taskId.trim() || "log"}.log`;
-            await exportSessionLog(name, sessionLogText(ws, adapterKind));
-            break;
-          }
-          case "edit.resetParameters":
-            setupPendingSync.current = true;
-            await dispatch({ type: "update_scan_setup", setup: { ...DEFAULT_SCAN_SETUP } });
-            break;
-          case "edit.undo":
-          case "edit.redo":
-            // The engine owns scan state and exposes no undo history, so these
-            // entries stay permanently disabled (see `availability`).
-            break;
-          case "edit.preferences":
-            setDialog("preferences");
-            break;
-          case "tools.runPreflight":
-            await dispatch({ type: "preflight" });
-            break;
-          case "tools.homeAllAxes":
-            await dispatch({ type: "home" });
-            break;
-          case "tools.restorePrevious":
-            await dispatch({ type: "restore_previous" });
-            break;
-          case "tools.deviceDiagnostics":
-            await Promise.all([dispatch({ type: "camera_status" }), dispatch({ type: "turntable_status" })]);
-            setDialog("diagnostics");
-            break;
-          case "devices.camera":
-            setDeviceConsole("camera");
-            break;
-          case "devices.turntable":
-            setDeviceConsole("turntable");
-            break;
-          case "help.userGuide":
-            setDialog("guide");
-            break;
-          case "help.safetyNotes":
-            setDialog("safety");
-            break;
-          case "help.about":
-            setDialog("about");
-            break;
-          default:
-            break;
-        }
-      } catch (reason: unknown) {
-        setActionError(reason instanceof Error ? reason.message : String(reason));
-      }
-    },
-    [adapterKind, dispatch, ws],
-  );
-
-  useEffect(() => {
-    if (!dialog) return;
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") setDialog(null);
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [dialog]);
-
-  if (!snapshot) {
-    return (
-      <main className="boot-screen">
-        <strong>Micro-CT Workstation</strong>
-        <span>{error ? `Engine unavailable · ${error}` : "Starting ct-engine control chain…"}</span>
-      </main>
-    );
-  }
-
-  if (!ws) {
-    return (
-      <main className="boot-screen boot-screen--error">
-        <strong>Engine protocol unavailable</strong>
-        <span>{error ?? "The engine returned no workstation view. Restart the desktop application."}</span>
-      </main>
-    );
-  }
-
-  return (
-    <main className="viewport-shell">
-      <div
-        className="design-canvas"
-        style={{ zoom: canvasLayout.zoom, width: `${canvasLayout.designWidth}px`, height: `${canvasLayout.designHeight}px` }}
-      >
-        <MenuBar
-          availability={availability}
-          onAction={(id) => void handleMenuAction(id)}
-        />
-        <div className="app-divider" />
-        {error || actionError || setupDraftError ? (
-          <div className="error-toast" role="alert">
-            <LineIcon name="warning" size={13} />
-            {setupDraftError ?? actionError ?? error}
-          </div>
-        ) : null}
-        {/* Main row and log row share one grid: the right column reaches the
-            bottom of the workspace and the console covers left + centre only. */}
-        <section className="workspace-body">
-          <section className="main-console">
-            <aside className="col">
-              <DevicePanel
-                ws={ws}
-                busy={busy || Boolean(transportError)}
-                stale={Boolean(transportError)}
-                setupInvalid={setupDraftInvalid}
-                hardwareConnected={snapshot.connectionState === "connected"}
-                desktopRuntime={adapterKind === "tauri"}
-                dispatch={dispatch}
-                onDeviceControl={setDeviceConsole}
-                taskLocked={snapshot.deviceControls.taskLock.locked}
-              />
-              <ScanParamsPanel
-                ws={ws}
-                busy={busy || Boolean(transportError) || Boolean(manualControlReason(snapshot))}
-                desktopRuntime={adapterKind === "tauri"}
-                dispatch={dispatch}
-                syncRevision={setupSync}
-                onInvalidChange={setSetupDraftInvalid}
-                onValidationError={setSetupDraftError}
-              />
-            </aside>
-            <LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={Boolean(transportError)} setupInvalid={setupDraftInvalid} feedbackId={snapshot.updatedAt} centerView={centerView} volume={activeVolume} previewError={previewError ? reconstructionMessageEn(previewError, "failed") : ws.reconstruction.status === "failed" ? reconstructionMessageEn(ws.reconstruction.message, "failed") : adapterKind !== "tauri" && centerView === "reconstruction" ? "No volume data in offline preview" : null} volumeMode={volumeMode} volumeResetRevision={volumeResetRevision} onVolumeAvailable={setVolume3DAvailable} />
-          </section>
-          <BottomConsole ws={ws} production={adapterKind === "tauri"} centerView={centerView} volumeReady={Boolean(activeVolume)} volume3DAvailable={volume3DAvailable} busy={busy} stale={Boolean(transportError)} volumeMode={volumeMode} onVolumeMode={setVolumeMode} onResetVolume={() => setVolumeResetRevision(value => value + 1)} onOpenReconstruction={openReconstruction} onShowEquipment={() => setCenterView("equipment")} onStartReconstruction={startReconstruction} />
-          <aside className="col col--right">
-            <XrayPanel ws={ws} busy={busy || Boolean(transportError)} dispatch={dispatch} stale={Boolean(transportError)} />
-            <OperationPanel snapshot={snapshot} ws={ws} stale={Boolean(transportError)} />
-          </aside>
-        </section>
-        <div className="app-divider" />
-        <footer className="status-bar">
-          <span className="status-bar__left">
-            <i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} aria-hidden="true" />
-            <strong>{transportError ? "Control service unavailable · device states unknown" : error || (ws.dataState === "fault" && snapshot.lastError) || ws.dock.playReason || ws.phaseWord}</strong>
-          </span>
-          <div className="status-bar__right">
-            <span>{ws.scanSetup.taskId || "No task selected"}</span>
-            {snapshot.mode === "developer_preview" && <span className="badge badge--dev">Offline preview</span>}
-            <span className={`badge badge--engine badge--${transportError ? "lost" : "connected"}`}>
-              <i aria-hidden="true" />Control service · {transportError ? "Unavailable" : "Ready"}
-            </span>
-            <div className="theme-toggle" role="group" aria-label="Theme">
-              {(["light", "dark"] as const).map(value => (
-                <button type="button" key={value} className="theme-toggle__seg" aria-pressed={theme === value} onClick={() => setTheme(value)}>
-                  <LineIcon name={value === "light" ? "sun" : "moon"} size={11} />
-                  {value === "light" ? "Light" : "Dark"}
-                </button>
-              ))}
-            </div>
-          </div>
-        </footer>
-        {dialog ? (
-          <InfoDialog
-            kind={dialog}
-            ws={ws}
-            snapshot={snapshot}
-            adapterKind={adapterKind}
-            theme={theme}
-            onTheme={setTheme}
-            onClose={() => setDialog(null)}
-          />
-        ) : null}
-        {deviceConsole && <DeviceConsole kind={deviceConsole} snapshot={snapshot} busy={busy} stale={Boolean(transportError)} dispatch={engineDispatch} onClose={() => setDeviceConsole(null)} />}
-        {ws.scanFlow.prompt && <ScanStageDialog
-          key={`${ws.scanSetup.taskId}:${ws.scanFlow.prompt.stage}`}
-          stage={ws.scanFlow.prompt.stage}
-          recorded={ws.scanFlow.geometry}
-          beamState={ws.xray.beamState}
-          busy={busy}
-          onConfirm={geometry => dispatch({ type: "confirm_scan_stage", stage: ws.scanFlow.prompt!.stage, geometry })}
-          onCancel={() => dispatch({ type: "cancel_scan_stage", stage: ws.scanFlow.prompt!.stage })}
-        />}
-      </div>
-    </main>
-  );
+    } catch(reason) { setActionError(String(reason)); }
+  };
+  const info = dialog ? <InfoDialog kind={dialog} version={version} ws={ws || null} snapshot={snapshot} adapterKind={adapterKind} theme={theme} troubleshootingGroup={troubleshootingGroup} onTheme={setTheme} onClose={() => setDialog(null)} /> : null;
+  const failureBanner = <FailureBanner report={visibleFailure} onDismiss={dismissFailure} onTroubleshooting={openTroubleshooting} onDiagnostics={() => setDialog("diagnostics")} topOffset={Math.round(FAILURE_TOP_LANE_DESIGN_PX * canvasLayout.zoom)} />;
+  if (!snapshot || !ws) return <main className="viewport-shell"><div className="design-canvas" style={{zoom:canvasLayout.zoom,width:`${canvasLayout.designWidth}px`,height:`${canvasLayout.designHeight}px`}}><MenuBar availability={availability} onAction={id => void handleMenuAction(id)} version={version} /><div className="app-divider" /><main className="boot-screen"><strong>Micro-CT Workstation</strong><span>{error || "Starting control service…"}</span><span>Device readings are UNKNOWN. Help and desktop platform actions remain available.</span></main><div className="app-divider" /><footer className="status-bar">Control service unavailable · no device action permitted</footer>{failureBanner}{info}<UpdateDialog open={update !== null} mode={update || "check"} onClose={() => setUpdate(null)} /></div></main>;
+  const submitPreparation = async (draft: ScanPreparation) => {
+    if (auxiliaryCurrent.current !== "prepare") return false;
+    return runScanPreparationRequest(preparationScope.current, draft, () => preparationContext.current, actions.run, setPreparationStage, setActionError);
+  };
+  return <main className="viewport-shell"><div className="design-canvas" style={{zoom:canvasLayout.zoom,width:`${canvasLayout.designWidth}px`,height:`${canvasLayout.designHeight}px`}}><MenuBar availability={availability} onAction={id => void handleMenuAction(id)} version={version} /><div className="app-divider" />
+    {failureBanner}
+    <section className="workspace-body">
+      <aside className="col device-column"><CameraPanel snapshot={snapshot} stale={stale} pending={pending} model={model} run={actions.run} onAdvanced={() => setAuxiliary("camera")} onPhoto={onPhoto} mediaRevision={requestRevision} onLive={revision => { if(revision === presentation.current) navigate("live"); }} /><TurntablePanel snapshot={snapshot} stale={stale} pending={pending} run={actions.run} onPreflight={openPreparation} onRecovery={() => setAuxiliary("recovery")} onBench={() => setAuxiliary("bench")} /></aside>
+      <section className="main-console"><LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={stale} setupInvalid={setupInvalid} feedbackId={snapshot.updatedAt} centerView={centerView} volume={activeVolume} previewError={previewError} volumeMode={volumeMode} volumeResetRevision={volumeResetRevision} onVolumeAvailable={setVolume3DAvailable} camera={snapshot.deviceControls.camera} photo={photo} requestRevision={requestRevision} onCloseMedia={closeMedia} runDevice={actions.run} pending={pending} /></section>
+      <BottomConsole tab={bottomTab} onTab={setBottomTab} ws={ws} production={adapterKind === "tauri"} centerView={centerView} volumeReady={Boolean(activeVolume)} volume3DAvailable={volume3DAvailable} busy={pending} stale={stale} volumeMode={volumeMode} onVolumeMode={setVolumeMode} onResetVolume={() => setVolumeResetRevision(value => value + 1)} onOpenReconstruction={openReconstruction} onShowEquipment={() => navigate("equipment")} onStartReconstruction={startReconstruction} />
+      <aside className="col col--right"><XrayPanel ws={ws} busy={pending || stale} dispatch={dispatch} stale={stale} /><OperationPanel snapshot={snapshot} ws={ws} stale={stale} /></aside>
+    </section><div className="app-divider" /><footer className="status-bar"><span className="status-bar__left"><i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} /><strong>{stale ? "Control service unavailable · device readings UNKNOWN" : snapshot.lastError || ws.dock.playReason || ws.phaseWord}</strong></span><div className="status-bar__right"><span>{ws.scanSetup.taskId || "No task selected"}</span>{snapshot.mode === "developer_preview" && <span className="badge badge--dev">Offline preview · no hardware</span>}<span className={`badge badge--engine badge--${stale ? "lost" : "connected"}`}>Control service · {stale ? "Unavailable" : "Ready"}</span><div className="theme-toggle" role="group" aria-label="Theme">{(["light","dark"] as const).map(value => <button key={value} className="theme-toggle__seg" aria-pressed={theme === value} onClick={() => setTheme(value)}>{value === "light" ? "Light" : "Dark"}</button>)}</div></div></footer>
+    {info}<UpdateDialog open={update !== null} mode={update || "check"} onClose={() => setUpdate(null)} />
+    {auxiliary === "camera" && <CameraSettingsDialog snapshot={snapshot} pending={pending} stale={stale} model={model} run={actions.run} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}
+    {auxiliary === "bench" && <TurntableBenchDialog snapshot={snapshot} pending={pending} stale={stale} run={actions.run} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}
+    {auxiliary === "recovery" && <TaskRecoveryDialog snapshot={snapshot} pending={pending} stale={stale} run={actions.run} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}
+    {auxiliary === "prepare" && <ScanPreparationDialog key={preparationRevision} snapshot={snapshot} dirtyCamera={model.dirty} resetRevision={preparationRevision} stage={preparationStage} onSubmit={submitPreparation} onClose={() => setAuxiliary(null, auxiliaryRevision)} onAdvanced={() => setAuxiliary("camera", auxiliaryRevision)} onStop={stop} />}
+    {ws.scanFlow.prompt && <ScanStageDialog key={`${ws.scanSetup.taskId}:${ws.scanFlow.prompt.stage}`} stage={ws.scanFlow.prompt.stage} recorded={ws.scanFlow.geometry} beamState={ws.xray.beamState} busy={pending} onConfirm={geometry => dispatch({ type:"confirm_scan_stage",stage:ws.scanFlow.prompt!.stage,geometry })} onCancel={() => dispatch({ type:"cancel_scan_stage",stage:ws.scanFlow.prompt!.stage })} />}
+  </div></main>;
 }
-
 export type { EngineSnapshot };

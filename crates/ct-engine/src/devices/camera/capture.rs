@@ -1,5 +1,8 @@
 //! Nikon SDRAM capture, correlated events and complete atomic host-file commit.
-//! Timing and file appearance never substitute for an exposure-end event.
+//! Timing and file appearance never substitute for an associated capture-end event.
+//! Independent capture validates one host NEF output; it does not infer a
+//! physical exposure count from one object/C102. Scans additionally require
+//! profile evidence for a single fixed physical acquisition.
 
 use super::nikon::*;
 use super::ptp::*;
@@ -23,13 +26,97 @@ fn emit(
     }
     Ok(())
 }
-pub(crate) fn capture(
+fn capture_event_error(camera: &mut NativeCamera, message: impl Into<String>) -> CameraError {
+    let error = CameraError::Safety(message.into());
+    if let Some(batch) = camera.health.last_capture_event_diagnostic.as_mut() {
+        batch.response.error = Some(error.to_string());
+    }
+    error
+}
+fn confirm_frozen_capture(
+    camera: &mut NativeCamera,
+    expected: &CameraProperties,
+    context: &CallContext,
+    scan_policy: bool,
+) -> Result<(), CameraError> {
+    camera.read_properties(context)?;
+    if capture_readback(&camera.health,scan_policy)? != *expected {
+        return Err(invalid(
+            "runtime notification changed frozen capture parameters; commit refused",
+        ));
+    }
+    let lv = camera.read_data(GET_PROPERTY, &[LV_STATUS as u32], 16, context)?;
+    if lv != [0] {
+        return Err(invalid(
+            "runtime notification requires fresh confirmed Live View OFF",
+        ));
+    }
+    camera.confirm_runtime_diagnostic(context)?;
+    Ok(())
+}
+fn capture_readback(health:&CameraHealth,scan_policy:bool)->Result<CameraProperties,CameraError>{
+    if scan_policy { profile_readback(health) } else { independent_readback(health) }
+}
+
+fn accept_automatic_output_notification(camera:&mut NativeCamera,parameter:u32,expected:&CameraProperties,context:&CallContext,scan_policy:bool)->Result<bool,CameraError>{
+    if scan_policy{return Ok(false);}
+    let eligible=camera.health.properties.iter().any(|(key,p)|p.code as u32==parameter&&!expected.contains_key(key)&&automatic_exposure_property(&camera.health,key));
+    if !eligible{return Ok(false);}
+    confirm_frozen_capture(camera,expected,context,false)?;Ok(true)
+}
+
+fn download_current_ram(
+    camera: &mut NativeCamera,
+    handle: u32,
+    session: &str,
+    operation_id: &str,
+    sender: &Option<Sender<CameraCaptureEvent>>,
+    context: &CallContext,
+) -> Result<Vec<u8>, CameraError> {
+    if !camera.d7100 || !camera.health.properties.get("rawFormat")
+        .is_some_and(|property| property.confirmed && property.actual.as_ref().and_then(CameraValue::integer) == Some(4)) {
+        return Err(invalid("D7100 RAM ObjectInfo requires confirmed NEF-only format"));
+    }
+    let metadata = camera.read_data(GET_OBJECT_INFO, &[handle], 64 * 1024, context)?;
+    let info = parse_d7100_ram_object_info(&metadata).map_err(|error| {
+        // Metadata only: never include image bytes in the capture diagnostic.
+        let shown = metadata.len().min(4096);
+        let hex: String = metadata[..shown]
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        capture_event_error(camera, format!(
+            "GetObjectInfo parse failed: opcode=0x{GET_OBJECT_INFO:04X}, handle=0x{handle:08X}, metadataLength={}, metadataShown={shown}, metadataTruncated={}, metadataHex={hex}; {error}",
+            metadata.len(), metadata.len() > shown
+        ))
+    })?;
+    emit(
+        sender,
+        CameraCaptureEvent::TransferStarted {
+            session_id: session.into(),
+            operation_id: operation_id.into(),
+            size: info.size as u64,
+        },
+        context,
+    )?;
+    let bytes = camera.read_data(GET_OBJECT, &[handle], info.size, context)?;
+    context.check()?;
+    if bytes.len() != info.size {
+        return Err(invalid("NEF length differs from camera object length"));
+    }
+    validate_nef(&bytes)?;
+    Ok(bytes)
+}
+#[cfg(test)]
+pub(crate) fn capture(camera:&mut NativeCamera,destination:&Path,operation_id:&str,sender:&Option<Sender<CameraCaptureEvent>>,context:&CallContext,commit_gate:&Mutex<()>)->Result<CapturedImage,CameraError>{ capture_with_policy(camera,destination,operation_id,sender,context,commit_gate,true) }
+pub(crate) fn capture_with_policy(
     camera: &mut NativeCamera,
     destination: &Path,
     operation_id: &str,
     sender: &Option<Sender<CameraCaptureEvent>>,
     context: &CallContext,
     commit_gate: &Mutex<()>,
+    scan_policy: bool,
 ) -> Result<CapturedImage, CameraError> {
     camera.ensure_connected()?;
     if !camera.health.capabilities.host_capture || !camera.d7100 {
@@ -59,9 +146,9 @@ pub(crate) fn capture(
     }
     // Refresh all actual camera parameters before capture. The native RAM
     // command does not initiate AF; MF/single/timed NEF also removes ambiguity.
-    let expected_profile = profile_readback(&camera.health)?;
+    let expected_profile = capture_readback(&camera.health,scan_policy)?;
     camera.read_properties(context)?;
-    if profile_readback(&camera.health)? != expected_profile {
+    if capture_readback(&camera.health,scan_policy)? != expected_profile {
         return Err(invalid(
             "camera parameters changed since the confirmed capture profile",
         ));
@@ -79,26 +166,116 @@ pub(crate) fn capture(
         return Err(invalid("capture requires current confirmed Live View OFF"));
     }
     camera.drain_events(context)?;
+    confirm_frozen_capture(camera,&expected_profile,context,scan_policy)?;
     let session = camera
         .health
         .session_id
         .clone()
         .ok_or_else(|| invalid("capture session missing"))?;
+    camera.health.last_capture_event_diagnostic = None;
     camera.capture_pending = true;
+    let exposure_ms = if scan_policy { shutter_property_ms(&camera.health.properties["shutter"])? } else { 60_000.0 };
+    camera.pending_capture = Some(PendingCapture {
+        session_id: session.clone(),
+        operation_id: operation_id.into(),
+        exposure_ms,
+        queue_drained: true,
+        accepted: false,
+    });
     camera
         .transport
         .execute(CAPTURE_RAM, &[0xffffffff], DataPhase::None, context)?
         .success()?;
+    camera.pending_capture.as_mut().unwrap().accepted = true;
     let mut object = None;
+    let mut downloaded = None;
     let mut exposure_ended = false;
+    let mut batch_sequence = 0;
+    let mut event_batches = Vec::new();
     loop {
         context.check()?;
-        let events = camera.events(context)?;
+        let result = camera.events(context);
+        let nonempty = result.as_ref().is_ok_and(|events| !events.is_empty())
+            || result.is_err()
+                && camera
+                    .health
+                    .last_event_diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| diagnostic.dataset_size > 0);
+        if nonempty {
+            batch_sequence += 1;
+            CameraEventBatchDiagnostic::record(
+                &mut event_batches,
+                batch_sequence,
+                result.as_ref().map_or(0, Vec::len),
+                camera
+                    .health
+                    .last_event_diagnostic
+                    .clone()
+                    .unwrap_or_default(),
+            );
+            camera.health.last_capture_event_diagnostic = Some(CameraCaptureEventDiagnostic {
+                session_id: session.clone(),
+                operation_id: operation_id.into(),
+                batch_sequence,
+                event_count: result.as_ref().map_or(0, Vec::len),
+                capture_complete_count: result.as_ref().map_or(0, |events| {
+                    events
+                        .iter()
+                        .filter(|event| event.code == CAPTURE_COMPLETE_RAM)
+                        .count()
+                }),
+                exposure_ended_observed: exposure_ended,
+                event_batches: event_batches.clone(),
+                response: camera
+                    .health
+                    .last_event_diagnostic
+                    .clone()
+                    .unwrap_or_default(),
+            });
+        }
+        let events = result?;
+        // Preserve reliable physical termination before any later rejection in
+        // this batch. A profile notification cannot erase the same batch's one
+        // associated RAM completion. Duplicate completion still has no credit.
+        let completions = events
+            .iter()
+            .filter(|event| event.code == CAPTURE_COMPLETE_RAM)
+            .count();
+        if completions > 1 || completions > 0 && exposure_ended {
+            return Err(capture_event_error(
+                camera,
+                "duplicate SDRAM capture complete event; file commit refused",
+            ));
+        }
+        if completions == 1 {
+            context.check()?;
+            if camera.health.session_id.as_deref() != Some(session.as_str()) {
+                return Err(capture_event_error(
+                    camera,
+                    "RAM completion arrived for a changed camera session",
+                ));
+            }
+            exposure_ended = true;
+            camera.capture_pending = false;
+            camera.pending_capture = None;
+            if let Some(batch) = camera.health.last_capture_event_diagnostic.as_mut() {
+                batch.exposure_ended_observed = true;
+            }
+            emit(
+                sender,
+                CameraCaptureEvent::ExposureEnded {
+                    session_id: session.clone(),
+                    operation_id: operation_id.into(),
+                },
+                context,
+            )?;
+        }
         for event in events {
             match event.code {
                 OBJECT_RAM => {
                     if object.is_some() || event.parameter == 0 {
-                        return Err(invalid("duplicate/invalid SDRAM object event"));
+                        return Err(capture_event_error(camera,format!("duplicate/invalid SDRAM object event: code=0x{:04X}, parameter=0x{:08X}",event.code,event.parameter)));
                     }
                     object = Some(event.parameter);
                     emit(
@@ -111,40 +288,47 @@ pub(crate) fn capture(
                         context,
                     )?;
                 }
-                CAPTURE_COMPLETE_RAM => {
-                    if exposure_ended {
-                        return Err(invalid("duplicate SDRAM capture complete event"));
-                    }
-                    exposure_ended = true;
-                    camera.capture_pending = false;
-                    emit(
-                        sender,
-                        CameraCaptureEvent::ExposureEnded {
-                            session_id: session.clone(),
-                            operation_id: operation_id.into(),
-                        },
-                        context,
-                    )?;
-                }
+                CAPTURE_COMPLETE_RAM => (), // Processed once before profile/event checks.
                 0x4002 | 0x400d | 0x400a => {
-                    return Err(invalid(
-                        "unassociated/card capture or store-full event during host RAM capture",
-                    ))
+                    return Err(capture_event_error(camera,format!("unassociated/card capture or store-full event during host RAM capture: code=0x{:04X}, parameter=0x{:08X}",event.code,event.parameter)))
                 }
                 0x4006 => {
-                    return Err(invalid(
-                        "camera property changed during capture; frozen profile invalid",
-                    ))
+                    if accept_automatic_output_notification(camera,event.parameter,&expected_profile,context,scan_policy)?{continue;}
+                    match camera.accept_runtime_notification(event.parameter, context) {
+                        Ok(true) => {
+                            if let Err(error)=confirm_frozen_capture(camera,&expected_profile,context,scan_policy) {
+                                return Err(capture_event_error(camera,error.to_string()));
+                            }
+                            continue;
+                        }
+                        Ok(false) => (),
+                        Err(error) => return Err(capture_event_error(camera, error.to_string())),
+                    }
+                    let property=camera.health.properties.iter().find(|(_,property)|property.code as u32==event.parameter).map(|(key,_)|key.clone()).unwrap_or_else(|| "none".into());
+                    return Err(capture_event_error(camera,format!("camera property changed during capture: code=0x4006, parameter=0x{:08X}, frozenProperty={property}; frozen profile invalid; file commit refused",event.parameter)))
                 }
                 0xc104 => (), // Nikon obsolete-event marker has no capture evidence.
                 _ => {
-                    return Err(invalid(
-                        "unexpected camera event during deterministic capture",
-                    ))
+                    return Err(capture_event_error(camera,format!("unexpected camera event during deterministic capture: code=0x{:04X}, parameter=0x{:08X}; file commit refused",event.code,event.parameter)))
                 }
             }
         }
-        if exposure_ended && object.is_some() {
+        // The MIT Nikon event path starts ObjectInfo/transfer on C101, while
+        // C102 is independent. Keep bounded data private until both proofs
+        // exist; transfer completion never synthesizes ExposureEnded.
+        if downloaded.is_none() {
+            if let Some(handle) = object {
+                downloaded = Some(download_current_ram(
+                    camera,
+                    handle,
+                    &session,
+                    operation_id,
+                    sender,
+                    context,
+                )?);
+            }
+        }
+        if exposure_ended && downloaded.is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -153,50 +337,74 @@ pub(crate) fn capture(
     // Repeated handles across fully drained operations are allowed because the
     // Nikon RAM handle can be reused; an unresolved operation poisons the session.
     let handle = object.unwrap();
-    let info = parse_object_info(
-        &camera
-            .transport
-            .execute(
-                GET_OBJECT_INFO,
-                &[handle],
-                DataPhase::Read { max: 64 * 1024 },
-                context,
-            )?
-            .data()?,
-    )?;
-    let _ = (&info.filename, info.format);
-    emit(
-        sender,
-        CameraCaptureEvent::TransferStarted {
-            session_id: session.clone(),
-            operation_id: operation_id.into(),
-            size: info.size as u64,
-        },
-        context,
-    )?;
-    let bytes = camera
-        .transport
-        .execute(
-            GET_OBJECT,
-            &[handle],
-            DataPhase::Read { max: info.size },
-            context,
-        )?
-        .data()?;
-    context.check()?;
-    if bytes.len() != info.size {
-        return Err(invalid("NEF length differs from camera object length"));
-    }
-    validate_nef(&bytes)?;
+    let bytes = downloaded.unwrap();
     context.check()?;
     // DeviceReady and an empty event queue finish this operation's association
     // boundary. A late/duplicate event never becomes a later frame's evidence.
     camera.device_ready(context)?;
-    if !camera.events(context)?.is_empty() {
+    let mut boundary_empty = false;
+    for _ in 0..8 {
+        let events = camera.events(context)?;
+        if events.is_empty() {
+            boundary_empty = true;
+            break;
+        }
+        batch_sequence += 1;
+        CameraEventBatchDiagnostic::record(
+            &mut event_batches,
+            batch_sequence,
+            events.len(),
+            camera
+                .health
+                .last_event_diagnostic
+                .clone()
+                .unwrap_or_default(),
+        );
+        camera.health.last_capture_event_diagnostic = Some(CameraCaptureEventDiagnostic {
+            session_id: session.clone(),
+            operation_id: operation_id.into(),
+            batch_sequence,
+            event_count: events.len(),
+            capture_complete_count: events
+                .iter()
+                .filter(|event| event.code == CAPTURE_COMPLETE_RAM)
+                .count(),
+            exposure_ended_observed: exposure_ended,
+            event_batches: event_batches.clone(),
+            response: camera
+                .health
+                .last_event_diagnostic
+                .clone()
+                .unwrap_or_default(),
+        });
+        for event in events {
+            if event.code == 0x4006 {
+                if accept_automatic_output_notification(camera,event.parameter,&expected_profile,context,scan_policy)?{continue;}
+                match camera.accept_runtime_notification(event.parameter, context) {
+                    Ok(true) => {
+                        if let Err(error) =
+                            confirm_frozen_capture(camera, &expected_profile, context,scan_policy)
+                        {
+                            return Err(capture_event_error(camera, error.to_string()));
+                        }
+                        continue;
+                    }
+                    Ok(false) => (),
+                    Err(error) => return Err(capture_event_error(camera, error.to_string())),
+                }
+            }
+            return Err(capture_event_error(camera, format!(
+                "extra capture event after transfer: code=0x{:04X}, parameter=0x{:08X}; association boundary unresolved",
+                event.code, event.parameter
+            )));
+        }
+    }
+    if !boundary_empty {
         return Err(invalid(
-            "extra capture event after transfer; association boundary unresolved",
+            "runtime notification queue did not become empty after transfer; association boundary unresolved",
         ));
     }
+    confirm_frozen_capture(camera,&expected_profile,context,scan_policy)?;
     let parent = destination
         .parent()
         .ok_or_else(|| invalid("capture destination has no parent"))?;

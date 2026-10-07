@@ -9,7 +9,8 @@ import { createHash } from "node:crypto";
 
 const root = resolve(import.meta.dirname, "..");
 const output = resolve(root, process.argv[2] || "release/native-device-controls-offline");
-if (output !== join(root,"release/native-device-controls-offline")) throw new Error("License output must be the offline candidate directory");
+const releaseVersion=JSON.parse(readFileSync(join(root,"package.json"),"utf8")).version;
+if (output !== join(root,"release/native-device-controls-offline") && output !== join(root,"release",releaseVersion)) throw new Error("License output must be the offline candidate or current version release directory");
 const notices = join(output,"licenses"); mkdirSync(notices,{recursive:true});
 const safe = (value) => value.replace(/[^a-zA-Z0-9_.-]/g,"_");
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");

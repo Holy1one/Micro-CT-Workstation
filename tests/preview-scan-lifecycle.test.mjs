@@ -1,34 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { transformWithEsbuild } from "vite";
+import { loadSourceModule } from "./load-source-module.mjs";
 
-const rtsRoot = new URL("../src/engine/rts9060/", import.meta.url);
-
-async function loadTypeScriptModule(fileName, imports = {}) {
-  let source = await readFile(new URL(fileName, rtsRoot), "utf8");
-  for (const [specifier, dataUrl] of Object.entries(imports)) {
-    source = source.replaceAll(`from "${specifier}"`, `from "${dataUrl}"`);
-  }
-  const { code } = await transformWithEsbuild(source, fileName, { loader: "ts", target: "es2022", format: "esm" });
-  return `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`;
-}
-
-const protocolUrl = await loadTypeScriptModule("protocol.ts");
-const transportUrl = await loadTypeScriptModule("transport.ts", { "./protocol": protocolUrl });
-const workflowUrl = await loadTypeScriptModule("workflow.ts", {
-  "./devices": await loadTypeScriptModule("devices.ts"),
-  "./protocol": protocolUrl,
-  "./transport": transportUrl,
-});
-const adapterUrl = await loadTypeScriptModule("../workstationAdapter.ts", {
-  "./rts9060/deviceControls": await loadTypeScriptModule("deviceControls.ts"),
-  "./rts9060/protocol": protocolUrl,
-  "./rts9060/workflow": workflowUrl,
-});
-const { parseLine, PULSES_PER_REV } = await import(protocolUrl);
-const { ScanWorkflow } = await import(workflowUrl);
-const { WorkstationAdapter } = await import(adapterUrl);
+const { parseLine, PULSES_PER_REV } = await loadSourceModule("src/engine/rts9060/protocol.ts");
+const { ScanWorkflow } = await loadSourceModule("src/engine/rts9060/workflow.ts");
+const { WorkstationAdapter } = await loadSourceModule("src/engine/workstationAdapter.ts");
 
 const storage = new Map();
 globalThis.window = {
@@ -335,7 +312,7 @@ test("completion retains the last signed angle and releases each matching captur
     const releases = transport.commands.filter(command => command.token === "CAPTURE_DONE");
     assert.equal(moves.length, 2);
     assert.deepEqual(releases.map(command => command.id), moves.map(command => command.id));
-    assert.equal(transport.commands.filter(command => command.token === "HOME").length, 2, "only boot and explicit prepared HOME exist");
+    assert.equal(transport.commands.filter(command => command.token === "HOME").length, 1, "only the explicit prepared HOME exists; boot never moves");
     assert.equal(transport.commands.filter(command => command.token === "MOVE_ABS").length, 0);
     assert.equal(workflow.source.beamOn, false);
   } finally { workflow.close(); }

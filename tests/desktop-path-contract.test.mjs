@@ -19,7 +19,7 @@ const read = async (path) => readFile(new URL(path, root), "utf8");
 export const OPERATION_PANEL_CLASS = "operation-panel";
 
 /** Log and Operation Status remain equal at the published design height. */
-export const BOTTOM_LOG_ROW_PX = 306;
+export const BOTTOM_LOG_ROW_PX = 209.375;
 
 /** The right column uses the same panel spacing as the workspace columns. */
 export const RIGHT_COLUMN_SPACER_PX = 12;
@@ -41,8 +41,9 @@ const escapeForRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  * class name actually rendered by App.tsx, so renaming the panel in both places
  * keeps working while a selector that matches nothing fails instead of skipping.
  */
+const resolveGeometry = css => css.replaceAll('var(--workstation-bottom-height)',`${css.match(/--workstation-bottom-height:\s*([\d.]+)px/)?.[1]}px`);
 export const classRuleBodies = (css, className) => [
-  ...css.matchAll(new RegExp(`\\.${escapeForRegExp(className)}\\s*\\{([^}]*)\\}`, "g")),
+  ...resolveGeometry(css).matchAll(new RegExp(`\\.${escapeForRegExp(className)}\\s*\\{([^}]*)\\}`, "g")),
 ].map((match) => match[1]);
 
 /**
@@ -51,8 +52,8 @@ export const classRuleBodies = (css, className) => [
  * the shared bottom edge, not something to fall back to a range for.
  */
 export const bottomLogRowPx = (css) => {
-  const match = css.match(
-    /\.workspace-body\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+12px\s+(\d+)px/,
+  const match = resolveGeometry(css).match(
+    /\.workspace-body\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+12px\s+([\d.]+)px/,
   );
   return match ? Number(match[1]) : null;
 };
@@ -60,13 +61,13 @@ export const bottomLogRowPx = (css) => {
 /** The `min-height` values the Operation Status panel declares, in source order. */
 export const operationPanelMinHeightsPx = (css, className = OPERATION_PANEL_CLASS) =>
   classRuleBodies(css, className)
-    .flatMap((body) => [...body.matchAll(/min-height:\s*(\d+)px/g)])
+    .flatMap((body) => [...body.matchAll(/min-height:\s*([\d.]+)px/g)])
     .map((match) => Number(match[1]));
 
 /** The `height` values the Operation Status panel declares, in source order. */
 export const operationPanelHeightsPx = (css, className = OPERATION_PANEL_CLASS) =>
   classRuleBodies(css, className)
-    .flatMap((body) => [...body.matchAll(/(?<!min-)height:\s*(\d+)px/g)])
+    .flatMap((body) => [...body.matchAll(/(?<!min-)height:\s*([\d.]+)px/g)])
     .map((match) => Number(match[1]));
 
 /** The separator the right status column puts between its two panels, or null. */
@@ -139,24 +140,16 @@ test("directory picker has dialog-only permission and preview remains fail-close
   assert.doesNotMatch(`${workflow}\n${adapter}`, /D:\\\\CT/);
 });
 
-test("scan setup patches stay partial and are validated atomically by the sidecar", async () => {
-  const [types, app, engine] = await Promise.all([
-    read("src/engine/types.ts"),
-    read("src/App.tsx"),
-    read("crates/ct-engine/src/lib.rs"),
-  ]);
-  assert.match(types, /type ScanSetupUpdate = Partial</);
-  assert.match(app, /setup: \{ \[field\]: parsed \}/);
-  assert.match(engine, /save_path: Option<String>/);
-  assert.match(engine, /projection_count: Option<u32>/);
-  assert.match(engine, /setup\.apply\(&self\.parameters, self\.max_xray_sec\)/);
-  assert.match(engine, /task_id: String::new\(\)/);
-  assert.match(engine, /projection_count: 0/);
-  assert.match(engine, /max_xray_sec: 600/);
-  assert.match(engine, /exposure_ms: Option<f64>/);
-  assert.match(engine, /1\.\.=3600/);
-  assert.match(engine, /!\(1\.\.=600\)\.contains\(&self\.max_xray_sec\)/);
-  assert.match(engine, /deny_unknown_fields/);
+test("scan preparation submits one complete draft and cancelling performs no partial write", async () => {
+  const [types, app, form] = await Promise.all([read("src/engine/types.ts"),read("src/App.tsx"),read("src/ScanPreparationDialog.tsx")]);
+  assert.match(types,/interface ScanPreparation/);
+  assert.match(app,/runScanPreparationRequest\(preparationScope\.current, draft/);
+  assert.match(form,/type: "prepare_scan", \.\.\.draft/);
+  assert.match(form,/type: "preflight"/);
+  assert.doesNotMatch(form,/onBlur|update_scan_setup|set_parameters|exposureMs:/);
+  for(const key of ["sodMm","objectToDetectorMm","detectorWidthMm","centerOffsetXMm","centerOffsetYMm","mirrorX","measurement","rotationDirection"]) assert.ok(form.includes(key),key);
+  assert.match(form,/const close = \(\) => \{ if \(!submitting\.current\) onClose\(\)/);
+  assert.match(form,/disabled=\{pending\} onClick=\{close\}>Cancel/);
 });
 
 // "maximized": true in tauri.conf.json creates the window maximized, which skips
@@ -201,14 +194,15 @@ test("window keeps browser arguments, maximizes from restored startup, and appli
 });
 
 test("fixed design canvas scales as one unit and side columns never scroll", async () => {
-  const [app, styles, tokens] = await Promise.all([
+  const [app, rawStyles, tokens] = await Promise.all([
     read("src/App.tsx"),
     read("src/styles.css"),
     read("src/tokens.css"),
   ]);
+  const styles=resolveGeometry(rawStyles);
   assert.match(styles, /\.design-canvas[\s\S]*width: 1920px;[\s\S]*height: 1080px;/);
   assert.match(app, /computeCanvasLayout\(window\.innerWidth, window\.innerHeight\)/);
-  assert.match(app, /zoom: canvasLayout\.zoom/);
+  assert.match(app, /zoom:\s*canvasLayout\.zoom/);
   assert.match(app, /canvasLayout\.designHeight/);
   assert.match(styles, /\.menu-dropdown \{[\s\S]*position: absolute;/);
   assert.doesNotMatch(app, /Math\.min\(window\.innerWidth \/ 1600/);
@@ -262,15 +256,15 @@ test("fixed design canvas scales as one unit and side columns never scroll", asy
   assert.deepEqual(operationPanelMinHeightsPx(styles), [operationPanelHeightPx]);
   assert.match(app, /className="panel operation-panel"/);
   assert.equal(rightColumnSpacerPx(styles), RIGHT_COLUMN_SPACER_PX);
-  assert.match(styles, /grid-template-rows: minmax\(0, 1fr\) 12px 306px;/);
-  assert.match(styles, /\.col--right \{[^}]*grid-template-rows: minmax\(0, 1fr\) 306px;/);
+  assert.match(styles, /grid-template-rows: minmax\(0, 1fr\) 12px 209\.375px;/);
+  assert.match(styles, /\.col--right \{[^}]*grid-template-rows: minmax\(0, 1fr\) 209\.375px;/);
   // The bottom console stays full width over the left + centre columns only,
   // and the right status column runs through to the bottom of the workspace.
-  assert.match(styles, /\.workspace-body > \.console \{[\s\S]*grid-column: 1 \/ 3;/);
+  assert.match(styles, /\.workspace-body > \.console \{[\s\S]*grid-column: 2;/);
   assert.match(styles, /\.col--right \{[\s\S]*grid-row: 1 \/ 4;/);
-  assert.match(styles, /\.col--right \{[^}]*grid-template-rows: minmax\(0, 1fr\) 306px;/);
+  assert.match(styles, /\.col--right \{[^}]*grid-template-rows: minmax\(0, 1fr\) 209\.375px;/);
   assert.match(styles, /\.viewport-shell \{[^}]*var\(--appBg\)/);
-  assert.match(app, /width: `\$\{canvasLayout\.designWidth\}px`/);
+  assert.match(app, /width:\s*`\$\{canvasLayout\.designWidth\}px`/);
   assert.ok((tokens.match(/--viewportGutter:/g) ?? []).length >= 2);
   assert.ok((tokens.match(/--canvasBorder:/g) ?? []).length >= 2);
   assert.match(styles, /\.col \{[^}]*overflow: hidden;/);
@@ -291,21 +285,40 @@ test("fixed design canvas scales as one unit and side columns never scroll", asy
   assert.ok(columnGap > 0 && rowGap <= columnGap * 1.5);
 });
 
-test("engineering menus and numeric scan fields stay compact and free of branding", async () => {
-  const [app, styles] = await Promise.all([read("src/App.tsx"), read("src/styles.css")]);
-  const menu = app.slice(app.indexOf("function MenuBar("), app.indexOf("function DevicePanel("));
-  assert.doesNotMatch(menu, /app-identity|MICRO|Production|badge|theme-toggle/);
-  assert.doesNotMatch(app, /Production workstation|parseHms|formatHms|hh:mm:ss|setup-note|panel__footnote|dock-guidance/);
-  const scan = app.slice(app.indexOf("function ScanParamsPanel("), app.indexOf("function DockIcon("));
-  assert.doesNotMatch(scan, /<small>1[–-]/);
-  assert.match(scan, /minutesToSeconds\(maxXray\)/);
-  assert.match(scan, /secondsToMinutes\(setup\.maxXraySec \|\| 600\)/);
-  // HelpTip renders the linear question icon with a self-drawn glass bubble;
-  // the native title attribute was dropped because WebView2 pops it unreliably.
-  assert.match(app, /className="help-tip"/);
-  assert.match(app, /createPortal\(/);
-  assert.match(app, /className="help-tip__bubble"/);
-  assert.match(app, /onPointerEnter=\{show\}/);
-  assert.doesNotMatch(app, /className="help-tip" title=/);
-  assert.match(styles, /button\.help-tip[^}]*border-radius: 50%/);
+test("menus and preparation retain compact chrome and the single camera shutter editor", async () => {
+  const [app, form, camera, styles] = await Promise.all([read("src/App.tsx"),read("src/ScanPreparationDialog.tsx"),read("src/CameraPanel.tsx"),read("src/styles.css")]);
+  const menu=app.slice(app.indexOf("function MenuBar("),app.indexOf("function DockKey("));
+  assert.doesNotMatch(menu,/Production workstation|badge--engine|theme-toggle/);
+  assert.match(form,/minutesToSeconds\(values.maxXray\)/);
+  assert.match(form,/secondsToMinutes\(setup.maxXraySec/);
+  assert.doesNotMatch(form,/Exposure in milliseconds|onBlur/);
+  assert.match(camera,/Native shutter/);
+  assert.match(app,/createPortal/);assert.match(styles,/button\.help-tip[^}]*border-radius: 50%/);
+});
+
+test("desktop installation preparation uses the sidecar-tested typed maintenance command", async () => {
+  const [host, client] = await Promise.all([read("src-tauri/src/main.rs"), read("src-tauri/src/engine_client.rs")]);
+  assert.match(host, /let first = client\.prepare_software_update\(\)\?/);
+  assert.match(client, /self\.request\("prepare_software_update", serde_json::json!\(\{"type":"prepare_software_update"\}\)\)/);
+  assert.doesNotMatch(host, /request\("prepare_software_update",\s*serde_json::json!\(\{\}\)/);
+});
+
+test("independent photo preview uses typed capture-ID lookup for both registered reads", async () => {
+  const [host, client] = await Promise.all([read("src-tauri/src/main.rs"), read("src-tauri/src/engine_client.rs")]);
+  assert.equal((host.match(/client\.camera_capture_descriptor\(&capture_id\)\?/g) ?? []).length, 2);
+  assert.match(client, /self\.request\("camera_capture_descriptor", serde_json::json!\(\{"type":"camera_capture_descriptor","captureId":capture_id\}\)\)/);
+  assert.doesNotMatch(host, /json!\(\{"captureId":capture_id\}\)/);
+});
+
+test("capture-directory query derives only from the engine root and legacy picker cannot set it", async () => {
+  const [host, facade, panel, domain] = await Promise.all([read("src-tauri/src/main.rs"),read("src/platform/cameraControls.ts"),read("src/CameraPanel.tsx"),read("crates/ct-engine/src/device_controls.rs")]);
+  const query = host.slice(host.indexOf("async fn resolve_camera_capture_directory"),host.indexOf("const DESIGN_WIDTH"));
+  assert.match(query,/state: tauri::State<'_, EngineState>/);
+  assert.match(query,/engine_snapshot\(state\)\.await\?/);
+  assert.match(query,/parameters\.get\("savePath"\)/);
+  assert.match(query,/root\.join\("CameraCaptures"\)/);
+  assert.doesNotMatch(query,/existing_known_folder|FOLDERID_Pictures|create_dir|set_capture_root|camera_capture"/);
+  assert.match(facade,/Legacy diagnostic picker only/);
+  assert.match(panel,/type: "set_capture_root", savePath: selectedRoot/);
+  assert.match(domain,/PathBuf::from\(self\.parameters\.save_path\.trim\(\)\)\.join\("CameraCaptures"\)/);
 });

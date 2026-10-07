@@ -101,7 +101,16 @@ mod windows_transport {
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::Win32::System::Com::*;
 
+    /// `ERROR_BUSY` (0x800700AA) is the device telling us another outstanding
+    /// operation still owns it, exactly as the validated reference implementation
+    /// treats it (`ErrorCodes.MTP_Device_Busy || 0x800700AA` -> short sleep and
+    /// retry). It is classified separately so callers can retry instead of
+    /// treating a transient busy device as a failed session.
     fn com_error(error: windows::core::Error) -> CameraError {
+        const ERROR_BUSY: i32 = 0x800700AAu32 as i32;
+        if error.code().0 == ERROR_BUSY {
+            return CameraError::DeviceBusy("Windows WPD: device busy (0x800700AA)".into());
+        }
         CameraError::Unavailable(format!("Windows WPD: {error}"))
     }
     fn wide(s: &str) -> Vec<u16> {

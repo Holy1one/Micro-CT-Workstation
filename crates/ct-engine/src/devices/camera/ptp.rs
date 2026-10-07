@@ -1,6 +1,7 @@
 //! Bounded PTP datasets shared by real WPD and scripted offline transports.
 
-use super::types::{CameraError, CameraIdentity, CameraProperty, CameraValue};
+use super::types::{CameraDeviceInfo, CameraError, CameraIdentity, CameraProperty, CameraValue};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,6 +36,13 @@ impl CallContext {
     }
 }
 
+/// Names the failing transaction of a multi-step device sequence, so a timeout on
+/// a shared deadline identifies which command hung instead of only reporting the
+/// generic deadline error.
+pub(crate) fn step_error(step: &str, error: CameraError) -> CameraError {
+    CameraError::Command(format!("{step}: {error}"))
+}
+
 #[derive(Debug)]
 pub(crate) struct PtpResponse {
     pub code: u16,
@@ -66,6 +74,8 @@ pub(crate) enum DataPhase {
 /// This trait intentionally has no Send bound. Its factory crosses threads;
 /// the COM-bearing implementation is created, used, and dropped on one thread.
 pub(crate) trait CameraTransport {
+    #[cfg(test)]
+    fn scripted_multiple_exposure_evidence(&self)->Option<super::types::MultipleExposureEvidence>{None}
     fn discover(&mut self, context: &CallContext) -> Result<Vec<CameraIdentity>, CameraError>;
     fn open(&mut self, id: &str, context: &CallContext) -> Result<(), CameraError>;
     fn close(&mut self) -> Result<(), CameraError>;
@@ -171,22 +181,23 @@ pub(crate) struct DeviceInfo {
     pub properties: Vec<u16>,
     pub events: Vec<u16>,
     pub vendor_id: u32,
+    pub diagnostic: CameraDeviceInfo,
 }
 pub(crate) fn parse_device_info(bytes: &[u8]) -> Result<DeviceInfo, CameraError> {
     let mut c = Cursor::new(bytes);
-    let _version = c.u16()?;
+    let standard_version = c.u16()?;
     let vendor_id = c.u32()?;
-    let _extension_version = c.u16()?;
-    let _extension = c.string()?;
-    let _mode = c.u16()?;
+    let vendor_extension_version = c.u16()?;
+    let vendor_extension_description = c.string()?;
+    let functional_mode = c.u16()?;
     let operations = c.array16()?;
     let events = c.array16()?;
     let properties = c.array16()?;
-    let _capture_formats = c.array16()?;
-    let _image_formats = c.array16()?;
+    let capture_formats = c.array16()?;
+    let image_formats = c.array16()?;
     let manufacturer = c.string()?;
     let model = c.string()?;
-    let _firmware = c.string()?;
+    let device_version = c.string()?;
     let serial = c.string()?;
     c.finish()?;
     if manufacturer.is_empty() || model.is_empty() {
@@ -196,6 +207,24 @@ pub(crate) fn parse_device_info(bytes: &[u8]) -> Result<DeviceInfo, CameraError>
         manufacturer,
         model,
         serial,
+        diagnostic: CameraDeviceInfo {
+            standard_version,
+            vendor_extension_id: vendor_id,
+            vendor_extension_version,
+            vendor_extension_description,
+            functional_mode,
+            device_version,
+            operations: operations.clone(),
+            events: events.clone(),
+            properties: properties.clone(),
+            capture_formats,
+            image_formats,
+            dataset_size: bytes.len(),
+            dataset_sha256: format!("{:x}", Sha256::digest(bytes)),
+            adapter_selection: String::new(),
+            effective_properties: properties.clone(),
+            vendor_property_codes: None,
+        },
         operations,
         properties,
         events,
@@ -263,6 +292,11 @@ pub(crate) fn parse_property(
         data_type,
         readable: true,
         writable,
+        supported: true,
+        native_writable: writable,
+        effective: true,
+        disabled_reason: None,
+        options: vec![],
         supported_values,
         range,
         actual: Some(actual),
@@ -333,6 +367,27 @@ pub(crate) struct ObjectInfo {
     pub filename: String,
 }
 pub(crate) fn parse_object_info(bytes: &[u8]) -> Result<ObjectInfo, CameraError> {
+    parse_ram_object_info(bytes, false)
+}
+/// Only the identity-verified D7100 NEF RAM path may use this compatibility.
+pub(crate) fn parse_d7100_ram_object_info(bytes: &[u8]) -> Result<ObjectInfo, CameraError> {
+    parse_ram_object_info(bytes, true)
+}
+fn d7100_object_date(c: &mut Cursor<'_>) -> Result<String, CameraError> {
+    let count = c.u8()? as usize;
+    if count == 0 {
+        return Ok(String::new());
+    }
+    let units: Vec<u16> = c.take(count * 2)?.chunks_exact(2)
+        .map(|x| u16::from_le_bytes([x[0], x[1]])).collect();
+    let end = units.iter().position(|unit| *unit == 0)
+        .ok_or_else(|| invalid("invalid D7100 ObjectInfo date terminator"))?;
+    if units[end..].iter().any(|unit| *unit != 0) {
+        return Err(invalid("nonzero D7100 ObjectInfo date padding"));
+    }
+    String::from_utf16(&units[..end]).map_err(|_| invalid("invalid PTP UTF-16"))
+}
+fn parse_ram_object_info(bytes: &[u8], d7100: bool) -> Result<ObjectInfo, CameraError> {
     let mut c = Cursor::new(bytes);
     let _storage = c.u32()?;
     let format = c.u16()?;
@@ -340,13 +395,13 @@ pub(crate) fn parse_object_info(bytes: &[u8]) -> Result<ObjectInfo, CameraError>
     let size = c.u32()? as usize;
     c.take(40)?;
     let filename = c.string()?;
-    let _capture_date = c.string()?;
-    let _modified = c.string()?;
+    let _capture_date = if d7100 { d7100_object_date(&mut c)? } else { c.string()? };
+    let _modified = if d7100 { d7100_object_date(&mut c)? } else { c.string()? };
     let _keywords = c.string()?;
     c.finish()?;
     if !(8..=MAX_OBJECT_BYTES).contains(&size)
         || !filename.to_ascii_lowercase().ends_with(".nef")
-        || !matches!(format, 0x3000 | 0xb101)
+        || !(matches!(format, 0x3000 | 0xb101) || d7100 && format == 0x3800)
     {
         return Err(invalid("RAM object is not a bounded Nikon NEF"));
     }
@@ -377,4 +432,21 @@ pub(crate) fn parse_nikon_events(bytes: &[u8]) -> Result<Vec<NikonEvent>, Camera
     }
     c.finish()?;
     Ok(events)
+}
+
+/// Nikon GetVendorPropCodes: UINT32 count followed by exactly that many UINT16
+/// codes (MIT BaseMTPCamera.LoadDeviceInfo). No padding/trailing data accepted.
+pub(crate) fn parse_vendor_property_codes(bytes: &[u8]) -> Result<Vec<u16>, CameraError> {
+    let mut cursor = Cursor::new(bytes);
+    let codes = cursor.array16()?;
+    cursor.finish()?;
+    if codes
+        .iter()
+        .any(|code| !matches!(*code, 0x5000..=0x5fff | 0xd000..=0xdfff))
+    {
+        return Err(invalid(
+            "Nikon vendor property list contains a non-property code",
+        ));
+    }
+    Ok(codes)
 }

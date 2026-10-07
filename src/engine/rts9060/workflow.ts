@@ -18,7 +18,7 @@ import { FirmwareTransport, type NanoTransport } from "./transport";
 
 export type WorkflowPhase = "booting" | "ready" | "scanning" | "paused" | "finishing" | "stopping" | "fault" | "stopped" | "completed";
 export type ConsoleLogLevel = "PASS" | "INFO" | "OK" | "WARN" | "ERR" | "ACTION";
-export type ConsoleLogSource = "system" | "xray" | "nano" | "camera" | "preflight" | "operator";
+export type ConsoleLogSource = "system" | "xray" | "nano" | "camera" | "preflight" | "operator" | "reconstruction";
 
 export interface ConsoleLogEntry {
   id: string;
@@ -44,6 +44,8 @@ interface Checkpoint {
   view: number;
   angleDeg: number;
   ts: string;
+  maxXraySec?: number;
+  captureEvidence?: { schemaVersion: number; profile: string; geometry: unknown };
 }
 
 const CHECKPOINT_KEY = "micro-ct-workstation.checkpoint";
@@ -214,6 +216,10 @@ export class ScanWorkflow {
   usbAutoShutDown = true;
   usbShutdownDelay = 5;
   checkpointAvailable = false;
+  checkpointError: string | null = null;
+  preparationOccupied=false;
+  captureEvidence: Checkpoint["captureEvidence"] = undefined;
+  acquisitionGuard: (() => void) | null = null;
 
   private pauseRequested = false;
   private stopRequested = false;
@@ -233,7 +239,9 @@ export class ScanWorkflow {
     this.onChange = onChange;
     this.transport = transport ?? new FirmwareTransport();
     this.link = new NanoLink(this.transport);
-    this.checkpointAvailable = this.readCheckpoint() !== null;
+    const checkpoint=this.readCheckpoint();
+    this.checkpointAvailable=checkpoint!==null||this.checkpointError!==null;
+    if(checkpoint){this.params={...this.params,taskId:checkpoint.taskId,savePath:checkpoint.savePath,projectionCount:checkpoint.projectionCount,exposureMs:checkpoint.exposureMs,maxXraySec:checkpoint.maxXraySec??600};this.captureEvidence=checkpoint.captureEvidence;}
     void this.boot();
   }
 
@@ -266,7 +274,7 @@ export class ScanWorkflow {
   }
 
   get manualControlsEnabled(): boolean {
-    if (!this.source.isConnected || this.source.isLatched || this.preflightRunning) return false;
+    if (this.preparationOccupied || !this.source.isConnected || this.source.isLatched || this.preflightRunning) return false;
     if (this.phase === "scanning") return true;
     if (["booting", "paused", "finishing", "stopping", "fault"].includes(this.phase)) return false;
     if (this.source.beamOn) return true;
@@ -277,13 +285,13 @@ export class ScanWorkflow {
     return (
       this.source.isConnected &&
       !this.source.isLatched &&
-      !this.preflightRunning &&
+      !this.preparationOccupied && !this.preflightRunning &&
       !["booting", "scanning", "paused", "finishing", "stopping", "fault"].includes(this.phase)
     );
   }
 
   get timerControlsEnabled(): boolean {
-    return !this.preflightRunning && ["ready", "stopped", "completed"].includes(this.phase);
+    return !this.preparationOccupied && !this.preflightRunning && ["ready", "stopped", "completed"].includes(this.phase);
   }
 
   // ------------------------------------------------------------- lifecycle
@@ -297,23 +305,9 @@ export class ScanWorkflow {
       await delay(140);
       this.log("INFO", "xray", `DEVELOPER PREVIEW X-ray · PREVIEW DATA ${this.source.readback().setKv.toFixed(1)} kV / ${this.source.readback().setUa.toFixed(1)} µA · NO DEVICE I/O`);
       this.camera.configure(this.params.savePath);
-      await this.link.exec(cmd.rearm("{id}"), ["OK"]);
-      await this.link.exec(cmd.home("{id}"), ["HOME_DONE"], 6000);
-      this.homed = true;
-      this.log("INFO", "nano", "turntable homed · Hall LOW at 0.00°");
-      await delay(120);
-      this.log("INFO", "camera", `DEVELOPER PREVIEW camera · PREVIEW DATA ${this.params.projectionCount} views · ${this.params.exposureMs} ms · NO DEVICE I/O`);
-      if (
-        this.params.taskId.trim() &&
-        this.params.savePath.trim() &&
-        this.params.projectionCount > 0 &&
-        this.params.exposureMs > 0 &&
-        this.params.maxXraySec > 0
-      ) {
-        await this.runPreflight();
-      } else {
-        this.log("WARN", "preflight", "Scan setup is incomplete · pre-inspection remains pending");
-      }
+      this.homed=false;
+      this.log("INFO","nano","NO HARDWARE · preview link discovered; explicit connection and HOME required");
+      this.log("WARN","preflight","Explicit preparation and Preflight required; startup never modifies acquisition settings");
       if (this.phase === "booting") this.phase = "ready";
       this.emit();
     } catch (err) {
@@ -331,6 +325,7 @@ export class ScanWorkflow {
     if (this.scanRunning || this.stopTask || ["scanning", "finishing", "stopping"].includes(this.phase)) {
       throw new Error("Preflight is unavailable while a scan is active");
     }
+    this.acquisitionGuard?.();
     this.validateCompleteParams(this.params);
     const recovering = this.phase === "fault" || this.phase === "stopped";
     this.preflightRunning = true;
@@ -348,6 +343,7 @@ export class ScanWorkflow {
       // supplied latch-release command. HOME remains a separate requirement.
       await this.link.exec(cmd.rearm("{id}"), ["OK"]);
       this.source.rearm();
+      this.acquisitionGuard?.();
       this.preflightPassed = true;
       if (recovering) {
         this.homed = false;
@@ -394,6 +390,7 @@ export class ScanWorkflow {
   }
 
   startScan(): void {
+    this.acquisitionGuard?.();
     if (this.scanRunning || this.stopTask) throw new Error("A scan is already active or stopping");
     if (this.phase === "fault") throw new Error("Device fault latched · run preflight and HOME to recover");
     if (!["ready", "completed", "paused"].includes(this.phase)) throw new Error("Scan is unavailable until the current operation has ended");
@@ -480,6 +477,7 @@ export class ScanWorkflow {
   }
 
   async restore(): Promise<void> {
+    this.acquisitionGuard?.();
     this.ensureNotScanning("restore");
     if (this.phase === "fault") {
       throw new Error("Device fault latched · run preflight and HOME before restoring");
@@ -501,10 +499,8 @@ export class ScanWorkflow {
       projectionCount: checkpoint.projectionCount,
       exposureMs: checkpoint.exposureMs,
     };
-    this.camera.configure(this.params.savePath);
     if (!this.link.lastStatus?.rearmed) await this.link.exec(cmd.rearm("{id}"), ["OK"]);
-    const restored = await this.moveToPhase(Math.abs(checkpoint.angleDeg));
-    await this.link.exec(cmd.captureDone(restored.id!), ["IDLE"]);
+    // Restore verifies simulated metadata; the next scan owns the next move.
     this.captured = checkpoint.view;
     this.angleDeg = checkpoint.angleDeg;
     this.frames = Array.from({ length: checkpoint.view }, (_, i) => ({
@@ -576,7 +572,6 @@ export class ScanWorkflow {
     this.preflightPassed = false;
     this.homed = false;
     if (this.phase !== "fault" && this.phase !== "booting" && this.phase !== "stopped") this.phase = "ready";
-    this.camera.configure(this.params.savePath);
     this.log("INFO", "system", `parameters updated · ${this.params.projectionCount} views · ${this.angleStepDeg.toFixed(2)}°/view · ${this.params.exposureMs} ms`);
     this.emit();
   }
@@ -699,6 +694,7 @@ export class ScanWorkflow {
           await this.link.exec(cmd.xrayWarning("{id}", true), ["OK"]);
         }
         const rb = this.source.readback();
+        this.acquisitionGuard?.();
         this.log("INFO", "xray", `DEVELOPER PREVIEW exposure · PREVIEW DATA ${this.params.exposureMs} ms · ${rb.setKv.toFixed(1)} kV / ${rb.setUa.toFixed(1)} µA · NO DEVICE I/O`);
         await this.awaitOrStop(delay(Math.max(this.params.exposureMs, 240)));
         const frame = await this.awaitOrStop(this.camera.capture(view, angle, this.params.exposureMs));
@@ -834,6 +830,7 @@ export class ScanWorkflow {
       view,
       angleDeg,
       ts: nowIso(),
+      maxXraySec:this.params.maxXraySec,captureEvidence:this.captureEvidence,
     };
     try {
       window.localStorage.setItem(CHECKPOINT_KEY, JSON.stringify(checkpoint));
@@ -845,11 +842,12 @@ export class ScanWorkflow {
 
   private readCheckpoint(): Checkpoint | null {
     try {
-      const raw = window.localStorage.getItem(CHECKPOINT_KEY);
-      return raw ? (JSON.parse(raw) as Checkpoint) : null;
-    } catch {
-      return null;
-    }
+      if(typeof window==="undefined"||!window.localStorage)return null;
+      const raw=window.localStorage.getItem(CHECKPOINT_KEY);if(!raw)return null;
+      const value=JSON.parse(raw) as Checkpoint;
+      if(typeof value.taskId!=="string"||!value.taskId.trim()||typeof value.savePath!=="string"||!value.savePath.trim()||!Number.isInteger(value.projectionCount)||value.projectionCount<1||value.projectionCount>3600||!Number.isFinite(value.exposureMs)||value.exposureMs<0.125||value.exposureMs>30000||!Number.isInteger(value.view)||value.view<0||value.view>value.projectionCount||!Number.isFinite(value.angleDeg))throw new Error("Retained preview checkpoint is invalid");
+      this.checkpointError=null;return value;
+    } catch(error) { this.checkpointError=String(error);return null; }
   }
 
   private clearCheckpoint(): void {
@@ -858,10 +856,12 @@ export class ScanWorkflow {
     } catch {
       /* ignore */
     }
-    this.checkpointAvailable = false;
+    this.checkpointAvailable = false;this.checkpointError=null;this.captureEvidence=undefined;
   }
 
   // ------------------------------------------------------------------- misc
+
+  recordEvent(level:ConsoleLogLevel,source:ConsoleLogSource,message:string):void{this.log(level,source,message);this.emit();}
 
   private log(level: ConsoleLogLevel, source: ConsoleLogSource, message: string): void {
     this.logs = [
