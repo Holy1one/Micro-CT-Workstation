@@ -44,7 +44,7 @@
       ],
       "risk": "critical",
       "description": "Owns Moxtek discovery, binary serial transport, measured readback, and fail-closed beam shutdown.",
-      "execution": "The scan coordinator requests setpoints and beam transitions; this module verifies source responses.",
+      "execution": "One serial owner verifies source responses. A complete monitoring pair shares a five-second budget and fresh current-generation readbacks for 250 ms; 50 ms read slices allow priority OFF and hard deadlines to preempt. No command replay. Serial diagnostics flow to domain logs and scan.log.",
       "gates": [
         "cargo test --manifest-path backend/Cargo.toml -p ct-engine devices::xray"
       ]

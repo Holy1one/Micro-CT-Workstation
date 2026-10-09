@@ -667,6 +667,8 @@ impl Engine {
             return;
         };
         let health = xray.health();
+        let diagnostics = xray.drain_diagnostics();
+        for message in diagnostics { self.log("WARN", "xray", &message); }
         if health.port.is_some() || self.cached_xray_health.as_ref().is_some_and(|previous|previous.port.is_some()){self.ever_xray=true;}
         let changed_error=self.cached_xray_health.as_ref().is_none_or(|previous|
             previous.last_error!=health.last_error || previous.connected!=health.connected

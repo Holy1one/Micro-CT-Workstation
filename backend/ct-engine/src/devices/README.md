@@ -4,8 +4,9 @@ Each device module owns one physical role and exposes message proxies from mod.r
 
 ## xray/
 
-- moxtek.rs owns the raw binary protocol, requested setpoints, measured readback and verified OFF. A new emission's status read allows five seconds, bounded by its continuous-output deadline; monitoring/OFF keep short fail-closed timeouts.
-- worker.rs is the single serial owner for manual and scan actions, cached health, priority OFF, caller/worker cancellation, independent monitoring and hard output deadlines. Confirmed OFF preserves the two-second re-enable gate across all callers.
+- moxtek.rs owns the raw binary protocol, requested setpoints, measured readback and verified OFF. A complete monitoring pair (0x43 + 0x80) shares at most five seconds, bounded by the absolute output deadline. OFF keeps one second per transaction. No command is replayed; invalid packets and exhausted budgets fail closed.
+- transport.rs accumulates fragmented replies across 50 ms cancellable read slices. Timeouts distinguish received bytes and elapsed/budget milliseconds; real driver errors fail immediately. A short OS read timeout alone does not discard a pending reply.
+- worker.rs is the single serial owner for manual and scan actions, cached health, priority OFF, caller/worker cancellation, independent monitoring and hard output deadlines. Scan and background emission checks share only a fully verified pair less than 250 ms old in the current generation; mutations, OFF and faults invalidate it. Priority OFF cancels both queued operations and autonomous polling. A bounded diagnostic queue feeds domain logs and scan.log. Confirmed OFF preserves the two-second re-enable gate across all callers.
 - Initial discovery failure before any source session or port evidence is a rejected connection attempt; it does not trigger Nano warning or a global Stop. Formerly owned sources and any transport/protocol/OFF failure retain fail-closed cleanup. The domain observer logs changed cached health failures once instead of on every engine tick.
 
 ## camera/

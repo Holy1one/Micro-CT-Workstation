@@ -13,7 +13,7 @@ use crate::devices::camera::{CameraAdapter, CameraCaptureEvent, CameraError};
 use crate::devices::turntable::{
     plan_projection, verify_fixed_configuration, verify_plan_capture_hold, MoveTicket, NanoAdapter,
 };
-use crate::devices::xray::{MoxtekAdapter, XrayHealth};
+use crate::devices::xray::{MoxtekAdapter, XrayError, XrayHealth};
 use crate::{timestamp, Parameters};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -374,6 +374,7 @@ impl RealScanHandle {
                 }
                 if worker_progress.lock().expect("scan progress mutex poisoned").output_dir_owned {
                     let root = Path::new(config.parameters.save_path.trim()).join(config.parameters.task_id.trim());
+                    log_xray_diagnostics(&xray, &worker_progress);
                     if let Err(error) = persist_scan_log(&root, &worker_progress, &result) {
                         let detail = format!("scan log could not be saved: {error}");
                         let rollback = if matches!(result, Ok(ScanCompletion::Completed)) {
@@ -1342,7 +1343,7 @@ fn run_scan_inner(
                             && last_xray_poll.elapsed() >= Duration::from_millis(250)
                         {
                             last_xray_poll = Instant::now();
-                            match xray.refresh_emission_status_shared(cancel.clone()) {
+                            match refresh_emission_monitored(xray, progress, cancel) {
                                 Ok(health) => {
                                     if let Some(warning) = health.telemetry_warning.clone() {
                                         push_message(progress, "WARN", "xray", warning);
@@ -1761,8 +1762,7 @@ fn capture_reference_group(
             {
                 return Err(format!("{group} cannot start reference {index}: continuous X-ray limit would be exceeded"));
             }
-            let health = xray
-                .refresh_emission_status_shared(cancel.clone())
+            let health = refresh_emission_monitored(xray, progress, cancel)
                 .map_err(|error| {
                     xray_operation_error(
                         error,
@@ -1826,7 +1826,7 @@ fn capture_reference_group(
                 if flat {
                     if last_poll.elapsed() >= Duration::from_millis(250) && abort.is_none() {
                         last_poll = Instant::now();
-                        if let Err(error) = xray.refresh_emission_status_shared(cancel.clone()) {
+                        if let Err(error) = refresh_emission_monitored(xray, progress, cancel) {
                             abort = Some(xray_operation_error(
                                 error,
                                 &format!("{group} emission monitor failed"),
@@ -2163,7 +2163,7 @@ fn move_to_projection_monitored(
                 }
             } else if beam_started.is_some() && last_poll.elapsed() >= Duration::from_millis(250) {
                 last_poll = Instant::now();
-                match xray.refresh_emission_status_shared(cancel.clone()) {
+                match refresh_emission_monitored(xray, progress, cancel) {
                     Ok(health) => set_xray_health(progress, health),
                     Err(error) => {
                         abort = Some(xray_operation_error(
@@ -2290,7 +2290,7 @@ fn commit_projection_monitored(
                 }
             } else if last_poll.elapsed() >= Duration::from_millis(250) {
                 last_poll = Instant::now();
-                match xray.refresh_emission_status_shared(cancel.clone()) {
+                match refresh_emission_monitored(xray, progress, cancel) {
                     Ok(health) => set_xray_health(progress, health),
                     Err(error) => {
                         abort = Some(xray_operation_error(
@@ -2385,6 +2385,18 @@ fn set_angle(progress: &Mutex<RealScanProgress>, angle_deg: f64) {
 
 fn set_beam(progress: &Mutex<RealScanProgress>, beam_on: bool) {
     update(progress, |value| value.beam_on = beam_on);
+}
+
+fn log_xray_diagnostics(xray: &MoxtekAdapter, progress: &Mutex<RealScanProgress>) {
+    for message in xray.drain_diagnostics() { push_message(progress, "WARN", "xray", message); }
+}
+
+fn refresh_emission_monitored(xray: &mut MoxtekAdapter, progress: &Mutex<RealScanProgress>, cancel: &Arc<AtomicBool>) -> Result<XrayHealth, XrayError> {
+    let result = xray.refresh_emission_status_shared(cancel.clone());
+    // Scan owns the proxy while running. Persist serial diagnostics in scan.log
+    // even when the domain's standalone observer has no X-ray adapter.
+    log_xray_diagnostics(xray, progress);
+    result
 }
 
 fn set_xray_health(progress: &Mutex<RealScanProgress>, health: XrayHealth) {
@@ -2930,6 +2942,29 @@ mod tests {
         let (sender, receiver) = mpsc::channel::<u8>();
         drop(sender);
         assert!(poll_scan_outcome(&receiver, &mut None).unwrap().is_err());
+    }
+
+    #[test]
+    fn scan_monitor_keeps_serial_diagnostics_in_the_durable_scan_log() {
+        let (mut xray, probe) = crate::devices::xray::test_worker(60.0, 200.0);
+        xray.beam_on(&AtomicBool::new(false)).unwrap();
+        probe.fail_next_read();
+        // A fresh verified pair may be reused for 250 ms. Wait for the real
+        // autonomous failure before checking its diagnostic delivery.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while xray.health().last_error.is_none() && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+        assert!(xray.health().last_error.is_some());
+        let progress = Mutex::new(RealScanProgress::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(refresh_emission_monitored(&mut xray, &progress, &cancel).is_err());
+        let messages = progress.lock().unwrap().messages.clone();
+        assert!(messages.iter().any(|entry| entry.source == "xray" && entry.message.contains("Moxtek serial command")));
+        let mut output = Vec::new();
+        write_scan_log(&mut output, &messages, &Err("communication fault".into())).unwrap();
+        let log = String::from_utf8(output).unwrap();
+        assert!(log.contains("Moxtek serial command"));
+        assert!(log.contains("budget="));
+        assert!(xray.drain_diagnostics().is_empty(), "diagnostics must not be logged twice");
     }
 
     #[test]

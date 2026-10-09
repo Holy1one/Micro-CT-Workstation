@@ -5,9 +5,13 @@
 //! the scan coordinator applies that safety policy before calling this module.
 
 use serde::Serialize;
-use serialport::{ClearBuffer, SerialPort, SerialPortInfo, SerialPortType};
+use serialport::{SerialPortInfo, SerialPortType};
+use super::transport::{BinaryTransport, SerialBinaryTransport, IO_TIMEOUT};
 use std::fmt;
-use std::io::{self, Read, Write};
+#[cfg(test)]
+use std::io;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,10 +20,10 @@ const MOXTEK_VID: u16 = 0x277B;
 const MOXTEK_PID: u16 = 0x07D1;
 const MOXTEK_SERIAL: &str = "183616";
 const BAUD_RATE: u32 = 57_600;
-const IO_TIMEOUT: Duration = Duration::from_secs(1);
-// The recovered Windows controller allows five seconds for a serial read.
-// Use that allowance only while confirming a new emission; active monitoring
-// and shutdown retain the short fail-closed timeout.
+// OEM D2XX read timeout is five seconds, although its queue wait is about
+// one second. Monitoring uses a shared five-second pair budget with cancellable
+// reads; OFF retains one second per transaction and commands are never replayed.
+const MONITOR_READ_BUDGET: Duration = Duration::from_secs(5);
 const ENABLE_STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PACKET_HEADER: u8 = 0x1B;
 const CMD_SET_VOLTAGE: u8 = 0x40;
@@ -116,67 +120,8 @@ impl fmt::Display for XrayError {
 
 impl std::error::Error for XrayError {}
 
-trait BinaryTransport: Send {
-    fn clear_input(&mut self) -> io::Result<()>;
-    fn write_all_bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
-    fn read_exact_bytes(&mut self, bytes: &mut [u8], timeout: Duration) -> io::Result<()>;
-}
-
-type SharedTransport = std::sync::Arc<std::sync::Mutex<Box<dyn BinaryTransport>>>;
-
-struct SerialBinaryTransport {
-    port: Box<dyn SerialPort>,
-}
-
-impl BinaryTransport for SerialBinaryTransport {
-    fn clear_input(&mut self) -> io::Result<()> {
-        self.port
-            .clear(ClearBuffer::Input)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
-    }
-
-    fn write_all_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let deadline = Instant::now() + IO_TIMEOUT;
-        let mut written = 0;
-        while written < bytes.len() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(io::ErrorKind::TimedOut,
-                    format!("Moxtek packet write timed out after {written}/{} bytes", bytes.len())));
-            }
-            self.port.set_timeout(remaining)
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-            match self.port.write(&bytes[written..]) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "Moxtek packet write made no progress")),
-                Ok(count) => written += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-
-    fn read_exact_bytes(&mut self, bytes: &mut [u8], timeout: Duration) -> io::Result<()> {
-        let deadline = Instant::now() + timeout;
-        let mut received = 0;
-        while received < bytes.len() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(io::ErrorKind::TimedOut,
-                    format!("Moxtek packet read timed out after {received}/{} bytes", bytes.len())));
-            }
-            self.port.set_timeout(remaining)
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-            match self.port.read(&mut bytes[received..]) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Moxtek packet read ended early")),
-                Ok(count) => received += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-}
+type SharedTransport = Arc<Mutex<Box<dyn BinaryTransport>>>;
+type Diagnostics = Arc<Mutex<VecDeque<String>>>;
 
 #[derive(Debug)]
 struct Setpoints {
@@ -203,6 +148,9 @@ pub struct RawMoxtekAdapter {
     operation_cancel: Option<std::sync::Arc<AtomicBool>>,
     external_cancel: Option<std::sync::Arc<AtomicBool>>,
     health_observer: Option<std::sync::Arc<std::sync::Mutex<XrayHealth>>>,
+    query_deadline: Option<Instant>,
+    output_deadline: Option<Instant>,
+    diagnostics: Diagnostics,
 }
 
 impl Default for RawMoxtekAdapter {
@@ -221,6 +169,9 @@ impl RawMoxtekAdapter {
             operation_cancel: None,
             external_cancel: None,
             health_observer: None,
+            query_deadline: None,
+            output_deadline: None,
+            diagnostics: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -233,6 +184,8 @@ impl RawMoxtekAdapter {
     }
     pub(super) fn set_external_cancel(&mut self,cancel:Option<std::sync::Arc<AtomicBool>>){self.external_cancel=cancel;}
     pub(super) fn observe_health(&mut self,health:std::sync::Arc<std::sync::Mutex<XrayHealth>>){self.health_observer=Some(health);}
+    pub(super) fn diagnostics(&self) -> Diagnostics { self.diagnostics.clone() }
+
     fn publish_transition(&self) {
         if let Some(observer)=self.health_observer.as_ref(){
             let mut cached=observer.lock().unwrap_or_else(|poison|poison.into_inner());
@@ -350,6 +303,7 @@ impl RawMoxtekAdapter {
         if self.health.beam_on {
             return Err(XrayError::Safety("Moxtek beam is already ON; duplicate enable is forbidden".into()));
         }
+        self.output_deadline = output_deadline;
         match self.beam_on_inner(cancel, output_deadline) {
             Ok(())=>Ok(self.health()),
             Err(error)=>{
@@ -375,8 +329,7 @@ impl RawMoxtekAdapter {
     /// silently cleared; transport failures mark the link disconnected.
     pub fn refresh_status(&mut self) -> Result<XrayHealth, XrayError> {
         let result: Result<(Setpoints, Status), XrayError> = (|| {
-            let setpoints = self.read_setpoints()?;
-            let status = self.read_status()?;
+            let (setpoints, status) = self.read_monitored_pair()?;
             Ok((setpoints, status))
         })();
         match result {
@@ -394,6 +347,7 @@ impl RawMoxtekAdapter {
                 self.health.last_error = None;
                 Ok(self.health())
             }
+            Err(XrayError::Cancelled) => Err(XrayError::Cancelled),
             Err(error) => {
                 self.health.connected = false;
                 self.health.beam_off_confirmed = false;
@@ -414,8 +368,7 @@ impl RawMoxtekAdapter {
                         "active emission has no setpoint verified in this session".into(),
                     )
                 })?;
-            let setpoints = self.read_setpoints()?;
-            let status = self.read_status()?;
+            let (setpoints, status) = self.read_monitored_pair()?;
             if !setpoints.enabled || !status.kv_enabled || !status.ua_enabled {
                 return Err(XrayError::Safety(
                     "Moxtek active emission lost one or more output flags".into(),
@@ -483,9 +436,15 @@ impl RawMoxtekAdapter {
                 Ok(self.health())
             }
             Err(error) => {
-                if self.force_off_inner().is_err() {
-                    self.health.beam_off_confirmed = false;
+                let cleanup = self.force_off_inner();
+                if matches!(error, XrayError::Cancelled) && cleanup.is_ok() {
+                    self.health.last_error = None;
+                    return Err(XrayError::Cancelled);
                 }
+                let error = match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => XrayError::Safety(format!("{error}; OFF unconfirmed: {cleanup}")),
+                };
                 self.health.last_error = Some(error.to_string());
                 Err(error)
             }
@@ -631,9 +590,13 @@ impl RawMoxtekAdapter {
         // Emergency OFF and its independent readbacks must bypass cancellation.
         let saved_cancel = self.operation_cancel.take();
         let saved_external=self.external_cancel.take();
+        let saved_query_deadline = self.query_deadline.take();
+        // OFF must run even after the output or monitor deadline expired.
+        self.output_deadline = None;
         let result = self.confirm_off_transaction();
         self.operation_cancel = saved_cancel;
         self.external_cancel=saved_external;
+        self.query_deadline = saved_query_deadline;
         result
     }
 
@@ -799,6 +762,15 @@ impl RawMoxtekAdapter {
         self.publish_transition();
     }
 
+    fn read_monitored_pair(&mut self) -> Result<(Setpoints, Status), XrayError> {
+        let deadline = Instant::now() + MONITOR_READ_BUDGET;
+        let deadline = self.output_deadline.map_or(deadline, |limit| limit.min(deadline));
+        let previous = self.query_deadline.replace(deadline);
+        let result = (|| { Ok((self.read_setpoints()?, self.read_status()?)) })();
+        self.query_deadline = previous;
+        result
+    }
+
     fn read_setpoints(&mut self) -> Result<Setpoints, XrayError> {
         let response = self.transact(CMD_GET_SETPOINTS, &[], 8)?;
         let enabled = match response[7] {
@@ -896,10 +868,33 @@ impl RawMoxtekAdapter {
             .transport
             .as_ref()
             .ok_or_else(|| XrayError::Transport("Moxtek adapter is not connected".into()))?;
-        let result = transact_transport(transport, command, payload, expected_length, read_timeout,||self.operation_cancelled());
-        if result.is_err(){return result;}
-        if self.operation_cancelled() {
-            return Err(XrayError::Cancelled);
+        let started = Instant::now();
+        let mut budget = read_timeout;
+        if matches!(command, CMD_GET_SETPOINTS | CMD_GET_STATUS) {
+            if let Some(limit) = self.query_deadline {
+                budget = limit.saturating_duration_since(started);
+            }
+        }
+        if let Some(limit) = self.output_deadline {
+            budget = budget.min(limit.saturating_duration_since(started));
+        }
+        let result = if budget.is_zero() {
+            Err(XrayError::Transport(format!("query cycle deadline reached before command 0x{command:02X}")))
+        } else {
+            transact_transport(transport, command, payload, expected_length, budget, ||
+                self.operation_cancelled() || self.output_deadline.is_some_and(|limit| Instant::now() >= limit))
+        };
+        let result = if self.output_deadline.is_some_and(|limit| Instant::now() >= limit) {
+            Err(XrayError::Safety("Continuous X-ray hard limit reached during serial transaction".into()))
+        } else if self.operation_cancelled() && result.is_ok() {
+            Err(XrayError::Cancelled)
+        } else { result };
+        if started.elapsed() > IO_TIMEOUT || (result.is_err() && !matches!(result, Err(XrayError::Cancelled))) {
+            let detail = match &result { Ok(_) => format!("reply verified, received={expected_length}/{expected_length}"), Err(error) => error.to_string() };
+            let mut log = self.diagnostics.lock().unwrap_or_else(|p| p.into_inner());
+            if log.len() == 64 { log.pop_front(); }
+            log.push_back(format!("Moxtek serial command 0x{command:02X} on {}: elapsed={} ms, read budget={} ms; {detail}",
+                self.health.port.as_deref().unwrap_or("unknown port"), started.elapsed().as_millis(), budget.as_millis()));
         }
         result
     }
@@ -914,6 +909,9 @@ fn transact_transport(
     cancelled: impl Fn()->bool,
 ) -> Result<Vec<u8>, XrayError> {
     if cancelled(){return Err(XrayError::Cancelled);}
+    // Include purge/write time in the transaction budget, so two queries cannot
+    // exceed their shared monitoring deadline by an extra write timeout each.
+    let read_deadline = Instant::now() + read_timeout;
     let mut transport = transport
         .lock()
         .map_err(|_| XrayError::Transport("Moxtek transport lock was poisoned".into()))?;
@@ -927,19 +925,24 @@ fn transact_transport(
         .map_err(|error| XrayError::Transport(format!("input purge failed: {error}")))?;
     if cancelled(){return Err(XrayError::Cancelled);}
     transport
-        .write_all_bytes(&packet)
-        .map_err(|error| XrayError::Transport(format!("write failed: {error}")))?;
+        .write_cancellable(&packet, read_deadline.saturating_duration_since(Instant::now()), &cancelled)
+        .map_err(|error| if error.kind() == std::io::ErrorKind::Interrupted && cancelled() {
+            XrayError::Cancelled
+        } else { XrayError::Transport(format!("write failed: {error}")) })?;
     let mut response = vec![0; expected_length];
     transport
-        .read_exact_bytes(&mut response, read_timeout)
-        .map_err(|error| XrayError::Transport(format!("read failed for command 0x{command:02X}: {error}")))?;
+        .read_cancellable(&mut response, read_deadline.saturating_duration_since(Instant::now()), &cancelled)
+        .map_err(|error| if error.kind() == std::io::ErrorKind::Interrupted && cancelled() {
+            XrayError::Cancelled
+        } else { XrayError::Transport(format!("read failed for command 0x{command:02X}: {error}")) })?;
+    if cancelled() { return Err(XrayError::Cancelled); }
     if response.len() < 3
         || response[0] != PACKET_HEADER
         || response[1] != command
         || usize::from(response[2]) != expected_length.saturating_sub(3)
     {
         return Err(XrayError::Protocol(format!(
-            "invalid response for command 0x{command:02X}"
+            "invalid response for command 0x{command:02X}: expected {expected_length} bytes, received {response:02X?}"
         )));
     }
     Ok(response)
@@ -1082,6 +1085,7 @@ pub(crate) mod tests {
         enabled_status_timeouts: Vec<Duration>,
         next_read_timeout: bool,
         panic_next_read: bool,
+        corrupt_next_reply: bool,
     }
 
     impl Default for FakeState {
@@ -1108,6 +1112,7 @@ pub(crate) mod tests {
                 enabled_status_timeouts: Vec::new(),
                 next_read_timeout: false,
                 panic_next_read: false,
+                corrupt_next_reply: false,
             }
         }
     }
@@ -1251,6 +1256,9 @@ pub(crate) mod tests {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "wrong response length"));
             }
             bytes.copy_from_slice(&response);
+            if std::mem::take(&mut self.lock().corrupt_next_reply) {
+                bytes[1] ^= 1;
+            }
             Ok(())
         }
     }
@@ -1704,6 +1712,150 @@ pub(crate) mod tests {
         assert!(!state.lock().unwrap().enabled,"worker must force OFF without any UI request");
         assert!(owner.health().last_error.is_some());
         assert!(owner.beam_on(&AtomicBool::new(false)).is_err(),"faulted worker may not automatically re-enable");
+    }
+
+    // Exercise the production receive loop through the actual owner, without
+    // opening a serial port. Only the next emitting 0x43 reply is delayed.
+    struct DelayedTransport {
+        inner: FakeTransport,
+        armed: Arc<AtomicBool>,
+        entered: Arc<AtomicBool>,
+        delay: Duration,
+        budgets: Arc<Mutex<Vec<(u8, Duration)>>>,
+    }
+    impl BinaryTransport for DelayedTransport {
+        fn clear_input(&mut self) -> io::Result<()> { self.inner.clear_input() }
+        fn write_all_bytes(&mut self, bytes: &[u8]) -> io::Result<()> { self.inner.write_all_bytes(bytes) }
+        fn read_exact_bytes(&mut self, bytes: &mut [u8], timeout: Duration) -> io::Result<()> { self.inner.read_exact_bytes(bytes, timeout) }
+        fn read_cancellable(&mut self, bytes: &mut [u8], timeout: Duration, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+            let (command, enabled) = { let state = self.inner.lock(); (state.writes.last().unwrap()[1], state.enabled) };
+            self.budgets.lock().unwrap().push((command, timeout));
+            if command != CMD_GET_SETPOINTS || !enabled || !self.armed.swap(false, Ordering::SeqCst) {
+                return self.inner.read_exact_bytes(bytes, timeout);
+            }
+            self.entered.store(true, Ordering::SeqCst);
+            let started = Instant::now();
+            super::super::transport::receive_packet(bytes, timeout, cancelled, |buffer, slice| {
+                if started.elapsed() < self.delay {
+                    thread::sleep(slice);
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                self.inner.read_exact_bytes(buffer, timeout)?;
+                Ok(buffer.len())
+            })
+        }
+    }
+    type DelayedFixture = (RawMoxtekAdapter, Arc<Mutex<FakeState>>, Arc<AtomicBool>, Arc<AtomicBool>, Arc<Mutex<Vec<(u8, Duration)>>>);
+    fn delayed_fixture(delay: Duration) -> DelayedFixture {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let armed = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let budgets = Arc::new(Mutex::new(Vec::new()));
+        let mut raw = RawMoxtekAdapter::new();
+        raw.connect_transport("FAKE".into(), MOXTEK_SERIAL.into(), Box::new(DelayedTransport {
+            inner: FakeTransport { state: state.clone() }, armed: armed.clone(), entered: entered.clone(), delay, budgets: budgets.clone(),
+        })).unwrap();
+        raw.set_parameters(60.0, 200.0).unwrap();
+        raw.last_off = Some(Instant::now() - Duration::from_secs(3));
+        (raw, state, armed, entered, budgets)
+    }
+
+    #[test]
+    fn active_monitor_waits_past_one_second_without_replaying_any_command() {
+        let (mut raw, state, armed, _, budgets) = delayed_fixture(Duration::from_millis(1100));
+        raw.beam_on(&AtomicBool::new(false)).unwrap();
+        let before = state.lock().unwrap().writes.len();
+        budgets.lock().unwrap().clear();
+        armed.store(true, Ordering::SeqCst);
+        assert!(raw.refresh_emission_status().unwrap().beam_on);
+        let writes = state.lock().unwrap().writes[before..].to_vec();
+        assert_eq!(writes.iter().map(|p| p[1]).collect::<Vec<_>>(), [CMD_GET_SETPOINTS, CMD_GET_STATUS]);
+        let budgets = budgets.lock().unwrap();
+        assert!(budgets[0].1 <= MONITOR_READ_BUDGET);
+        assert!(budgets[1].1 < MONITOR_READ_BUDGET - Duration::from_secs(1), "0x80 must share the remaining pair budget");
+        assert!(raw.diagnostics.lock().unwrap().iter().any(|log| log.contains("0x43") && log.contains("reply verified")));
+    }
+
+    #[test]
+    fn permanent_monitor_timeout_forces_off_with_progress_and_does_not_retry_on() {
+        let (mut raw, state, armed, _, _) = delayed_fixture(Duration::from_secs(60));
+        raw.beam_on(&AtomicBool::new(false)).unwrap();
+        armed.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let error = raw.refresh_emission_status().unwrap_err();
+        assert!(started.elapsed() >= MONITOR_READ_BUDGET);
+        assert!(started.elapsed() < MONITOR_READ_BUDGET + Duration::from_secs(1));
+        assert!(error.to_string().contains("received=0/8"));
+        assert!(raw.health().beam_off_confirmed);
+        let state = state.lock().unwrap();
+        assert!(!state.enabled);
+        assert_eq!(state.beam_enable_times.len(), 1);
+    }
+
+    #[test]
+    fn a_mismatched_reply_is_not_retried_or_treated_as_a_fresh_monitor_sample() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut raw = connected_adapter(state.clone());
+        raw.set_parameters(60.0, 200.0).unwrap(); raw.last_off = Some(Instant::now() - Duration::from_secs(3));
+        raw.beam_on(&AtomicBool::new(false)).unwrap();
+        let count = state.lock().unwrap().writes.len();
+        state.lock().unwrap().corrupt_next_reply = true;
+        assert!(matches!(raw.refresh_emission_status(), Err(XrayError::Protocol(_))));
+        let state = state.lock().unwrap();
+        assert_eq!(state.writes[count..].iter().filter(|packet| packet[1] == CMD_GET_SETPOINTS).count(), 2,
+            "one failed monitor query and one independent OFF verification, no replay");
+        assert!(!state.enabled);
+        assert_eq!(state.beam_enable_times.len(), 1);
+        assert!(raw.health().beam_off_confirmed);
+    }
+
+    #[test]
+    fn priority_off_interrupts_autonomous_five_second_monitor_without_a_false_fault() {
+        let (raw, state, armed, entered, _) = delayed_fixture(Duration::from_secs(60));
+        let mut owner = super::super::worker::MoxtekAdapter::from_raw(raw);
+        owner.beam_on(&AtomicBool::new(false)).unwrap();
+        armed.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+        assert!(entered.load(Ordering::SeqCst), "independent owner monitor must run without snapshots");
+        let started = Instant::now();
+        assert!(owner.request_off().recv_timeout(Duration::from_secs(1)).unwrap().unwrap().beam_off_confirmed);
+        assert!(started.elapsed() < Duration::from_millis(500), "OFF must preempt five-second monitoring");
+        assert!(owner.health().last_error.is_none(), "normal cancellation is not a communication fault");
+        assert!(!state.lock().unwrap().enabled);
+        assert_eq!(state.lock().unwrap().beam_enable_times.len(), 1);
+    }
+
+    #[test]
+    fn continuous_output_limit_preempts_a_stalled_monitor() {
+        let (raw, state, armed, entered, _) = delayed_fixture(Duration::from_secs(60));
+        let mut owner = super::super::worker::MoxtekAdapter::from_raw(raw);
+        let hard_limit = Instant::now() + Duration::from_millis(700);
+        owner.beam_on_until(&AtomicBool::new(false), hard_limit).unwrap();
+        armed.store(true, Ordering::SeqCst);
+        let deadline = hard_limit + Duration::from_secs(1);
+        while (state.lock().unwrap().enabled || owner.health().last_error.is_none()) && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+        assert!(entered.load(Ordering::SeqCst));
+        assert!(!state.lock().unwrap().enabled);
+        let off_at = state.lock().unwrap().beam_transitions.iter().filter(|(on, _)| !on).map(|(_, at)| *at).last().unwrap();
+        assert!(off_at < hard_limit + Duration::from_millis(300));
+        assert!(owner.health().last_error.as_deref().is_some_and(|error| error.contains("hard limit")));
+    }
+
+    #[test]
+    fn fresh_emission_readback_is_shared_but_off_invalidates_the_cache() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut raw = connected_adapter(state.clone());
+        raw.set_parameters(60.0, 200.0).unwrap(); raw.last_off = Some(Instant::now() - Duration::from_secs(3));
+        let mut owner = super::super::worker::MoxtekAdapter::from_raw(raw);
+        owner.beam_on(&AtomicBool::new(false)).unwrap();
+        owner.refresh_emission_status().unwrap();
+        let count = state.lock().unwrap().writes.len();
+        for _ in 0..8 { owner.refresh_emission_status().unwrap(); }
+        assert_eq!(state.lock().unwrap().writes.len(), count, "scan and owner polls must share the same fresh verified pair");
+        owner.force_off().unwrap();
+        assert!(owner.refresh_emission_status().is_err(), "a previous ON readback may never authorize monitoring after OFF");
+        assert!(!state.lock().unwrap().enabled);
     }
 
     #[test]

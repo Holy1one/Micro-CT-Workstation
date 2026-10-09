@@ -5,6 +5,7 @@
 
 mod moxtek;
 mod worker;
+mod transport;
 
 pub use moxtek::{
     XrayError, XrayHealth, MAX_CURRENT_UA, MAX_SETPOINT_POWER_W,
