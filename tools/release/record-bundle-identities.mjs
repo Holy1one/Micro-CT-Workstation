@@ -1,0 +1,20 @@
+/** Verify the MSI-extracted or installed app and adjacent engine against the current source build. */
+import {readFileSync,writeFileSync} from 'node:fs';
+import {resolve,join,dirname} from 'node:path';
+import {createHash} from 'node:crypto';
+const root=resolve(import.meta.dirname,'../..');
+const version=JSON.parse(readFileSync(join(root,'package.json'),'utf8')).version;
+const output=join(root,'.cache/tests/release',version);
+if(process.argv.length!==3)throw Error('Pass the application EXE extracted from the actual MSI, or installed from it');
+const path=resolve(process.argv[2]);const bytes=readFileSync(path);
+const marker='__TAURI_BUNDLE_TYPE_VAR_MSI';const offset=bytes.indexOf(Buffer.from(marker));
+if(offset<0||bytes.indexOf(Buffer.from(marker),offset+1)>=0)throw Error('Installed MSI app identity is absent or ambiguous');
+const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
+const compiled=readFileSync(join(root,'.cache/cargo/release/ct-workstation.exe'));
+const restored=Buffer.from(bytes);Buffer.from('__TAURI_BUNDLE_TYPE_VAR_UNK').copy(restored,offset);
+if(!restored.equals(compiled)&&!bytes.equals(compiled))throw Error('Installed application does not match the compiled app and MSI marker');
+const engine=readFileSync(join(dirname(path),'ct-engine.exe'));
+if(!engine.equals(readFileSync(join(root,'backend/src-tauri/binaries/ct-engine-x86_64-pc-windows-msvc.exe'))))throw Error('Installed engine differs from the source build');
+const identity={kind:'msi',marker,markerOffset:offset,verificationMethod:'msi-package-files',artifactSha256:sha(readFileSync(join(output,'micro-ct-workstation_'+version+'_windows_x86_64.msi'))),applicationExeSha256:sha(bytes),engineSha256:sha(engine)};
+writeFileSync(join(output,'bundle-identities.json'),JSON.stringify({msi:identity},null,2)+'\n',{flag:'wx'});
+console.log('PASS MSI application and engine match the current build');

@@ -1,28 +1,12 @@
-# Documentation map
+# 文档入口
 
-## Current references
+- [architecture/README.md](architecture/README.md)：当前架构与阅读导航。
+- [architecture/directory-map.md](architecture/directory-map.md)：目录职责和内容边界。
+- [architecture/frontend-functional-spec.md](architecture/frontend-functional-spec.md)：前端功能与后端接口。
+- [architecture/frontend-error-codes.md](architecture/frontend-error-codes.md)：错误码与界面呈现。
+- [guides/windows-integration.md](guides/windows-integration.md)：Windows 集成。
+- [guides/3d-scene-maintenance.md](guides/3d-scene-maintenance.md)：三维几何与视角维护。
+- [guides/desktop-update-distribution.md](guides/desktop-update-distribution.md)：发行与签名。
+- [validation/README.md](validation/README.md)：验收摘要。
 
-- `architecture/README.md`: primary software architecture entry.
-- `architecture/directory-map.md`: responsibility of every active directory and important subdirectory.
-- `architecture/execution-flows.md`: startup, command, scan, failure, and shutdown flows.
-- `architecture/dual-control-topology.md`: current PC-direct topology and the planned Arduino-managed backend boundary.
-- `architecture/module-graph.md`: generated module dependency view; never edit by hand.
-- `WINDOWS-INTEGRATION.md`: current Windows process, device-module, and hardware acceptance boundary.
-- `3d-model-and-camera-guide.md`: current procedural 3D scene maintenance guide.
-
-## Decisions
-
-`decisions/` records durable choices, rejected alternatives, and consequences. Update a decision only when the shipped facts change; create a new decision when replacing its rationale.
-
-## Historical material
-
-- `CURRENT-PROGRESS.md`, `CONSOLE-REDESIGN.md`, and `system_design.md` are dated implementation snapshots.
-- `PHASE-1-3-IMPLEMENTATION-PLAN.md` is a superseded plan.
-- `WINDOWS-CODEX-PROMPT.md` is an archived handoff prompt with an obsolete machine path.
-- `HARDWARE-V3.md` records a retired hardware-planning location.
-
-Historical documents explain why the repository evolved but are not authority for current paths or behavior. Source code, tests, `module-map/`, and `docs/architecture/` take precedence.
-
-## Verification evidence
-
-`shots/` contains screenshots, probe scripts, JSON measurements, and transient QA logs from earlier acceptance work. These files are evidence, not product code or reusable architecture. Python caches and other regenerated output do not belong in design truth.
+历史进度、旧交接提示词、过时计划和重复架构页已从当前工作树移除。Git 保存提交历史；仍有价值的原始验收记录和过程资料在本机 .cache/tests/ 保留。文档配图统一从根 assets/ 引用。

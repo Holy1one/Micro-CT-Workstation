@@ -1,77 +1,42 @@
 # Micro-CT Workstation
 
-Micro-CT-App 是 Windows 工业上位机工程：React 提供操作界面，Tauri 提供桌面能力，Rust `ct-engine` 统一控制 Moxtek 射线源、Nikon D7100 相机和 RTS9060 Nano 转台。
+Windows 桌面 Micro-CT 上位机。React 展示状态并发送命令，Tauri 提供桌面能力，Rust ct-engine 统一控制 Moxtek、Nikon D7100 和 Nano 转台。
 
-## 架构原则
+## 开发与构建
 
-- `ct-engine` 是设备连接、安全门控、扫描状态和投影事务的唯一权威。
-- Tauri 只管理窗口、原生路径/对话框、sidecar 生命周期和 IPC 转发。
-- React 只发送领域命令并渲染完整快照；3D 场景只读展示。
-- 浏览器开发预览完全离线，不能访问真实设备；Tauri IPC 失败时不能回退到预览。
-- 每个投影在转台到位、出束状态监测、主机侧图像文件确认和 `CAPTURE_DONE` 全部成功后才提交；射线在设定的连续出束时间内跨投影保持开启，到时关束冷却。
+在仓库根目录执行：
 
-完整架构入口见 [`docs/architecture/README.md`](docs/architecture/README.md)，逐目录说明见 [`docs/architecture/directory-map.md`](docs/architecture/directory-map.md)，PC 直控与未来 Arduino 主控双线方案见 [`docs/architecture/dual-control-topology.md`](docs/architecture/dual-control-topology.md)。
-
-## 核心模块
-
-- `crates/ct-engine/src/devices/xray/`：Moxtek 通信、实测回读和 fail-closed 关束。
-- `crates/ct-engine/src/devices/camera/`：D7100 / DigiCamControl 和主机文件确认。
-- `crates/ct-engine/src/devices/turntable/`：Nano 协议、运动确认、警告和急停。
-- `crates/ct-engine/src/scan.rs`：跨设备投影事务编排。
-- `src-tauri/`：薄桌面壳和 versioned JSONL sidecar 客户端。
-- `src/engine/`：前端契约、生产 adapter 和浏览器预览。
-- `module-map/`：机器可读模块归属与隐藏依赖。
-
-相机模块使用原生 Rust Windows WPD/PTP、能力协商和设备自主控制；实现边界见 [ADR 0003](docs/decisions/0003-native-wpd-camera-and-device-control.md)。当前交付离线候选，真实事件、方向、flash 和联动扫描认证仍为 BLOCKED。
-
-## Windows 入口
-
-Windows 11 x64 是真实设备集成与最终发布平台。安装 MSVC Build Tools、WebView2、Rust `x86_64-pc-windows-msvc`、Node 后运行 `npm.cmd run tauri:dev`。真实相机、串口和射线操作必须取得本次明确授权，详见 `docs/WINDOWS-INTEGRATION.md`。
-
-## 免安装版发布与启动
-
-运行 `npm.cmd run portable:build`，将当前前端、桌面壳和内嵌引擎一起编译，并更新唯一交付入口 `portable-release/micro-ct-workstation-portable.exe`。直接双击该 EXE，无需 CMD 或批处理启动器；Windows 需具备 WebView2 运行时。同目录 `build-info.json` 记录构建时间、源提交、工作区是否含未提交改动和 EXE SHA256。EXE 与 `build-info.json` 都是本机可再生成的打包产物，不提交到 Git：仓库只跟踪 `portable-release/README.md`，版本留档用 tag 记录源码提交，接收方按 tag 在本机重新构建。
-
-`npm.cmd run build` 只更新网页产物，不能更新桌面 EXE。`target/release/` 是 Cargo/Tauri 编译输出和缓存，不作为用户启动入口；关闭相关程序后可删除该目录，但下次构建会重新生成并增加编译时间。日常保留编译缓存，只使用本机 `portable-release/` 中的正式交付副本。
-
-应用将内嵌 `ct-engine` 校验并释放到本机运行时目录，在后台通过管道通信。引擎进程必须运行，但无需显示控制台；退出时请关闭主窗口，由应用执行停止、关闭管道和引擎清理。
-
-未经硬件验收的设备重大迁移交付明确标记的离线候选包，例如
-`release/native-device-controls-offline/`，保留上述现用正式入口及其来源/哈希。
-候选包包含 EXE、构建信息、哈希、第三方许可、离线验证报告与硬件待验收项；
-离线通过不能标记真实设备认证完成。
-
-## 界面尺寸与窗口规则
-
-界面以 1920×1080 为设计基准，必须铺满窗口客户区四边。控件使用统一缩放系数，网格宽高随实际客户区适配；1920×1080 桌面扣除标题栏和任务栏后也不得出现左右留边。超宽或较矮客户区由中央区域和布局尺寸吸收比例差异，不拉伸文字、不裁切控件、不引入固定栏目滚动。
-
-桌面默认最大化。物理屏幕宽度 ≤1920 或高度 ≤1080 时不允许保持窗口化；高分屏在 DPI 换算后工作区小于 1888×1072 逻辑像素时也采用这一限制。限制模式保留最小化和关闭，禁用原生缩放/最大化按钮，并在还原、拖拽或跨屏移动后重新应用最大化策略。其他屏幕允许窗口化，最小客户端为 1728×972 逻辑像素（再按可用工作区上限收敛）。
-
-射线实测缺失或读取失败时显示“—”，输出状态区分已确认 ON、已确认 OFF 和 UNKNOWN；设定值始终单独展示。控制服务连接与设备连接分别显示。界面不拥有设备或扫描状态。
-
-客户区顶部为 39px 自定义标题栏，包含紧凑的可展开工程菜单、品牌标识和窗口控制按钮，不增加重复的 Production 文案。该规格以 `src/AGENTS.md` 为准。解释通过圆圈问号悬停查看，输入错误直接显示。投影数接受 1–3600 的任意正整数；曝光单位 ms，D7100 额定定时快门为 0.125–30000 ms，连接后按相机枚举的上下限及原生档位校验并读回确认。最长出束时间按 min 输入，默认 10；引擎仍使用秒并保留既有冷却规则。
-
-底部 Log Aggregation 与 Operation Status 均为 306 个设计像素高，顶端、底端对齐，与上方栏目保持 12px 间距；保留列宽、排列和右侧通栏布局。固定栏目不引入滚动，日志列表、图像条和浮层对话框可以滚动。3D 转台与样品依据确认的转台脉冲位置换算角度，并在反馈之间做 300 ms 匀速过渡；数值读数始终是确认角度。暂停、停止、失联及完成会终止过渡或定位到最终确认姿态，界面不会自行预测下一步运动。
-
-## 开发与验证命令
-
-```powershell
+~~~powershell
 npm.cmd ci
 npm.cmd run dev -- --port 4173 --strictPort
 npm.cmd run tauri:dev
-```
+npm.cmd run installer:build
+~~~
 
-验证：
+Windows x64 安装包兼容目标为 Windows 10 和 Windows 11，使用 MSI 提供目录选择、开始菜单/桌面快捷方式，以及修改、修复、卸载。installer:build 输出 release/micro-ct-workstation_<version>_windows_x86_64.msi，该目录只保留最新安装包；构建来源、签名和许可证在 .cache/tests/release/<version>/，许可证同时安装。随包提供 WebView2 引导安装器（缺少运行时时自动联网安装）；开发构建需要 MSVC Build Tools、Rust MSVC toolchain 和 Node.js。网页 build 只更新前端构建输出。安装须由用户自行启动。
 
-```powershell
-npm.cmd run typecheck
-npm.cmd run test:sites
+## 目录与资料
+
+- [AGENTS.md](AGENTS.md)：规则和按任务读取顺序。
+- [docs/architecture/README.md](docs/architecture/README.md)：控制链、接口与结构化约束。
+- [docs/architecture/directory-map.md](docs/architecture/directory-map.md)：逐目录职责。
+- [docs/guides/windows-integration.md](docs/guides/windows-integration.md)：Windows 集成。
+- [docs/guides/desktop-update-distribution.md](docs/guides/desktop-update-distribution.md)：发行、签名和升级。
+- [docs/validation/README.md](docs/validation/README.md)：验收摘要与证据边界。
+
+关键 Logo 母版、字体和打包图标位于 assets/。运行时只暂存 256px 透明 Logo 与字体到 .cache/frontend/public/assets/，原图和历史截图不进入应用包；历史界面截图留在 .cache/screenshots/。
+
+前端入口和构建配置集中在 frontend/{index.html,tsconfig.json,vite.config.mjs}。Rust workspace 位于 backend/{Cargo.toml,Cargo.lock}，领域引擎与桌面壳分别位于 backend/ct-engine/ 和 backend/src-tauri/。从仓库根运行 npm 脚本即可；直接执行 Cargo 时指定 --manifest-path backend/Cargo.toml，或进入 backend/。根目录保留 npm、Git 入口及规则和导航文档；.cargo/config.toml 统一全仓编译缓存位置。
+
+## 离线验证
+
+~~~powershell
 npm.cmd run module-map:check
-cargo test --workspace
-```
+npm.cmd run typecheck
+npm.cmd run build
+cargo test --manifest-path backend/Cargo.toml --workspace
+~~~
 
-运行 `npm.cmd run impact` 可根据当前 Git 工作区列出所属模块、受影响模块、强依赖和必跑门禁。
+tests/ 本机保留，但按用户要求不进入 Git。完整的本机验证入口为 npm.cmd run verify；前端、桌面和固件测试入口分别为 test:frontend、test:desktop、firmware:test。全新检出包含必要构建、发布和架构检查工具；本地外部测试套件需要单独提供。crate 内单元测试随源码保留。
 
-## 原生设备控制候选
-
-运行 npm.cmd run candidate:build 生成 release/native-device-controls-offline/micro-ct-native-device-controls-offline.exe 及来源、哈希、许可；正式 portable-release/ 保留旧任务处理版本。顶部 Devices 打开 Camera/Turntable 浮层，主布局保持 39px 标题栏和 306px 底栏。原始 NEF 只读，schema 2 数据与合法重构缓存保留；原生 backend 只向完整 schema 3 任务续扫。所有离线通过均不等于设备认证。
+缓存、日志、截图和测试运行输出均位于 .cache/。原始 NEF、扫描清单与任务持久数据使用应用既有保存位置，不属于工程缓存清理范围。真实设备验收须另有明确授权与本次设备证据。

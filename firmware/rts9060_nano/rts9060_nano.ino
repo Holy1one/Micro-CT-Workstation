@@ -61,8 +61,8 @@ constexpr uint8_t BUZZER_ON_LEVEL  = BUZZER_ACTIVE_HIGH ? HIGH : LOW;
 constexpr uint8_t BUZZER_OFF_LEVEL = BUZZER_ACTIVE_HIGH ? LOW  : HIGH;
 constexpr uint8_t PROTOCOL_VERSION = 2;
 #define DEVICE_TYPE_TEXT "RTS9060_NANO"
-#define FIRMWARE_VERSION_TEXT "2.1.0"
-#define FIRMWARE_BUILD_TEXT "20260918"
+#define FIRMWARE_VERSION_TEXT "2.1.1"
+#define FIRMWARE_BUILD_TEXT "20261009"
 constexpr uint32_t XRAY_WARNING_PERIOD_MS = 1000;
 constexpr uint32_t XRAY_WARNING_ON_MS = 500;
 constexpr uint8_t STEP_IDLE = LOW;
@@ -614,7 +614,7 @@ static void sendInfo(uint32_t id) {
   Serial.print(F(" PROTOCOL=")); Serial.print(PROTOCOL_VERSION);
   Serial.print(F(" BUILD=")); Serial.print(F(FIRMWARE_BUILD_TEXT));
   Serial.print(F(" BUZZER=")); Serial.print(BUZZER_INSTALLED ? 1 : 0);
-  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING"));
+  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE"));
 }
 
 static void beginMove(uint32_t id, int32_t target) {
@@ -737,6 +737,25 @@ static void handleCommand(char *line) {
     printAck(id, "CLEAR_FAULT");
     Serial.print("OK "); Serial.print(id); Serial.println(" FAULT_CLEARED");
     updateIndicators();
+  } else if (!strcmp(command, "RESTORE_REFERENCE")) {
+    if (!takeId(&id)) { printError(0, "BAD_REFERENCE_RESTORE"); return; }
+    int32_t expected = 0;
+    if (!parseI32(strtok(nullptr, " \t"), &expected) || !noMoreTokens()) {
+      printError(id, "BAD_REFERENCE_RESTORE"); return;
+    }
+    if (!requireIdle(id) || !requireRearmed(id) || !requireHeartbeat(id)) return;
+    if (g_xrayWarning || expected > 0 || expected < -MAX_POSITION_PULSES ||
+        g_pulses != expected || g_targetPulses != expected || g_captureId != 0) {
+      printError(id, "REFERENCE_RESTORE_POSITION_CHANGED"); return;
+    }
+    // PC has verified the frozen checkpoint and explicit unchanged-position
+    // attestation. Restore eligibility only: never change counters or pulse STEP.
+    g_referenceValid = true;
+    g_homed = true;
+    printAck(id, "RESTORE_REFERENCE");
+    Serial.print("OK "); Serial.print(id);
+    Serial.print(" REFERENCE_RESTORED POS="); Serial.println(static_cast<long>(g_pulses));
+    updateIndicators();
   } else if (!strcmp(command, "HOME")) {
     if (!takeId(&id) || !noMoreTokens()) { printError(0, "BAD_HOME"); return; }
     if (!requireIdle(id) || !requireRearmed(id) || !requireHeartbeat(id)) return;
@@ -855,7 +874,7 @@ void setup() {
   Serial.print(F(" PROTOCOL=")); Serial.print(PROTOCOL_VERSION);
   Serial.print(F(" BUILD=")); Serial.print(F(FIRMWARE_BUILD_TEXT));
   Serial.print(F(" BUZZER=")); Serial.print(BUZZER_INSTALLED ? 1 : 0);
-  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING"));
+  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE"));
   updateIndicators();
 }
 

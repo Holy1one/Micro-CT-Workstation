@@ -1,0 +1,1215 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! Thin Windows desktop host for the Micro-CT workstation.
+//!
+//! This crate owns native paths, dialogs, window lifecycle, and forwarding to
+//! the ct-engine sidecar. It intentionally does not duplicate device, safety,
+//! or scan state from the production engine.
+
+mod engine_client;
+mod camera_forwarder;
+mod updater;
+#[cfg(windows)]
+mod windows_icons;
+use engine_client::EngineClient;
+use serde_json::Value;
+#[cfg(debug_assertions)]
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
+use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
+
+struct EngineState(Mutex<Option<EngineClient>>,std::sync::atomic::AtomicBool,std::sync::atomic::AtomicBool,std::sync::atomic::AtomicBool);
+struct SoftwareUpdateHost(Result<updater::UpdaterService, String>);
+
+fn engine_data_directory() -> Result<std::path::PathBuf, String> {
+    let path = if let Some(path) = std::env::var_os("MICRO_CT_ENGINE_DATA_DIR") {
+        std::path::PathBuf::from(path)
+    } else {
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA unavailable")?).join("MicroCTWorkstation")
+    };
+    if !path.is_absolute() {return Err("Engine data directory must be absolute".into());}
+    Ok(path)
+}
+
+fn update_service(state: &SoftwareUpdateHost) -> Result<updater::UpdaterService, String> {
+    state.0.as_ref().cloned().map_err(Clone::clone)
+}
+
+#[tauri::command]
+async fn software_update_check(channel: String, state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    update_service(&state)?.check(channel).await
+}
+#[tauri::command]
+async fn software_update_download(update_id: String, state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    update_service(&state)?.download_update(update_id).await
+}
+#[tauri::command]
+fn software_update_status(state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    update_service(&state)?.status()
+}
+#[tauri::command]
+fn software_update_cancel(update_id: String, state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    update_service(&state)?.cancel(update_id)
+}
+#[tauri::command]
+async fn software_update_import(app: tauri::AppHandle, state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let service = update_service(&state)?;
+    service.clear_feedback()?;
+    let chosen = tauri::async_runtime::spawn_blocking(move || app.dialog().file()
+        .add_filter("Signed offline update", &["zip"]).blocking_pick_file())
+        .await.map_err(|error| error.to_string())?;
+    match chosen {
+        Some(path) => service.import_zip(path.into_path().map_err(|error| error.to_string())?).await,
+        None => service.status(),
+    }
+}
+
+fn validate_update_authority(snapshot: &Value, expected_session: &str, expected_operation: &str) -> Result<updater::UpdateAuthority, String> {
+    if snapshot.get("engineSessionId").and_then(Value::as_str) != Some(expected_session)
+        || snapshot.get("mode").and_then(Value::as_str) != Some("production_locked") {
+        return Err("Maintenance authority came from an unrelated or preview engine".into());
+    }
+    let report: updater::UpdateAuthority = serde_json::from_value(snapshot.get("softwareUpdatePreparation")
+        .cloned().ok_or("Maintenance authority missing")?).map_err(|error| error.to_string())?;
+    if report.session_id != expected_session || report.operation_id != expected_operation {
+        return Err("Maintenance authority operation changed".into());
+    }
+    report.validate()?;
+    let completed = snapshot.get("operations").and_then(Value::as_array).is_some_and(|operations| operations.iter().any(|operation|
+        operation.get("operationId").and_then(Value::as_str) == Some(expected_operation)
+        && operation.get("kind").and_then(Value::as_str) == Some("prepare_software_update")
+        && operation.get("status").and_then(Value::as_str) == Some("completed")));
+    if !completed {return Err("Matching maintenance operation has not completed".into());}
+    Ok(report)
+}
+
+fn prepare_update_engine(app: &tauri::AppHandle) -> Result<(updater::UpdateAuthority, updater::ProcessIdentity), String> {
+    let state = app.state::<EngineState>();
+    if state.1.load(Ordering::SeqCst) {return Err("Desktop is already shutting down".into());}
+    let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+        .as_ref().cloned().ok_or("ct-engine is unavailable")?;
+    let first = client.prepare_software_update()?;
+    let session = first.get("engineSessionId").and_then(Value::as_str).ok_or("Engine session missing")?.to_owned();
+    let operation = first.get("softwareUpdatePreparation").and_then(|report| report.get("operationId"))
+        .and_then(Value::as_str).filter(|value| !value.is_empty()).ok_or("Maintenance operation missing")?.to_owned();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut snapshot = first;
+    loop {
+        let status = snapshot.get("softwareUpdatePreparation").and_then(|report| report.get("status")).and_then(Value::as_str);
+        if status == Some("ready") {break;}
+        if matches!(status, Some("blocked" | "cancelled")) {
+            return Err(snapshot["softwareUpdatePreparation"]["error"].as_str().unwrap_or("Maintenance preparation was blocked or cancelled").to_owned());
+        }
+        if std::time::Instant::now() >= deadline {return Err("Maintenance preparation timed out; installer was not started".into());}
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        snapshot = client.request("snapshot", serde_json::json!({}))?;
+    }
+    // Re-read this locked authority immediately before closing the owned stdin.
+    snapshot = client.request("snapshot", serde_json::json!({}))?;
+    let authority = validate_update_authority(&snapshot, &session, &operation)?;
+    if state.1.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("Desktop close superseded software update preparation".into());
+    }
+    client.begin_shutdown();
+    client.wait_for_exit(std::time::Duration::from_secs(90))?;
+    let (pid, creation_time, exit_code) = client.exited_process_identity()?;
+    Ok((authority, updater::ProcessIdentity {pid, creation_time, exit_code}))
+}
+
+#[cfg(test)]
+mod maintenance_authority_tests {
+    use super::*;
+    fn ready_snapshot() -> Value {
+        serde_json::json!({"engineSessionId":"current-session","mode":"production_locked",
+            "operations":[{"operationId":"fresh-maintenance","kind":"prepare_software_update","status":"completed"}],
+            "softwareUpdatePreparation":{"sessionId":"current-session","operationId":"fresh-maintenance",
+                "status":"ready","ready":true,"maintenanceLocked":true,"createdAt":"2026-10-05T00:00:00Z",
+                "completedAt":"2026-10-05T00:00:01Z","turntableStop":"confirmed","xrayOff":"never-owned",
+                "cameraCleanup":"confirmed","noActiveTransactions":true,"error":null}})
+    }
+    #[test]
+    fn ready_report_requires_real_session_locked_cleanup_and_matching_completed_operation() {
+        let source = ready_snapshot();
+        assert!(validate_update_authority(&source,"current-session","fresh-maintenance").is_ok());
+        for field in ["turntableStop","xrayOff","cameraCleanup"] {
+            let mut changed = source.clone();changed["softwareUpdatePreparation"][field]=serde_json::json!("unknown");
+            assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        }
+        for field in ["maintenanceLocked","noActiveTransactions"] {
+            let mut changed = source.clone();changed["softwareUpdatePreparation"][field]=serde_json::json!(false);
+            assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        }
+        for status in ["queued","running","failed","cleanup_unconfirmed","cancelled"] {
+            let mut changed = source.clone();changed["operations"][0]["status"]=serde_json::json!(status);
+            assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        }
+    }
+    #[test]
+    fn missing_old_or_preview_authority_never_grants_install_permission() {
+        let source = ready_snapshot();
+        assert!(validate_update_authority(&source,"old-session","fresh-maintenance").is_err());
+        assert!(validate_update_authority(&source,"current-session","old-maintenance").is_err());
+        let mut changed = source.clone();changed["mode"]=serde_json::json!("developer_preview");
+        assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        changed=source.clone();changed.as_object_mut().unwrap().remove("softwareUpdatePreparation");
+        assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+        changed=source;changed["softwareUpdatePreparation"].as_object_mut().unwrap().remove("maintenanceLocked");
+        assert!(validate_update_authority(&changed,"current-session","fresh-maintenance").is_err());
+    }
+}
+
+#[tauri::command]
+async fn software_update_confirm_apply(update_id: String, expected_version: String, app: tauri::AppHandle,
+    state: tauri::State<'_, SoftwareUpdateHost>) -> Result<updater::UpdateState, String> {
+    let service = update_service(&state)?;
+    let verified = service.prepare_apply(&update_id, &expected_version)?;
+    let application = app.clone();
+    let preparation = tauri::async_runtime::spawn_blocking(move || prepare_update_engine(&application))
+        .await.map_err(|error| error.to_string())?;
+    let (authority, engine) = match preparation {
+        Ok(value) => value,
+        Err(error) => {app.state::<EngineState>().1.store(false, Ordering::SeqCst);service.apply_failed(error.clone()); return Err(error);}
+    };
+    if let Err(error) = service.spawn_helper(verified, authority, engine) {
+        app.state::<EngineState>().1.store(false, Ordering::SeqCst);service.apply_failed(error.clone());return Err(error);
+    }
+    let current = service.status()?;
+    app.state::<EngineState>().3.store(true, Ordering::SeqCst);
+    app.exit(0);
+    Ok(current)
+}
+
+fn begin_shutdown(app:&tauri::AppHandle){
+    let state=app.state::<EngineState>();
+    if state.1.swap(true,Ordering::SeqCst){return;}
+    if let Ok(guard)=state.0.lock(){if let Some(client)=guard.as_ref(){client.begin_shutdown();}}
+    let app=app.clone();
+    std::thread::spawn(move||{
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(90);
+        loop{
+            let state=app.state::<EngineState>();
+            let client=state.0.lock().ok().and_then(|guard|guard.as_ref().cloned());
+            let result=if let Some(client)=client{
+                client.begin_shutdown();Some(client.wait_for_shutdown(deadline.saturating_duration_since(std::time::Instant::now())).map(|status|status.code().unwrap_or(1)))
+            }else if state.2.load(Ordering::SeqCst){Some(Ok(0))}else{None};
+            if let Some(result)=result{
+                match result{
+                    Ok(code)=>{if code!=0{eprintln!("Engine has exited with code {code}; closing desktop without claiming confirmed cleanup");}state.3.store(true,Ordering::SeqCst);app.exit(code);},
+                    Err(error)=>{
+                        eprintln!("Desktop close waits for unconfirmed engine cleanup: {error}");
+                        state.1.store(false,Ordering::SeqCst);
+                        if let Some(window)=app.get_webview_window("main"){let _=window.show();let _=window.set_focus();}
+                        app.dialog().message(format!("The control service is still stopping. Device cleanup could not be confirmed.\n\n{error}\n\nCheck the physical devices and retry closing after cleanup finishes."))
+                            .title("Shutdown needs attention").kind(tauri_plugin_dialog::MessageDialogKind::Error).show(|_|{});
+                    }
+                }
+                return;
+            }
+            if std::time::Instant::now()>=deadline{eprintln!("Engine bootstrap cleanup remains unconfirmed");state.1.store(false,Ordering::SeqCst);return;}
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+}
+
+/// A renderer can request only the next active-camera frame. Endpoint discovery,
+/// binary reading and complete session/codec validation stay in the thin host.
+#[tauri::command]
+async fn camera_live_view_frame(after_seq:u64,state:tauri::State<'_,EngineState>)->Result<Value,String> {
+    let client={
+        let guard=state.0.lock().map_err(|_|"Engine client unavailable")?;
+        guard.as_ref().ok_or("ct-engine is still starting")?.clone()
+    };
+    let metadata=client.request("camera_pipe_descriptor",serde_json::json!({"type":"camera_pipe_descriptor"}))?;
+    let descriptor:ct_engine::devices::camera::LiveViewPipeDescriptor=serde_json::from_value(metadata["liveViewPipeDescriptor"].clone()).map_err(|error|format!("No active Live View endpoint: {error}"))?;
+    let expected_session=descriptor.session_id.clone();
+    let current_view=&metadata["deviceControls"]["camera"]["liveView"];
+    if current_view["active"].as_bool()!=Some(true) || current_view["sessionId"].as_str()!=Some(expected_session.as_str()) {
+        return Err("Live View session was revoked; discard the frame".into());
+    }
+    // The latest-only slot may still contain the frame already presented. Avoid
+    // opening the pipe until the engine has announced newer, fresh evidence.
+    if current_view["fresh"].as_bool()!=Some(true) || current_view["sequence"].as_u64().is_none_or(|seq|seq<=after_seq) {
+        return Ok(Value::Null);
+    }
+    let frame=tauri::async_runtime::spawn_blocking(move||camera_forwarder::read_frame(&descriptor,after_seq)).await.map_err(|error|error.to_string())??;
+    // A close/disconnect/Stop may have happened while the local pipe was read.
+    let latest=client.request("snapshot",serde_json::json!({}))?;
+    let view=&latest["deviceControls"]["camera"]["liveView"];
+    confirm_live_view_delivery(frame, view, &expected_session)
+}
+
+fn confirm_live_view_delivery(frame: Value, view: &Value, expected_session: &str) -> Result<Value,String> {
+    if view["active"].as_bool()!=Some(true)
+        || view["sessionId"].as_str()!=Some(expected_session) {
+        return Err("Live View session was revoked; discard the frame".into());
+    }
+    if frame.is_null() { return Ok(Value::Null); }
+    if view["fresh"].as_bool()!=Some(true) { return Err("Live View frame is stale; discard the frame".into()); }
+    Ok(frame)
+}
+
+#[tauri::command]
+async fn camera_preset_import(app:tauri::AppHandle)->Result<Option<String>,String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move||{
+        let Some(file)=app.dialog().file().set_title("Import camera presets").add_filter("Camera presets",&["json"]).blocking_pick_file() else{return Ok(None);};
+        let path=file.into_path().map_err(|error|error.to_string())?;
+        if path.extension().and_then(|value|value.to_str()).is_none_or(|value|!value.eq_ignore_ascii_case("json")){return Err("Camera presets require a JSON file".into());}
+        let size=std::fs::metadata(&path).map_err(|error|error.to_string())?.len();
+        if size>ct_engine::presets::MAX_PRESET_BYTES as u64{return Err("Camera preset file exceeds the bounded import limit".into());}
+        let text=std::fs::read_to_string(path).map_err(|error|error.to_string())?;
+        ct_engine::presets::PresetStore::parse_import(&text)?;
+        Ok(Some(text))
+    }).await.map_err(|error|error.to_string())?
+}
+
+#[tauri::command]
+async fn camera_preset_export(contents:String,app:tauri::AppHandle)->Result<Option<String>,String> {
+    use tauri_plugin_dialog::DialogExt;
+    ct_engine::presets::PresetStore::parse_import(&contents)?;
+    tauri::async_runtime::spawn_blocking(move||{
+        let Some(file)=app.dialog().file().set_title("Export camera presets").set_file_name("microct-camera-presets.json").add_filter("Camera presets",&["json"]).blocking_save_file() else{return Ok(None);};
+        let path=file.into_path().map_err(|error|error.to_string())?;
+        if path.extension().and_then(|value|value.to_str()).is_none_or(|value|!value.eq_ignore_ascii_case("json")){return Err("Camera presets require a JSON target".into());}
+        // Same-directory staging preserves existing exports on a failed write.
+        let temporary=path.with_extension(format!("{}.{}.tmp",std::process::id(),chrono_safe_nonce()));
+        let result=(||{
+            use std::io::Write;
+            let mut output=std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|error|error.to_string())?;
+            output.write_all(contents.as_bytes()).and_then(|_|output.sync_all()).map_err(|error|error.to_string())?;drop(output);
+            std::fs::rename(&temporary,&path).map_err(|error|error.to_string())
+        })();
+        if result.is_err(){let _=std::fs::remove_file(&temporary);}
+        result?;Ok(Some(path.to_string_lossy().into_owned()))
+    }).await.map_err(|error|error.to_string())?
+}
+fn chrono_safe_nonce()->u128 {std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()}
+
+#[tauri::command]
+async fn resolve_camera_capture_directory(state: tauri::State<'_, EngineState>)->Result<String,String> {
+    let snapshot = engine_snapshot(state).await?;
+    camera_capture_directory_from_snapshot(&snapshot)
+}
+
+/// This query derives from the unique engine root; it does not authorize capture or create directories.
+fn camera_capture_directory_from_snapshot(snapshot: &Value)->Result<String,String> {
+    let configured = snapshot.get("parameters").and_then(|parameters|parameters.get("savePath"))
+        .and_then(Value::as_str).filter(|value|!value.trim().is_empty())
+        .ok_or("Camera capture root unavailable; configure Parameters.savePath first")?;
+    let root = std::path::PathBuf::from(configured.trim());
+    if !root.is_absolute() || configured.contains('\0') {return Err("Engine camera capture root is not a valid absolute path".into());}
+    Ok(root.join("CameraCaptures").to_string_lossy().into_owned())
+}
+
+const DESIGN_WIDTH: f64 = 1920.0;
+const DESIGN_HEIGHT: f64 = 1080.0;
+const MIN_READABLE_SCALE: f64 = 0.9;
+const WORK_AREA_MARGIN: f64 = 16.0;
+const WINDOW_POLICY_DEBOUNCE_MS: u64 = 160;
+static WINDOW_POLICY_REVISION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
+fn existing_known_folder(folder_id: &windows_sys::core::GUID) -> Result<std::path::PathBuf, String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
+
+    let mut raw_path = std::ptr::null_mut();
+    let result = unsafe { SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &mut raw_path) };
+    if result < 0 || raw_path.is_null() {
+        return Err(format!("SHGetKnownFolderPath failed with HRESULT 0x{:08X}", result as u32));
+    }
+
+    let length = unsafe {
+        let mut length = 0usize;
+        while *raw_path.add(length) != 0 {
+            length += 1;
+        }
+        length
+    };
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+        std::slice::from_raw_parts(raw_path, length)
+    }));
+    unsafe { CoTaskMemFree(raw_path.cast()) };
+
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(format!("Configured image directory does not exist: {}", path.display()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_descendant_path(path: &std::path::Path, parent: &std::path::Path) -> bool {
+    let normalize = |value: &std::path::Path| {
+        value
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    let path = normalize(path);
+    let parent = normalize(parent);
+    path.len() > parent.len()
+        && path.starts_with(&parent)
+        && path.as_bytes().get(parent.len()) == Some(&b'\\')
+}
+
+#[cfg(target_os = "windows")]
+fn select_image_directory(
+    pictures: Result<std::path::PathBuf, String>,
+    camera_roll: Result<std::path::PathBuf, String>,
+) -> Result<std::path::PathBuf, String> {
+    match (pictures, camera_roll) {
+        (Ok(pictures), Ok(camera_roll)) if is_descendant_path(&camera_roll, &pictures) => {
+            Ok(camera_roll)
+        }
+        (Ok(pictures), _) => Ok(pictures),
+        (Err(_), Ok(camera_roll)) => Ok(camera_roll),
+        (Err(pictures_error), Err(camera_roll_error)) => Err(format!(
+            "Unable to resolve an existing Windows image directory. Pictures: {pictures_error}; Camera Roll: {camera_roll_error}"
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn resolve_default_image_directory() -> Result<String, String> {
+    use windows_sys::Win32::UI::Shell::{FOLDERID_CameraRoll, FOLDERID_Pictures};
+
+    let selected = select_image_directory(
+        existing_known_folder(&FOLDERID_Pictures),
+        existing_known_folder(&FOLDERID_CameraRoll),
+    )?;
+    Ok(selected.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn resolve_default_image_directory() -> Result<String, String> {
+    Err("Default image directory resolution is only supported on Windows".to_string())
+}
+
+/// Opens an existing directory in Windows Explorer so the operator can inspect the
+/// projection images. Anything that is not an existing directory is rejected: the
+/// path comes from the scan setup or from the native picker only.
+#[tauri::command]
+fn open_directory_in_shell(path: String) -> Result<String, String> {
+    let directory = std::path::PathBuf::from(&path);
+    if !directory.is_dir() {
+        return Err(format!("Not an existing directory: {path}"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&directory)
+            .spawn()
+            .map_err(|error| format!("Failed to open Windows Explorer: {error}"))?;
+        Ok(directory.to_string_lossy().into_owned())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Opening a folder is only supported on Windows".to_string())
+    }
+}
+
+/// Writes the exported session log. The target is chosen through the native save
+/// dialog; only log/txt files inside an existing folder are accepted so the menu
+/// entry cannot be used to write arbitrary files.
+#[tauri::command]
+fn export_session_log(path: String, contents: String) -> Result<String, String> {
+    let target = std::path::PathBuf::from(&path);
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "log" && extension != "txt" {
+        return Err("Only .log or .txt session logs can be exported".to_string());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Export target has no parent directory".to_string())?;
+    if !parent.is_dir() {
+        return Err("Export target folder does not exist".to_string());
+    }
+    std::fs::write(&target, contents)
+        .map(|_| target.to_string_lossy().into_owned())
+        .map_err(|error| format!("Failed to write session log: {error}"))
+}
+
+fn calculate_min_inner_size(
+    work_area_width: f64,
+    work_area_height: f64,
+    decoration_width: f64,
+    decoration_height: f64,
+) -> (f64, f64) {
+    let available_width =
+        (work_area_width - WORK_AREA_MARGIN - decoration_width.max(0.0)).max(1.0);
+    let available_height =
+        (work_area_height - WORK_AREA_MARGIN - decoration_height.max(0.0)).max(1.0);
+    let target_width = DESIGN_WIDTH * MIN_READABLE_SCALE;
+    let target_height = DESIGN_HEIGHT * MIN_READABLE_SCALE;
+
+    (
+        target_width.min(available_width).max(1.0),
+        target_height.min(available_height).max(1.0),
+    )
+}
+
+/// Enforces monitor-aware maximization and applies readable minima when restored.
+///
+/// `set_min_size` ends up in `SetWindowPos`, and positioning a maximized window
+/// drops the maximized state while keeping the maximized size: the window then
+/// looks maximized but is offset and `IsZoomed` stays false. Maximized windows
+/// therefore keep the startup state untouched; the minimum is applied on the
+/// first resize that leaves maximized mode.
+#[cfg(windows)]
+unsafe extern "system" fn window_policy_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND, message: u32,
+    wparam: usize, lparam: isize, subclass_id: usize, maximize_only: usize,
+) -> isize {
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_SYSCOMMAND,
+        SC_MOVE, SC_SIZE, SC_RESTORE, HTCAPTION, WM_GETMINMAXINFO, MINMAXINFO,
+    };
+    if maximize_only != 0 {
+        let command = (wparam & 0xfff0) as u32;
+        if message == WM_SYSCOMMAND
+            && (command == SC_MOVE || command == SC_SIZE
+                || (command == SC_RESTORE && IsIconic(hwnd) == 0))
+        {
+            return 0;
+        }
+        if message == WM_NCLBUTTONDBLCLK && wparam == HTCAPTION as usize {
+            return 0;
+        }
+    }
+    if message == WM_NCDESTROY {
+        RemoveWindowSubclass(hwnd, Some(window_policy_proc), subclass_id);
+    }
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    if maximize_only != 0 && message == WM_GETMINMAXINFO && lparam != 0 {
+        use windows_sys::Win32::Graphics::Gdi::{
+            MonitorFromWindow, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+        };
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            let sizes = &mut *(lparam as *mut MINMAXINFO);
+            // Preserve the native invisible frame while fitting the visible
+            // window to rcWork, including taskbars on non-primary monitors.
+            let frame_x = (-sizes.ptMaxPosition.x).max(0);
+            let frame_y = (-sizes.ptMaxPosition.y).max(0);
+            sizes.ptMaxPosition.x = info.rcWork.left - info.rcMonitor.left - frame_x;
+            sizes.ptMaxPosition.y = info.rcWork.top - info.rcMonitor.top - frame_y;
+            sizes.ptMaxSize.x = info.rcWork.right - info.rcWork.left + frame_x * 2;
+            sizes.ptMaxSize.y = info.rcWork.bottom - info.rcWork.top + frame_y * 2;
+        }
+    }
+    result
+}
+
+fn apply_dynamic_min_size(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    if window.is_minimized().unwrap_or(false) {
+        return Ok(());
+    }
+    if let Some(monitor) = window.current_monitor()? {
+        let scale = monitor.scale_factor();
+        let work_area = monitor.work_area().size.to_logical::<f64>(scale);
+        let physical = monitor.size();
+        let maximize_only = requires_maximized_window(
+            physical.width, physical.height, work_area.width, work_area.height,
+        );
+        let was_maximized = window.is_maximized().unwrap_or(false);
+        // Keep Windows' resizable frame so maximization respects the taskbar.
+        // Block user restore/size/move commands instead of removing that frame.
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::UI::Shell::SetWindowSubclass;
+            if SetWindowSubclass(window.hwnd()?.0, Some(window_policy_proc), 1, usize::from(maximize_only)) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        if window.is_maximizable()? == maximize_only {
+            window.set_maximizable(!maximize_only)?;
+        }
+        if maximize_only {
+            if !was_maximized { window.set_min_size(None::<tauri::LogicalSize<f64>>)?; }
+            if !window.is_maximized().unwrap_or(false) { window.maximize()?; }
+            return Ok(());
+        }
+        if was_maximized {
+            if !window.is_maximized().unwrap_or(false) { window.maximize()?; }
+            return Ok(());
+        }
+        let outer_size = window.outer_size()?.to_logical::<f64>(scale);
+        let inner_size = window.inner_size()?.to_logical::<f64>(scale);
+        let decoration_width = (outer_size.width - inner_size.width).max(0.0);
+        let decoration_height = (outer_size.height - inner_size.height).max(0.0);
+        let (min_width, min_height) = calculate_min_inner_size(
+            work_area.width,
+            work_area.height,
+            decoration_width,
+            decoration_height,
+        );
+        window.set_min_size(Some(tauri::LogicalSize::new(min_width, min_height)))?;
+    }
+    Ok(())
+}
+
+/// "1K" means up to 1080p here. High-resolution monitors also lock maximized
+/// when their DPI-adjusted work area cannot leave room around a readable window.
+fn requires_maximized_window(
+    physical_width: u32, physical_height: u32,
+    work_width: f64, work_height: f64,
+) -> bool {
+    physical_width <= 1920 || physical_height <= 1080
+        || work_width < DESIGN_WIDTH * MIN_READABLE_SCALE + 160.0
+        || work_height < DESIGN_HEIGHT * MIN_READABLE_SCALE + 100.0
+}
+
+/// Startup order matters: the window is created restored so Windows can record
+/// restore bounds, the readable minimum is applied while it is still restored,
+/// and only then is the window maximized. Maximizing from the configuration
+/// skips the restored state, which leaves the shell at maximized size with
+/// `IsZoomed` false and no placement to restore to.
+fn configure_window(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    #[cfg(windows)]
+    windows_icons::apply(window)?;
+    apply_dynamic_min_size(window)?;
+    window.maximize()?;
+    window.show()
+}
+
+fn schedule_dynamic_min_size(window: tauri::WebviewWindow) {
+    let revision = WINDOW_POLICY_REVISION.fetch_add(1, Ordering::Relaxed) + 1;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(WINDOW_POLICY_DEBOUNCE_MS));
+        if WINDOW_POLICY_REVISION.load(Ordering::Relaxed) != revision {
+            return;
+        }
+        let app = window.app_handle().clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Err(error) = apply_dynamic_min_size(&window) {
+                eprintln!("Unable to refresh dynamic window minimum: {error}");
+            }
+        });
+    });
+}
+
+#[cfg(debug_assertions)]
+fn append_diagnostic(line: &str) {
+    use std::io::Write;
+    let path: PathBuf = std::env::temp_dir().join("micro-ct-diagnostics.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+#[cfg(debug_assertions)]
+fn write_startup_snapshot(snapshot: &Value) -> Result<(), String> {
+    let path: PathBuf = std::env::temp_dir().join("micro-ct-startup-snapshot.json");
+    let document = serde_json::to_vec_pretty(snapshot).map_err(|error| error.to_string())?;
+    std::fs::write(&path, document).map_err(|error| {
+        format!(
+            "Unable to write startup snapshot evidence at {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Connects to `ct-engine` off the UI thread.
+///
+/// Tauri creates the webview before `setup` runs but only starts pumping the
+/// event loop afterwards, so any blocking work in `setup` starves WebView2
+/// while it is bringing up its browser process. That shows up as a window whose
+/// content area goes black a few seconds after launch.
+fn connect_engine(app: &tauri::AppHandle) -> Result<(), String> {
+    if app.state::<EngineState>().1.load(Ordering::SeqCst){return Err("Window closed before engine bootstrap".into());}
+    let engine = EngineClient::spawn()
+        .map_err(|error| format!("Unable to start ct-engine: {error}"))?;
+    let startup_snapshot = engine
+        .request("snapshot", serde_json::json!({}))
+        .map_err(|error| format!("ct-engine startup snapshot failed: {error}"))?;
+    #[cfg(debug_assertions)]
+    {
+        eprintln!("CT_ENGINE_STARTUP_SNAPSHOT={startup_snapshot}");
+        write_startup_snapshot(&startup_snapshot)?;
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = &startup_snapshot;
+
+    let state = app.state::<EngineState>();
+    let mut guard = state
+        .0
+        .lock()
+        .map_err(|_| "Engine client unavailable".to_string())?;
+    if state.1.load(Ordering::SeqCst){drop(guard);engine.begin_shutdown();return engine.wait_for_exit(std::time::Duration::from_secs(90));}
+    *guard = Some(engine);
+    Ok(())
+}
+
+fn bootstrap_engine(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        match connect_engine(&app) {
+            Ok(()) => {
+                #[cfg(debug_assertions)]
+                append_diagnostic(&format!(
+                    "ENGINE_READY_MS={}",
+                    started.elapsed().as_millis()
+                ));
+                #[cfg(not(debug_assertions))]
+                let _ = started;
+            }
+            Err(error) => {
+                eprintln!("ct-engine bootstrap failed: {error}");
+                #[cfg(debug_assertions)]
+                append_diagnostic(&format!("ENGINE_BOOTSTRAP_FAILED {error}"));
+            }
+        }
+        app.state::<EngineState>().2.store(true,Ordering::SeqCst);
+    });
+}
+
+/// Wait for bootstrap before delivering a request. No delivered command is retried.
+async fn ready_engine(state: &EngineState) -> Result<EngineClient, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if state.1.load(Ordering::SeqCst) { return Err("Desktop is shutting down".into()); }
+        if let Some(client) = state.0.lock().map_err(|_| "Engine client unavailable")?.as_ref().cloned() {
+            return Ok(client);
+        }
+        if state.2.load(Ordering::SeqCst) { return Err("Unable to start the control service; open diagnostics or repair the installation".into()); }
+        if std::time::Instant::now() >= deadline { return Err("Control service startup timed out; open diagnostics before retrying".into()); }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Commands wait asynchronously for bootstrap while the window stays responsive.
+#[tauri::command]
+async fn engine_snapshot(state: tauri::State<'_, EngineState>) -> Result<Value, String> {
+    let client = ready_engine(&state).await?;
+    client.request("snapshot", serde_json::json!({}))
+}
+
+#[tauri::command]
+async fn engine_command(
+    command: Value,
+    state: tauri::State<'_, EngineState>,
+) -> Result<Value, String> {
+    let name = command
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or("Command type is required")?;
+    let client = ready_engine(&state).await?;
+    client.request(name, command.clone())
+}
+
+/// Read a committed camera frame through the engine's snapshot. The renderer
+/// supplies only an index; it cannot use this command to read arbitrary files.
+#[tauri::command]
+async fn frame_preview(index: u32, state: tauri::State<'_, EngineState>) -> Result<Vec<u8>, String> {
+    let snapshot = {
+        let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+            .as_ref().cloned().ok_or("ct-engine is still starting")?;
+        client.request("snapshot", serde_json::json!({}))?
+    };
+    let workstation = snapshot.get("workstation").ok_or("Workstation snapshot missing")?;
+    let frame = workstation.get("frames").and_then(Value::as_array)
+        .and_then(|frames| frames.iter().find(|frame| frame.get("index").and_then(Value::as_u64) == Some(u64::from(index))))
+        .ok_or("Committed frame unavailable")?;
+    registered_nef_preview(frame)
+}
+
+fn registered_nef_preview(frame: &Value) -> Result<Vec<u8>, String> {
+    let path = frame.get("path").and_then(Value::as_str).ok_or("Camera file path missing")?;
+    let expected_size = frame.get("bytes").and_then(Value::as_u64).ok_or("Camera file size missing")?;
+    let expected_hash = frame.get("sha256").and_then(Value::as_str).ok_or("Camera file hash missing")?;
+    let file = std::path::Path::new(path);
+    if file.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("nef")) != Some(true)
+        || expected_size == 0 || expected_size > 128 * 1024 * 1024
+        || expected_hash.len() != 64 || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Unsupported camera frame".into());
+    }
+    use std::io::Read;
+    let input = std::fs::File::open(file).map_err(|error| format!("Camera file read failed: {error}"))?;
+    if input.metadata().map_err(|error| error.to_string())?.len() != expected_size {
+        return Err("Camera file changed since capture commit".into());
+    }
+    let mut bytes = Vec::with_capacity(expected_size as usize);
+    input.take(expected_size + 1).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 != expected_size {
+        return Err("Camera file changed since scan commit".into());
+    }
+    use sha2::{Digest, Sha256};
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
+        return Err("Camera file hash changed since scan commit".into());
+    }
+    let jpeg = embedded_jpeg(&bytes).ok_or_else(|| "NEF contains no displayable embedded JPEG".to_string())?;
+    if jpeg.len() > 16 * 1024 * 1024 {return Err("Embedded preview exceeds the display size bound".into());}
+    Ok(jpeg)
+}
+
+/// A completed independent photo remains addressable by its registered ID.
+/// Camera reconnects do not turn a renderer path into a preview capability.
+#[tauri::command]
+async fn camera_capture_preview(capture_id: String, state: tauri::State<'_, EngineState>) -> Result<Value, String> {
+    if capture_id.is_empty() || capture_id.len() > 256 || capture_id.contains('\0') {
+        return Err("Invalid capture ID".into());
+    }
+    if state.1.load(Ordering::SeqCst) {return Err("Desktop is shutting down".into());}
+    let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+        .as_ref().cloned().ok_or("ct-engine is still starting")?;
+    let first = client.camera_capture_descriptor(&capture_id)?;
+    let descriptor = first.get("cameraCaptureDescriptor").ok_or("Capture descriptor unavailable")?.clone();
+    if descriptor.get("captureId").and_then(Value::as_str) != Some(capture_id.as_str())
+        || descriptor.get("format").and_then(Value::as_str) != Some("NEF")
+        || descriptor.get("exposureEnded").and_then(Value::as_bool) != Some(true)
+        || descriptor.get("sessionId").and_then(Value::as_str).is_none_or(str::is_empty)
+        || descriptor.get("operationId").and_then(Value::as_str).is_none_or(str::is_empty) {
+        return Err("Capture is not registered as complete".into());
+    }
+    let read_descriptor = descriptor.clone();
+    let jpeg = tauri::async_runtime::spawn_blocking(move || registered_nef_preview(&read_descriptor))
+        .await.map_err(|error| error.to_string())??;
+    let current = client.camera_capture_descriptor(&capture_id)?;
+    if state.1.load(Ordering::SeqCst) || first.get("engineSessionId") != current.get("engineSessionId")
+        || current.get("cameraCaptureDescriptor") != Some(&descriptor) {
+        return Err("Capture preview became stale during read".into());
+    }
+    Ok(serde_json::json!({"captureId":capture_id,"sessionId":descriptor["sessionId"],
+        "operationId":descriptor["operationId"],"jpeg":jpeg}))
+}
+
+/// Return only the completed, engine-registered preview volume. The renderer
+/// chooses a method, never a filesystem path.
+#[tauri::command]
+async fn reconstruction_preview(
+    method: String,
+    state: tauri::State<'_, EngineState>,
+) -> Result<Value, String> {
+    if !matches!(method.as_str(), "fdk" | "sirt" | "cgls") {
+        return Err("Unknown reconstruction method".into());
+    }
+    let snapshot = {
+        let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+            .as_ref().cloned().ok_or("ct-engine is still starting")?;
+        client.request("snapshot", serde_json::json!({}))?
+    };
+    let workstation = snapshot.get("workstation").ok_or("Workstation snapshot missing")?;
+    let reconstruction = workstation.get("reconstruction").ok_or("Reconstruction state missing")?;
+    if reconstruction.get("unlocked").and_then(Value::as_bool) != Some(true)
+        || reconstruction.get("status").and_then(Value::as_str) != Some("completed")
+        || reconstruction.get("selectedMethod").and_then(Value::as_str) != Some(method.as_str()) {
+        return Err("Reconstruction preview is not ready".into());
+    }
+    let path = reconstruction.get("cachePath").and_then(Value::as_str)
+        .ok_or("Reconstruction cache is missing")?;
+    let save_path = workstation.get("scanSetup").and_then(|setup| setup.get("savePath"))
+        .and_then(Value::as_str).ok_or("Scan output directory is missing")?;
+    let output_root = std::fs::canonicalize(save_path)
+        .map_err(|error| format!("Scan output directory unavailable: {error}"))?;
+    let cache_dir = std::fs::canonicalize(path)
+        .map_err(|error| format!("Reconstruction cache unavailable: {error}"))?;
+    if !cache_dir.starts_with(&output_root) || cache_dir == output_root {
+        return Err("Reconstruction cache is outside the scan output".into());
+    }
+    let metadata_path = std::fs::canonicalize(cache_dir.join("preview.json"))
+        .map_err(|error| format!("Preview metadata unavailable: {error}"))?;
+    let volume_path = std::fs::canonicalize(cache_dir.join("preview.bin"))
+        .map_err(|error| format!("Preview volume unavailable: {error}"))?;
+    if !metadata_path.starts_with(&cache_dir) || !volume_path.starts_with(&cache_dir) {
+        return Err("Preview file escaped its cache directory".into());
+    }
+    let metadata: Value = serde_json::from_slice(&std::fs::read(metadata_path)
+        .map_err(|error| format!("Preview metadata read failed: {error}"))?)
+        .map_err(|error| format!("Preview metadata invalid: {error}"))?;
+    let shape = metadata.get("shape").and_then(Value::as_array)
+        .filter(|shape| shape.len() == 3).ok_or("Preview shape missing")?;
+    let mut voxel_count = 1usize;
+    for dimension in shape {
+        let n = dimension.as_u64().ok_or("Preview shape invalid")?;
+        if n == 0 || n > 160 { return Err("Preview shape exceeds limit".into()); }
+        voxel_count = voxel_count.checked_mul(n as usize).ok_or("Preview shape overflow")?;
+    }
+    let spacing = metadata.get("spacingMm").and_then(Value::as_array)
+        .filter(|spacing| spacing.len() == 3).ok_or("Preview spacing missing")?;
+    if spacing.iter().any(|value| value.as_f64().is_none_or(|n| !n.is_finite() || n <= 0.0)) {
+        return Err("Preview spacing invalid".into());
+    }
+    let window_min = metadata.get("windowMin").and_then(Value::as_f64)
+        .ok_or("Preview window missing")?;
+    let window_max = metadata.get("windowMax").and_then(Value::as_f64)
+        .ok_or("Preview window missing")?;
+    if !window_min.is_finite() || !window_max.is_finite() || window_max <= window_min {
+        return Err("Preview window invalid".into());
+    }
+    let bytes = std::fs::read(volume_path)
+        .map_err(|error| format!("Preview volume read failed: {error}"))?;
+    if bytes.len() != voxel_count { return Err("Preview volume size changed".into()); }
+    use sha2::{Digest, Sha256};
+    let expected_hash = metadata.get("sha256").and_then(Value::as_str)
+        .ok_or("Preview checksum missing")?;
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
+        return Err("Preview volume checksum changed".into());
+    }
+    Ok(serde_json::json!({
+        "shape": shape,
+        "spacingMm": spacing,
+        "windowMin": window_min,
+        "windowMax": window_max,
+        "voxels": bytes,
+    }))
+}
+
+fn embedded_jpeg(nef: &[u8]) -> Option<Vec<u8>> {
+    let mut largest: Option<(usize, usize)> = None;
+    let mut cursor = 0;
+    while cursor + 1 < nef.len() {
+        if nef[cursor] == 0xff && nef[cursor + 1] == 0xd8 {
+            let start = cursor;
+            cursor += 2;
+            while cursor + 1 < nef.len() && cursor - start <= 16 * 1024 * 1024 {
+                if nef[cursor] == 0xff && nef[cursor + 1] == 0xd9 {
+                    let end = cursor + 2;
+                    if end - start >= 4 * 1024
+                        && largest.is_none_or(|(old_start, old_end)| end - start > old_end - old_start) {
+                        largest = Some((start, end));
+                    }
+                    cursor = end;
+                    break;
+                }
+                cursor += 1;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    largest.map(|(start, end)| nef[start..end].to_vec())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    #[tokio::test]
+    async fn startup_read_waits_until_bootstrap_settles_instead_of_reporting_a_transport_fault() {
+        use super::*;
+        let state = EngineState(Mutex::new(None),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false));
+        let mut pending = Box::pin(ready_engine(&state));
+        tokio::select! {
+            _ = &mut pending => panic!("Bootstrap is still running; startup must remain pending"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
+        }
+        state.2.store(true, Ordering::SeqCst);
+        assert!(matches!(pending.await, Err(message) if message.contains("Unable to start the control service")));
+        state.1.store(true, Ordering::SeqCst);
+        assert!(matches!(ready_engine(&state).await, Err(message) if message == "Desktop is shutting down"));
+    }
+
+    #[test]
+    fn capture_directory_query_uses_the_configured_engine_root() {
+        let configured = r"E:\NO_HARDWARE\custom image root";
+        let snapshot = serde_json::json!({"parameters":{"savePath":configured}});
+        assert_eq!(super::camera_capture_directory_from_snapshot(&snapshot).unwrap(),
+            std::path::PathBuf::from(configured).join("CameraCaptures").to_string_lossy());
+    }
+
+    #[test]
+    fn capture_directory_query_rejects_unknown_empty_and_relative_roots() {
+        for snapshot in [serde_json::json!({}),serde_json::json!({"parameters":{}}),
+            serde_json::json!({"parameters":{"savePath":null}}),serde_json::json!({"parameters":{"savePath":42}}),
+            serde_json::json!({"parameters":{"savePath":""}}),serde_json::json!({"parameters":{"savePath":"  \t"}}),
+            serde_json::json!({"parameters":{"savePath":"E:/NO_HARDWARE/nul\u{0}root"}}),
+            serde_json::json!({"parameters":{"savePath":"relative/capture-root"}})] {
+            assert!(super::camera_capture_directory_from_snapshot(&snapshot).is_err(), "unknown roots cannot fall back to Pictures");
+        }
+    }
+
+    #[test]
+    fn missing_live_frame_stays_pending_only_in_the_same_active_session() {
+        let pending = serde_json::json!({"active":true,"fresh":false,"sessionId":"A"});
+        assert!(super::confirm_live_view_delivery(serde_json::Value::Null, &pending, "A").unwrap().is_null());
+        for view in [serde_json::json!({"active":false,"fresh":false,"sessionId":"A"}),
+            serde_json::json!({"active":true,"fresh":true,"sessionId":"B"}),
+            serde_json::json!({"active":"true","fresh":true,"sessionId":"A"})] {
+            assert!(super::confirm_live_view_delivery(serde_json::Value::Null, &view, "A").is_err());
+        }
+        let frame = serde_json::json!({"sequence":2});
+        assert!(super::confirm_live_view_delivery(frame.clone(), &pending, "A").is_err());
+        let current = serde_json::json!({"active":true,"fresh":true,"sessionId":"A"});
+        assert_eq!(super::confirm_live_view_delivery(frame.clone(), &current, "A").unwrap(), frame);
+    }
+    use super::{calculate_min_inner_size, requires_maximized_window, export_session_log, open_directory_in_shell,
+                select_image_directory, embedded_jpeg};
+    use std::path::PathBuf;
+
+    #[test]
+    fn nef_preview_selects_the_largest_complete_embedded_jpeg() {
+        let mut small = vec![0xff, 0xd8];
+        small.extend(vec![1_u8; 4_096]);
+        small.extend([0xff, 0xd9]);
+        let mut large = vec![0xff, 0xd8];
+        large.extend(vec![2_u8; 8_192]);
+        large.extend([0xff, 0xd9]);
+        let nef = [&small[..], &[0; 12], &large[..]].concat();
+        assert_eq!(embedded_jpeg(&nef), Some(large));
+        assert!(embedded_jpeg(&[0xff, 0xd8, 1, 2]).is_none());
+    }
+
+    #[test]
+    fn small_and_high_dpi_work_areas_require_maximized_windows() {
+        assert!(requires_maximized_window(1920, 1080, 1920.0, 1040.0));
+        assert!(requires_maximized_window(1366, 768, 1366.0, 728.0));
+        assert!(!requires_maximized_window(2560, 1440, 2560.0, 1400.0));
+        assert!(!requires_maximized_window(2560, 1440, 2048.0, 1112.0));
+        assert!(!requires_maximized_window(3840, 2160, 2560.0, 1400.0));
+        assert!(requires_maximized_window(3840, 2160, 1920.0, 1040.0));
+        assert!(requires_maximized_window(3440, 1440, 1720.0, 680.0));
+    }
+
+    #[test]
+    fn minimum_inner_size_uses_readable_design_scale_when_space_allows() {
+        assert_eq!(
+            calculate_min_inner_size(1920.0, 1080.0, 16.0, 40.0),
+            (1728.0, 972.0)
+        );
+    }
+
+    #[test]
+    fn minimum_inner_size_clamps_to_low_resolution_available_area() {
+        assert_eq!(
+            calculate_min_inner_size(1024.0, 768.0, 16.0, 40.0),
+            (992.0, 712.0)
+        );
+    }
+
+    #[test]
+    fn minimum_inner_size_never_exceeds_available_area_or_drops_below_one() {
+        let (width, height) = calculate_min_inner_size(10.0, 10.0, 100.0, 100.0);
+        assert_eq!((width, height), (1.0, 1.0));
+    }
+
+    #[test]
+    fn image_directory_selection_rejects_legacy_camera_roll_on_another_drive() {
+        let pictures = PathBuf::from(r"E:\Main\Pictures");
+        let camera_roll = PathBuf::from(r"C:\Users\x\Pictures\Camera Roll");
+
+        assert_eq!(
+            select_image_directory(Ok(pictures.clone()), Ok(camera_roll)),
+            Ok(pictures)
+        );
+    }
+
+    #[test]
+    fn image_directory_selection_prefers_camera_roll_below_current_pictures() {
+        let pictures = PathBuf::from(r"E:\Main\Pictures");
+        let camera_roll = PathBuf::from(r"E:\Main\Pictures\Camera Roll");
+
+        assert_eq!(
+            select_image_directory(Ok(pictures), Ok(camera_roll.clone())),
+            Ok(camera_roll)
+        );
+    }
+
+    #[test]
+    fn image_directory_selection_uses_pictures_without_camera_roll() {
+        let pictures = PathBuf::from(r"E:\Main\Pictures");
+
+        assert_eq!(
+            select_image_directory(Ok(pictures.clone()), Err("Camera Roll missing".to_string())),
+            Ok(pictures)
+        );
+    }
+
+    #[test]
+    fn image_directory_selection_uses_camera_roll_when_pictures_is_missing() {
+        let camera_roll = PathBuf::from(r"E:\Main\Pictures\Camera Roll");
+
+        assert_eq!(
+            select_image_directory(Err("Pictures missing".to_string()), Ok(camera_roll.clone())),
+            Ok(camera_roll)
+        );
+    }
+
+    #[test]
+    fn image_directory_selection_reports_both_lookup_failures() {
+        let error = select_image_directory(
+            Err("Pictures missing".to_string()),
+            Err("Camera Roll missing".to_string()),
+        )
+        .expect_err("both lookup failures must be reported");
+
+        assert!(error.contains("Pictures: Pictures missing"));
+        assert!(error.contains("Camera Roll: Camera Roll missing"));
+    }
+
+    #[test]
+    fn export_session_log_writes_log_targets_and_rejects_other_extensions() {
+        // The parent is TEMP itself, which always exists: this contract never
+        // creates directories.
+        let folder = std::env::temp_dir();
+        let target = folder.join("micro-ct-session-contract.log");
+        std::fs::remove_file(&target).ok();
+        let written = export_session_log(
+            target.to_string_lossy().into_owned(),
+            "line one\n".to_string(),
+        )
+        .expect("a .log target inside an existing folder must be writable");
+        assert_eq!(written, target.to_string_lossy().into_owned());
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("written log must be readable"),
+            "line one\n"
+        );
+        std::fs::remove_file(&target).ok();
+
+        assert_eq!(
+            export_session_log(
+                folder.join("session.exe").to_string_lossy().into_owned(),
+                "x".to_string(),
+            )
+            .expect_err("non-log extensions must be rejected"),
+            "Only .log or .txt session logs can be exported"
+        );
+    }
+
+    #[test]
+    fn export_session_log_rejects_a_missing_parent_directory() {
+        let missing = std::env::temp_dir()
+            .join("micro-ct-export-missing-folder")
+            .join("session-log.txt");
+
+        assert_eq!(
+            export_session_log(missing.to_string_lossy().into_owned(), "x".to_string())
+                .expect_err("a missing folder must be rejected"),
+            "Export target folder does not exist"
+        );
+    }
+
+    #[test]
+    fn open_directory_in_shell_rejects_paths_that_are_not_directories() {
+        let error = open_directory_in_shell(
+            std::env::temp_dir()
+                .join("micro-ct-open-missing-folder")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect_err("a missing directory must be rejected before Explorer is launched");
+
+        assert!(error.starts_with("Not an existing directory:"));
+    }
+}
+
+fn main() {
+    if let Some(result) = updater::early_helper() {
+        if let Err(error) = result {eprintln!("Software update helper failed: {error}");std::process::exit(1);}
+        return;
+    }
+    let exit_code=std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let event_exit_code=exit_code.clone();
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .on_page_load(|webview, payload| {
+            #[cfg(debug_assertions)]
+            append_diagnostic(&format!(
+                "PAGE_LOAD label={} event={:?} url={}",
+                webview.label(),
+                payload.event(),
+                payload.url()
+            ));
+            #[cfg(not(debug_assertions))]
+            let _ = (webview, payload);
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested{api,..}=event{
+                api.prevent_close();begin_shutdown(window.app_handle());return;
+            }
+            if matches!(event,tauri::WindowEvent::Destroyed){begin_shutdown(window.app_handle());return;}
+            #[cfg(windows)]
+            if matches!(event, tauri::WindowEvent::ScaleFactorChanged { .. }) {
+                if let Some(webview) = window.app_handle().get_webview_window(window.label()) {
+                    if let Err(error) = windows_icons::apply(&webview) {
+                        eprintln!("Unable to refresh window icons: {error}");
+                    }
+                }
+            }
+            if matches!(
+                event,
+                tauri::WindowEvent::Moved(_)
+                    | tauri::WindowEvent::Resized(_)
+                    | tauri::WindowEvent::ScaleFactorChanged { .. }
+            ) {
+                if let Some(webview_window) =
+                    window.app_handle().get_webview_window(window.label())
+                {
+                    schedule_dynamic_min_size(webview_window);
+                }
+            }
+        })
+        .manage(EngineState(Mutex::new(None),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false)))
+        .setup(|app| {
+            #[cfg(windows)]
+            app.manage(windows_icons::Icons::default());
+            // Acquire the shared instance lease before any engine can start.
+            // An applying helper holds it exclusively; a failed lease cannot
+            // become a second live device-control process during replacement.
+            let updater = engine_data_directory().and_then(updater::UpdaterService::new)
+                .map_err(std::io::Error::other)?;
+            app.manage(SoftwareUpdateHost(Ok(updater)));
+            bootstrap_engine(app.app_handle().clone());
+            if let Some(window) = app.get_webview_window("main") {
+                configure_window(&window)?;
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            software_update_check,
+            software_update_download,
+            software_update_status,
+            software_update_cancel,
+            software_update_import,
+            software_update_confirm_apply,
+            camera_live_view_frame,
+            camera_preset_import,
+            camera_preset_export,
+            resolve_camera_capture_directory,
+            engine_snapshot,
+            engine_command,
+            frame_preview,
+            camera_capture_preview,
+            reconstruction_preview,
+            resolve_default_image_directory,
+            open_directory_in_shell,
+            export_session_log
+        ])
+        .build(tauri::generate_context!())
+        .expect("Unable to initialize Micro-CT Workstation")
+        .run_return(move|app, event| {
+            if let tauri::RunEvent::ExitRequested{api,code,..}=&event{
+                if !app.state::<EngineState>().3.load(Ordering::SeqCst){api.prevent_exit();begin_shutdown(app);}
+                else if let Some(code)=code{event_exit_code.store(*code,Ordering::SeqCst);}
+            }
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Ok(mut guard) = app.state::<EngineState>().0.lock() {
+                    if let Some(client)=guard.take(){client.begin_shutdown();}
+                }
+            }
+        });
+    // The current runtime maps RequestExit(code) to ControlFlow::Exit(0).
+    // Preserve the accepted request after Tauri has finished its cleanup.
+    std::process::exit(exit_code.load(Ordering::SeqCst));
+}

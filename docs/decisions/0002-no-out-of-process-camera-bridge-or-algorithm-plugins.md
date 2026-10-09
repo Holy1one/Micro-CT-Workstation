@@ -22,7 +22,7 @@ in-process camera transport. Reconstruction methods are implemented inside
 Neither seam is adopted. Both draft directories and their module-map ownership
 were removed, and the replacement facts are recorded here.
 
-- Camera ownership remains in `crates/ct-engine/src/devices/camera/`. The pre-migration
+- Camera ownership remains in `backend/ct-engine/src/devices/camera/`. The pre-migration
   adapter invoked DigiCamControl RemoteCmd externally; no additional managed
   camera bridge, bridge handshake, or bridge-side scan state was adopted. ADR
   0003 replaces this transport choice with native Rust Windows WPD/PTP while
@@ -60,8 +60,8 @@ and a release tag keep one truth source.
 
 ## Consequences
 
-- `bridges/` and `algorithm-plugins/` no longer exist. `module-map/modules.json`
-  and `module-map/directory-policy.json` no longer register them, and the
+- `bridges/` and `algorithm-plugins/` no longer exist. `docs/architecture/modules.json`
+  and `docs/architecture/directory-policy.json` no longer register them, and the
   `extensions` module now owns only the Sites static preview worker.
 - Adding a reconstruction algorithm is a source change in `ct-engine` carried by
   a release tag. Exporting scientific artifacts stays the supported way to

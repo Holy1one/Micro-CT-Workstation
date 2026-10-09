@@ -1,0 +1,219 @@
+{
+  "version": 1,
+  "description": "Approved responsibilities after the user-authorized directory reorganization; generated exceptions are declared explicitly.",
+  "parents": [
+    {
+      "path": ".",
+      "allowedChildren": [
+        ".cache",
+        ".cargo",
+        ".git",
+        "assets",
+        "backend",
+        "docs",
+        "firmware",
+        "frontend",
+        "node_modules",
+        "release",
+        "tests",
+        "tools"
+      ]
+    },
+    {
+      "path": "frontend",
+      "allowedChildren": [
+        "preview",
+        "src"
+      ]
+    },
+    {
+      "path": "frontend/src",
+      "allowedChildren": [
+        "engine",
+        "platform",
+        "scene"
+      ]
+    },
+    {
+      "path": "frontend/src/engine",
+      "allowedChildren": []
+    },
+    {
+      "path": "frontend/src/platform",
+      "allowedChildren": []
+    },
+    {
+      "path": "frontend/src/scene",
+      "allowedChildren": []
+    },
+    {
+      "path": "frontend/preview",
+      "allowedChildren": [
+        "hosting",
+        "rts9060"
+      ]
+    },
+    {
+      "path": "frontend/preview/rts9060",
+      "allowedChildren": []
+    },
+    {
+      "path": "frontend/preview/hosting",
+      "allowedChildren": []
+    },
+    {
+      "path": "backend",
+      "allowedChildren": [
+        "ct-engine",
+        "src-tauri"
+      ]
+    },
+    {
+      "path": "backend/ct-engine",
+      "allowedChildren": [
+        "src"
+      ]
+    },
+    {
+      "path": "backend/ct-engine/src",
+      "allowedChildren": [
+        "devices"
+      ]
+    },
+    {
+      "path": "backend/ct-engine/src/devices",
+      "allowedChildren": [
+        "camera",
+        "turntable",
+        "xray"
+      ]
+    },
+    {
+      "path": "backend/ct-engine/src/devices/camera",
+      "allowedChildren": []
+    },
+    {
+      "path": "backend/ct-engine/src/devices/xray",
+      "allowedChildren": []
+    },
+    {
+      "path": "backend/ct-engine/src/devices/turntable",
+      "allowedChildren": []
+    },
+    {
+      "path": "firmware",
+      "allowedChildren": [
+        "rts9060_nano"
+      ]
+    },
+    {
+      "path": "firmware/rts9060_nano",
+      "allowedChildren": []
+    },
+    {
+      "path": "tools",
+      "allowedChildren": [
+        "build",
+        "lib",
+        "release",
+        "verify"
+      ]
+    },
+    {
+      "path": "tools/build",
+      "allowedChildren": []
+    },
+    {
+      "path": "tools/release",
+      "allowedChildren": []
+    },
+    {
+      "path": "tools/verify",
+      "allowedChildren": []
+    },
+    {
+      "path": "tools/lib",
+      "allowedChildren": []
+    },
+    {
+      "path": "tests",
+      "allowedChildren": [
+        "desktop",
+        "firmware",
+        "fixtures",
+        "frontend",
+        "helpers"
+      ]
+    },
+    {
+      "path": "tests/frontend",
+      "allowedChildren": []
+    },
+    {
+      "path": "tests/desktop",
+      "allowedChildren": []
+    },
+    {
+      "path": "tests/firmware",
+      "allowedChildren": []
+    },
+    {
+      "path": "tests/fixtures",
+      "allowedChildren": []
+    },
+    {
+      "path": "tests/helpers",
+      "allowedChildren": []
+    },
+    {
+      "path": "docs",
+      "allowedChildren": [
+        "architecture",
+        "decisions",
+        "guides",
+        "validation"
+      ]
+    },
+    {
+      "path": "docs/architecture",
+      "allowedChildren": []
+    },
+    {
+      "path": "docs/guides",
+      "allowedChildren": []
+    },
+    {
+      "path": "docs/decisions",
+      "allowedChildren": []
+    },
+    {
+      "path": "docs/validation",
+      "allowedChildren": []
+    },
+    {
+      "path": "assets",
+      "allowedChildren": []
+    },
+    {
+      "path": "backend/src-tauri",
+      "allowedChildren": [
+        "binaries",
+        "capabilities",
+        "gen",
+        "src"
+      ]
+    },
+    {
+      "path": "backend/src-tauri/src",
+      "allowedChildren": []
+    },
+    {
+      "path": "backend/src-tauri/capabilities",
+      "allowedChildren": []
+    },
+    {
+      "path": ".cargo",
+      "allowedChildren": []
+    }
+  ]
+}

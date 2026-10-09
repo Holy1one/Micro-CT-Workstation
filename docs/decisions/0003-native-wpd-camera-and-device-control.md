@@ -100,8 +100,9 @@
 - 顶部增加 Devices 菜单，分别打开可滚动 Camera、Turntable 浮层；保留 File/Edit/
   Tools/Help、39px 自定义标题栏、品牌与 306px 底栏及主面板排布。主界面固定栏目
   不新增滚动，控制台始终提供安全 Stop，所有门控由后端再次执行。
-- 设备重大迁移先交付 `release/native-device-controls-offline/` 离线候选，包含 EXE、
-  source/build info/hash、第三方许可与离线报告，保留现用正式 EXE、来源与哈希。
+- 设备重大迁移交付 `release/` 下最新 MSI 离线候选；
+  source/build info/hash、第三方许可与离线报告归 `.cache/tests/release/<version>/`。
+  历史来源、身份与验收记录保留，不作为当前安装入口。
   源码、模拟 transport/fake 及同生产协调器离线检查通过不能标记硬件认证完成。
 - 真实固件逐字节一致性、D7100 事件关联、运动方向、负载角度/回零精度和联动扫描
   必须另行明确授权实机验收。此门槛前不得连接设备、读取 flash、烧录、拍摄、

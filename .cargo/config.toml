@@ -1,0 +1,3 @@
+# Keep all workspace compilation products outside maintained source directories.
+[build]
+target-dir = ".cache/cargo"

@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "upgradeCode": "A96DC7F4-7384-4B5E-9AB5-6BE9CB76C8F2",
+  "versions": [
+    {
+      "appVersion": "0.9.0-rc.1",
+      "productVersion": "0.9.1"
+    },
+    {
+      "appVersion": "0.9.0-rc.2",
+      "productVersion": "0.9.2"
+    },
+    {
+      "appVersion": "0.9.0-rc.3",
+      "productVersion": "0.9.3"
+    },
+    {
+      "appVersion": "0.9.5",
+      "productVersion": "0.9.5"
+    },
+    {
+      "appVersion": "0.9.6",
+      "productVersion": "0.9.6"
+    },
+    {
+      "appVersion": "0.9.7",
+      "productVersion": "0.9.7"
+    },
+    {
+      "appVersion": "0.9.8",
+      "productVersion": "0.9.8"
+    },
+    {
+      "appVersion": "0.9.9",
+      "productVersion": "0.9.9"
+    },
+    {
+      "appVersion": "0.9.10",
+      "productVersion": "0.9.10"
+    },
+    {
+      "appVersion": "0.9.11",
+      "productVersion": "0.9.11"
+    },
+    {
+      "appVersion": "0.9.12",
+      "productVersion": "0.9.12"
+    },
+    {
+      "appVersion": "0.9.13",
+      "productVersion": "0.9.13"
+    },
+    {
+      "appVersion": "0.9.14",
+      "productVersion": "0.9.14"
+    },
+    {
+      "appVersion": "0.9.15",
+      "productVersion": "0.9.15"
+    },
+    {
+      "appVersion": "0.9.16",
+      "productVersion": "0.9.16"
+    },
+    {
+      "appVersion": "0.9.17",
+      "productVersion": "0.9.17"
+    },
+    {
+      "appVersion": "0.9.18",
+      "productVersion": "0.9.18"
+    },
+    {
+      "appVersion": "0.9.19",
+      "productVersion": "0.9.19"
+    },
+    {
+      "appVersion": "0.9.20",
+      "productVersion": "0.9.20"
+    }
+  ]
+}

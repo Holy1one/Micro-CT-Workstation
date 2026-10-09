@@ -2,10 +2,11 @@
   "schemaVersion": 1,
   "candidate": {
     "source": "rts9060_nano.ino",
-    "bytes": 32429,
-    "sha256": "470133efbb0f2192c725a0aef223cf6256030ce1f9c0dc541bd3cea4efa8e562",
-    "recoveredFrom": "tmp/tests/turntable/20260929-firmware-recovery/rts9060_nano/rts9060_nano.ino",
-    "hardwareCertified": false
+    "bytes": 33475,
+    "sha256": "ecadf6220e53954cb303e0e40fb85710f73735ebe5271a127c8a4ba93bd84423",
+    "recoveredFrom": ".cache/tests/turntable/20260929-firmware-recovery/rts9060_nano/rts9060_nano.ino",
+    "hardwareCertified": false,
+    "originalSourceSha256": "470133efbb0f2192c725a0aef223cf6256030ce1f9c0dc541bd3cea4efa8e562"
   },
   "avr": {
     "core": "arduino:avr",

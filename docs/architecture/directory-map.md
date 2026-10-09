@@ -1,230 +1,33 @@
-# 目录功能定位
+# 目录职责
 
-本表覆盖仓库中的活动目录及重要子目录。模块路径归属以 `module-map/modules.json` 为机器事实源；本文件解释人类应如何理解和使用这些目录。
-
-下面各目录树按当前工作副本列举，不包含 `node_modules/`、`dist/`、`target/`、`.vite/`、`gen/`、`binaries/` 等可再生成目录。新增或移动文件时必须在同一改动中同步本表。
-
-## 智能体规则层级
-
-仓库只保留四份会被智能体按目录继承的规则文件，避免重复占用上下文：
-
-- `AGENTS.md`：全仓架构、安全不变量和验证要求。
-- `crates/ct-engine/AGENTS.md`：Rust 领域内核与三类生产设备的共同约束。
-- `src/AGENTS.md`：React、前端 engine、浏览器预览、3D 和平台服务的共同约束。
-- `src-tauri/AGENTS.md`：桌面壳、sidecar 和 IPC 约束。
-
-其他目录和子目录的功能说明使用 README，需要时再读取，不作为常驻规则上下文。
-
-## 根目录
-
-| 路径 | 功能定位 | 执行关系 / 约束 |
+| 目录 | 允许内容 | 边界 |
 |---|---|---|
-| `crates/` | Rust workspace 的领域 crate | 当前只有 `ct-engine`；新增 crate 必须保持 Tauri 壳轻量 |
-| `docs/` | 当前架构、使用指南、历史方案和验收证据 | 当前事实必须与源码同步；历史内容必须明确标记 |
-| `firmware/rts9060_nano/` | 已批准恢复来源的 Nano 固件源码候选、固定构建配置与真实源码 host harness | 只跟踪源码；离线重建不证明当前 flash、物理方向或脉冲时序，产物进入 `tmp/tests/turntable/` |
-| `module-map/` | 模块归属与隐藏依赖的声明式事实源 | 由 `scripts/` 生成图谱并计算影响面 |
-| `portable-release/` | 免安装版本机构建输出及构建校验信息 | 由 `npm.cmd run portable:build` 更新；EXE 与 `build-info.json` 不提交，只跟踪说明用 `README.md`；不是源码或设计事实源 |
-| `target/release/` | Cargo/Tauri release 编译输出和缓存 | 不作为日常启动入口；可清理，下次构建自动再生成 |
-| `release/` | 离线候选与版本化发行构建产物 | 由 `npm.cmd run candidate:build` 生成 `release/native-device-controls-offline/`，由 `build-update-release.mjs` 生成 `release/<version>/`；只作可再生成交付物，不是源码或设计事实源 |
-| `tmp/` | 固定分类的测试、调试、会话与缓存输出 | 自动/过程测试输出进入 `tmp/tests/<module>/<run-id>/`；不进入版本控制，不作为实现依据 |
-| `public/` | Vite 原样复制的静态资源 | `assets/` 只保存 UI 图片和 SVG，不包含运行逻辑 |
-| `scripts/` | 构建、打包、图谱和验证脚本 | 只能编排确定性工具，不得访问真实设备 |
-| `src/` | React/TypeScript 表现层和浏览器预览 | 生产设备命令只能通过 Tauri 进入 `ct-engine` |
-| `src-tauri/` | Windows 桌面壳 | 只处理 OS 能力、sidecar 生命周期和 IPC 转发 |
-| `tests/` | Node 合同测试与布局测试 | 离线运行，不接触真实设备 |
-| `worker/` | Sites/静态部署兼容 worker | 只服务构建产物，不参与桌面设备控制 |
+| frontend/src | React 组件、样式、engine 契约、platform 服务、scene 展示 | 不持有生产扫描状态、不直接连接设备 |
+| frontend/preview | workstationAdapter、rts9060 模拟、hosting 静态服务 | 严格离线，不作为设备证据 |
+| backend/ct-engine | Rust 领域内核、设备模块、扫描和重构、crate 单元测试 | 唯一生产状态及安全权威 |
+| backend/src-tauri | OS 能力、IPC、生命周期、更新 | 薄桌面壳 |
+| firmware/rts9060_nano | 原始固件候选、身份和构建配置、其固定 include 所需 stub | .ino 保持核验身份，构建不上传 |
+| assets | 透明 Logo 母版、字体、必要打包图标、来源说明 | 一处维护，构建只收集轻量运行资源；历史截图归 .cache/screenshots |
+| tests | frontend、desktop、firmware、fixtures、helpers | 本机保留，不进入 Git；私有 Rust 单测仍在 crate 内 |
+| tools | build、release、verify、lib | 构建/发布/约束工具继续跟踪，不连接设备 |
+| docs/architecture | 当前架构、接口、流程、目录说明及三份约束 JSON | JSON 是自动检查依据 |
+| docs/guides | 当前开发、设备集成、发布和维护说明 | 不混入实施流水 |
+| docs/decisions | 有效长期决策 | 不创建未实现的后端占位目录 |
+| docs/validation | 最小验收摘要 | 原始本机过程证据归 .cache/tests |
+| .cache | cargo、frontend、tests、screenshots、debug、sessions | 可再生成产物；清理先保护真实数据和唯一证据 |
+| release | 只保存最新 Windows MSI | 全部为本地生成物；签名、身份、来源和许可证归 .cache/tests/release/<version> |
 
-根级 `AGENTS.md` 是仓库规则入口；`Cargo.toml`、`package.json`、`tsconfig.json`、`vite.config.mjs` 和 `index.html` 是工作区、前端和构建入口。`Cargo.lock` 与 `package-lock.json` 是生成的依赖锁文件，不手工注释或编辑。
+frontend/index.html、tsconfig.json、vite.config.mjs 集中维护前端启动、类型与构建配置；npm 脚本显式指定配置路径。前端 root 为 frontend/，构建和暂存资源仍在 .cache/frontend/。
 
-## Rust 生产引擎
+Rust workspace 清单与唯一锁文件位于 backend/{Cargo.toml,Cargo.lock}，两个成员为 ct-engine/ 和 src-tauri/。从仓库根直接执行 Cargo 时指定 --manifest-path backend/Cargo.toml；在 backend/ 内可直接使用 cargo。Tauri 的 npm 开发、安装包与发行入口统一经过 tools/build/run-tauri.mjs，显式指定桌面 crate 与 npm 钩子的工作目录。
 
-```text
-crates/ct-engine/
-├── AGENTS.md                  crate constraints inherited by src/**
-├── README.md                  crate overview and module ownership
-├── Cargo.toml                 crate dependency declaration
-└── src/
-    ├── main.rs                JSONL sidecar process entry and EOF shutdown
-    ├── lib.rs                 domain commands, safety state, snapshots, API DTOs
-    ├── scan.rs                transactional projection coordinator
-    ├── operations.rs          background operation records and cancellation
-    ├── device_controls.rs     independent device commands and safety decisions
-    ├── capture_profile.rs     schema-3 frozen native acquisition evidence
-    ├── presets.rs             versioned camera-only multi-preset storage
-    ├── task_registry.rs       persistent unfinished-task lock
-    ├── software_update.rs     maintenance barrier, pre-update device cleanup and report
-    ├── reconstruction.rs      offline correction and volume reconstruction
-    ├── reconstruction_preprocess.rs reference noise, support and axis estimation
-    ├── fdk.wgsl               FDK GPU compute shader; one invocation per ZYX voxel
-    └── devices/
-        ├── mod.rs             device namespace and topology boundary
-        ├── README.md          per-device module ownership notes
-        ├── xray/
-        │   ├── mod.rs         stable X-ray module surface
-        │   ├── moxtek.rs      bounded raw Moxtek protocol
-        │   └── worker.rs      unique serial owner/watchdog/priority OFF
-        ├── camera/
-        │   ├── mod.rs         stable camera module surface
-        │   ├── README.md      camera module ownership notes
-        │   ├── actor.rs       Send message proxy; COM/thread ownership
-        │   ├── wpd.rs         independent Windows WPD MTP transport
-        │   ├── ptp.rs         bounded standard PTP data parser
-        │   ├── nikon.rs       necessary MIT Nikon protocol
-        │   ├── properties.rs  descriptor-backed labels/options and mode dependencies
-        │   ├── capture.rs     correlated SDRAM events and atomic NEF
-        │   ├── live_view.rs   validated latest-only JPEG and user-ACL pipe
-        │   ├── types.rs       serializable camera evidence published in snapshots
-        │   ├── tests.rs       scripted transport regression for the production pipeline
-        │   └── THIRD-PARTY-NOTICES.md upstream notice text for imported sources
-        └── turntable/
-            ├── mod.rs         stable turntable module surface
-            ├── README.md      turntable module ownership notes
-            ├── nano.rs        serial worker/heartbeat/STOP/epoch admission
-            └── planner.rs     fixed-direction unwrapped pulse plans
-```
+根级保留 7 个入口文件：package.json、package-lock.json、.npmrc（npm）；.gitignore、.gitattributes（Git）；AGENTS.md、README.md（全仓规则和导航）。npm 依赖保留 node_modules/；.cargo/config.toml 是全仓共享编译输出约束，从根、backend 或 crate 内启动 Cargo 都使用根 .cache/cargo/。Tauri 固定生成例外为 backend/src-tauri/gen/、binaries/。不在根级保留第二份 Cargo 清单、锁文件或桌面源码副本。
 
-三类设备目录可以独立分支深入开发，但公开 surface、扫描协调器消费方式和跨设备安全事务发生变化时，必须同步检查 `engine-core` 及所有强依赖边。设备模块不互相调用；跨设备顺序只存在于 `scan.rs` 和领域引擎。
+## 结构化约束
 
-## 前端
+- modules.json：文件所有者、模块职责、公开 surface 和验证门禁。
+- edges.json：IPC、协议与编译器不可见的语义依赖。
+- directory-policy.json：重要边界下允许存在的直接子目录。
+- module-graph.md：由 tools/verify/gen-module-graph.mjs 生成，禁止手工维护。
 
-```text
-src/
-├── AGENTS.md                  frontend and browser-preview constraints
-├── README.md                  presentation-layer ownership notes
-├── main.tsx                   React bootstrap only
-├── App.tsx                    workstation panels, view routing and user interaction
-├── CameraPanel.tsx            permanent camera column; native properties and draft
-├── CameraSettingsDialog.tsx   full native catalog and presets on the shared draft
-├── TurntablePanel.tsx         prescribed-direction controls and scan-preparation entry
-├── DeviceConsoles.tsx         auxiliary bench dialog for device controls
-├── ReconstructionConsole.tsx  compact reconstruction controls and result entry
-├── ScanPreparationDialog.tsx  one local prepare_scan draft; cancel submits nothing
-├── TaskRecoveryDialog.tsx     retained-task recovery and explicit abandonment
-├── UpdateDialog.tsx           native update state; explicit confirmation installs
-├── WorkstationDialog.tsx      shared modal chrome; closing performs no device action
-├── WorkstationMedia.tsx       media and result content layer above the device dock
-├── camera-draft.ts            shared camera draft model and correlated operation waiting
-├── icons.tsx                  unified linear icon set for the console
-├── vite-env.d.ts              Vite ambient asset/env types
-├── tokens.css                 design-token source of truth
-├── styles.css                 component layout and visual rules
-├── canvas-layout.ts           fixed workstation scaling calculation
-├── scan-input.ts              numeric validation and minute/second UI conversion
-├── menuActions.ts             menu vocabulary and availability
-├── engine/
-│   ├── types.ts               shared EngineCommand/EngineSnapshot contract
-│   ├── adapter.ts             runtime adapter selection
-│   ├── tauriAdapter.ts        production Tauri invoke implementation
-│   ├── useEngine.ts           React state bridge
-│   ├── workstationAdapter.ts  browser-preview adapter
-│   ├── deviceControls.ts      pure presentation rules for native device evidence
-│   └── rts9060/               preview-only simulated workflow
-│       ├── protocol.ts        Nano command parsing helpers
-│       ├── transport.ts       in-memory firmware transport
-│       ├── devices.ts         simulated X-ray and camera
-│       ├── deviceControls.ts  browser-only simulated device UI model
-│       └── workflow.ts        simulated scan workflow
-├── platform/
-│   ├── desktopPaths.ts        desktop dialogs and path services
-│   ├── cameraControls.ts      native camera media/preset IPC facade
-│   ├── cameraLiveView.ts      bounded decoded image lifetime in renderer memory
-│   ├── cameraCaptures.ts      capture-ID-only registered NEF preview facade
-│   └── updater.ts             native release operations facade
-└── scene/
-    ├── LiveSceneCanvas.tsx    Three.js canvas and camera controller
-    ├── ReconstructionPreview.tsx linked slices and read-only volume preview
-    ├── EquipmentScene.tsx     equipment geometry and beam visualization
-    ├── angle-feedback.ts     bounded constant-speed interpolation of confirmed pose
-    ├── scene-config.ts        optical-axis geometry constants
-    ├── scene-fit.ts           measured frustum fitting helpers for scene framing
-    ├── stage-surroundings.tsx environment geometry and textures
-    ├── theme-three.ts         CSS-token to Three.js theme conversion
-    ├── StaticSceneFallback.tsx non-WebGL fallback
-    ├── useSceneFallback.ts    WebGL capability/context-loss hook
-    └── types.ts               read-only scene view-model types
-```
-
-`src/engine/rts9060/` 是浏览器开发预览，不是活动 Nano 固件或生产设备驱动。它必须保持离线，并与 `types.ts` 的生产契约一致。
-
-## Tauri 桌面壳
-
-```text
-src-tauri/
-├── AGENTS.md                  desktop shell and IPC constraints
-├── README.md                  shell ownership notes
-├── src/main.rs                Tauri commands, native paths, window lifecycle
-├── src/engine_client.rs       sidecar verification and JSONL request client
-├── src/camera_forwarder.rs    bounded Live View pipe reader and ACK in one 250 ms window
-├── src/updater.rs             restricted release transport, signature check, early helper
-├── build.rs                   build-time metadata, embedded engine and Windows resources
-├── Cargo.toml                 shell dependencies
-├── tauri.conf.json            bundle, window, and sidecar configuration
-├── update-public-key.pub      compiled release trust root for signed update packages
-├── capabilities/              explicit Tauri permission declarations
-├── icons/                     generated platform icon assets
-├── gen/schemas/               generated Tauri schemas; do not hand-edit
-└── binaries/                  generated sidecar copies; ignored by Git
-```
-
-## 工具、测试与文档
-
-```text
-scripts/
-├── README.md                      script inventory and offline boundary
-├── lib/
-│   ├── module-map.mjs             shared glob, JSON, and file-walk helpers
-│   └── release-version.mjs        canonical SemVer and installer ledger verification
-├── gen-module-graph.mjs           declarations -> generated Markdown graph
-├── verify-module-map.mjs          ownership and edge consistency gate
-├── impact.mjs                     Git changes -> affected modules and gates
-├── prepare-engine-sidecar.mjs     Rust sidecar build/copy step
-├── prepare-sites-build.mjs        Sites-compatible output assembly
-├── build-portable.mjs             current Tauri release -> verified portable EXE + metadata
-├── process-logo.mjs               icon source processing
-├── build-turntable-firmware.mjs   hash-pinned Nano firmware candidate rebuild
-├── test-turntable-firmware.mjs    host-harness compile and deterministic firmware checks
-├── collect-candidate-licenses.mjs locked dependency license/notice collection
-├── build-update-release.mjs       versioned NSIS/MSI/portable release bundling
-├── inspect-msi.ps1                read-only MSI table inspection
-├── record-bundle-identities.mjs   actual bundle bytes vs portable marker verification
-├── sign-update-release.mjs        staged artifact/manifest signing and offline ZIP verify
-├── update-sign.ps1                protected local signing material handling
-├── update-keygen-child.mjs        short-lived keygen child; secrets never enter argv
-└── msi-version-ledger.json        fixed UpgradeCode and monotonic installer versions
-
-tests/
-├── README.md                      offline contract test inventory
-├── layout-geometry.mjs            alignment geometry helpers for the console
-├── load-source-module.mjs         loads actual TS source and imports for offline tests
-├── first-launch-response.jsonl    first-launch IPC response fixture
-├── update-signature-fixture.json  release signature verification fixture
-├── angle-feedback.test.mjs        observable angle-following behavior
-├── canvas-layout.test.mjs         fixed-canvas sizing invariants
-├── console-feedback.test.mjs      console feedback derived from the shipped App.tsx
-├── desktop-path-contract.test.mjs native path, picker, save and window contracts
-├── engine-session-evidence.test.mjs real frontend session-evidence contract
-├── fault-banner-safety.test.mjs   console FAULT-banner safety contract
-├── layout-geometry.test.mjs       console alignment regression gate
-├── menu-wiring-contract.test.mjs  menu-to-command wiring
-├── native-device-controls.test.mjs native draft, ordering and occupation policy
-├── preview-domain-parity.test.mjs browser adapter domain parity
-├── preview-scan-lifecycle.test.mjs preview scan lifecycle, stop/pause and final angle
-├── reconstruction-view.test.mjs   result navigation and validated result loading
-├── scan-input.test.mjs            numeric input and minute conversion contracts
-├── scene-framing.test.mjs         scene framing contract
-├── sites-worker.test.mjs          static worker/build output contract
-├── update-feedback.test.mjs       update success/failure feedback separation
-├── update-release-version.test.mjs release version and installer ledger gates
-└── workstation-ui-operation.test.mjs UI waiter rejects queue ack/old sessions as success
-
-docs/
-├── architecture/              current architecture and generated graph
-├── decisions/                 lasting architecture decisions and alternatives
-├── shots/                     QA evidence and one-off probes, not product code
-├── *.mermaid                  diagrams tied to current or historical docs
-└── remaining *.md             integration guides, design notes, or marked plans
-```
-
-## 生成物与不可注释文件
-
-下列文件不能安全内嵌英文注释：JSON（标准不允许注释）、依赖锁文件、PNG/ICO/ICNS、可执行文件和自动生成 schema。它们通过本目录图、相邻 README、字段名和生成脚本说明职责。手写 Rust、TypeScript、TSX、CSS、JavaScript 和构建脚本使用英文模块注释解释 purpose、inputs、outputs 和 safety boundary。
+新增、移动或删除维护路径时，同步 JSON、引用和相邻说明，并运行 npm.cmd run module-map:check。新的领域目录须先获得人工批准。

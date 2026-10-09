@@ -1,183 +1,57 @@
 # Micro-CT-App 工作约定
 
-本应用Micro-CT的目标是构建 Windows 桌面上位机：PC 独立控制 Moxtek 射线源、Nikon D7100 相机和 CH340/Nano 转台，并把命令、遥测、图像与扫描事务统一收敛到 Rust `ct-engine`。
+## 共同必读
 
-## 执行前必读
+所有任务先读本文件。当前用户要求优先；源码、配置和测试高于说明文档。沿相关调用和数据流完成最小完整改动，保留用户已有修改。真实设备动作遵循上级工作区的 AGENTS.md。
 
-开始任何涉及本仓库的实现、修改、测试设计、目录调整或架构判断前，必须先完整阅读：
+## 按任务读取
 
-1. `docs/architecture/README.md`：当前整体软件架构、控制链、模块边界和投影事务执行逻辑；
-2. `module-map/README.md`：模块归属、隐藏依赖、影响分析和目录冻结机制；
-3. `docs/architecture/directory-map.md`：根目录及重要子目录的具体职责和禁止混放的内容。
+| 任务 | 补充读取 |
+|---|---|
+| 目录整理、新增或移动文件 | docs/architecture/directory-map.md、modules.json、directory-policy.json |
+| 前端修改 | docs/architecture/frontend-functional-spec.md、frontend-error-codes.md、frontend/AGENTS.md |
+| 后端修改 | docs/architecture/execution-flows.md、相应设备 README、backend/ct-engine/AGENTS.md、modules.json 门禁 |
+| IPC、协议、快照字段修改 | docs/architecture/edges.json、全部相关生产消费方及测试 |
+| 桌面能力修改 | backend/src-tauri/AGENTS.md、对应平台接口与桌面测试 |
+| 发布修改 | docs/guides/desktop-update-distribution.md、tools/release/、版本账本和公钥 |
+| 整体架构判断 | docs/architecture/README.md、directory-map.md、modules.json、edges.json |
 
-如果任务涉及新增/移动文件、调整模块边界、修改 IPC/JSONL/设备协议、创建目录或引入新依赖，还必须在动手前查看：
+表中的 JSON 均位于 docs/architecture/。详细说明在相应文档维护；规则文件不保存进度、会话流水或一次性任务提示词。
 
-- `module-map/modules.json`：路径所有者、风险和必跑门禁；
-- `module-map/edges.json`：编译器不可见的强依赖；
-- `module-map/directory-policy.json`：允许存在的受控目录结构；
-- `docs/architecture/module-graph.md`：当前生成的模块依赖关系。
+## 设计边界
 
-读取后先按实际任务确定所属模块、受影响模块、允许编辑范围和验证门禁，再开始修改。源码与测试高于文档；发现必读文档与当前源码不一致时，先报告差异并在同一任务中修正文档，不得继续依赖已知过期说明。
+- backend/ct-engine 是生产设备、任务、安全状态、扫描事务和进度的唯一权威。
+- frontend/src 只展示完整快照和发送领域命令；backend/src-tauri 只管理 OS 能力、引擎生命周期和 IPC；三维场景只读展示。
+- frontend/preview 仅用于离线浏览器开发，不接触真实设备。生产 IPC 失败不得回退到模拟成功。
+- 相机、射线和转台设备模块互不调用；跨设备扫描顺序由扫描协调器持有，独立 HOME 安全裁决由领域入口持有。
+- 设定值不得冒充实测值；UNKNOWN、超时、失联和关束未确认不得显示或处理为正常、安全完成。
+- 相机和转台可独立连接、自检；正式扫描首期采用 D7100 主机 RAM NEF。其他设备能力以身份、实际描述及可验证语义为依据，不试发未知厂商操作。
+- Live View 开启时拒绝拍摄；独立拍摄、Live View、手动旋转不自动开束。普通转台运动只沿既有生产方向，HOME 保留固件内部有界反向退让。
+- HOME 在射线已连接时先关束读回确认，结束不自动开束；台架物理隔离确认不能覆盖曾连接射线后的 UNKNOWN。
+- 扫描、暂停、清理、重构和持久未完成任务占用期间保持手动控制锁；Stop 和状态读取始终可用。放弃任务必须完成清理并保留全部文件。
+- 所有开束入口经过 Moxtek adapter；确认关束后至少 2 秒才允许再次开束，重连不得绕过。正常投影连续出束，末张及暂停依据关联 ExposureEnded 关束；完整文件/hash 和匹配 CAPTURE_DONE 仍是提交条件。
+- 达到 maxXraySec 立即关束确认并按既定 300 秒关束间隔处理未开始投影；空场无法在单组上限内完成时关束报错，不短间隔循环开束。Stop、联锁、掉线和未知状态优先立即关束。
+- 原始 NEF 只读；旧 schema 2 及旧采集 profile 保留读取、重构和合法缓存能力，不伪造证据或改写旧数据。取消受理与硬件清理完成分别表达，迟到事件不得恢复动作或提交旧结果。
+- 软件安全不能替代屏蔽、门锁、急停、安全继电器和现场规程。
 
-## 架构
+## 目录和变更纪律
 
-```text
-React / TypeScript
-  -> Tauri invoke
-  -> EngineClient
-  -> versioned JSONL stdio
-  -> ct-engine
-       -> NanoAdapter
-       -> MoxtekAdapter
-       -> CameraAdapter
-```
+目录职责见 directory-map.md。结构化 modules.json、edges.json 和 directory-policy.json 是自动检查依据，必须与新增、移动和接口变化同步更新。新的顶层或领域职责目录需要人工明确批准；在已有职责内拆分实现也须更新相邻说明、路径归属和引用。不得预建无实现目录。
 
-- `crates/ct-engine/`：生产领域内核；唯一持有设备连接、预检、安全门控、扫描状态和事务进度。
-- `src-tauri/`：Windows 桌面壳、原生路径/对话框、sidecar 生命周期与 IPC 转发。
-- `src/`：React 表现层；只消费完整快照并发送命令。
-- `src/engine/rts9060/` 与 `WorkstationAdapter`：浏览器开发预览，不访问真实硬件。
-- `tests/`：前端、布局和桌面契约测试。
-- `docs/`：架构或验收说明；内容必须与当前源码一致，历史材料应明确标记为历史。
+生产源码分别位于 frontend/、backend/、firmware/；backend/ 包含 ct-engine/ 领域引擎、src-tauri/ 桌面壳和唯一 Cargo workspace 清单及锁文件。维护资源集中 assets/；工具在 tools/；外部测试在 tests/；详细资料在 docs/。禁止把临时输出混入这些维护目录。
 
-## 控制逻辑
+## 生成物和 Git
 
-1. UI 把操作转换为领域命令，生产模式只通过 Tauri 发送给 `ct-engine`。
-2. `ct-engine` 分别连接三类设备，验证身份与能力后才允许预检和扫描。
-3. 每个投影视为事务：转台到位并确认、持续出束状态确认、相机拍摄、主机完整文件与哈希确认、同一运动 ID 的 `CAPTURE_DONE`、提交进度。正常投影之间保持出束；正常末张投影及暂停按本次会话、操作关联的可靠 `ExposureEnded` 关束，继续完成文件确认、转台释放和提交后才报告 Completed/Paused。曝光结束与文件完成是不同证据，禁止按曝光计时、临时文件出现或工具退出猜测曝光完成。
-4. 暂停只在安全提交边界生效；界面 Stop 结束当前扫描并等待关束确认，不锁存软件急停。真实设备故障、掉线、超时和未知状态一律 fail-closed；Nano STOP 和硬件急停保护继续有效。
-5. 恢复不得伪造旧安全条件；按当前状态重新建立设备连接、预检和 HOME 等必要条件。
+- .cache/cargo/：Rust 编译；.cache/frontend/：Vite 与网页输出。
+- .cargo/config.toml 是全仓共享输出配置；从根运行 Cargo 时指定 --manifest-path backend/Cargo.toml，npm 入口统一处理桌面路径。
+- .cache/tests/<module>/<run-id>/：命令、结果和有用日志；.cache/screenshots/、debug/、sessions/：临时输出。
+- backend/src-tauri/binaries/ 和 gen/ 是明确的 Tauri 生成位置，均忽略 Git。
+- release/ 只保存最新 Windows MSI 安装包；构建来源、签名、许可证和身份信息归 .cache/tests/release/<version>/，许可证同时进入 MSI。历史验收记录保留可核验来源，退出交付目录。
+- tests/ 与纯测试工具本机保留且不跟踪；构建、发布、模块检查工具、JSON 约束、锁文件、版本账本和公钥继续跟踪。
+- 删除缓存前区分可再生成文件、原始扫描数据与唯一有效验收证据；原始数据和现有生产成果必须保留。
 
-Nano 串口协议为外部设备契约，当前核心命令/响应包括 `HEARTBEAT/HBACK`、`PING`、`INFO`、`STATUS`、`SET_MICROSTEPS`、`REARM`、`HOME`、`MOVE_ABS`、`MOVE_REL`、`CAPTURE_DONE`、`STOP`、`GET_HALL` 和 `XRAY_WARNING`。不得读取封存源码或靠猜测改变协议；固件候选只有经活动来源核验后才能纳入维护，离线重建和 VERSION/BUILD 字符串均不能证明与设备 flash 一致。协议升级必须同步活动固件、Rust adapter、预览实现与测试。
+## 验证要求
 
-## 不变量
+按 modules.json 运行影响模块门禁。基本检查：npm.cmd run module-map:check、npm.cmd run typecheck、npm.cmd run build、cargo test --manifest-path backend/Cargo.toml --workspace。本机完整验证可用 npm.cmd run verify；外部测试套件仅在本机存在时运行。
 
-- 主界面为固定工业控制台：任何固定栏目不得出现栏内滚动条或依赖拖动才能看全的控件；唯一允许的栏内滚动是底部日志控制台（日志列表与图像条）和浮层菜单对话框。新增或调整面板时必须让全部功能在设计画幅（1920 宽）内完整可见，不得用滚动代替排版收敛。
-- 1920×1080 是布局设计基准，界面必须铺满实际窗口客户区，严禁为保持固定 16:9 而居中留边或裁切。控件使用统一缩放系数，网格宽高随客户区比例适配；验收必须比较画布四边与客户区四边。桌面默认最大化；物理宽度 ≤1920 或高度 ≤1080，或 DPI 换算后的工作区不足以容纳可读窗口时，限制为最大化（允许最小化和关闭）。高分辨率且有效空间充足时允许窗口化；移动显示器或改变 DPI 后重新应用策略。
-- Tauri IPC 失败时不得回退到浏览器模拟实现。
-- React、Tauri 和 3D 场景不得保存或推进第二份生产扫描状态。
-- 射线设定值不得冒充实测值；关束未确认时不得报告安全完成。
-- Moxtek 每次关束后至少 2 秒才允许再次开束；扫描前空场只允许一次开束和一次结束关束，不得逐张开关。扫描结束后不再采集后空场或后暗场。投影跨角度连续出束，仅 `maxXraySec` 上限触发关束和 300 秒休息；Stop/故障立即关束。空场无法在单次连续出束上限内完成时关束报故障，不自动循环开束。全部开束入口必须通过设备层时序门控，断线重连不得绕过。
-- D7100 使用主机侧保存与文件确认，不得静默回退到相机存储卡。
-- 相机模块负责原生传输、身份/能力发现、属性读写、Live View、关联拍摄事件与主机文件确认；原生技术选择见 `docs/decisions/0003-native-wpd-camera-and-device-control.md`，实际实现状态仍以源码为准。其他品牌只开放设备描述和安全语义均有证据的标准能力，正式扫描首期仅支持 D7100 NEF。
-- 相机、转台独立连接和检查自身，不要求完整扫描参数或其他设备已连接。独立单拍使用独立保存目录与操作 ID，不写入扫描帧数、manifest 或断点。单拍、Live View 和手动旋转不自动开束；引擎仍处理真实故障。Live View 开启时拒绝拍摄，不自动停预览再拍摄。
-- 相机参数先进入草稿，明确 Apply 才串行写入并读回；部分失败返回实际或未知状态并失效预检，不伪造回滚。相机快门和扫描 Exposure 共用目标值，保留原生档位精确匹配；扫描前必须写入并读回一致。预设仅保存已确认的相机参数，不包含射线、扫描路径、转台动作或未知物理焦点位置。
-- 普通转台运动固定沿现有生产方向；UI 正数表示沿该方向前进，协议保持现有负符号，前后端均拒绝普通逆向。HOME 保留固件内部有界反向退让例外；UI 不提供反向、任意多圈、速度、微步或以 ZERO 代替 HOME 的入口。
-- HOME 在连接射线源时先关束读回确认，完成后不自动开束。仅转台台架模式要求操作员确认射线物理隔离，射线仍为 UNKNOWN/未监测并禁止开束；连接射线后重新验证，曾连接而 OFF 未知时不得以台架确认覆盖。
-- 扫描、暂停、收尾、停止清理和重构期间锁定手动控制，安全停止和状态读取始终可用。持久未完成任务锁跨重启与 taskId 切换生效；锁定手动参数、对焦和运动，受控恢复 HOME 是例外。放弃任务必须先停止/清理并确认必要关束，再持久标记后解锁，保留全部文件且不得标记 Completed 或覆盖原目录。
-- 新后端仅向包含完整冻结采集 profile 的 schema 3 任务追加投影；schema 2 保持原文件、可离线读取和重构，但不得续扫。原始 NEF 只读，数值重构算法不因设备迁移而改变，合法缓存继续按原版本和哈希验证。
-- 设备 worker 是单一通信所有者；监测、Stop/OFF 和退出清理不依赖 UI 轮询，也不等待相机或运动长操作。停止使旧操作代次失效，迟到结果不得提交、开束、恢复 Live View 或解锁；取消已请求与硬件完成必须分别表达，清理未确认不得报告完成。
-- 真实设备动作遵循根 `AGENTS.md` 的授权要求；测试和开发预览不得访问真实设备。
-- `target/`、`dist/`、`node_modules/`、`src-tauri/binaries/`、`portable-release/` 中的打包产物、日志、崩溃转储和会话记忆都是可再生成内容，不进入版本控制，也不进入设计事实源。
-
-## 修改边界
-
-- 改 `crates/ct-engine/`：检查安全状态机、三类 adapter、JSONL 契约和 Tauri 客户端。
-- 改 `src-tauri/`：保持壳层轻量，不把设备或扫描状态移入 Tauri。
-- 改 `src/engine/types.ts` 或命令字段：同步 Rust DTO、预览实现和 IPC 契约测试。
-- 改 `src/scene/`：仅改变展示与相机交互，不发送设备命令。
-- 改硬件接口或 Nano 协议：同时检查 `Micro-CT-Hardware/` 与根级跨域契约。
-
-## 单一事实来源
-
-| 关注点 | 声明位置 | 主要消费方 |
-|---|---|---|
-| 模块路径归属、风险与门禁 | `module-map/modules.json` | 图谱生成、影响分析、开发者 |
-| 编译器不可见的强依赖 | `module-map/edges.json` | 影响分析、评审与验收 |
-| 当前架构与执行逻辑 | `docs/architecture/` | 所有模块与未来迁移设计 |
-| JSONL 请求/响应 DTO | `crates/ct-engine/src/lib.rs` | sidecar、Tauri `EngineClient` |
-| 前端命令与快照类型 | `src/engine/types.ts` | React、生产/预览 adapter |
-| Nano 外部协议实现 | `crates/ct-engine/src/devices/turntable/nano.rs` | `ct-engine`；活动固件建立后做跨仓一致性校验 |
-
-源码和测试高于文档，当前架构文档高于历史计划。机器生成图谱只用于导航，不替代源码证据。
-
-## 模块化变更纪律
-
-1. 非平凡改动先运行 `npm.cmd run impact`；已有基线时使用 `node scripts/impact.mjs --base <verified-ref>`。
-2. 新增或移动路径时，同一改动更新 `module-map/modules.json`；新增字符串协议、跨进程或语义依赖时更新 `module-map/edges.json`。
-3. X 射线、相机、转台分别在 `crates/ct-engine/src/devices/` 下独立开发；设备模块不得互相调用。扫描跨设备顺序由扫描协调器持有，独立 HOME 等跨设备安全裁决由 `ct-engine` 领域入口持有。
-4. 未来 Arduino 主控作为新的 device backend 接入，必须保留 PC 直控实现和同一领域契约；两条路径不得静默回退，Arduino 不得成为第二个未经对账的生产扫描状态源。
-5. 运行影响模块列出的门禁；未运行项明确报告 `BLOCKED`。
-
-## 目录冻结与新增申请
-
-当前顶层目录和 `module-map/modules.json` 声明的功能分区视为已冻结。优先把新文件放入现有职责最匹配的目录，不得为了方便创建 `new`、`misc`、`temp`、`common`、`utils2`、个人姓名或任务编号等含义不清的持久目录。
-
-受控目录的当前直接子目录同时记录在 `module-map/directory-policy.json`，由 `npm.cmd run module-map:check` 强制检查。目录申请获批后，代码、相邻 README、`modules.json`/`edges.json`（按影响需要）和 `directory-policy.json` 必须在同一改动中更新。
-
-以下情况必须在创建目录之前向人工发送一次申请，并等待明确批准：
-
-- 创建任何新的顶层目录；
-- 在任意层级创建一个代表新设备、新服务、新进程、新数据格式、新插件类别或新领域职责的目录；
-- 新内容无法合理归入当前任何模块，或需要修改 `module-map/modules.json` 才能获得所有者；
-- 为未来设想提前创建空目录、占位目录或未实现 backend。
-
-申请必须使用以下信息，不得先创建再补申请：
-
-```text
-[NEW DIRECTORY REQUEST]
-Proposed path: <仓库相对路径>
-Owning module: <现有模块或拟新增模块>
-Reason: <为什么需要这项功能>
-Why existing directories are insufficient: <逐项说明不能放入哪里>
-Planned contents: <文件类型、入口和公开接口>
-Dependencies and affected modules: <调用方、被调用方、强依赖>
-Lifecycle: <tracked source | generated | cache | test evidence>
-Git policy: <tracked 或对应的 .gitignore 规则>
-Verification: <新增后需要运行的门禁>
-```
-
-等待审批时可以继续不依赖该目录的工作，但不得创建目录、占位文件或把内容临时塞进错误模块。人工拒绝后必须使用现有目录或重新提交不同方案。
-
-无需单独申请的情况只有：
-
-1. 工具在下表固定位置生成编译/缓存目录；
-2. 在 `tmp/` 固定分类下创建一次运行目录；
-3. 在现有模块内部仅为拆分同一职责而创建实现子目录，且没有新公共边界、进程、协议或所有者。此类改动仍须同步相邻 README、`module-map/modules.json`、`module-map/directory-policy.json` 和相关 import；如果是否属于“同一职责”存在疑问，按需要申请处理。
-
-## 编译、缓存、调试与测试产物
-
-所有可再生成内容只允许进入下列固定位置，不得散落在源码目录、仓库根或 `docs/`：
-
-| 内容 | 固定位置 | Git 策略 |
-|---|---|---|
-| Node 依赖 | `node_modules/` | 忽略 |
-| Rust/Cargo 编译与测试缓存 | `target/` | 忽略；禁止在子 crate 设置第二个 `target/` |
-| Vite 缓存 | `.vite/` | 忽略 |
-| 前端/Sites 构建输出 | `dist/` | 忽略 |
-| Tauri sidecar 副本 | `src-tauri/binaries/` | 忽略 |
-| 通用工具缓存 | `tmp/cache/<module>/` | 忽略 |
-| 自动/过程测试输出 | `tmp/tests/<module>/<run-id>/` | 忽略 |
-| 调试日志、trace、dump | `tmp/debug/<module>/<run-id>/` | 忽略 |
-| 临时运行会话、模拟数据 | `tmp/sessions/<module>/<run-id>/` | 忽略 |
-| 未筛选截图和视觉对比 | `tmp/screenshots/<module>/<run-id>/` | 忽略 |
-| 覆盖率输出 | `coverage/` | 忽略 |
-| 经人工筛选的长期验收证据 | `docs/shots/<YYYY-MM-DD>-<topic>/` | 跟踪；必须有说明文件 |
-| 发布候选中间产物 | `release/` | 忽略 |
-| 免安装交付包（EXE、`build-info.json`） | `portable-release/` | 忽略；只跟踪说明文件 `README.md` |
-
-免安装正式版的唯一交付入口为 `portable-release/micro-ct-workstation-portable.exe`，使用 `npm.cmd run portable:build` 同步编译前端、桌面壳和内嵌引擎，并生成同目录 `build-info.json`。这两个文件都是可再生成的打包产物，只在本机构建与分发，不进入版本控制：`.gitignore` 忽略 `portable-release/*`，目录中只跟踪说明用 `README.md`。发布留档用 tag 记录源码提交，由接收方按 tag 在本机重新构建，而不是从仓库下载二进制。`target/release/` 只承担编译输出与缓存职责，不作为日常启动入口。未经硬件验收的设备重大迁移必须交付 `release/` 下明确标记的离线候选 EXE，保留现用正式入口及其来源/哈希；离线通过不得标记设备认证完成。涉及桌面交付必须在本机构建并验证所交付 EXE；仅运行 `vite build` 或浏览器截图不能证明桌面版本可用。
-
-`<module>` 使用稳定短名：`ct-engine`、`xray`、`camera`、`turntable`、`frontend`、`preview`、`scene`、`desktop`、`tooling`。`<run-id>` 使用 `YYYYMMDD-HHmmss-<short-topic>`，不得使用“final”“new”等无法追溯的名称。
-
-任何会生成文件的简单过程测试，都把本次产生的日志、JSON、图片、临时输入和输出统一放进一个 `tmp/tests/<module>/<run-id>/`。至少保存：
-
-- `command.txt`：实际执行命令和必要参数；
-- `result.json` 或 `summary.md`：时间、退出码、PASS/FAIL/BLOCKED 和结论；
-- `stdout.log`、`stderr.log`：仅在命令产生有诊断价值的输出时保存；
-- 其他文件：使用描述用途的稳定名称，禁止写入仓库根目录。
-
-默认只保留为本地临时产物。确需长期留档时，由人工筛选最小证据集后移动到 `docs/shots/<YYYY-MM-DD>-<topic>/`，并添加 README，写明来源提交、执行命令、环境、结果、未测边界和为何值得版本控制。禁止把整个缓存目录、依赖、原始大日志或含敏感路径/设备信息的文件直接提交。
-
-## 验证
-
-```powershell
-npm.cmd ci
-npm.cmd run typecheck
-npm.cmd run test:sites
-npm.cmd run module-map:check
-cargo test --workspace
-```
-
-只运行与改动匹配的必要门禁，但涉及设备、安全、IPC 或发布时必须覆盖相关全链。测试通过只证明离线逻辑；真实运动、相机和射线结论必须有本次明确授权下取得的设备证据。
-
-交付报告列出改动文件、影响的控制链、执行命令及 `PASS/FAIL/BLOCKED`、未测边界和剩余风险。不在本文件记录版本进度、阶段计划或会话历史。
+设备、安全、IPC 和发布变更覆盖相应控制链。目录迁移核对源码内容、资源哈希、依赖引用、桌面构建和正常启动/退出；运行时不连接真实设备。交付列出 PASS、FAIL、BLOCKED、命令及未测边界。无本次硬件证据时明确写“仅离线验证”。

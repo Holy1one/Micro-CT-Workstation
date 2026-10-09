@@ -1,0 +1,64 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Micro-CT Workstation",
+  "version": "0.9.20",
+  "identifier": "edu.lzu.microct.workstation",
+  "build": {
+    "beforeDevCommand": "npm run engine:build && npm run dev -- --port 4173 --strictPort",
+    "devUrl": "http://127.0.0.1:4173",
+    "beforeBuildCommand": "npm run engine:build -- --release && npm run build",
+    "frontendDist": "../../.cache/frontend/dist/client"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Micro-CT Workstation",
+        "width": 1920,
+        "height": 1080,
+        "visible": false,
+        "fullscreen": false,
+        "decorations": false,
+        "resizable": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu-sandbox"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "msi"
+    ],
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "wix": {
+        "version": "0.9.20",
+        "upgradeCode": "A96DC7F4-7384-4B5E-9AB5-6BE9CB76C8F2",
+        "language": "en-US",
+        "template": "../../tools/release/windows-installer.wxs",
+        "fragmentPaths": [
+          "gen/installer-licenses.wxs",
+          "gen/installer-folder-picker.wxs"
+        ],
+        "bannerPath": "../../assets/installer-banner.bmp",
+        "dialogImagePath": "../../assets/installer-dialog.bmp"
+      }
+    },
+    "externalBin": [
+      "binaries/ct-engine"
+    ],
+    "icon": [
+      "../../assets/app-32x32.png",
+      "../../assets/app-128x128.png",
+      "../../assets/app-128x128@2x.png",
+      "../../assets/app-icon.icns",
+      "../../assets/app-icon.ico"
+    ]
+  }
+}

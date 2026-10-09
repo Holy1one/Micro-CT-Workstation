@@ -2,18 +2,20 @@
 
 This directory contains a recovered **candidate**, not hardware-certified firmware.
 The user approved importing the source from
-`tmp/tests/turntable/20260929-firmware-recovery/rts9060_nano/rts9060_nano.ino`.
-The imported `.ino` is preserved byte for byte: 32,429 bytes and SHA-256
+`.cache/tests/turntable/20260929-firmware-recovery/rts9060_nano/rts9060_nano.ino`.
+The original imported `.ino` had 32,429 bytes and SHA-256
 `470133efbb0f2192c725a0aef223cf6256030ce1f9c0dc541bd3cea4efa8e562`.
-`build-config.json` pins this identity and the build settings. Historical comments
+The current 2.1.1 / 20261009 candidate adds `RESTORE_REFERENCE <id> <expected-pos>`
+and advertises that capability. `build-config.json` pins the current source and
+retains the original source identity. Historical comments
 in the candidate are retained as source provenance; they do not establish current
 wiring or authorize reading any archived project.
 
 ## Offline build and harness
 
 ```powershell
-node scripts/build-turntable-firmware.mjs
-node scripts/test-turntable-firmware.mjs
+node tools/build/build-turntable-firmware.mjs
+node tests/firmware/test-turntable-firmware.mjs
 cargo test -p ct-engine devices::turntable
 ```
 
@@ -23,13 +25,13 @@ AVR GCC `7.3.0-atmel3.6.1-arduino7`, Nano ATmega328P, 16 MHz and the
 No previously generated HEX is used. The script builds the sketch and core from
 source, links an ELF and generates HEX/BIN. It records every command, compiler
 version, source identity, lengths, hashes and memory use in a fresh
-`tmp/tests/turntable/<run-id>/` directory. There is no upload or serial command.
+`.cache/tests/turntable/<run-id>/` directory. There is no upload or serial command.
 
 The first rebuilt candidate occupies 13,416 bytes of flash and 1,382 bytes of RAM
 under the pinned configuration; these are build observations, not proof of the
 currently installed flash. Each run's `result.json` is the artifact evidence.
 
-`host_harness.cpp` directly includes the unchanged `.ino` with its existing
+`host_harness.cpp` directly includes the current `.ino` with its existing
 `HOST_HARNESS` branch. `host_arduino_stubs.h` supplies deterministic clock, pins
 and ASCII I/O. It executes the actual parser, pulse count and state transitions,
 including prescribed negative moves, ABS normalization, REL full circles,
@@ -50,6 +52,13 @@ software falling edge and does not model AVR interrupt scheduling.
   planner sends bounded negative relative moves from confirmed unwrapped pulses.
 - A move ends in CAPTURE_HOLD, released only by the same move ID's CAPTURE_DONE.
   STOP invalidates reference/homed/rearmed. Warning remains set until explicit OFF.
+- RESTORE_REFERENCE restores the previous calibrated reference only after the PC
+  verifies an unchanged-position operator confirmation and frozen checkpoint.
+  The firmware requires idle/rearmed/fresh heartbeat, warning OFF and an exact
+  expected/current/target counter match. It does not change counters or emit STEP;
+  wrong positions, active motion, FAULT and a pressed STOP remain rejected. This
+  is reference recovery, not a newly executed HOME. It requires separate upload
+  authorization and hardware acceptance before use on a production controller.
 - The potential shared-flag/ISR ordering race in `stepPulseStart` remains
   unmodified and unproven; host tests cannot validate this timing.
 
