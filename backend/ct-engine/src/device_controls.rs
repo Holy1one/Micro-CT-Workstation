@@ -755,12 +755,12 @@ impl Engine {
             if !reusable{nano.rearm_cancelled(cancel.clone()).map_err(|e|e.to_string())?;}
             if cancel.load(Ordering::SeqCst){return Err("Preflight cancelled".into());}
             let restoring=scan::resume_manifest_exists(&params);
-            Ok(Box::new(move |engine|{engine.capture_profile=Some(profile.clone());engine.cached_camera_health=Some(camera.health());engine.set_kv=health.set_voltage_kv.ok_or("Verified voltage missing")?;engine.set_ua=health.set_current_ua.ok_or("Verified current missing")?;engine.cached_xray_health=Some(health);if recovery{engine.set_kv_confirmed=true;engine.set_ua_confirmed=true;engine.usb_auto_shut_down=false;engine.usb_auto_shut_down_confirmed=true;if let Some(max)=frozen_max{engine.max_xray_sec=max;}}else if profile.is_card_destination()&&!engine.max_xray_sec_explicit{
+            Ok(Box::new(move |engine|{engine.capture_profile=Some(profile.clone());engine.cached_camera_health=Some(camera.health());engine.set_kv=health.set_voltage_kv.ok_or("Verified voltage missing")?;engine.set_ua=health.set_current_ua.ok_or("Verified current missing")?;engine.cached_xray_health=Some(health);if recovery{engine.set_kv_confirmed=true;engine.set_ua_confirmed=true;engine.usb_auto_shut_down=false;engine.usb_auto_shut_down_confirmed=true;if let Some(max)=frozen_max{engine.max_xray_sec=max;}}else if let Some(limit)=card_default_max_xray_sec(&profile,engine.max_xray_sec_explicit){
                 // A new camera-card acquisition defaults to the unified 1000 s
                 // continuous limit. An explicit value for this task is kept, and a
                 // host-RAM task keeps the 600 s default.
-                engine.max_xray_sec=crate::scan::SCAN_MAX_XRAY_SEC;
-                engine.log("INFO","system",&format!("Camera-card acquisition defaults to the unified {} s continuous X-ray limit; set an explicit limit before Preflight to change it",crate::scan::SCAN_MAX_XRAY_SEC));
+                engine.max_xray_sec=limit;
+                engine.log("INFO","system",&format!("Camera-card acquisition defaults to the unified {limit} s continuous X-ray limit; set an explicit limit before Preflight to change it"));
             }engine.fault_latched=false;engine.preflight=true;engine.homed=reusable;engine.reference_verified_this_process|=reusable;engine.phase=if reusable{Phase::Ready}else{Phase::ReadyForHome};engine.scan_references=scan::ReferenceFrames::default();engine.metadata_resume=restoring;engine.scan_prompt=if restoring||engine.scan_geometry.is_some(){None}else{Some("geometry")};engine.scan_stage=if engine.scan_prompt.is_some(){"geometry"}else{"idle"};engine.last_error=None;if unchanged&&reusable{engine.log("PASS","nano","Operator-confirmed unchanged turntable reference verified; no HOME or movement performed");}Ok(())}))
         })
     }
@@ -1810,6 +1810,72 @@ mod tests{
         let mut engine=Engine::new(false);engine.cached_camera_health=Some(previous);engine.preflight=true;engine.capture_profile=Some(crate::capture_profile::test_profile());
         engine.sync_camera_readback(actual);assert!(!engine.preflight);assert!(engine.capture_profile.is_none());
         let focus=&engine.cached_camera_health.as_ref().unwrap().properties["focusMode"];assert!(focus.target.is_none());assert_eq!(focus.actual,Some(CameraValue::Integer(0)));assert!(!engine.fault_latched);
+    }
+    #[test]
+    fn card_safe_finishing_is_registered_as_acquired_pending_import_and_never_completed(){
+        let(mut engine,_root)=registered_stop_fixture("card-pending-import");
+        let parameters=engine.parameters.clone();
+        assert_eq!(engine.snapshot()["cardAcquisition"]["destination"],"unknown");
+        assert_eq!(engine.snapshot()["cardAcquisition"]["pendingImportTasks"],0);
+        let(camera,_)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});
+        let identity=crate::devices::turntable::NanoIdentity{
+            device:crate::devices::turntable::EXPECTED_DEVICE.into(),
+            version:crate::scan::CARD_FIRMWARE_VERSION.into(),protocol:2,
+            build:crate::scan::CARD_FIRMWARE_BUILD.into(),buzzer_installed:true,
+            capabilities:vec!["HEARTBEAT_ACK".into(),crate::scan::CARD_SETTLE_CAPABILITY.into()]};
+        let policy=crate::scan::card_capture_policy(&identity,false).unwrap();
+        let profile=crate::capture_profile::CaptureProfile::from_card_readback(&camera.health(),camera.card_profile_readback().unwrap(),None,policy).unwrap();
+        // The default limit of a new card acquisition is the unified 1000 s; an
+        // explicit value is kept and a host-RAM profile never takes the card default.
+        assert_eq!(card_default_max_xray_sec(&profile,false),Some(crate::scan::SCAN_MAX_XRAY_SEC));
+        assert_eq!(card_default_max_xray_sec(&profile,true),None);
+        assert_eq!(card_default_max_xray_sec(&crate::capture_profile::test_profile(),false),None);
+        let record=|index:u32,kind:&str|json!({"index":index,"kind":kind,"angleDeg":0.0,
+            "exposureMs":parameters.exposure_ms,"state":crate::scan::DATA_PENDING_IMPORT,
+            "cameraSessionId":"session-card","operationId":format!("op-{index}"),
+            "storageId":65537u32,"storageChanged":false,"handle":256u32+index,"parent":1u32,
+            "sourceFileName":format!("DSC_{index:04}.NEF"),"format":12288u32,
+            "size":26733241u64,"captureDate":"20261011T120000"});
+        let records:Vec<Value>=(1..=parameters.projection_count).map(|index|record(index,"projection"))
+            .chain((1..=20u32).map(|index|record(index,"preDark"))).collect();
+        let manifest=|acquisition:&str,records:Vec<Value>|json!({"schemaVersion":4,
+            "scanId":parameters.task_id,"projectionCount":parameters.projection_count,
+            "exposureMs":parameters.exposure_ms,"captureProfile":profile,
+            "maxXraySec":crate::scan::SCAN_MAX_XRAY_SEC,"voltageKv":20.0,"currentUa":100.0,
+            "captureDestination":"cameraCard","acquisitionStatus":acquisition,
+            "dataStatus":crate::scan::DATA_PENDING_IMPORT,"stage":"finalizing","completed":false,
+            "geometry":geometry(),"references":{"preDark":[],"preFlat":[],"postFlat":[],"postDark":[]},
+            "frames":[],"captureRecords":records});
+        let directory=PathBuf::from(parameters.save_path.trim()).join(parameters.task_id.trim());
+        std::fs::create_dir_all(&directory).unwrap();
+        // An acquisition that is not safely finished cannot be promoted, and the
+        // task keeps its lock.
+        std::fs::write(directory.join("manifest.json"),serde_json::to_vec(&manifest("running",records.clone())).unwrap()).unwrap();
+        engine.enqueue_acquired_pending_import().unwrap();
+        pump(&mut engine);
+        assert!(engine.task_registry.locked());
+        assert!(engine.task_registry.pending_import_tasks().is_empty());
+        assert_ne!(engine.phase,Phase::Completed);
+        assert!(engine.metadata_completed==false);
+        // Safe finishing (worker joined, beam OFF confirmed, ledger persisted) is
+        // registered as a retained task with import required: no hardware lock, no
+        // completion and no reconstruction.
+        std::fs::write(directory.join("manifest.json"),serde_json::to_vec(&manifest(crate::scan::ACQUISITION_ACQUIRED,records)).unwrap()).unwrap();
+        engine.enqueue_acquired_pending_import().unwrap();
+        pump(&mut engine);
+        assert!(!engine.task_registry.locked(),"the scan occupancy is released");
+        assert_eq!(engine.phase,Phase::Stopped);
+        assert_eq!(engine.scan_stage,"pending_import");
+        assert!(!engine.metadata_completed,"a pending import is never reconstructable");
+        assert_eq!(engine.task_registry.pending_import_tasks().len(),1);
+        assert!(engine.task_registry.check_retained_location(&parameters).unwrap());
+        assert_eq!(engine.task_registry.snapshot()["retained"][0]["status"],crate::task_registry::TASK_STATUS_ACQUIRED_PENDING_IMPORT);
+        let snapshot=engine.snapshot();
+        assert_eq!(snapshot["cardAcquisition"]["pendingImportTasks"],1);
+        assert_eq!(snapshot["cardAcquisition"]["currentTaskPendingImport"],true);
+        assert_eq!(snapshot["cardAcquisition"]["importRequired"],false,"an import requirement needs the active card profile");
+        assert_eq!(snapshot["workstation"]["reconstruction"]["unlocked"],false);
+        assert_eq!(engine.task_registry.mark_import_verified(&parameters),Err("Import verification is missing sealed, committed card evidence".into()));
     }
     /// Hardware finding (2026-10-08, real Moxtek): after `send_voltage 4 kV` the
     /// verified readback is 3.99971 kV, and a following `send_current 10 uA`

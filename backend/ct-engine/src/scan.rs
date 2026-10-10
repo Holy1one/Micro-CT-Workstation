@@ -5387,7 +5387,7 @@ mod tests {
 
     macro_rules! card_scripted_camera {
         () => {
-            crate::devices::camera::scripted_camera_with_probe(
+            crate::devices::camera::scripted_card_adapter(
                 crate::devices::camera::ScriptedCameraConfig {
                     card_capture: true,
                     exposure_delay: Duration::from_millis(2),
@@ -5698,6 +5698,19 @@ mod tests {
         );
         assert_ne!(registry.snapshot()["retained"][0]["status"], "completed");
         assert!(registry.mark_import_verified(&parameters).is_err());
+        // Offline gate evidence: the whole scan's opcodes and read bounds, the card
+        // record count and the complete task-directory listing.
+        let mut local_files: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        local_files.sort();
+        println!(
+            "card scan evidence: opcodes={:X?} reads={:?} records={} localFiles={local_files:?}",
+            probe.calls(),
+            &reads[read_mark..],
+            records.len()
+        );
     }
 
     #[test]

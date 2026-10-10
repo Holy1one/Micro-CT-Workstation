@@ -434,9 +434,6 @@ impl CameraAdapter {
         if self.health().live_view.active {
             return Err(invalid("capture prohibited while Live View is active"));
         }
-        self.control
-            .card_capture_pending
-            .store(false, Ordering::Release);
         match self.call(
             Request::Capture {
                 path: path.into(),
@@ -1348,6 +1345,12 @@ fn execute(
             events,
             scan_policy,
         } => {
+            // This entry is host-RAM: any still-pending capture verdict is replaced
+            // only here, on the owner thread, so a refused or cancelled card
+            // operation keeps its own card termination evidence.
+            control
+                .card_capture_pending
+                .store(false, Ordering::Release);
             let image = capture_with_policy(
                 camera,
                 path,
