@@ -4,6 +4,10 @@
 
 use super::capture::capture_with_policy;
 use super::card_capture::{capture_to_card, CardCaptureOutcome, CardCapturePlan};
+use super::card_import::{
+    download_card_object, enumerate_card_objects, CardImportDownload, CardImportInventory,
+    CardImportObject, CardImportProgress,
+};
 use super::live_view::*;
 use super::nikon::*;
 use super::properties::{refresh_property_controls,clear_live_view_controls,require_card_destination};
@@ -34,6 +38,14 @@ const CARD_STORAGE_DATASET_MAX: usize = 64 * 1024;
 /// budget well under the Stop pre-emption budget is what prevents that.
 const LV_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(75);
+/// Metadata-only enumeration budget for one authorized import. The work is
+/// bounded per object by the shared deadline and by the cancellation generation,
+/// so a wedged card cannot delay Stop; the budget only has to cover a large card
+/// listing of bounded `GetObjectInfo` reads.
+const CARD_IMPORT_ENUMERATE_TIMEOUT: Duration = Duration::from_secs(1800);
+/// One card object: bounded metadata re-read plus one bounded `GetObject`. The
+/// bound follows the largest object the strict parser accepts.
+const CARD_IMPORT_OBJECT_TIMEOUT: Duration = Duration::from_secs(600);
 const LV_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 enum Request {
@@ -64,6 +76,18 @@ enum Request {
         operation_id: String,
         events: Option<mpsc::Sender<CameraCaptureEvent>>,
     },
+    /// Authorized card import, metadata phase: fresh `GetStorageIDs`,
+    /// `GetStorageInfo` and `GetObjectHandles` enumeration with one bounded
+    /// `GetObjectInfo` per handle. Read-only device metadata, no image byte.
+    CardImportEnumerate { storages: Vec<u32> },
+    /// Authorized card import, one object: bounded metadata re-read, one bounded
+    /// `GetObject`, complete-NEF validation and a streaming staged write. The
+    /// image bytes leave the card only here, and only for a verified task.
+    CardImportObject {
+        object: Box<CardImportObject>,
+        staging: PathBuf,
+        progress: Option<Arc<Mutex<CardImportProgress>>>,
+    },
     LvStart(u64),
     LvStop,
     LvRead(String,u64),
@@ -79,6 +103,8 @@ enum Reply {
     Captured(CapturedImage),
     CardPlan(CardPlan),
     CardCaptured(CardCaptureOutcome),
+    CardImportInventory(Box<CardImportInventory>),
+    CardImportDownloaded(Box<CardImportDownload>),
     Done,
 }
 struct Message {
@@ -488,6 +514,49 @@ impl CameraAdapter {
             Some(cancel),
         )? {
             Reply::CardCaptured(outcome) => Ok(outcome),
+            _ => unreachable!(),
+        }
+    }
+    /// Metadata phase of the authorized card import through the same single COM
+    /// owner: fresh `GetStorageIDs`/`GetStorageInfo`/`GetObjectHandles` enumeration
+    /// with one bounded `GetObjectInfo` per handle. No image byte is requested and
+    /// the card is never modified.
+    pub(crate) fn card_import_enumerate(
+        &self,
+        storages: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<CardImportInventory, CameraError> {
+        match self.call(
+            Request::CardImportEnumerate {
+                storages: storages.to_vec(),
+            },
+            CARD_IMPORT_ENUMERATE_TIMEOUT,
+            Some(cancel),
+        )? {
+            Reply::CardImportInventory(inventory) => Ok(*inventory),
+            _ => unreachable!(),
+        }
+    }
+    /// One bounded card object download through the same single COM owner. The
+    /// bytes are staged and hashed inside the request; the caller commits them
+    /// atomically without overwriting.
+    pub(crate) fn card_import_download(
+        &self,
+        object: &CardImportObject,
+        staging: &Path,
+        cancel: &AtomicBool,
+        progress: Option<&Arc<Mutex<CardImportProgress>>>,
+    ) -> Result<CardImportDownload, CameraError> {
+        match self.call(
+            Request::CardImportObject {
+                object: Box::new(object.clone()),
+                staging: staging.to_path_buf(),
+                progress: progress.cloned(),
+            },
+            CARD_IMPORT_OBJECT_TIMEOUT,
+            Some(cancel),
+        )? {
+            Reply::CardImportDownloaded(download) => Ok(*download),
             _ => unreachable!(),
         }
     }
@@ -1412,6 +1481,20 @@ fn execute(
             // evidence, and the card operation's own diagnostics already carry it.
             Ok(Reply::CardCaptured(outcome?))
         }
+        Request::CardImportEnumerate { storages } => Ok(Reply::CardImportInventory(Box::new(
+            enumerate_card_objects(camera, storages, context)?,
+        ))),
+        Request::CardImportObject {
+            object,
+            staging,
+            progress,
+        } => Ok(Reply::CardImportDownloaded(Box::new(download_card_object(
+            camera,
+            object,
+            staging,
+            context,
+            progress.as_ref(),
+        )?))),
         Request::LvStart(live_epoch) => {
             camera.ensure_connected()?;
             if !camera.health.capabilities.live_view {

@@ -323,6 +323,10 @@ pub struct Engine {
     real_scan: Option<RealScanHandle>,
     real_scan_revision: u64,
     real_scan_message_count: usize,
+    /// The authorized card import state of the retained pending-import task. It
+    /// is the bounded shared record the import worker publishes into; the snapshot
+    /// only copies it, so a slow card can never block status reads or Stop.
+    card_import: Option<devices::camera::card_import::CardImportReporter>,
     scan_stage: &'static str,
     scan_prompt: Option<&'static str>,
     scan_geometry: Option<ScanGeometry>,
@@ -410,6 +414,7 @@ impl Engine {
             real_scan: None,
             real_scan_revision: 0,
             real_scan_message_count: 0,
+            card_import: None,
             scan_stage: "idle",
             scan_prompt: None,
             scan_geometry: None,
@@ -501,6 +506,31 @@ impl Engine {
     fn busy(&self) -> bool {
         self.real_scan.is_some() || self.reconstruction.is_some() || self.operations.blocks_controls()
             || matches!(self.phase, Phase::Running | Phase::Paused | Phase::Finishing | Phase::Stopping)
+    }
+
+    /// Drains the bounded messages the card import worker published. The worker
+    /// never writes engine state itself, and a slow or wedged transfer only ever
+    /// grows this bounded vector.
+    fn sync_card_import(&mut self) {
+        let Some(reporter) = self.card_import.clone() else { return; };
+        for message in reporter.take_messages() {
+            self.log(message.level, "camera", &message.text);
+        }
+    }
+
+    /// The authorized card import state of the retained pending-import task.
+    /// `idle` means no import ran for the current pending task yet.
+    fn card_import_progress(&self) -> devices::camera::card_import::CardImportProgress {
+        self.card_import
+            .as_ref()
+            .map(|reporter| {
+                reporter
+                    .progress
+                    .lock()
+                    .expect("import progress mutex poisoned")
+                    .clone()
+            })
+            .unwrap_or_default()
     }
 
     fn sync_real_scan(&mut self) {
@@ -2074,6 +2104,7 @@ impl Engine {
 
     pub fn tick(&mut self) {
         self.sync_operations();
+        self.sync_card_import();
         self.sync_software_update_preparation();
         self.sync_real_scan();
         self.sync_reconstruction();
@@ -2411,6 +2442,7 @@ impl Engine {
             .as_ref()
             .map_or(0, |value| value.card_records.len());
         let pending = self.task_registry.pending_import_tasks();
+        let import = self.card_import_progress();
         json!({
             "destination": if card_profile { "cameraCard" } else if self.capture_profile.is_some() { "hostRam" } else { "unknown" },
             "active": card_profile,
@@ -2420,6 +2452,19 @@ impl Engine {
             "pendingImportTasks": pending.len(),
             "currentTaskPendingImport": pending.iter().any(|record| record.parameters == self.parameters),
             "importRequired": card_profile && acquisition == Some(scan::ACQUISITION_ACQUIRED),
+            // The authorized USB import of the retained pending-import task.
+            // `importedRecords` counts records whose committed local file was
+            // verified; `verifiedRecords` counts records the manifest already
+            // records as verified, so a durable receipt is never claimed from
+            // bytes alone. The projection counters use the same rule.
+            "importStatus": import.status,
+            "importOperationId": if import.operation_id.is_empty() { Value::Null } else { json!(import.operation_id) },
+            "importError": import.error,
+            "importedRecords": import.imported,
+            "verifiedRecords": import.verified,
+            "acquiredProjectionCount": import.acquired_projections,
+            "importedProjectionCount": import.imported_projections,
+            "verifiedProjectionCount": import.verified_projections,
         })
     }
 

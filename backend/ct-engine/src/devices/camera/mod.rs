@@ -2,6 +2,7 @@
 mod actor;
 mod capture;
 mod card_capture;
+pub(crate) mod card_import;
 mod live_view;
 mod nikon;
 mod ptp;

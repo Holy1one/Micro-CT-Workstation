@@ -97,10 +97,134 @@ impl Engine {
                 engine.metadata_manifest=true;
                 engine.metadata_resume=false;
                 engine.metadata_completed=false;
+                // The import state belongs to the newest pending-import task. The
+                // registry just re-validated one card record per projection, so the
+                // acquired projection count is proven evidence, not a plan value.
+                let reporter=crate::devices::camera::card_import::CardImportReporter::new();
+                let projections=parameters.projection_count;
+                reporter.publish(|value|value.acquired_projections=projections);
+                engine.card_import=Some(reporter);
                 engine.log("PASS","system","Card acquisition safely finished; the task is retained as acquired with import required. The NEFs stay on the camera card until the authorized USB import is verified, and reconstruction stays locked.");
                 Ok(())
             }))
         })
+    }
+    /// The retained pending-import task an import request names. An explicit
+    /// `taskId`/`savePath` pair must match a retained record exactly; otherwise
+    /// the active task is used when it is itself pending, a single pending task is
+    /// accepted, and anything ambiguous is refused.
+    fn pending_import_parameters(&self,payload:&Value)->Result<crate::Parameters,&'static str>{
+        let pending:Vec<crate::Parameters>=self.task_registry.pending_import_tasks().iter().map(|record|record.parameters.clone()).collect();
+        if pending.is_empty(){return Err("NO_PENDING_IMPORT_TASK");}
+        match (payload.get("taskId").and_then(Value::as_str).map(str::trim).filter(|value|!value.is_empty()),
+               payload.get("savePath").and_then(Value::as_str).map(str::trim).filter(|value|!value.is_empty())) {
+            (Some(task_id),Some(save_path))=>pending.iter()
+                .find(|parameters|parameters.task_id==task_id&&parameters.save_path==save_path)
+                .cloned()
+                .ok_or("PENDING_IMPORT_TASK_NOT_FOUND"),
+            (None,None)=>{
+                if pending.iter().any(|parameters|*parameters==self.parameters){Ok(self.parameters.clone())}
+                else if pending.len()==1{Ok(pending[0].clone())}
+                else{Err("PENDING_IMPORT_TASK_AMBIGUOUS")}
+            }
+            _=>Err("INVALID_PARAMETERS"),
+        }
+    }
+    /// The authorized USB import entry point. It holds the camera transport
+    /// occupation through the ordinary camera device operation, so an independent
+    /// capture, Live View, a parameter change and a new scan cannot contend for the
+    /// single COM owner while it runs. Nothing is started for a task the registry
+    /// does not already retain as `acquired_pending_import`.
+    pub(crate) fn enqueue_card_import(&mut self,payload:&Value)->Result<(),&'static str>{
+        if self.preview{return Err("PRODUCTION_LOCKED");}
+        if self.maintenance_lock{return Err("SOFTWARE_UPDATE_MAINTENANCE_LOCKED");}
+        if self.real_scan.is_some()||self.busy(){return Err("DEVICE_CONTROL_LOCKED");}
+        if self.operations.device_active("camera"){return Err("DEVICE_OPERATION_ACTIVE");}
+        if self.card_import.as_ref().is_some_and(|reporter|reporter.progress.lock().map(|value|value.status==crate::devices::camera::card_import::IMPORT_STATUS_RUNNING).unwrap_or(false)){return Err("CARD_IMPORT_ACTIVE");}
+        let parameters=self.pending_import_parameters(payload)?;
+        let camera=self.camera.as_ref().cloned().ok_or("CAMERA_NOT_CONNECTED")?;
+        let health=camera.health();
+        if !health.connected||health.isolated||!health.cleanup_confirmed{return Err("CAMERA_NOT_CONNECTED");}
+        if health.live_view.active{return Err("CAMERA_LIVE_VIEW_ACTIVE");}
+        let reporter=crate::devices::camera::card_import::CardImportReporter::new();
+        reporter.publish(|value|{value.status=crate::devices::camera::card_import::IMPORT_STATUS_RUNNING;value.stage="admission";});
+        let camera_for_job=camera.clone();
+        let parameters_for_job=parameters.clone();
+        let reporter_for_job=reporter.clone();
+        let operation_progress=reporter.operation.clone();
+        self.enqueue_device("camera","card_import",move|cancel|{
+            match crate::devices::camera::card_import::run_card_import(&camera_for_job,&parameters_for_job,&cancel,&reporter_for_job){
+                Ok(summary)=>{
+                    let parameters=parameters_for_job.clone();
+                    Ok(Box::new(move|engine|engine.complete_card_import(&parameters,summary)))
+                }
+                Err(failure)=>{
+                    let cancelled=matches!(failure,crate::devices::camera::card_import::CardImportFailure::Cancelled);
+                    let message=failure.message();
+                    reporter_for_job.publish(|value|{
+                        value.status=if cancelled{crate::devices::camera::card_import::IMPORT_STATUS_CANCELLED}else{crate::devices::camera::card_import::IMPORT_STATUS_FAILED};
+                        value.stage=if cancelled{"cancelled"}else{"failed"};
+                        if !cancelled{value.error=Some(message.clone());}
+                    });
+                    Err(message)
+                }
+            }
+        })?;
+        let operation_id=self.operations.last_id.clone().unwrap_or_default();
+        reporter.publish(|value|value.operation_id=operation_id.clone());
+        self.operations.track_progress(&operation_id,operation_progress);
+        self.card_import=Some(reporter);
+        self.log("INFO","camera",&format!("Authorized USB import started for task {} on the same camera owner (operation {}); reconstruction stays locked until every record is verified and sealed",parameters.task_id,operation_id));
+        Ok(())
+    }
+    /// Cancels a running import without touching the verified files, the
+    /// acquisition journal or the retained pending-import state. The camera session
+    /// is invalidated exactly like an operator Stop so an in-flight transfer is
+    /// bounded; the task stays re-importable.
+    pub(crate) fn cancel_card_import(&mut self)->Result<(),&'static str>{
+        let running=self.card_import.as_ref().is_some_and(|reporter|reporter.progress.lock().map(|value|value.status==crate::devices::camera::card_import::IMPORT_STATUS_RUNNING).unwrap_or(false));
+        if !running{return Err("CARD_IMPORT_NOT_RUNNING");}
+        self.operations.cancel_device("camera");
+        if let Some(camera)=self.camera.as_ref(){camera.request_cancel();}
+        self.log("ACTION","camera","Card import cancellation requested; every verified file, the acquisition journal and the pending-import state are retained");
+        Ok(())
+    }
+    /// Owner-side completion of a sealed import. The manifest already proves the
+    /// verified state, so the registry promotes the retained record and only then
+    /// does the current task become reconstructable.
+    fn complete_card_import(&mut self,parameters:&crate::Parameters,summary:crate::devices::camera::card_import::CardImportSummary)->Result<(),String>{
+        let registered=self.task_registry.mark_import_verified(parameters);
+        if let Err(error)=registered{
+            if let Some(reporter)=self.card_import.as_ref(){
+                reporter.publish(|value|{value.status=crate::devices::camera::card_import::IMPORT_STATUS_FAILED;value.stage="failed";value.error=Some(error.clone());});
+            }
+            return Err(format!("The sealed card import could not be registered as completed: {error}"));
+        }
+        let current=self.parameters==*parameters;
+        if current{
+            // No fabricated completion: the engine's own reconstruction gate must
+            // accept the durable manifest before this task is reported complete.
+            let verified=crate::scan::completed_manifest_exists(&self.parameters);
+            self.metadata_manifest=true;
+            self.metadata_resume=false;
+            self.metadata_completed=verified;
+            if !verified{
+                self.fault_latched=true;
+                self.preflight=false;
+                self.phase=Phase::Fault;
+                self.scan_stage="fault";
+                let error="The sealed card import is not accepted by the completed-manifest gate; reconstruction stays locked".to_owned();
+                self.last_error=Some(error.clone());
+                self.log("ERR","camera",&error);
+                return Err(error);
+            }
+            self.phase=if self.task_exit_pending{Phase::Stopping}else{Phase::Completed};
+            self.scan_stage=if self.task_exit_pending{"stopping"}else{"completed"};
+            self.scan_prompt=None;
+            self.last_error=None;
+        }
+        self.log("PASS","camera",&format!("Card import verified and sealed: {}/{} records with local file identities and {} projection(s); the retained task is registered as completed and reconstruction is unlocked",summary.verified,summary.records,summary.projections));
+        Ok(())
     }
     pub(crate) fn enqueue_stop_for_shutdown(&mut self)->Result<(),&'static str>{self.enqueue_stop(true,false)}
     pub(crate) fn sync_camera_health(&mut self) {
@@ -275,7 +399,7 @@ impl Engine {
         })
     }
     pub(crate) fn device_command(&mut self,command:&str,payload:Value)->Option<Result<(),&'static str>> {
-        if !matches!(command,"connect"|"disconnect"|"stop"|"preflight"|"home"|"retry_device"|"restore_previous"|"start_scan"|"start_reconstruction"|"abandon_scan"|"preset_list"|"preset_save"|"preset_delete"|"preset_load"|"preset_compare"|"preset_import"|"preset_export"|"camera_pipe_descriptor"|"camera_test_capture"|"camera_connect"|"camera_disconnect"|"camera_status"|"camera_identity"|"camera_read_properties"|"camera_apply_properties"|"camera_capture"|"camera_live_view_start"|"camera_live_view_stop"|"camera_live_view_read"|"camera_live_view_configure"|"camera_autofocus"|"camera_focus"|"turntable_connect"|"turntable_disconnect"|"turntable_status"|"turntable_identity"|"turntable_home"|"turntable_relative"|"turntable_to_angle"|"turntable_bench_mode"|"xray_connect"|"xray_disconnect"|"xray_status"|"xray_identity"|"xray_toggle"|"xray_off"|"send_voltage"|"send_current"|"usb_auto_shut_down_toggle"|"set_usb_shutdown_delay") {return None;}
+        if !matches!(command,"connect"|"disconnect"|"stop"|"preflight"|"home"|"retry_device"|"restore_previous"|"start_scan"|"start_reconstruction"|"abandon_scan"|"preset_list"|"preset_save"|"preset_delete"|"preset_load"|"preset_compare"|"preset_import"|"preset_export"|"camera_pipe_descriptor"|"camera_test_capture"|"camera_connect"|"camera_disconnect"|"camera_status"|"camera_identity"|"camera_read_properties"|"camera_apply_properties"|"camera_capture"|"camera_live_view_start"|"camera_live_view_stop"|"camera_live_view_read"|"camera_live_view_configure"|"camera_autofocus"|"camera_focus"|"camera_card_import"|"camera_card_import_cancel"|"start_card_import"|"cancel_card_import"|"turntable_connect"|"turntable_disconnect"|"turntable_status"|"turntable_identity"|"turntable_home"|"turntable_relative"|"turntable_to_angle"|"turntable_bench_mode"|"xray_connect"|"xray_disconnect"|"xray_status"|"xray_identity"|"xray_toggle"|"xray_off"|"send_voltage"|"send_current"|"usb_auto_shut_down_toggle"|"set_usb_shutdown_delay") {return None;}
         Some(self.execute_device_command(command,payload))
     }
     fn execute_device_command(&mut self,command:&str,payload:Value)->Result<(),&'static str> {
@@ -364,6 +488,8 @@ impl Engine {
                 self.enqueue_device("camera","disconnect",move |_|{let health=camera.disconnect_confirmed().map_err(|error|format!("Camera cleanup unconfirmed: {error}"))?;if !health.cleanup_confirmed{return Err("Camera cleanup unconfirmed; isolated proxy retained".into());}Ok(Box::new(move |engine|{engine.cached_camera_health=Some(health);engine.camera=None;engine.preflight=false;Ok(())}))})
             }
             "camera_read_properties"|"camera_apply_properties"|"camera_capture"|"camera_test_capture"|"camera_live_view_start"|"camera_live_view_stop"|"camera_live_view_read"|"camera_live_view_configure"|"camera_autofocus"|"camera_focus"=>self.enqueue_camera_control(command,payload),
+            "camera_card_import"|"start_card_import"=>self.enqueue_card_import(&payload),
+            "camera_card_import_cancel"|"cancel_card_import"=>self.cancel_card_import(),
             "home"|"turntable_home"=>self.enqueue_home(command=="home"),
             "turntable_relative"|"turntable_to_angle"=>self.enqueue_motion(command,payload),
             "retry_device"=>{

@@ -240,6 +240,16 @@ struct Script {
     /// Empty in every RAM session, where `object_info` stays the single RAM
     /// answer for handle `0xffff0001`.
     card_object_info: BTreeMap<u32, Vec<u8>>,
+    /// Additive card import mode: GetObject answers keyed by the requested
+    /// handle. Empty in every RAM session, where `raw` stays the single RAM
+    /// object answer for handle `0xffff0001`. A scripted answer shorter than the
+    /// ObjectInfo size is exactly the truncated-transfer case.
+    card_object_bytes: BTreeMap<u32, Vec<u8>>,
+    /// Additive card import mode: object reads served so far, and the optional
+    /// `(count, flag)` that makes the Nth completed `GetObject` raise the
+    /// import's cancellation flag. Test-only, fully deterministic: no timing.
+    card_object_reads: usize,
+    cancel_after_object_reads: Option<(usize, Arc<AtomicBool>)>,
     /// Every read phase this transport served as `(opcode, max)`, so a card test
     /// can prove no image-sized transfer was ever requested.
     reads: Vec<(u16, usize)>,
@@ -413,6 +423,9 @@ impl Script {
             complete_after_download: false,
             poll_after_download_signal: None,
             card_object_info: BTreeMap::new(),
+            card_object_bytes: BTreeMap::new(),
+            card_object_reads: 0,
+            cancel_after_object_reads: None,
             storage_ids: Vec::new(),
             storage_infos: BTreeMap::new(),
             object_handles: BTreeMap::new(),
@@ -736,6 +749,20 @@ impl CameraTransport for Fake {
                     CameraError::Unsupported("scripted object handles are not scripted".into())
                 })?,
             GET_OBJECT => {
+                // Additive card import mode resolves the object bytes by the
+                // requested handle, so a bounded card download can be scripted
+                // per object. Without a scripted card answer the single RAM
+                // object answer is unchanged.
+                if let Some(bytes) = s.card_object_bytes.get(&params[0]) {
+                    let bytes = bytes.clone();
+                    s.card_object_reads += 1;
+                    if let Some((count, flag)) = s.cancel_after_object_reads.clone() {
+                        if s.card_object_reads >= count {
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    return Ok(PtpResponse { code: OK, data: bytes });
+                }
                 assert_eq!(params, [0xffff0001]);
                 if s.complete_after_download {
                     s.complete_after_download = false;
@@ -863,6 +890,16 @@ impl ScriptedCameraProbe {
     /// Additive card mode: answer `GetObjectInfo [handle]` with this exact card
     /// dataset instead of the single RAM object answer.
     pub(crate) fn set_card_object(&self,handle:u32,bytes:Vec<u8>){self.script.lock().unwrap().card_object_info.insert(handle,bytes);}
+    /// Additive card import mode: answer `GetObject [handle]` with these exact
+    /// object bytes. A length shorter than the scripted ObjectInfo size is the
+    /// truncated-transfer case; nothing here fabricates a length.
+    pub(crate) fn set_card_object_bytes(&self,handle:u32,bytes:Vec<u8>){self.script.lock().unwrap().card_object_bytes.insert(handle,bytes);}
+    /// Additive card import mode: raise this cancellation flag once `count`
+    /// `GetObject` reads have completed. Deterministic, no timing.
+    pub(crate) fn cancel_after_object_reads(&self,count:usize,flag:Arc<AtomicBool>){self.script.lock().unwrap().cancel_after_object_reads=Some((count,flag));}
+    /// Completed card object reads, so a resume test can prove an
+    /// already-verified record was never downloaded again.
+    pub(crate) fn card_object_read_count(&self)->usize{self.script.lock().unwrap().card_object_reads}
     /// Replace the event batches released by the next card trigger.
     pub(crate) fn set_capture_events(&self,batches:Vec<Vec<NikonEvent>>){self.script.lock().unwrap().capture_events=batches;}
     /// Script the body Live View state a fresh `GET_PROPERTY [LV_STATUS]` reads.
