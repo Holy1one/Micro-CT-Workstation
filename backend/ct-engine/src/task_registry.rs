@@ -36,8 +36,13 @@ pub struct TaskRegistry {
     pending_registration: Option<RegisterFile>,
 }
 
-pub struct TaskWritePlan {path:PathBuf,expected:RegisterFile,next:RegisterFile,register:Option<Parameters>,completed:Option<Parameters>,unpersisted:Option<RegisterFile>,deleted:Vec<Parameters>}
-impl TaskWritePlan {
+/// Versioned registry status for a safely finished card acquisition whose data is
+/// still on the camera card. The record stays retained (its directory cannot be
+/// reused) while no scan hardware remains occupied, and it is never treated as a
+/// completed or reconstructable project until the USB import is verified.
+pub const TASK_STATUS_ACQUIRED_PENDING_IMPORT: &str = "acquired_pending_import";
+
+pub struct TaskWritePlan {path:PathBuf,expected:RegisterFile,next:RegisterFile,register:Option<Parameters>,completed:Option<Parameters>,unpersisted:Option<RegisterFile>,deleted:Vec<Parameters>}impl TaskWritePlan {
     pub fn deleted_count(&self)->usize{self.deleted.len()}
     pub fn active_deleted(&self)->bool{self.expected.active.is_some()&&self.next.active.is_none()}
     pub fn execute(&self,cancel:&AtomicBool)->Result<(),String>{
@@ -105,6 +110,43 @@ impl TaskRegistry {
         if !self.can_abandon(){return Err("Task identity is unverified".into());}
         self.prepare_terminal("abandoned",None)
     }
+    /// Safe finishing of a card acquisition whose data is still on the camera card.
+    /// The task leaves the active slot (so scan hardware is no longer occupied and
+    /// manual controls unlock) but stays retained with its directory reserved, and
+    /// it is never reconstructable until the import is verified.
+    pub fn mark_acquired_pending_import(&mut self, parameters: &Parameters) -> Result<(), String> {
+        if !self.matches(parameters) {
+            return Err("Card acquisition completion does not match the registered active task".into());
+        }
+        validate_acquired_card_record(parameters)?;
+        self.mark_terminal(TASK_STATUS_ACQUIRED_PENDING_IMPORT)
+    }
+    /// The authorized USB import verified every card object: the retained task is
+    /// sealed as completed. The manifest itself must already prove the verified
+    /// state, so a caller cannot promote a pending import.
+    pub fn mark_import_verified(&mut self, parameters: &Parameters) -> Result<(), String> {
+        validate_verified_card_record(parameters)?;
+        let mut next = self.file.clone();
+        let record = next
+            .retained
+            .iter_mut()
+            .find(|record| {
+                record.status == TASK_STATUS_ACQUIRED_PENDING_IMPORT
+                    && same_location(&record.parameters, parameters)
+            })
+            .ok_or("No retained acquisition is waiting for its import")?;
+        record.status = "completed".into();
+        record.updated_at = timestamp();
+        self.persist(next)
+    }
+    /// Retained tasks whose card data still has to be imported, in registry order.
+    pub fn pending_import_tasks(&self) -> Vec<&TaskRecord> {
+        self.file
+            .retained
+            .iter()
+            .filter(|record| record.status == TASK_STATUS_ACQUIRED_PENDING_IMPORT)
+            .collect()
+    }
     fn prepare_terminal(&self,status:&str,completed:Option<Parameters>)->Result<TaskWritePlan,String>{
         let expected=self.file.clone();let mut next=expected.clone();let mut record=next.active.take().ok_or("NO_ACTIVE_TASK")?;record.status=status.into();record.updated_at=timestamp();next.retained.push(record);
         // Stop may arrive before a reserved registration's background write.
@@ -158,7 +200,7 @@ impl TaskRegistry {
     fn validate_structure(&self) -> Result<(), String> {
         for record in self.file.active.iter().chain(self.file.retained.iter()) {
             record.parameters.validate().map_err(str::to_owned)?;
-            if !matches!(record.status.as_str(), "unfinished" | "completed" | "abandoned")
+            if !matches!(record.status.as_str(), "unfinished" | "completed" | "abandoned" | TASK_STATUS_ACQUIRED_PENDING_IMPORT)
                 || record.registered_at.is_empty() || record.updated_at.is_empty() {
                 return Err("Invalid persistent task record".into());
             }
@@ -283,20 +325,8 @@ pub(crate) fn lexical_path(path:&Path)->String{
 }
 
 fn validate_acquisition_record(parameters: &Parameters, completed: bool) -> Result<(), String> {
-    let root = acquisition_root(parameters);
-    let manifest = root.join("manifest.json");
-    let checkpoint = root.join("preparation-checkpoint.json");
-    let path = if manifest.exists() { manifest } else if checkpoint.exists() { checkpoint }
-        else { return Err("Registered acquisition evidence is missing; manual control remains locked".into()); };
-    let data: Value = serde_json::from_reader(File::open(path).map_err(|error| error.to_string())?)
-        .map_err(|error| format!("Registered acquisition evidence is corrupt: {error}"))?;
-    if !matches!(data["schemaVersion"].as_u64(), Some(2 | 3))
-        || data["scanId"].as_str() != Some(parameters.task_id.as_str())
-        || data["projectionCount"].as_u64() != Some(u64::from(parameters.projection_count))
-        || data["exposureMs"].as_f64() != Some(parameters.exposure_ms) {
-        return Err("Registered acquisition evidence does not match the active task".into());
-    }
-    if data["schemaVersion"].as_u64()==Some(3) {
+    let data = registered_record_json(parameters)?;
+    if data["schemaVersion"].as_u64()==Some(3) || data["schemaVersion"].as_u64()==Some(4) {
         let profile:crate::capture_profile::CaptureProfile=serde_json::from_value(data["captureProfile"].clone()).map_err(|error|format!("Registered capture profile is invalid: {error}"))?;
         profile.validate()?;
         if profile.exposure_ms()!=Some(parameters.exposure_ms)
@@ -312,6 +342,117 @@ fn validate_acquisition_record(parameters: &Parameters, completed: bool) -> Resu
         || data["references"]["preDark"].as_array().map(Vec::len) != Some(10)
         || data["references"]["preFlat"].as_array().map(Vec::len) != Some(10)) {
         return Err("Completion is missing sealed, committed acquisition evidence".into());
+    }
+    Ok(())
+}
+
+/// Loads the registered manifest/checkpoint and checks that it belongs to this
+/// task. Schema 4 is accepted here so a card acquisition can be registered; the
+/// status-specific rules live in the callers below.
+fn registered_record_json(parameters: &Parameters) -> Result<Value, String> {
+    let root = acquisition_root(parameters);
+    let manifest = root.join("manifest.json");
+    let checkpoint = root.join("preparation-checkpoint.json");
+    let path = if manifest.exists() { manifest } else if checkpoint.exists() { checkpoint }
+        else { return Err("Registered acquisition evidence is missing; manual control remains locked".into()); };
+    let data: Value = serde_json::from_reader(File::open(path).map_err(|error| error.to_string())?)
+        .map_err(|error| format!("Registered acquisition evidence is corrupt: {error}"))?;
+    if !matches!(data["schemaVersion"].as_u64(), Some(2 | 3 | 4))
+        || data["scanId"].as_str() != Some(parameters.task_id.as_str())
+        || data["projectionCount"].as_u64() != Some(u64::from(parameters.projection_count))
+        || data["exposureMs"].as_f64() != Some(parameters.exposure_ms) {
+        return Err("Registered acquisition evidence does not match the active task".into());
+    }
+    Ok(data)
+}
+
+/// Safe finishing evidence for a card task whose import is still open: schema 4,
+/// card destination and card profile, `acquired`, an open data state, one record
+/// per projection with real card provenance, and no local frames yet.
+fn validate_acquired_card_record(parameters: &Parameters) -> Result<(), String> {
+    let data = registered_record_json(parameters)?;
+    if data["schemaVersion"].as_u64() != Some(4) {
+        return Err("A card acquisition must be registered as schema 4".into());
+    }
+    let destination = serde_json::from_value::<crate::capture_profile::CaptureDestination>(
+        data["captureDestination"].clone(),
+    )
+    .map_err(|_| "Registered card acquisition has no card destination")?;
+    if destination != crate::capture_profile::CaptureDestination::CameraCard {
+        return Err("Registered card acquisition is not a card destination".into());
+    }
+    let profile = serde_json::from_value::<crate::capture_profile::CaptureProfile>(
+        data["captureProfile"].clone(),
+    )
+    .map_err(|error| format!("Registered capture profile is invalid: {error}"))?;
+    if !profile.is_card_destination() {
+        return Err("Registered card acquisition lacks the frozen card profile".into());
+    }
+    if data["acquisitionStatus"].as_str() != Some(crate::scan::ACQUISITION_ACQUIRED) {
+        return Err("Card acquisition is not safely finished".into());
+    }
+    if !matches!(
+        data["dataStatus"].as_str(),
+        Some(crate::scan::DATA_PENDING_IMPORT) | Some(crate::scan::DATA_IMPORTING)
+    ) {
+        return Err("Card acquisition data is not open for import".into());
+    }
+    if data["frames"].as_array().is_some_and(|frames| !frames.is_empty()) {
+        return Err("A card acquisition waiting for its import cannot hold local frames".into());
+    }
+    let records: Vec<crate::scan::CardCaptureRecord> =
+        serde_json::from_value(data["captureRecords"].clone())
+            .map_err(|error| format!("Registered card records are invalid: {error}"))?;
+    if records.iter().filter(|record| record.kind == "projection").count()
+        != parameters.projection_count as usize
+    {
+        return Err("Registered card records do not cover every projection".into());
+    }
+    if records.iter().any(|record| {
+        !crate::scan::card_data_status_valid(&record.state)
+            || record.storage_id == 0
+            || record.handle == 0
+            || record.source_file_name.trim().is_empty()
+            || record.camera_session_id.trim().is_empty()
+            || record.operation_id.trim().is_empty()
+            || record.imported_file.is_some()
+    }) {
+        return Err("Registered card records lack their acquisition provenance".into());
+    }
+    Ok(())
+}
+
+/// Verified-import evidence: the schema-4 manifest must already prove the sealed
+/// import before a retained task may become completed.
+fn validate_verified_card_record(parameters: &Parameters) -> Result<(), String> {
+    let data = registered_record_json(parameters)?;
+    if data["schemaVersion"].as_u64() != Some(4)
+        || data["captureDestination"].as_str() != Some("cameraCard")
+        || data["acquisitionStatus"].as_str() != Some(crate::scan::ACQUISITION_ACQUIRED)
+        || data["dataStatus"].as_str() != Some(crate::scan::DATA_VERIFIED)
+        || data["completed"].as_bool() != Some(true)
+        || data["stage"].as_str() != Some("completed")
+        || data["frames"].as_array().map(Vec::len) != Some(parameters.projection_count as usize)
+        || data["references"]["preDark"].as_array().map(Vec::len) != Some(10)
+        || data["references"]["preFlat"].as_array().map(Vec::len) != Some(10)
+    {
+        return Err("Import verification is missing sealed, committed card evidence".into());
+    }
+    let profile = serde_json::from_value::<crate::capture_profile::CaptureProfile>(
+        data["captureProfile"].clone(),
+    )
+    .map_err(|error| format!("Registered capture profile is invalid: {error}"))?;
+    if !profile.is_card_destination() {
+        return Err("Verified card acquisition lacks the frozen card profile".into());
+    }
+    let records: Vec<crate::scan::CardCaptureRecord> =
+        serde_json::from_value(data["captureRecords"].clone())
+            .map_err(|error| format!("Registered card records are invalid: {error}"))?;
+    if records.iter().filter(|record| record.kind == "projection").count()
+        != parameters.projection_count as usize
+        || !records.iter().all(crate::scan::card_record_is_reconstructable)
+    {
+        return Err("Verified card records are not all reconstructable".into());
     }
     Ok(())
 }
@@ -442,5 +583,134 @@ mod tests {
         assert!(old.execute(&AtomicBool::new(true)).is_err());assert!(!path.exists());
         let abandon=registry.prepare_abandon().unwrap();abandon.execute(&AtomicBool::new(false)).unwrap();registry.commit(abandon).unwrap();
         assert!(!registry.locked());assert!(old.execute(&AtomicBool::new(false)).is_err());assert!(!TaskRegistry::load(&path).locked());
+    }
+
+    fn card_record_json(index: u32, kind: &str, verified: bool) -> Value {
+        let mut record = json!({
+            "index": index, "kind": kind, "angleDeg": -(index as f64), "exposureMs": 200.0,
+            "state": if verified { crate::scan::DATA_VERIFIED } else { crate::scan::DATA_PENDING_IMPORT },
+            "cameraSessionId": "session-card", "operationId": format!("op-{index}"),
+            "storageId": 65537u32, "storageChanged": false, "handle": 256u32 + index,
+            "parent": 1u32, "sourceFileName": format!("DSC_{index:04}.NEF"),
+            "format": 12288u32, "size": 40_000_000u64, "captureDate": "20261010T120000"
+        });
+        if verified {
+            record["importedFile"] = json!({"index": index, "angleDeg": -(index as f64), "exposureMs": 200.0,
+                "fileName": format!("frame-{index:04}.nef"), "path": format!("/data/frame-{index:04}.nef"),
+                "bytes": 40_000_000u64, "sha256": "aa".repeat(32)});
+        }
+        record
+    }
+
+    /// Writes a schema-4 card manifest: `verified` selects a sealed import with
+    /// local frames, otherwise a safely finished acquisition whose data is open.
+    fn card_manifest(parameters: &Parameters, data_status: &str, verified: bool) {
+        let root = acquisition_root(parameters);
+        fs::create_dir_all(&root).unwrap();
+        let frame = |index: u32| json!({"index": index, "angleDeg": -(index as f64), "exposureMs": 200.0,
+            "fileName": format!("frame-{index:04}.nef"), "path": format!("/data/frame-{index:04}.nef"),
+            "bytes": 40_000_000u64, "sha256": "aa".repeat(32)});
+        let reference = |index: u32| json!({"index": index, "exposureMs": 200.0,
+            "fileName": format!("ref-{index:04}.nef"), "path": format!("/data/ref-{index:04}.nef"),
+            "bytes": 40_000_000u64, "sha256": "bb".repeat(32)});
+        let records: Vec<Value> = (1..=parameters.projection_count)
+            .map(|index| card_record_json(index, "projection", verified))
+            .chain((1..=2u32).map(|index| card_record_json(index, "preDark", verified)))
+            .collect();
+        let manifest = json!({
+            "schemaVersion": 4, "scanId": parameters.task_id,
+            "projectionCount": parameters.projection_count, "exposureMs": parameters.exposure_ms,
+            "captureProfile": crate::capture_profile::test_card_profile("single"),
+            "maxXraySec": 1000, "voltageKv": 20.0, "currentUa": 100.0,
+            "captureDestination": "cameraCard", "acquisitionStatus": crate::scan::ACQUISITION_ACQUIRED,
+            "dataStatus": data_status,
+            "stage": if verified { "completed" } else { "projections" },
+            "completed": verified,
+            "geometry": {"sodMm":40.0,"objectToDetectorMm":25.0,"detectorWidthMm":40.0,
+                "centerOffsetXMm":0.0,"centerOffsetYMm":0.0,"rotationDirection":"counterclockwise",
+                "mirrorX":false,"measurement":"measured"},
+            "references": {"preDark": (1..=10u32).map(reference).collect::<Vec<_>>(),
+                "preFlat": (1..=10u32).map(reference).collect::<Vec<_>>(), "postFlat": [], "postDark": []},
+            "frames": if verified { (1..=parameters.projection_count).map(frame).collect::<Vec<_>>() } else { Vec::new() },
+            "captureRecords": records
+        });
+        fs::write(root.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn acquired_pending_import_unlocks_the_scan_and_reserves_the_directory_across_restart() {
+        let root = root("card-pending-import"); let path = root.join("active-task.json"); let parameters = parameters(&root);
+        let mut registry = TaskRegistry::load(&path); registry.register(&parameters).unwrap();
+        card_manifest(&parameters, crate::scan::DATA_PENDING_IMPORT, false);
+        registry.mark_acquired_pending_import(&parameters).unwrap();
+        // Safe finishing released the scan occupancy and the manual locks ...
+        assert!(!registry.locked() && registry.error().is_none());
+        assert!(registry.check_manual().is_ok());
+        assert_eq!(registry.snapshot()["status"], "unlocked");
+        assert_eq!(registry.pending_import_tasks().len(), 1);
+        // ... but the directory stays reserved and the task is not completed.
+        assert!(registry.retained_location(&parameters));
+        assert!(registry.check_target_available(&parameters).unwrap_err().contains("SCAN_OUTPUT_RETAINED"));
+        assert!(registry.prepare_register(&parameters).is_err());
+        // A restart keeps the pending-import state, the reservation and no lock.
+        let restored = TaskRegistry::load(&path);
+        assert!(restored.error().is_none() && !restored.locked());
+        assert_eq!(restored.pending_import_tasks().len(), 1);
+        assert!(restored.retained_location(&parameters));
+        assert_eq!(restored.snapshot()["retained"][0]["status"], TASK_STATUS_ACQUIRED_PENDING_IMPORT);
+    }
+
+    #[test]
+    fn only_a_sealed_verified_import_completes_a_pending_import_task() {
+        let root = root("card-verified-import"); let path = root.join("active-task.json"); let parameters = parameters(&root);
+        let mut registry = TaskRegistry::load(&path); registry.register(&parameters).unwrap();
+        card_manifest(&parameters, crate::scan::DATA_PENDING_IMPORT, false);
+        registry.mark_acquired_pending_import(&parameters).unwrap();
+        // The import is still open, so it cannot seal the task.
+        assert!(registry.mark_import_verified(&parameters).is_err());
+        assert_eq!(registry.pending_import_tasks().len(), 1);
+        // A "verified" status without the local file identity is refused.
+        card_manifest(&parameters, crate::scan::DATA_VERIFIED, false);
+        assert!(registry.mark_import_verified(&parameters).is_err());
+        // Only the sealed, fully reconstructable import completes the record.
+        card_manifest(&parameters, crate::scan::DATA_VERIFIED, true);
+        registry.mark_import_verified(&parameters).unwrap();
+        assert!(registry.pending_import_tasks().is_empty());
+        assert_eq!(registry.snapshot()["retained"][0]["status"], "completed");
+        assert!(registry.retained_location(&parameters));
+        let restored = TaskRegistry::load(&path);
+        assert_eq!(restored.snapshot()["retained"][0]["status"], "completed");
+        assert!(!restored.locked());
+    }
+
+    #[test]
+    fn pending_import_requires_card_evidence_with_provenance() {
+        let root = root("card-evidence"); let path = root.join("active-task.json"); let parameters = parameters(&root);
+        let mut registry = TaskRegistry::load(&path); registry.register(&parameters).unwrap();
+        // A RAM schema-3 checkpoint is not card evidence.
+        checkpoint(&parameters);
+        assert!(registry.mark_acquired_pending_import(&parameters).is_err());
+        // A card acquisition that already holds local frames is not waiting for import.
+        card_manifest(&parameters, crate::scan::DATA_PENDING_IMPORT, true);
+        assert!(registry.mark_acquired_pending_import(&parameters).is_err());
+        // A record without its card provenance is refused.
+        card_manifest(&parameters, crate::scan::DATA_PENDING_IMPORT, false);
+        let manifest_path = acquisition_root(&parameters).join("manifest.json");
+        let mut data: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        data["captureRecords"][0]["sourceFileName"] = json!("");
+        fs::write(&manifest_path, serde_json::to_vec(&data).unwrap()).unwrap();
+        assert!(registry.mark_acquired_pending_import(&parameters).is_err());
+        // A record count that does not cover every projection is refused.
+        card_manifest(&parameters, crate::scan::DATA_PENDING_IMPORT, false);
+        let mut data: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        // Index 0 is the first projection record; dropping it leaves one projection.
+        data["captureRecords"].as_array_mut().unwrap().remove(0);
+        fs::write(&manifest_path, serde_json::to_vec(&data).unwrap()).unwrap();
+        assert!(registry.mark_acquired_pending_import(&parameters).is_err());
+        // The complete card evidence is accepted.
+        card_manifest(&parameters, crate::scan::DATA_PENDING_IMPORT, false);
+        registry.mark_acquired_pending_import(&parameters).unwrap();
+        assert_eq!(registry.pending_import_tasks().len(), 1);
+        assert!(!registry.locked());
     }
 }
