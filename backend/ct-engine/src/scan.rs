@@ -181,6 +181,111 @@ pub struct RealFrame {
     pub sha256: String,
 }
 
+/// Schema-4 acquisition state of a card scan. `acquired` is the safe-finishing
+/// terminal state; the data states stay separate so a pending import can never be
+/// reported as a completed project.
+pub const ACQUISITION_ACQUIRED: &str = "acquired";
+pub const DATA_PENDING_IMPORT: &str = "pendingImport";
+pub const DATA_IMPORTING: &str = "importing";
+pub const DATA_VERIFIED: &str = "verified";
+pub const DATA_IMPORT_FAILED: &str = "importFailed";
+
+/// One card-resident exposure in a schema-4 manifest. It records the original
+/// camera object identity, because at acquisition time there is no local path and
+/// no content hash; the verified local file is attached only after the authorized
+/// USB import. A record without an imported file can never feed reconstruction.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CardCaptureRecord {
+    pub index: u32,
+    /// `projection`, `preDark` or `preFlat`.
+    pub kind: String,
+    pub angle_deg: f64,
+    pub exposure_ms: f64,
+    /// One of the `DATA_*` states.
+    pub state: String,
+    pub camera_session_id: String,
+    pub operation_id: String,
+    pub storage_id: u32,
+    pub storage_changed: bool,
+    pub handle: u32,
+    pub parent: u32,
+    /// Original camera filename, kept as provenance for the later import.
+    pub source_file_name: String,
+    pub format: u16,
+    pub size: u64,
+    pub capture_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_file: Option<RealFrame>,
+}
+
+impl CardCaptureRecord {
+    pub(crate) fn from_receipt(
+        index: u32,
+        kind: &str,
+        angle_deg: f64,
+        exposure_ms: f64,
+        receipt: &crate::devices::camera::CardObjectReceipt,
+    ) -> Self {
+        Self {
+            index,
+            kind: kind.into(),
+            angle_deg,
+            exposure_ms,
+            state: DATA_PENDING_IMPORT.into(),
+            camera_session_id: receipt.session_id.clone(),
+            operation_id: receipt.operation_id.clone(),
+            storage_id: receipt.storage_id,
+            storage_changed: receipt.storage_changed,
+            handle: receipt.handle,
+            parent: receipt.parent,
+            source_file_name: receipt.filename.clone(),
+            format: receipt.format,
+            size: receipt.size,
+            capture_date: receipt.capture_date.clone(),
+            imported_file: None,
+        }
+    }
+}
+
+/// A card record is reconstructable input only after its import was verified and
+/// the local file carries the post-import identity.
+pub(crate) fn card_record_is_reconstructable(record: &CardCaptureRecord) -> bool {
+    record.state == DATA_VERIFIED && record.imported_file.is_some()
+}
+
+/// Every data state a schema-4 record may report. An unknown state is a schema
+/// drift and blocks completion instead of being treated as verified.
+pub(crate) fn card_data_status_valid(status: &str) -> bool {
+    matches!(
+        status,
+        DATA_PENDING_IMPORT | DATA_IMPORTING | DATA_IMPORT_FAILED | DATA_VERIFIED
+    )
+}
+
+/// Schema-4 completion rule: a card task counts as completed only when it wrote to
+/// the card, froze the card profile, finished safely (`acquired`), verified the
+/// whole import (`verified`), kept one reconstructable record per projection and
+/// kept every reference record reconstructable too.
+pub(crate) fn schema_four_completion_consistent(
+    destination: Option<crate::capture_profile::CaptureDestination>,
+    profile: Option<&CaptureProfile>,
+    acquisition_status: Option<&str>,
+    data_status: Option<&str>,
+    records: &[CardCaptureRecord],
+    projection_count: u32,
+) -> bool {
+    destination == Some(crate::capture_profile::CaptureDestination::CameraCard)
+        && profile.is_some_and(CaptureProfile::is_card_destination)
+        && acquisition_status == Some(ACQUISITION_ACQUIRED)
+        && data_status == Some(DATA_VERIFIED)
+        && records.iter().filter(|record| record.kind == "projection").count()
+            == projection_count as usize
+        && records
+            .iter()
+            .all(|record| card_data_status_valid(&record.state) && card_record_is_reconstructable(record))
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanMessage {
     pub timestamp: String,
@@ -556,6 +661,18 @@ pub(crate) struct StoredScanManifest {
     pub(crate) references: ReferenceFrames,
     stage: String,
     pub(crate) frames: Vec<RealFrame>,
+    /// Schema 4 only: where this acquisition wrote its NEFs.
+    #[serde(default)]
+    capture_destination: Option<crate::capture_profile::CaptureDestination>,
+    /// Schema 4 only: `acquired` after safe finishing.
+    #[serde(default)]
+    acquisition_status: Option<String>,
+    /// Schema 4 only: `pendingImport` / `importing` / `verified` / `importFailed`.
+    #[serde(default)]
+    data_status: Option<String>,
+    /// Schema 4 only: every card exposure receipt, references included.
+    #[serde(default)]
+    capture_records: Vec<CardCaptureRecord>,
 }
 
 /// Only the completion bit is needed for command gating. Unknown manifest
@@ -580,7 +697,7 @@ pub fn completed_manifest_exists(parameters: &Parameters) -> bool {
         return false;
     };
     serde_json::from_reader::<_, StoredScanManifest>(file).is_ok_and(|manifest| {
-        matches!(manifest.schema_version, 2 | 3)
+        matches!(manifest.schema_version, 2 | 3 | 4)
             && manifest.completed
             && manifest.stage == "completed"
             && (manifest.schema_version == 2
@@ -591,6 +708,18 @@ pub fn completed_manifest_exists(parameters: &Parameters) -> bool {
                     && manifest
                         .max_xray_sec
                         .is_some_and(|maximum| (SCAN_MIN_XRAY_SEC..=SCAN_MAX_XRAY_SEC).contains(&maximum)))
+            // A schema-4 task is only "completed" once every card exposure was
+            // acquired, imported and verified; a pending import keeps it open even
+            // when safe finishing already happened.
+            && (manifest.schema_version != 4
+                || schema_four_completion_consistent(
+                    manifest.capture_destination,
+                    manifest.capture_profile.as_ref(),
+                    manifest.acquisition_status.as_deref(),
+                    manifest.data_status.as_deref(),
+                    &manifest.capture_records,
+                    manifest.projection_count,
+                ))
             && manifest.scan_id == parameters.task_id
             && manifest.projection_count == parameters.projection_count
             && (manifest.exposure_ms - parameters.exposure_ms).abs() < 1e-6
@@ -4002,5 +4131,158 @@ mod tests {
         state.cooldown_until = Some(now + Duration::from_secs(300));
         state.refresh_estimate(now);
         assert_eq!(state.estimated_remaining_seconds, Some(300));
+    }
+
+    fn card_record(index: u32, kind: &str, state: &str, imported: bool) -> CardCaptureRecord {
+        CardCaptureRecord {
+            index,
+            kind: kind.into(),
+            angle_deg: -(index as f64),
+            exposure_ms: 200.0,
+            state: state.into(),
+            camera_session_id: "session-card".into(),
+            operation_id: format!("op-{index}"),
+            storage_id: 0x0001_0001,
+            storage_changed: false,
+            handle: 0x0000_0100 + index,
+            parent: 0x0000_0001,
+            source_file_name: format!("DSC_{index:04}.NEF"),
+            format: 0x3000,
+            size: 40_000_000,
+            capture_date: "20261010T120000".into(),
+            imported_file: imported.then(|| RealFrame {
+                index,
+                angle_deg: -(index as f64),
+                exposure_ms: 200.0,
+                file_name: format!("frame-{index:04}.nef"),
+                path: format!("/data/frame-{index:04}.nef"),
+                bytes: 40_000_000,
+                sha256: format!("{index:064x}"),
+            }),
+        }
+    }
+
+    #[test]
+    fn schema_four_completion_requires_a_verified_import_and_reconstructable_records() {
+        let profile = crate::capture_profile::test_card_profile("single");
+        let card = crate::capture_profile::CaptureDestination::CameraCard;
+        let mut records: Vec<CardCaptureRecord> = (1..=3)
+            .map(|index| card_record(index, "projection", DATA_VERIFIED, true))
+            .collect();
+        records.extend((1..=2).map(|index| card_record(index, "preDark", DATA_VERIFIED, true)));
+        let consistent = |records: &[CardCaptureRecord], acquisition: &str, data: &str, projections: u32| {
+            schema_four_completion_consistent(
+                Some(card),
+                Some(&profile),
+                Some(acquisition),
+                Some(data),
+                records,
+                projections,
+            )
+        };
+        assert!(consistent(&records, ACQUISITION_ACQUIRED, DATA_VERIFIED, 3));
+        // Safe finishing alone is not a completed project while the import is open.
+        assert!(!consistent(&records, ACQUISITION_ACQUIRED, DATA_PENDING_IMPORT, 3));
+        assert!(!consistent(&records, ACQUISITION_ACQUIRED, DATA_IMPORTING, 3));
+        assert!(!consistent(&records, ACQUISITION_ACQUIRED, DATA_IMPORT_FAILED, 3));
+        assert!(!consistent(&records, "running", DATA_VERIFIED, 3));
+        // One projection without a reconstructable record blocks completion.
+        assert!(!consistent(&records, ACQUISITION_ACQUIRED, DATA_VERIFIED, 4));
+        let mut missing_file = records.clone();
+        missing_file[0].imported_file = None;
+        assert!(!consistent(&missing_file, ACQUISITION_ACQUIRED, DATA_VERIFIED, 3));
+        let mut regressed = records.clone();
+        regressed[1].state = DATA_PENDING_IMPORT.into();
+        assert!(!consistent(&regressed, ACQUISITION_ACQUIRED, DATA_VERIFIED, 3));
+        // An unverified reference frame blocks completion too.
+        let mut reference_open = records.clone();
+        reference_open[3].imported_file = None;
+        assert!(!consistent(&reference_open, ACQUISITION_ACQUIRED, DATA_VERIFIED, 3));
+        // Only the card destination with a card profile can complete schema 4.
+        assert!(!schema_four_completion_consistent(
+            Some(crate::capture_profile::CaptureDestination::HostRam),
+            Some(&profile),
+            Some(ACQUISITION_ACQUIRED),
+            Some(DATA_VERIFIED),
+            &records,
+            3,
+        ));
+        assert!(!schema_four_completion_consistent(
+            Some(card),
+            Some(&crate::capture_profile::test_profile()),
+            Some(ACQUISITION_ACQUIRED),
+            Some(DATA_VERIFIED),
+            &records,
+            3,
+        ));
+        assert!(!schema_four_completion_consistent(
+            None,
+            Some(&profile),
+            Some(ACQUISITION_ACQUIRED),
+            Some(DATA_VERIFIED),
+            &records,
+            3,
+        ));
+    }
+
+    #[test]
+    fn card_records_keep_object_provenance_and_attach_the_verified_file_later() {
+        let receipt = crate::devices::camera::CardObjectReceipt {
+            session_id: "session-card".into(),
+            operation_id: "op-1".into(),
+            storage_id: 0x0001_0001,
+            storage_changed: false,
+            handle: 0x0000_0100,
+            parent: 0x0000_0001,
+            filename: "DSC_0100.NEF".into(),
+            format: 0x3000,
+            size: 40_000_000,
+            capture_date: "20261010T120000".into(),
+        };
+        let mut record = CardCaptureRecord::from_receipt(7, "projection", -7.0, 200.0, &receipt);
+        assert_eq!(record.state, DATA_PENDING_IMPORT);
+        assert!(record.imported_file.is_none());
+        assert!(!card_record_is_reconstructable(&record));
+        assert_eq!(record.source_file_name, "DSC_0100.NEF");
+        assert_eq!(record.storage_id, 0x0001_0001);
+        assert_eq!(record.camera_session_id, "session-card");
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["sourceFileName"], "DSC_0100.NEF");
+        assert_eq!(json["storageChanged"], false);
+        assert!(json.get("importedFile").is_none());
+        assert_eq!(
+            serde_json::from_value::<CardCaptureRecord>(json).unwrap(),
+            record
+        );
+        // After a verified import the record carries the local identity.
+        record.state = DATA_VERIFIED.into();
+        record.imported_file = Some(RealFrame {
+            index: 7,
+            angle_deg: -7.0,
+            exposure_ms: 200.0,
+            file_name: "frame-0007.nef".into(),
+            path: "/data/frame-0007.nef".into(),
+            bytes: 40_000_000,
+            sha256: "aa".repeat(32),
+        });
+        assert!(card_record_is_reconstructable(&record));
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["state"], DATA_VERIFIED);
+        assert_eq!(json["importedFile"]["fileName"], "frame-0007.nef");
+        assert_eq!(
+            serde_json::from_value::<CardCaptureRecord>(json).unwrap(),
+            record
+        );
+        // Unknown fields are refused so a schema drift cannot pass silently.
+        let mut drifted = serde_json::to_value(&record).unwrap();
+        drifted["unknownField"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<CardCaptureRecord>(drifted).is_err());
+        // Only the declared data states are accepted by the completion rule.
+        assert!(card_data_status_valid(DATA_PENDING_IMPORT));
+        assert!(card_data_status_valid(DATA_IMPORTING));
+        assert!(card_data_status_valid(DATA_IMPORT_FAILED));
+        assert!(card_data_status_valid(DATA_VERIFIED));
+        assert!(!card_data_status_valid("import-unknown"));
+        assert!(!card_data_status_valid(""));
     }
 }

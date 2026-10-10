@@ -541,6 +541,33 @@ pub fn validate_parameter_keys(parameters: &CameraProperties) -> Result<(), Stri
     Ok(())
 }
 
+/// A schema-7 card profile with the same frozen acquisition as `test_profile`,
+/// built from the RAM profile so tests do not need a scripted card session.
+#[cfg(test)]
+pub(crate) fn test_card_profile(mode: &str) -> CaptureProfile {
+    let mut profile = test_profile();
+    profile.schema_version = 7;
+    profile
+        .readback
+        .insert("recordingMedia".into(), CameraValue::Integer(0));
+    profile
+        .parameters
+        .insert("recordingMedia".into(), CameraValue::Integer(0));
+    profile.capture_destination = Some(CaptureDestination::CameraCard);
+    profile.card_policy = Some(CardCapturePolicy {
+        mode: mode.into(),
+        settle_ms: MOVE_SETTLE_MS,
+        settle_anchor: MOVE_SETTLE_ANCHOR.into(),
+        firmware_version: "2.2.0".into(),
+        firmware_build: "20261010".into(),
+        firmware_source_sha256:
+            "811bae5c1d6e08b318c81ac8d077908df127e00d1e95bf185cf090b5ad1069ec".into(),
+    });
+    profile.parameters_hash = profile.canonical_hash().unwrap();
+    profile.validate().unwrap();
+    profile
+}
+
 #[cfg(test)]
 pub(crate) fn test_profile() -> CaptureProfile {
     let identity = CameraIdentity {
