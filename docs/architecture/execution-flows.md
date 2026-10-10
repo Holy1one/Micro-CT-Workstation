@@ -52,6 +52,19 @@ operator gesture
 
 FDK 有 CPU 与真实 GPU 计算路径，首帧实测和数值比对通过且预计至少快 15% 才选 GPU；失败时全量 CPU 重算。小规模扫描可选 64³、五轮 CPU SIRT；超出计算预算时置灰。CGLS 无后端，保持不可选。体素间距是计算采样间距，不代表实测分辨率。这些数值路径的离线测试不证明 CT定量精度。D7100 独立 NEF/LV 已有指定 P0包分项实机证据，见 [当前架构的验证边界](README.md#更新维护与验证边界)；完整射线联动、新 profile 6策略实机及重构精度未由该 P0证据认证。
 
+## D7100 存卡采集（schema 4 / profile 7，离线候选）
+
+卡目标扫描与主机 RAM 扫描是两条独立路径，由冻结的采集 profile 选择，不做隐式回退。
+
+1. 预检按 `capture_profile::scan_camera_issues_for(health, CaptureDestination::CameraCard)` 校验：相机已连接、`capabilities.cardCapture` 已协商、Live View OFF、`recordingMedia=0` 鲜读确认。卡 profile 由 `CaptureProfile::from_card_readback` 生成（schema 7，含 `CardCapturePolicy`：single/overflow、150 ms 末下降沿契约、控制器固件 version/build/源哈希）。
+2. 启动前在相机 owner 线程内枚举存储：`GetStorageIDs` → 逐 id `GetStorageInfo` → `bind_storage_ids` → `plan_task_cards`（整任务 = 10 暗 + 10 空 + N 投影，按 64 MiB/张保守上界与剩余张数校验）。只读、容量未知、容量不足或无法证明 Overflow 时，在**任何设备动作之前**以 `CARD_*` 稳定码拒绝；单卡足够即通过，缺第二张卡不当作容量。
+3. 每张投影：MOVE → 匹配 ticket 的 `READY_TO_CAPTURE` → 先持久化拍摄意图 → 相机一次标准 `InitiateCapture`（`0x100E`，参数 `0xFFFFFFFF`）→ 恰好一个 `ObjectAdded`（`0x4002`）对象与一个 `CaptureComplete`（`0x400D`）→ 严格 `GetObjectInfo` 解析并把 receipt 持久化 → 同 ticket 的 `CAPTURE_DONE` → IDLE → 下一位置。`StoreFull`（`0x400A`）只作为 Overflow 换槽过渡；`StoreRemoved`（`0x4005`）、RAM 事件、重复或多余对象、未知事件、会话变更都拒绝该张。扫描循环**不请求任何图像载荷**（无 `GetObject`/`GetPartialObject`/缩略图），不落本地文件、不产生哈希。
+4. 参考帧（10 暗 + 10 空）走同一存卡事务，并同样计入 `captureRecords`。
+5. 安全收尾后写 schema-4 清单（`captureDestination=cameraCard`、`acquisitionStatus=acquired`、`dataStatus=pendingImport`、`frames` 为空），并登记 `acquired_pending_import`：任务离开 active 槽（释放扫描占用与手动锁）但目录保留不可复用，且**不可重构**。
+6. 经授权的 USB 导入逐对象下载、校验并封存，把每张 `captureRecords` 升级为 `verified` 并附本地文件身份，清单置 `dataStatus=verified`、`completed=true`，登记才转为 completed；重构与预览只接受该状态（`scan::schema_four_completion_consistent`）。
+
+占用与恢复：`acquired_pending_import` 与扫描硬件占用分离；待导入任务保持目录保留并可跨重启恢复，导入失败保留待导入状态与原始卡对象，绝不删除或重拍。
+
 ## 故障与关闭
 
 - 首次 Moxtek 发现失败且从未打开串口、无既有射线会话或故障证据时，连接回执为 rejected，保留具体发现错误并提示检查 Windows USB 识别；退役未使用的代理，不触发全局 Stop 或 Nano 蜂鸣器。输出仍为 UNKNOWN、禁止开束，扫描预检失效。曾拥有射线会话、已有端口证据、真实通信/协议故障及关束未确认仍走原失效安全清理与警报；独立 Stop 的 UNKNOWN 警报规则保持有效。Moxtek owner 继续独立监测，领域观察器只在错误或关束证据变化时记录错误，避免每个 tick 刷满日志并丢失首次失败原因。
