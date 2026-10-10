@@ -131,6 +131,17 @@ export interface LogEntry {
   message: string;
 }
 
+/** Card acquisition destination, per-scan status and pending USB imports. */
+export interface CardAcquisition {
+  destination: "cameraCard" | "hostRam" | "unknown";
+  active: boolean;
+  acquisitionStatus: string | null;
+  dataStatus: string | null;
+  recordCount: number;
+  pendingImportTasks: number;
+  currentTaskPendingImport: boolean;
+  importRequired: boolean;
+}
 export interface EngineSnapshot {
   engineSessionId: string;
   snapshotSequence: number;
@@ -155,6 +166,9 @@ export interface EngineSnapshot {
   parameters: ScanParameters;
   progress: ScanProgress;
   imageCount: number;
+  /** Card acquisition state: destination, per-scan status and pending imports.
+   *  Additive; a snapshot captured before the card migration may omit it. */
+  cardAcquisition?: CardAcquisition;
   logs: LogEntry[];
   lastError: string | null;
   updatedAt: string;

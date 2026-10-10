@@ -380,6 +380,18 @@ export class WorkstationAdapter implements EngineAdapter {
       operations: structuredClone(this.nativeControls.operations),
       deviceControls: this.nativeControls.snapshot(),
       cameraScanReadiness: this.nativeControls.scanReadiness(),
+      // The offline preview freezes no capture profile and has no camera card
+      // session, so the card destination stays unknown and nothing is pending.
+      cardAcquisition: {
+        destination: "unknown",
+        active: false,
+        acquisitionStatus: null,
+        dataStatus: null,
+        recordCount: 0,
+        pendingImportTasks: 0,
+        currentTaskPendingImport: false,
+        importRequired: false,
+      },
       softwareUpdatePreparation: this.updatePreparation ? { ...this.updatePreparation } : null,
       cameraCaptureDescriptor: null,
       mode: "developer_preview",

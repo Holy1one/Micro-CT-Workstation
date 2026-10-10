@@ -463,6 +463,10 @@ const FIRST_START_XRAY_KEYS = [
 ];
 const FIRST_START_CONSOLE_PROGRESS_KEYS = ["captured", "total", "percent", "angleDeg", "etaText", "barTone", "barLabel"];
 const FIRST_START_FRAME_KEYS = ["index", "angleDeg", "exposureMs", "fileName"];
+const FIRST_START_CARD_KEYS = [
+  "destination", "active", "acquisitionStatus", "dataStatus", "recordCount",
+  "pendingImportTasks", "currentTaskPendingImport", "importRequired",
+];
 const FIRST_START_DEVICE_IDS = ["turntable", "camera", "xray"] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -563,6 +567,14 @@ function hasCompleteFirstStartSnapshot(snapshot: EngineSnapshot): boolean {
   const hasWorkstation = Object.prototype.hasOwnProperty.call(snapshot, "workstation");
   const rootKeys = hasWorkstation ? [...FIRST_START_SNAPSHOT_KEYS, "workstation"] : FIRST_START_SNAPSHOT_KEYS;
   if (!hasExactOwnKeys(snapshot, rootKeys)) return false;
+  // Additive card state: a snapshot captured before the card migration may omit it,
+  // but any published value must be complete and consistent.
+  if (snapshot.cardAcquisition !== undefined && (
+    !hasExactOwnKeys(snapshot.cardAcquisition, FIRST_START_CARD_KEYS)
+    || !["cameraCard", "hostRam", "unknown"].includes(snapshot.cardAcquisition.destination)
+    || ![snapshot.cardAcquisition.active, snapshot.cardAcquisition.currentTaskPendingImport, snapshot.cardAcquisition.importRequired].every((value) => typeof value === "boolean")
+    || ![snapshot.cardAcquisition.recordCount, snapshot.cardAcquisition.pendingImportTasks].every((value) => Number.isInteger(value) && value >= 0)
+    || ![snapshot.cardAcquisition.acquisitionStatus, snapshot.cardAcquisition.dataStatus].every((value) => value === null || typeof value === "string"))) return false;
   if (!hasExactOwnKeys(snapshot.safety, FIRST_START_SAFETY_KEYS)) return false;
   if (![snapshot.safety.xrayAvailable, snapshot.safety.xrayEnabled, snapshot.safety.interlockOk].every((value) => typeof value === "boolean") ||
     !isString(snapshot.safety.lockReason)) return false;
