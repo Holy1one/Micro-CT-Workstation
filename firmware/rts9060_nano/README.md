@@ -14,7 +14,12 @@ longer includes the extra pulse period that `finishPhase` previously added. HOME
 phases, the acceleration/cruise ramp, the 20 us pulse width, direction setup,
 heartbeat, the STOP path and the same-ID `CAPTURE_HOLD` release are unchanged. The
 2.1.1 / 20261009 candidate's `RESTORE_REFERENCE <id> <expected-pos>` capability is
-retained. The current source is 34,782 bytes with SHA-256
+retained. The `READY`/`INFO` capability list additionally advertises
+`MOVE_SETTLE_150MS`, so the engine can verify from the connected controller that
+the flashed firmware implements the 150 ms contract instead of trusting the source
+alone; `nano.rs` exposes `NanoIdentity::advertises_move_settle_150ms()`, and a
+controller without the token keeps working with its longer wait rather than being
+rejected. The current source is 34,782 bytes with SHA-256
 `811bae5c1d6e08b318c81ac8d077908df127e00d1e95bf185cf090b5ad1069ec`;
 `build-config.json` pins that identity, keeps the original source identity and
 records the previous 2.1.1 candidate hash. Historical comments

@@ -46,7 +46,20 @@ pub struct NanoIdentity {
     pub capabilities: Vec<String>,
 }
 
+/// Advertised by firmware 2.2.0+: every ordinary MOVE waits the unified
+/// `MOVE_SETTLE_MS` (150 ms) measured from the last STEP falling edge before
+/// `READY_TO_CAPTURE`. A controller without it is still usable (its wait is only
+/// longer), but a card scan must not claim the 150 ms contract for it.
+pub const MOVE_SETTLE_CAPABILITY: &str = "MOVE_SETTLE_150MS";
+
 impl NanoIdentity {
+    /// True when the connected controller advertises the unified 150 ms
+    /// last-step-falling-edge settle contract.
+    pub fn advertises_move_settle_150ms(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|capability| capability == MOVE_SETTLE_CAPABILITY)
+    }
     fn require_supported(&self) -> Result<(), NanoError> {
         if self.device != EXPECTED_DEVICE {
             return Err(NanoError::Identity(format!(
@@ -1436,6 +1449,24 @@ fn parse_bool_field(fields: &HashMap<&str, &str>, key: &str) -> Result<bool, Nan
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_unified_settle_contract_is_reported_from_the_advertised_capabilities() {
+        let mut identity = NanoIdentity {
+            device: EXPECTED_DEVICE.into(),
+            version: "2.2.0".into(),
+            protocol: EXPECTED_PROTOCOL,
+            build: "20261010".into(),
+            buzzer_installed: true,
+            capabilities: vec!["HEARTBEAT_ACK".into(), MOVE_SETTLE_CAPABILITY.into()],
+        };
+        assert!(identity.advertises_move_settle_150ms());
+        // An older controller keeps working; it just does not claim the contract.
+        identity
+            .capabilities
+            .retain(|capability| capability != MOVE_SETTLE_CAPABILITY);
+        assert!(!identity.advertises_move_settle_150ms());
+    }
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]

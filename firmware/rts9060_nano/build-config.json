@@ -2,9 +2,15 @@
   "schemaVersion": 1,
   "candidate": {
     "source": "rts9060_nano.ino",
-    "bytes": 34782,
-    "sha256": "811bae5c1d6e08b318c81ac8d077908df127e00d1e95bf185cf090b5ad1069ec",
+    "bytes": 34818,
+    "sha256": "2843f57ecb3d304c47f061f5d342b1b809a807dc2a7980ccc0cf9d14f0ecaa1e",
     "version": "2.2.0",
+    "advertisedCapabilities": [
+      "HEARTBEAT_ACK",
+      "XRAY_WARNING",
+      "RESTORE_REFERENCE",
+      "MOVE_SETTLE_150MS"
+    ],
     "settlePolicy": {
       "ordinaryMoveSettleMs": 150,
       "anchor": "last-step-falling-edge",

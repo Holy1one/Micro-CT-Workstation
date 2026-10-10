@@ -633,7 +633,7 @@ static void sendInfo(uint32_t id) {
   Serial.print(F(" PROTOCOL=")); Serial.print(PROTOCOL_VERSION);
   Serial.print(F(" BUILD=")); Serial.print(F(FIRMWARE_BUILD_TEXT));
   Serial.print(F(" BUZZER=")); Serial.print(BUZZER_INSTALLED ? 1 : 0);
-  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE"));
+  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE,MOVE_SETTLE_150MS"));
 }
 
 static void beginMove(uint32_t id, int32_t target) {
@@ -893,7 +893,7 @@ void setup() {
   Serial.print(F(" PROTOCOL=")); Serial.print(PROTOCOL_VERSION);
   Serial.print(F(" BUILD=")); Serial.print(F(FIRMWARE_BUILD_TEXT));
   Serial.print(F(" BUZZER=")); Serial.print(BUZZER_INSTALLED ? 1 : 0);
-  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE"));
+  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE,MOVE_SETTLE_150MS"));
   updateIndicators();
 }
 
