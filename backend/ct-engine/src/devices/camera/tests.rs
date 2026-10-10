@@ -846,6 +846,20 @@ impl ScriptedCameraProbe {
     pub(crate) fn set_object_handles(&self, id: u32, handles: &[u32]) {
         self.script.lock().unwrap().script_object_handles(id, handles);
     }
+    /// Scripts the event batches the next card trigger releases, as
+    /// `(code, parameter)` pairs per batch. `scan.rs` cannot name the private
+    /// `NikonEvent`, so the card scan tests script the association this way.
+    pub(crate) fn set_card_events(&self, batches: Vec<Vec<(u16, u32)>>) {
+        self.script.lock().unwrap().capture_events = batches
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .into_iter()
+                    .map(|(code, parameter)| NikonEvent { code, parameter })
+                    .collect()
+            })
+            .collect();
+    }
     /// Additive card mode: answer `GetObjectInfo [handle]` with this exact card
     /// dataset instead of the single RAM object answer.
     pub(crate) fn set_card_object(&self,handle:u32,bytes:Vec<u8>){self.script.lock().unwrap().card_object_info.insert(handle,bytes);}
