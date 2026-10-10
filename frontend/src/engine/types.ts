@@ -131,9 +131,13 @@ export interface LogEntry {
   message: string;
 }
 
+export type CardAcquisitionDestination = "cameraCard" | "hostRam" | "unknown";
+/** Engine USB-import lifecycle for a camera-card acquisition. */
+export type CardImportStatus = "idle" | "running" | "cancelled" | "failed" | "verified";
+
 /** Card acquisition destination, per-scan status and pending USB imports. */
 export interface CardAcquisition {
-  destination: "cameraCard" | "hostRam" | "unknown";
+  destination: CardAcquisitionDestination;
   active: boolean;
   acquisitionStatus: string | null;
   dataStatus: string | null;
@@ -141,6 +145,17 @@ export interface CardAcquisition {
   pendingImportTasks: number;
   currentTaskPendingImport: boolean;
   importRequired: boolean;
+  /** Import lifecycle. A card task is never completed before this is `verified`. */
+  importStatus: CardImportStatus;
+  importOperationId: string | null;
+  importError: string | null;
+  /** Camera objects with a committed local import receipt (all record kinds). */
+  importedRecords: number;
+  /** Imported objects whose content/size/NEF verification passed. */
+  verifiedRecords: number;
+  acquiredProjectionCount: number;
+  importedProjectionCount: number;
+  verifiedProjectionCount: number;
 }
 export interface EngineSnapshot {
   engineSessionId: string;
@@ -233,6 +248,8 @@ export type EngineCommand =
   | { type: "camera_capture_descriptor"; captureId: string }
   | { type: "prepare_software_update" }
   | { type: "cancel_software_update_prepare"; operationId: string }
+  | { type: "start_card_import"; taskId: string }
+  | { type: "cancel_card_import" }
   | { type: "camera_connect"; deviceId?: string; acknowledgeUnconfirmedCleanup?: boolean }
   | { type: "camera_disconnect" | "camera_status" | "camera_identity" | "camera_read_properties" | "camera_live_view_start" | "camera_live_view_stop" | "camera_autofocus" }
   | { type: "camera_apply_properties"; properties: CameraProperties; presetId?: string }

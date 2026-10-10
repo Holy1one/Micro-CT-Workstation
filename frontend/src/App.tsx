@@ -5,7 +5,7 @@
  * decisions; those remain authoritative in ct-engine.
  */
 
-import { englishDisplayText } from "./engine/native-labels";
+import { englishDisplayText, unicodeDisplayText } from "./engine/native-labels";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -47,6 +47,7 @@ import { StaticSceneFallback } from "./scene/StaticSceneFallback";
 import { useSceneFallback } from "./scene/useSceneFallback";
 import type { ViewPreset } from "./scene/types";
 import type {
+  CardAcquisition,
   DeviceOperation,
   ConsoleLogLine,
   ConsoleFrame,
@@ -56,6 +57,7 @@ import type {
   ReconstructionGeometry,
   ReconstructionMethodId,
   ReconstructionOptions,
+  RetainedTaskRecord,
   ScanPromptStage,
   WorkstationView,
   IndependentCapturedImage,
@@ -466,7 +468,10 @@ const FIRST_START_FRAME_KEYS = ["index", "angleDeg", "exposureMs", "fileName"];
 const FIRST_START_CARD_KEYS = [
   "destination", "active", "acquisitionStatus", "dataStatus", "recordCount",
   "pendingImportTasks", "currentTaskPendingImport", "importRequired",
+  "importStatus", "importOperationId", "importError", "importedRecords", "verifiedRecords",
+  "acquiredProjectionCount", "importedProjectionCount", "verifiedProjectionCount",
 ];
+const CARD_IMPORT_STATUSES = ["idle", "running", "cancelled", "failed", "verified"] as const;
 const FIRST_START_DEVICE_IDS = ["turntable", "camera", "xray"] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -575,6 +580,14 @@ function hasCompleteFirstStartSnapshot(snapshot: EngineSnapshot): boolean {
     || ![snapshot.cardAcquisition.active, snapshot.cardAcquisition.currentTaskPendingImport, snapshot.cardAcquisition.importRequired].every((value) => typeof value === "boolean")
     || ![snapshot.cardAcquisition.recordCount, snapshot.cardAcquisition.pendingImportTasks].every((value) => Number.isInteger(value) && value >= 0)
     || ![snapshot.cardAcquisition.acquisitionStatus, snapshot.cardAcquisition.dataStatus].every((value) => value === null || typeof value === "string"))) return false;
+  // The frozen USB-import extension is validated with the same strictness as the
+  // original card block; an omitted block stays valid, a partial one never does.
+  if (snapshot.cardAcquisition !== undefined && (
+    !CARD_IMPORT_STATUSES.includes(snapshot.cardAcquisition.importStatus)
+    || ![snapshot.cardAcquisition.importOperationId, snapshot.cardAcquisition.importError].every((value) => value === null || typeof value === "string")
+    || ![snapshot.cardAcquisition.importedRecords, snapshot.cardAcquisition.verifiedRecords,
+      snapshot.cardAcquisition.acquiredProjectionCount, snapshot.cardAcquisition.importedProjectionCount,
+      snapshot.cardAcquisition.verifiedProjectionCount].every((value) => Number.isInteger(value) && value >= 0))) return false;
   if (!hasExactOwnKeys(snapshot.safety, FIRST_START_SAFETY_KEYS)) return false;
   if (![snapshot.safety.xrayAvailable, snapshot.safety.xrayEnabled, snapshot.safety.interlockOk].every((value) => typeof value === "boolean") ||
     !isString(snapshot.safety.lockReason)) return false;
@@ -1010,6 +1023,75 @@ export function deriveConsoleFeedback(
     detail: `Queue idle · no scan in flight · ${total > 0 ? `${total} projections configured` : "scan setup not configured"}`,
     active: false,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* Camera-card acquisition and USB import presentation.                */
+/* Every value below is read from the engine snapshot; the UI never    */
+/* invents an import state, a file count or an import percentage.      */
+/* ------------------------------------------------------------------ */
+
+const CARD_DESTINATION_LABELS: Record<CardAcquisition["destination"], string> = {
+  cameraCard: "Camera SD card",
+  hostRam: "Host RAM",
+  unknown: "Unknown",
+};
+
+/** One operator-facing state word derived from the engine's two status fields. */
+function cardAcquisitionStateWord(card: CardAcquisition): string {
+  if (card.importStatus === "verified" || card.dataStatus === "verified") return "Verified · sealed";
+  if (card.importStatus === "running" || card.dataStatus === "importing") return "Importing";
+  if (card.importStatus === "failed" || card.dataStatus === "import_failed") return "Import failed";
+  if (card.importStatus === "cancelled") return "Import cancelled · import required";
+  if (card.dataStatus === "pending_import") return "Acquired · pending import";
+  switch (card.acquisitionStatus) {
+    case "acquired": return "Acquired · pending import";
+    case "running": return "Acquiring";
+    case "paused": return "Acquisition paused";
+    case "prepared": return "Prepared";
+    case "stopped": return "Acquisition stopped";
+    case "fault": return "Acquisition fault";
+    default: return "Unknown";
+  }
+}
+
+/** The USB transfer owns the camera; single capture, Live View, parameter writes
+ *  and a new scan against the same camera stay refused until it settles. */
+function cardImportLockReason(card: CardAcquisition | undefined): string | null {
+  if (card?.importStatus !== "running") return null;
+  return "Camera card import in progress · the USB transfer owns this camera until it is cancelled or verified";
+}
+
+/** Why reconstruction and project opening must refuse this data set, or null. */
+function cardReconstructionGate(card: CardAcquisition | undefined): string | null {
+  if (!card || card.destination !== "cameraCard") return null;
+  if (card.importStatus === "verified") return null;
+  if (card.importStatus === "running") {
+    return "Camera card import is running · reconstruction stays locked until every imported file is verified and the data set is sealed";
+  }
+  if (card.importStatus === "failed" || card.dataStatus === "import_failed") {
+    return "Acquisition complete · import required · the USB import failed, so reconstruction stays locked. Resume the card import and wait for verification.";
+  }
+  if (card.importStatus === "cancelled") {
+    return "Acquisition complete · import required · the USB import was cancelled, so reconstruction stays locked. Resume the card import and wait for verification.";
+  }
+  if (["prepared", "running", "paused"].includes(String(card.acquisitionStatus))) {
+    return "The camera-card acquisition is still in progress · only a verified, sealed data set can be reconstructed";
+  }
+  return "Acquisition complete · import required · the data is still on the camera SD card, so reconstruction stays locked until the USB import is verified and sealed.";
+}
+
+/** Retained tasks the engine still holds with their data on the card. */
+function pendingImportTaskRecords(snapshot: EngineSnapshot): RetainedTaskRecord[] {
+  return snapshot.deviceControls.taskLock.retained.filter(record => /pending_import/i.test(record.status));
+}
+
+/** Compare a picker result with one task directory without trusting either separator. */
+function sameTaskDirectory(candidate: string, savePath: string, taskId: string): boolean {
+  const normalize = (value: string) => value.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const chosen = normalize(candidate);
+  return Boolean(chosen) && Boolean(savePath.trim()) && Boolean(taskId.trim())
+    && chosen === normalize(`${savePath}/${taskId}`);
 }
 
 /** Ring progress read-out. Unknown progress is never drawn as 0%. */
@@ -1595,8 +1677,13 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
   );
 }
 
-function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws: WorkstationView; stale: boolean }) {
+function OperationPanel({ snapshot, ws, stale, onImport }: { snapshot: EngineSnapshot; ws: WorkstationView; stale: boolean; onImport: () => void }) {
   const feedback = deriveConsoleFeedback(snapshot, ws, stale, hasDeviceSessionEverEstablished());
+  const card = snapshot.cardAcquisition;
+  // Card state is additive: an older snapshot without the block renders no row.
+  const cardState = card ? cardAcquisitionStateWord(card) : null;
+  const canImport = Boolean(card && (card.currentTaskPendingImport || card.pendingImportTasks > 0))
+    && card?.importStatus !== "running" && !stale;
   return (
     <section className="panel operation-panel">
       <div className="panel__header">
@@ -1605,6 +1692,19 @@ function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws:
         <span className={`chip chip--${stale ? "muted" : ws.phaseTone}`}>{stale ? "UNKNOWN" : ws.phaseWord}</span>
       </div>
       <StateFeedback feedback={feedback} stale={stale} />
+      {card && <div className="op-card">
+        <div className="op-card__row">
+          <span className="op-card__tag" title="Where this acquisition stores its images">CARD · {CARD_DESTINATION_LABELS[card.destination].toUpperCase()}</span>
+          <strong role="status">{stale ? "UNKNOWN" : cardState}</strong>
+          <button type="button" disabled={!canImport} title={stale ? "Control service unavailable" : card.importStatus === "running" ? "Import already running" : card.currentTaskPendingImport || card.pendingImportTasks > 0 ? "Open the USB card import and verification controls" : "No task is waiting for a card import"} onClick={onImport}>Card import…</button>
+        </div>
+        <div className="op-card__counts">
+          <span>Pending imports <b>{stale ? "—" : String(card.pendingImportTasks)}</b></span>
+          <span>Acquired <b>{stale ? "—" : String(card.acquiredProjectionCount)}</b></span>
+          <span>Imported <b>{stale ? "—" : String(card.importedProjectionCount)}</b></span>
+          <span>Verified <b>{stale ? "—" : String(card.verifiedProjectionCount)}</b></span>
+        </div>
+      </div>}
       <div className="op-stats">
         <div className="op-stat">
           <span>CAPTURED</span>
@@ -1632,6 +1732,85 @@ function OperationPanel({ snapshot, ws, stale }: { snapshot: EngineSnapshot; ws:
       </div>
     </section>
   );
+}
+
+/* ------------------------------------------------------------------ */
+/* Camera card import dialog (overlay; no fixed panel changes)          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One explicit operator entry for the USB card import. It starts/resumes and
+ * cancels the engine's import and renders only engine-reported progress; the
+ * preview and a task without a card profile never reach this state.
+ */
+function CardImportDialog({ snapshot, pending, stale, run, onClose, onStop }: { snapshot: EngineSnapshot; pending: boolean; stale: boolean; run: (command: EngineCommand) => void; onClose: () => void; onStop: () => void }) {
+  const card = snapshot.cardAcquisition;
+  const retained = pendingImportTaskRecords(snapshot);
+  const defaultTaskId = retained.find(record => record.parameters.taskId === snapshot.parameters.taskId)?.parameters.taskId
+    ?? (card?.currentTaskPendingImport ? snapshot.parameters.taskId : retained[0]?.parameters.taskId ?? snapshot.parameters.taskId);
+  const [taskId, setTaskId] = useState(defaultTaskId);
+  useEffect(() => { setTaskId(defaultTaskId); }, [defaultTaskId]);
+  const operation = card?.importOperationId
+    ? snapshot.operations.find(item => item.operationId === card.importOperationId) ?? null
+    : null;
+  const progress = operation?.progress;
+  const running = card?.importStatus === "running";
+  const verified = card?.importStatus === "verified";
+  const readyToImport = Boolean(card) && !running && !pending && !stale
+    && (card!.currentTaskPendingImport || card!.pendingImportTasks > 0 || retained.length > 0);
+  const determinate = Boolean(progress && progress.totalBytes > 0);
+  const percent = determinate ? Math.max(0, Math.min(100, progress!.percent)) : null;
+  const eta = progress && progress.estimatedRemainingSec != null
+    ? `About ${Math.ceil(progress.estimatedRemainingSec / 10) * 10}s remaining`
+    : "Estimating remaining time…";
+  const statusLine = !card ? "No camera-card acquisition state is published by the engine"
+    : verified ? "Import verified · every imported file is sealed and reconstruction is unlocked"
+    : running ? "Acquisition complete · transferring via USB"
+    : "Acquisition complete · import required";
+  const inProgressFile = progress && progress.totalFiles > 0
+    ? Math.min(progress.verifiedFiles + 1, progress.totalFiles)
+    : null;
+  return <WorkstationDialog title="Camera Card Import" onClose={onClose} onStop={onStop}>
+    <p className={`card-import__status ${verified ? "is-verified" : running ? "is-running" : "is-pending"}`} role="status">{statusLine}</p>
+    <dl className="modal-facts">
+      <div><dt>Destination</dt><dd>{card ? CARD_DESTINATION_LABELS[card.destination] : "UNKNOWN"}</dd></div>
+      <div><dt>Acquisition state</dt><dd>{card && !stale ? cardAcquisitionStateWord(card) : "UNKNOWN"}</dd></div>
+      <div><dt>Pending import tasks</dt><dd>{card && !stale ? card.pendingImportTasks : "UNKNOWN"}</dd></div>
+      <div><dt>Acquired projections</dt><dd>{card && !stale ? card.acquiredProjectionCount : "UNKNOWN"}</dd></div>
+      <div><dt>Imported projections</dt><dd>{card && !stale ? card.importedProjectionCount : "UNKNOWN"}</dd></div>
+      <div><dt>Verified projections</dt><dd>{card && !stale ? card.verifiedProjectionCount : "UNKNOWN"}</dd></div>
+      <div><dt>Camera objects imported / recorded</dt><dd>{card && !stale ? `${card.importedRecords} / ${card.recordCount}` : "UNKNOWN"}</dd></div>
+      <div><dt>Camera objects verified</dt><dd>{card && !stale ? card.verifiedRecords : "UNKNOWN"}</dd></div>
+    </dl>
+    {running && <div className="card-import__progress">
+      <div className="recon-workspace__load-summary">
+        <span>{operation ? englishDisplayText(`USB transfer · ${operation.stage}`) : "Waiting for the engine's transfer operation…"}</span>
+        <b>{determinate ? `${percent}%` : "—"}</b>
+      </div>
+      <div className={`recon-workspace__progress-track${determinate ? "" : " is-indeterminate"}`} role="progressbar" aria-label="Camera card USB import progress" aria-valuenow={percent ?? undefined} aria-valuemin={0} aria-valuemax={100} aria-valuetext={determinate ? `${percent}% of file data transferred` : "Preparing transfer"}>
+        <i style={{ width: determinate ? `${percent}%` : undefined }} />
+      </div>
+      <div className="recon-workspace__load-summary">
+        <span>{progress && progress.totalFiles > 0
+          ? `${progress.verifiedFiles} / ${progress.totalFiles} files done${inProgressFile && progress.verifiedFiles < progress.totalFiles ? ` · file ${inProgressFile} in progress` : ""}`
+          : "File counts are not yet reported by the engine"}</span>
+        <b role="status">{determinate ? eta : "—"}</b>
+      </div>
+      {determinate && <p className="card-import__note">{progress!.processedBytes} / {progress!.totalBytes} bytes read by the engine</p>}
+    </div>}
+    {card?.importError && <p className="card-import__error" role="alert">{englishDisplayText(card.importError)}</p>}
+    {retained.length > 1 && <label className="card-import__task">Task waiting for import
+      <select aria-label="Task waiting for a camera card import" value={taskId} disabled={running || pending} onChange={event => setTaskId(event.target.value)}>
+        {retained.map(record => <option key={`${record.parameters.savePath}/${record.parameters.taskId}`} value={record.parameters.taskId}>{unicodeDisplayText(record.parameters.taskId)}</option>)}
+      </select>
+    </label>}
+    <div className="permanent-actions">
+      <button className="primary" disabled={!readyToImport} title={stale ? "Control service unavailable" : running ? "An import is already running" : pending ? "Operation pending" : readyToImport ? "Start or resume the USB import for the selected task" : "No task is waiting for a card import"} onClick={() => run({ type: "start_card_import", taskId })}>{card?.importStatus === "failed" || card?.importStatus === "cancelled" ? "Resume USB import" : "Start USB import"}</button>
+      <button disabled={!running || stale} title={running ? "Stop the USB transfer; every verified file and the acquisition ledger are kept" : "No import is running"} onClick={() => run({ type: "cancel_card_import" })}>Cancel import</button>
+    </div>
+    <p className="card-import__note">The camera card keeps every original file. Only files the engine imports and verifies are sealed for reconstruction; an unverified task is never shown as completed or reconstructable.</p>
+    {!card && <p className="card-import__error" role="alert">This engine build publishes no camera-card acquisition state.</p>}
+  </WorkstationDialog>;
 }
 
 /* ------------------------------------------------------------------ */

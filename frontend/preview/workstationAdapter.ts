@@ -161,6 +161,14 @@ export class WorkstationAdapter implements EngineAdapter {
       }
       case "camera_capture_descriptor":
         throw new Error("Browser preview has no registered NEF file");
+      // The browser preview owns no camera card session and no USB transfer.
+      // It must never report a started, cancelled or verified import.
+      case "start_card_import":
+        wf.recordEvent("ERR", "camera", "NO HARDWARE · browser preview has no camera card session; no USB import is performed");
+        throw new Error("NO HARDWARE · the browser preview cannot import camera card data");
+      case "cancel_card_import":
+        wf.recordEvent("ERR", "camera", "NO HARDWARE · no camera card import is running in the browser preview");
+        throw new Error("NO HARDWARE · no camera card import is running");
       case "connect":
       case "disconnect":
         // The workstation link is established at boot and stays up.
@@ -382,6 +390,8 @@ export class WorkstationAdapter implements EngineAdapter {
       cameraScanReadiness: this.nativeControls.scanReadiness(),
       // The offline preview freezes no capture profile and has no camera card
       // session, so the card destination stays unknown and nothing is pending.
+      // The import fields are the same frozen shape with neutral values: the
+      // preview never reports an import it did not perform.
       cardAcquisition: {
         destination: "unknown",
         active: false,
@@ -391,6 +401,14 @@ export class WorkstationAdapter implements EngineAdapter {
         pendingImportTasks: 0,
         currentTaskPendingImport: false,
         importRequired: false,
+        importStatus: "idle",
+        importOperationId: null,
+        importError: null,
+        importedRecords: 0,
+        verifiedRecords: 0,
+        acquiredProjectionCount: 0,
+        importedProjectionCount: 0,
+        verifiedProjectionCount: 0,
       },
       softwareUpdatePreparation: this.updatePreparation ? { ...this.updatePreparation } : null,
       cameraCaptureDescriptor: null,
