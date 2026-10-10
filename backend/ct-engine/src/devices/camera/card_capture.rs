@@ -105,6 +105,40 @@ fn same_provenance(first: &ExpectedCardObject, second: &ExpectedCardObject) -> b
         && first.capture_date == second.capture_date
 }
 
+/// Validates a file name the import derives from an acquisition record before it is
+/// joined to the task directory. Only a plain relative name is accepted: no path
+/// separator, no parent traversal, no drive or UNC prefix, no control character, no
+/// reserved Windows device name and no trailing dot or space. The raw card file name
+/// stays provenance and is never used as a target path.
+pub(crate) fn safe_import_file_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 255 {
+        return Err("IMPORT_TARGET_NAME_INVALID".into());
+    }
+    if name.contains(['/', '\\', ':'])
+        || name.chars().any(char::is_control)
+        || name.ends_with('.')
+        || name.ends_with(' ')
+        || name == "."
+        || name == ".."
+    {
+        return Err("IMPORT_TARGET_NAME_INVALID".into());
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(['.', ' '])
+        .to_ascii_lowercase();
+    const RESERVED: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    if RESERVED.contains(&stem.as_str()) {
+        return Err("IMPORT_TARGET_NAME_RESERVED".into());
+    }
+    Ok(())
+}
+
 /// Bound for the metadata-only `GetObjectInfo` read. The card dataset is a
 /// 52-byte header plus two bounded strings; this is a ceiling, never an image.
 const CARD_OBJECT_INFO_MAX: usize = 64 * 1024;
@@ -1575,5 +1609,21 @@ mod tests {
             bind_expected_objects(&expected, &[]).unwrap_err(),
             "IMPORT_OBJECT_MISSING: record 1"
         );
+    }
+
+    #[test]
+    fn import_target_names_reject_escapes_and_platform_hazards() {
+        for name in ["frame-0007.nef", "reference-0001.nef", "a.b.c"] {
+            assert!(safe_import_file_name(name).is_ok(), "{name}");
+        }
+        for name in [
+            "", ".", "..", "../escape.nef", "sub/dir.nef", "sub\\dir.nef", "C:frame.nef",
+            "\\\\server\\share.nef", "trailing.", "trailing ", "con", "con.nef", "NUL.nef",
+            "lpt1.nef", "with\u{0}control.nef", "line\nbreak.nef",
+        ] {
+            assert!(safe_import_file_name(name).is_err(), "{name} must be refused");
+        }
+        assert!(safe_import_file_name(&"x".repeat(256)).is_err());
+        assert!(safe_import_file_name(&format!("{}.nef", "y".repeat(251))).is_ok());
     }
 }
