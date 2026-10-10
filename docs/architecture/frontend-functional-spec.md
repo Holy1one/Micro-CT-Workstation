@@ -224,7 +224,7 @@ Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些�
 }
 ```
 
-一次收集全部数据并原子提交；projectionCount整数1–3600，角步长由引擎360/N派生；maxXraySec为整数1–600秒（若以分钟收集须明确转换，默认600秒）。通用几何DTO可表示两方向和真实/估计来源，用于读取既有资料；当前prepare_scan要求rotationDirection="counterclockwise"且measurement="measured"，estimated或clockwise明确拒绝。SOD、物体到探测器距离及屏宽必须有限且大于0；两轴偏移必须有限；mirrorX必须boolean。只读展示当前根、任务目录和确认原生快门，不能在此重复编辑快门。取消未提交草稿无文件/任务锁/动作。
+一次收集全部数据并原子提交；projectionCount整数1–3600，角步长由引擎360/N派生；maxXraySec为整数秒、范围1–1000（界面用 mm:ss 或十进制分钟收集并精确换算，默认600秒；旧任务沿用原冻结值，独立手动出束默认期限保持600秒）。通用几何DTO可表示两方向和真实/估计来源，用于读取既有资料；当前prepare_scan要求rotationDirection="counterclockwise"且measurement="measured"，estimated或clockwise明确拒绝。SOD、物体到探测器距离及屏宽必须有限且大于0；两轴偏移必须有限；mirrorX必须boolean。只读展示当前根、任务目录和确认原生快门，不能在此重复编辑快门。取消未提交草稿无文件/任务锁/动作。
 
 prepare成功的同会话/同任务响应后调用`{type:"preflight",restore?:boolean,confirmUsbAutoShutdownRelease?:boolean}`。新任务不带恢复覆盖；恢复需明确本次confirmUsbAutoShutdownRelease。Preflight/Start/恢复鲜读比较，不写快门/RAM/burst，不自动停LV。自动配置、未知、漂移、未Apply均阻塞；展示`cameraScanReadiness.issues[]`的key/actual/requirement/remedy并允许转Advanced，关闭提示不解除门禁。相机预检按当前已确认参数逐项检查；界面使用英文参数标签、实际值、要求和建议呈现，原始错误保留在日志与 Copy details。高级设置左右栏目撑满标题和固定按钮区之间的可用高度。
 

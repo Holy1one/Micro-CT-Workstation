@@ -8,7 +8,7 @@
 import { FIRMWARE_VERSION, LINK_LABEL } from "./rts9060/protocol";
 import { PreviewDeviceControls } from "./rts9060/deviceControls";
 import { shutterExposureMs } from "../src/engine/deviceControls";
-import { parseLayerDrafts } from "../src/scan-input";
+import { MAX_XRAY_LIMIT_SEC, MIN_XRAY_LIMIT_SEC, parseLayerDrafts } from "../src/scan-input";
 import { ScanWorkflow, type ConsoleLogEntry, type WorkflowPhase } from "./rts9060/workflow";
 import type {
   ConsoleDataState,
@@ -123,7 +123,7 @@ export class WorkstationAdapter implements EngineAdapter {
           || /[. ]$/.test(task) || /^(?:cameracaptures|con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(task)
           || !wf.params.savePath.trim() || !Number.isInteger(command.projectionCount)
           || command.projectionCount < 1 || command.projectionCount > 3600
-          || !Number.isInteger(command.maxXraySec) || command.maxXraySec < 1 || command.maxXraySec > 600) throw new Error("INVALID_SCAN_PREPARATION");
+          || !Number.isInteger(command.maxXraySec) || command.maxXraySec < MIN_XRAY_LIMIT_SEC || command.maxXraySec > MAX_XRAY_LIMIT_SEC) throw new Error("INVALID_SCAN_PREPARATION");
         const geometry = this.validGeometry(command.geometry);
         const shutter = this.nativeControls.camera.properties.shutter;
         const exposure = this.nativeControls.camera.connected && shutter?.readable && shutter.dataType===6 && shutter.confirmed && !shutter.error && shutter.actual !== null && (shutter.target===null||shutter.target===shutter.actual) ?  shutterExposureMs(shutter.actual, shutter.code) : null;

@@ -94,6 +94,17 @@ pub struct ReferenceFrame {
     pub sha256: String,
 }
 
+/// Unified continuous-X-ray limit for a scan: 1000 s, approved by the user after
+/// consulting the vendor. Existing tasks keep their frozen value, the independent
+/// manual beam default stays 600 s, and the hard real-time deadline enforcement in
+/// the Moxtek owner is unchanged.
+pub const SCAN_MIN_XRAY_SEC: u32 = 1;
+pub const SCAN_MAX_XRAY_SEC: u32 = 1000;
+
+pub fn scan_xray_seconds_valid(seconds: u32) -> bool {
+    (SCAN_MIN_XRAY_SEC..=SCAN_MAX_XRAY_SEC).contains(&seconds)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScanResume {
     pub capture_profile: CaptureProfile,
@@ -579,7 +590,7 @@ pub fn completed_manifest_exists(parameters: &Parameters) -> bool {
                     .is_some_and(|profile| profile.validate().is_ok())
                     && manifest
                         .max_xray_sec
-                        .is_some_and(|maximum| (1..=600).contains(&maximum)))
+                        .is_some_and(|maximum| (SCAN_MIN_XRAY_SEC..=SCAN_MAX_XRAY_SEC).contains(&maximum)))
             && manifest.scan_id == parameters.task_id
             && manifest.projection_count == parameters.projection_count
             && (manifest.exposure_ms - parameters.exposure_ms).abs() < 1e-6
@@ -605,7 +616,7 @@ pub fn persist_preparation_checkpoint(
     capture_profile: &CaptureProfile,
 ) -> Result<(), String> {
     capture_profile.validate()?;
-    if !(1..=600).contains(&max_xray_sec) {
+    if !scan_xray_seconds_valid(max_xray_sec) {
         return Err("Invalid frozen continuous X-ray limit".into());
     }
     let root = Path::new(parameters.save_path.trim()).join(parameters.task_id.trim());
@@ -693,7 +704,7 @@ pub fn load_resume(
     capture_profile.matches(actual_profile)?;
     let max_xray_sec = manifest
         .max_xray_sec
-        .filter(|maximum| (1..=600).contains(maximum))
+        .filter(|maximum| scan_xray_seconds_valid(*maximum))
         .ok_or("Frozen continuous X-ray limit is missing or invalid")?;
     manifest.geometry.validate().map_err(str::to_owned)?;
     if !matches!(
@@ -1023,7 +1034,7 @@ fn run_scan_inner(
 ) -> Result<(), String> {
     let parameters = &config.parameters;
     config.capture_profile.validate()?;
-    if !(1..=600).contains(&config.max_xray_sec)
+    if !scan_xray_seconds_valid(config.max_xray_sec)
         || config
             .resume
             .as_ref()
@@ -2654,6 +2665,15 @@ mod tests {
         geometry.validate().unwrap();
         let frozen:ScanGeometry=serde_json::from_value(serde_json::to_value(&geometry).unwrap()).unwrap();assert_eq!(frozen,geometry);
         geometry.scintillator_layers[1].thickness_mm=0.;assert_eq!(geometry.validate(),Err("INVALID_SCINTILLATOR_STACK"));
+    }
+    #[test]
+    fn scan_xray_limit_accepts_the_approved_1000_seconds_and_rejects_more() {
+        assert_eq!(SCAN_MAX_XRAY_SEC, 1000);
+        assert!(!scan_xray_seconds_valid(0));
+        assert!(scan_xray_seconds_valid(1));
+        assert!(scan_xray_seconds_valid(600));
+        assert!(scan_xray_seconds_valid(1000));
+        assert!(!scan_xray_seconds_valid(1001));
     }
     use super::*;
     use crate::devices::turntable::{LineTransport, EXPECTED_DEVICE};

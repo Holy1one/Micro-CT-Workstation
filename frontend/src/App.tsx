@@ -26,7 +26,7 @@ import { UpdateDialog } from "./UpdateDialog";
 import { getApplicationVersion } from "./platform/updater";
 import { deriveFailureReport, deviceConnectionReason, manualControlReason } from "./engine/deviceControls";
 import { LineIcon, type LineIconName } from "./icons";
-import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } from "./scan-input";
+import { projectionError, exposureError } from "./scan-input";
 import { hasDeviceSessionEverEstablished, useEngine } from "./engine/useEngine";
 import {
   chooseImageDirectory,

@@ -220,7 +220,7 @@ impl ScanSetupInput {
             parameters.exposure_ms = exposure_ms;
         }
         if let Some(value) = self.max_xray_sec {
-            if !(1..=600).contains(&value) {
+            if !crate::scan::scan_xray_seconds_valid(value) {
                 return Err("INVALID_PARAMETERS");
             }
             max_xray_sec = value;
@@ -1034,7 +1034,7 @@ impl Engine {
                         && !scan::resume_manifest_exists(&self.parameters) {
                         return Err("SCAN_OUTPUT_EXISTS_USE_NEW_TASK");
                     }
-                    if !(1..=600).contains(&self.max_xray_sec) {
+                    if !crate::scan::scan_xray_seconds_valid(self.max_xray_sec) {
                         return Err("INVALID_PARAMETERS");
                     }
                     if !self
@@ -1181,7 +1181,7 @@ impl Engine {
                     );
                 } else {
                     self.parameters.validate()?;
-                    if !(1..=600).contains(&self.max_xray_sec) {
+                    if !crate::scan::scan_xray_seconds_valid(self.max_xray_sec) {
                         return Err("INVALID_PARAMETERS");
                     }
                     self.fault_latched = false;
@@ -2107,7 +2107,7 @@ impl Engine {
         let angle = self.angle_deg();
         let data_state = self.data_state();
         let configured = self.parameters.validate().is_ok()
-            && (1..=600).contains(&self.max_xray_sec);
+            && crate::scan::scan_xray_seconds_valid(self.max_xray_sec);
         let checkpoint_available = if self.preview { self.current > 0 || self.logs.iter().any(|entry| entry["message"].as_str().is_some_and(|message| message.contains("Preview scan ended"))) }
             else { configured && self.phase != Phase::Completed && self.metadata_resume };
         let pending_restore = !self.preview && checkpoint_available && self.restored_frames.is_empty();
@@ -2992,17 +2992,36 @@ mod tests {
         .error_code
         .is_none());
         assert_eq!(engine.max_xray_sec, 600);
+        assert!(send(
+            &mut engine,
+            "update_scan_setup",
+            json!({"setup":{"maxXraySec":1000}}),
+        )
+        .error_code
+        .is_none());
+        assert_eq!(engine.max_xray_sec, 1000);
         assert_eq!(
             send(
                 &mut engine,
                 "update_scan_setup",
-                json!({"setup":{"maxXraySec":601}}),
+                json!({"setup":{"maxXraySec":1001}}),
             )
             .error_code
             .as_deref(),
             Some("INVALID_PARAMETERS")
         );
-        assert_eq!(engine.max_xray_sec, 600);
+        assert_eq!(engine.max_xray_sec, 1000);
+        assert_eq!(
+            send(
+                &mut engine,
+                "update_scan_setup",
+                json!({"setup":{"maxXraySec":0}}),
+            )
+            .error_code
+            .as_deref(),
+            Some("INVALID_PARAMETERS")
+        );
+        assert_eq!(engine.max_xray_sec, 1000);
     }
 
     #[test]

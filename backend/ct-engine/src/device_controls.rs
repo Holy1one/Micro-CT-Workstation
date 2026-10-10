@@ -48,7 +48,7 @@ impl Engine {
         let input:Preparation=serde_json::from_value(payload.clone()).map_err(|_|"INVALID_SCAN_PREPARATION")?;
         input.geometry.validate()?;
         if input.geometry.rotation_direction!="counterclockwise"||input.geometry.measurement!="measured"{return Err("INVALID_SCAN_GEOMETRY");}
-        if !(1..=600).contains(&input.max_xray_sec){return Err("INVALID_PARAMETERS");}
+        if !crate::scan::scan_xray_seconds_valid(input.max_xray_sec){return Err("INVALID_PARAMETERS");}
         let exposure=if self.preview{self.parameters.exposure_ms}else{
             let health=self.camera.as_ref().ok_or("CAMERA_NOT_CONNECTED")?.health();
             crate::devices::camera::shutter_property_ms(health.properties.get("shutter").ok_or("CAMERA_SHUTTER_UNCONFIRMED")?).map_err(|_|"CAMERA_SHUTTER_UNCONFIRMED")?
@@ -678,7 +678,7 @@ impl Engine {
         if self.task_registry.locked()&&!self.task_registry.matches(&self.parameters){return Err("UNFINISHED_TASK_LOCKED");}
         if self.busy(){return Err("SCAN_ACTIVE");}
         self.parameters.validate()?;
-        if !(1..=600).contains(&self.max_xray_sec){return Err("INVALID_PARAMETERS");}
+        if !crate::scan::scan_xray_seconds_valid(self.max_xray_sec){return Err("INVALID_PARAMETERS");}
         let nano=self.nano.as_ref().cloned().ok_or("NANO_NOT_CONNECTED")?;
         let camera=self.camera.as_ref().cloned().ok_or("CAMERA_NOT_CONNECTED")?;
         let mut xray=self.xray.as_ref().cloned().ok_or("XRAY_NOT_CONNECTED")?;
@@ -1012,7 +1012,7 @@ fn read_frozen_recovery(parameters:&crate::Parameters)->Result<(f64,f64,u32,crat
     let profile:crate::capture_profile::CaptureProfile=serde_json::from_value(data["captureProfile"].clone()).map_err(|e|e.to_string())?;profile.require_current_policy()?;
     let kv=data["voltageKv"].as_f64().ok_or("Frozen voltage missing")?;let ua=data["currentUa"].as_f64().ok_or("Frozen current missing")?;
     let max=u32::try_from(data["maxXraySec"].as_u64().ok_or("Frozen continuous X-ray limit missing")?).map_err(|_|"Invalid frozen continuous X-ray limit")?;
-    if !(1..=600).contains(&max){return Err("Frozen continuous X-ray limit outside bounds".into());}
+    if !crate::scan::scan_xray_seconds_valid(max){return Err("Frozen continuous X-ray limit outside bounds".into());}
     Ok((kv,ua,max,profile))
 }
 fn verified_candidate_path(directory:&std::path::Path)->Result<PathBuf,String>{

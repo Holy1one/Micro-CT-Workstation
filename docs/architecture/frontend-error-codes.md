@@ -185,7 +185,7 @@ device_value_rejection_error(error) =
 
 ## G6. 扫描准备与恢复 / 放弃（24）
 
-`prepare_scan` 原子提交实测几何（必须 `measurement=measured` + `counterclockwise`），`maxXraySec` 1..=600；相机预检使用当前 profile 6 的原生参数读回。`camera safety check failed` 中的结构化要求显示为可读的相机参数问题，不分类为控制服务未响应。
+`prepare_scan` 原子提交实测几何（必须 `measurement=measured` + `counterclockwise`），`maxXraySec` 为整数秒且落在 `ct-engine scan::SCAN_MIN_XRAY_SEC..=SCAN_MAX_XRAY_SEC`（1..=1000，旧任务沿用原冻结值）；相机预检使用当前 profile 6 的原生参数读回。`camera safety check failed` 中的结构化要求显示为可读的相机参数问题，不分类为控制服务未响应。
 
 | 码 | 触发条件 | 面 | `ENGINE:<CODE>` | fault/锁 | 前端呈现 | 源码 |
 |---|---|---|---|---|---|---|

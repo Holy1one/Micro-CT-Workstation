@@ -300,7 +300,7 @@ fn validate_acquisition_record(parameters: &Parameters, completed: bool) -> Resu
         let profile:crate::capture_profile::CaptureProfile=serde_json::from_value(data["captureProfile"].clone()).map_err(|error|format!("Registered capture profile is invalid: {error}"))?;
         profile.validate()?;
         if profile.exposure_ms()!=Some(parameters.exposure_ms)
-            || !data["maxXraySec"].as_u64().is_some_and(|maximum|(1..=600).contains(&maximum))
+            || !data["maxXraySec"].as_u64().is_some_and(|maximum|(1..=u64::from(crate::scan::SCAN_MAX_XRAY_SEC)).contains(&maximum))
             || data["voltageKv"].as_f64().is_none_or(|value|!value.is_finite())
             || data["currentUa"].as_f64().is_none_or(|value|!value.is_finite()) {
             return Err("Registered acquisition has incomplete frozen safety or capture parameters".into());

@@ -14,6 +14,7 @@
 
 import { CameraD7100, delay, XraySource12W, type CapturedFrame } from "./devices";
 import { cmd, degreesForPulses, FIRMWARE_VERSION, milliDeg, parseLine, pulsesForDegrees, type NanoStatus, type ParsedLine, parseStatus, PULSES_PER_REV } from "./protocol";
+import { MAX_XRAY_LIMIT_SEC, MIN_XRAY_LIMIT_SEC } from "../../src/scan-input";
 import { FirmwareTransport, type NanoTransport } from "./transport";
 
 export type WorkflowPhase = "booting" | "ready" | "scanning" | "paused" | "finishing" | "stopping" | "fault" | "stopped" | "completed";
@@ -573,9 +574,9 @@ export class ScanWorkflow {
     }
     if (
       "maxXraySec" in partial &&
-      (!Number.isInteger(next.maxXraySec) || next.maxXraySec < 1 || next.maxXraySec > 600)
+      (!Number.isInteger(next.maxXraySec) || next.maxXraySec < MIN_XRAY_LIMIT_SEC || next.maxXraySec > MAX_XRAY_LIMIT_SEC)
     ) {
-      throw new Error("Maximum continuous X-ray duration must be between 1 and 600 seconds");
+      throw new Error(`Maximum continuous X-ray duration must be between ${MIN_XRAY_LIMIT_SEC} and ${MAX_XRAY_LIMIT_SEC} seconds`);
     }
 
     this.params = next;
@@ -665,8 +666,8 @@ export class ScanWorkflow {
     if (!Number.isFinite(params.exposureMs) || params.exposureMs < 0.125 || params.exposureMs > 30000) {
       throw new Error("Exposure must be between 0.125 and 30000 ms");
     }
-    if (!Number.isInteger(params.maxXraySec) || params.maxXraySec < 1 || params.maxXraySec > 600) {
-      throw new Error("Maximum continuous X-ray duration must be between 1 and 600 seconds");
+    if (!Number.isInteger(params.maxXraySec) || params.maxXraySec < MIN_XRAY_LIMIT_SEC || params.maxXraySec > MAX_XRAY_LIMIT_SEC) {
+      throw new Error(`Maximum continuous X-ray duration must be between ${MIN_XRAY_LIMIT_SEC} and ${MAX_XRAY_LIMIT_SEC} seconds`);
     }
   }
 

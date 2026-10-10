@@ -22,9 +22,12 @@
  *   MOVE_ABS <id> <毫度> / MOVE_REL <id> <毫度>
  *   CAPTURE_DONE <id> / STOP <id>
  *
- * 运动语义：命令先回 ACK，脉冲跑完后进入 SETTLING，稳定 500 ms 后进入
- * CAPTURE_HOLD 并回 READY_TO_CAPTURE；在 CAPTURE_DONE（同一个 id）之前
- * 不接受任何新的运动命令。整个过程中 STOP、心跳、按钮、串口都在轮询。
+ * 运动语义：命令先回 ACK，脉冲跑完后进入 SETTLING；普通移动统一等待
+ * MOVE_SETTLE_MS = 150 ms，且从最后一个 STEP 脉冲的下降沿起算，到期后进入
+ * CAPTURE_HOLD 并回 READY_TO_CAPTURE；零位移 MOVE 从命令受理起算同样的 150 ms。
+ * 该等待与角度、投影数量无关，也不再额外等待一个脉冲周期。在 CAPTURE_DONE
+ * （同一个 id）之前不接受任何新的运动命令。整个过程中 STOP、心跳、按钮、串口
+ * 都在轮询。150 ms 是固件预留的稳定等待，负载端是否停稳仍须图像与机械验收。
  */
 
 // 定义 HOST_HARNESS 后可以用普通 C++ 编译器（配合 host_arduino_stubs.h）跑逻辑单测，
@@ -61,8 +64,8 @@ constexpr uint8_t BUZZER_ON_LEVEL  = BUZZER_ACTIVE_HIGH ? HIGH : LOW;
 constexpr uint8_t BUZZER_OFF_LEVEL = BUZZER_ACTIVE_HIGH ? LOW  : HIGH;
 constexpr uint8_t PROTOCOL_VERSION = 2;
 #define DEVICE_TYPE_TEXT "RTS9060_NANO"
-#define FIRMWARE_VERSION_TEXT "2.1.1"
-#define FIRMWARE_BUILD_TEXT "20261009"
+#define FIRMWARE_VERSION_TEXT "2.2.0"
+#define FIRMWARE_BUILD_TEXT "20261010"
 constexpr uint32_t XRAY_WARNING_PERIOD_MS = 1000;
 constexpr uint32_t XRAY_WARNING_ON_MS = 500;
 constexpr uint8_t STEP_IDLE = LOW;
@@ -81,7 +84,7 @@ constexpr uint32_t PERIOD_HOME_SLOW_US = 8000;  // 回零最终复触发 125 Hz
 constexpr uint32_t PERIOD_START_US = 12000;  // 起步周期
 constexpr uint32_t RAMP_STEP_US = 100;       // 每个脉冲加减速的周期步长
 
-constexpr uint32_t SETTLE_MS = 500;            // 到位后稳定时间
+constexpr uint32_t MOVE_SETTLE_MS = 150;       // 普通移动统一稳定时间，从末脉冲下降沿起算
 constexpr uint32_t HEARTBEAT_TIMEOUT_MS = 2000;  // 上位机心跳超时
 constexpr uint32_t DEBOUNCE_MS = 20;
 constexpr uint32_t HOME_HOLD_MS = 2000;        // 长按 2 s 请求回零
@@ -423,8 +426,10 @@ static void completeHome() {
 // 一个脉冲段跑完后的收尾：普通移动进入 SETTLING，回零各阶段按边沿推进。
 static void finishPhase() {
   if (g_state == State::MOVE) {
+    // 普通移动的正常路径已在最后一个下降沿进入稳定计时；这里只是防御性兜底
+    // （例如下降沿事件被外部清除），仍然保留完整的 MOVE_SETTLE_MS 等待。
     g_state = State::SETTLING;
-    g_settleDueMs = millis() + SETTLE_MS;
+    g_settleDueMs = millis() + MOVE_SETTLE_MS;
     return;
   }
   if (g_state == State::HOME_CLEAR) {
@@ -438,6 +443,16 @@ static void finishPhase() {
     // 快速找边沿超出行程 = 有界故障，绝不允许无限转下去
     stopAndLock("HOME_FAST_LIMIT", g_activeId, true);
   }
+}
+
+// 普通移动的稳定计时锚点 = 最后一个 STEP 脉冲的下降沿。这里用 g_stepFallingUs
+// 反推毫秒锚点，因为下降沿可能由 ISR 在本轮循环之前产生；全程使用无符号运算，
+// millis/micros 回绕时仍保证"末下降沿之后至少 MOVE_SETTLE_MS"。
+static void beginMoveSettling(uint32_t nowUs, uint32_t nowMs) {
+  const uint32_t sinceFallingUs = nowUs - g_stepFallingUs;
+  const uint32_t anchorMs = nowMs - sinceFallingUs / 1000UL;
+  g_state = State::SETTLING;
+  g_settleDueMs = anchorMs + MOVE_SETTLE_MS;
 }
 
 static void serviceMotion() {
@@ -473,11 +488,15 @@ static void serviceMotion() {
       g_stepFallingUs = nowUs;
     }
 #endif
-    return;                 // 高电平期间只等下降沿，不做别的事
+    if (g_stepHigh) return; // 高电平期间只等下降沿，不做别的事
   }
 
-  if (g_pulseDone) {        // 中断刚拉低，根据当前周期排下一个脉冲
+  if (g_pulseDone) {        // 中断刚拉低：末脉冲即运动终点，否则按周期排下一个脉冲
     g_pulseDone = false;
+    if (g_state == State::MOVE && g_stepsLeft == 0) {
+      beginMoveSettling(nowUs, nowMs);
+      return;
+    }
     uint32_t gap = g_periodUs > STEP_PULSE_US ? g_periodUs - STEP_PULSE_US : 1UL;
     g_nextStepDueUs = g_stepFallingUs + gap;
   }
@@ -622,9 +641,9 @@ static void beginMove(uint32_t id, int32_t target) {
   g_activeId = id;
   g_captureId = 0;
   g_targetPulses = target;
-  if (delta == 0) {                       // 原地不动也要走稳定流程
+  if (delta == 0) {                       // 原地不动也从命令受理起算同样的等待
     g_state = State::SETTLING;
-    g_settleDueMs = millis() + SETTLE_MS;
+    g_settleDueMs = millis() + MOVE_SETTLE_MS;
     return;
   }
   uint64_t magnitude = delta > 0 ? static_cast<uint64_t>(delta) : static_cast<uint64_t>(-delta);
