@@ -469,9 +469,12 @@ const FIRST_START_FRAME_KEYS = ["index", "angleDeg", "exposureMs", "fileName"];
 const FIRST_START_CARD_KEYS = [
   "destination", "active", "acquisitionStatus", "dataStatus", "recordCount",
   "pendingImportTasks", "currentTaskPendingImport", "importRequired",
+];
+const FIRST_START_CARD_IMPORT_KEYS = [
   "importStatus", "importOperationId", "importError", "importedRecords", "verifiedRecords",
   "acquiredProjectionCount", "importedProjectionCount", "verifiedProjectionCount",
 ];
+const FIRST_START_CARD_FULL_KEYS = [...FIRST_START_CARD_KEYS, ...FIRST_START_CARD_IMPORT_KEYS];
 const CARD_IMPORT_STATUSES = ["idle", "running", "cancelled", "failed", "verified"] as const;
 const FIRST_START_DEVICE_IDS = ["turntable", "camera", "xray"] as const;
 
@@ -576,15 +579,18 @@ function hasCompleteFirstStartSnapshot(snapshot: EngineSnapshot): boolean {
   // Additive card state: a snapshot captured before the card migration may omit it,
   // but any published value must be complete and consistent.
   if (snapshot.cardAcquisition !== undefined && (
-    !hasExactOwnKeys(snapshot.cardAcquisition, FIRST_START_CARD_KEYS)
+    !(hasExactOwnKeys(snapshot.cardAcquisition, FIRST_START_CARD_KEYS)
+      || hasExactOwnKeys(snapshot.cardAcquisition, FIRST_START_CARD_FULL_KEYS))
     || !["cameraCard", "hostRam", "unknown"].includes(snapshot.cardAcquisition.destination)
     || ![snapshot.cardAcquisition.active, snapshot.cardAcquisition.currentTaskPendingImport, snapshot.cardAcquisition.importRequired].every((value) => typeof value === "boolean")
     || ![snapshot.cardAcquisition.recordCount, snapshot.cardAcquisition.pendingImportTasks].every((value) => Number.isInteger(value) && value >= 0)
     || ![snapshot.cardAcquisition.acquisitionStatus, snapshot.cardAcquisition.dataStatus].every((value) => value === null || typeof value === "string"))) return false;
-  // The frozen USB-import extension is validated with the same strictness as the
-  // original card block; an omitted block stays valid, a partial one never does.
-  if (snapshot.cardAcquisition !== undefined && (
-    !CARD_IMPORT_STATUSES.includes(snapshot.cardAcquisition.importStatus)
+  // The USB-import extension is additive: the engine publishes the base block until
+  // its import work lands, and once any import key appears the whole extension must
+  // be present and consistent.
+  if (snapshot.cardAcquisition !== undefined && snapshot.cardAcquisition.importStatus !== undefined && (
+    !hasExactOwnKeys(snapshot.cardAcquisition, FIRST_START_CARD_FULL_KEYS)
+    || !CARD_IMPORT_STATUSES.includes(snapshot.cardAcquisition.importStatus)
     || ![snapshot.cardAcquisition.importOperationId, snapshot.cardAcquisition.importError].every((value) => value === null || typeof value === "string")
     || ![snapshot.cardAcquisition.importedRecords, snapshot.cardAcquisition.verifiedRecords,
       snapshot.cardAcquisition.acquiredProjectionCount, snapshot.cardAcquisition.importedProjectionCount,
@@ -1270,6 +1276,10 @@ function ControlDock({
   // exempt: ending a scan must never depend on parameter-validity checks.
   const keysDisabled = stale;
   const setupBlocked = keysDisabled || setupInvalid;
+  // A running camera-card import owns the camera, so this dock must not offer a
+  // scan start. Home and Restore stay independent of the card transfer.
+  const cardImportReason = cardImportLockReason(snapshot.cardAcquisition);
+  const playBlocked = setupBlocked || cardImportReason !== null;
   const announcement = englishDisplayText(`${feedback.state}. ${feedback.detail} Progress ${progressReadout}.`);
 
   return (
@@ -1333,8 +1343,8 @@ function ControlDock({
           variant="play"
           icon={play.icon}
           label={play.label}
-          title={setupInvalid ? "Complete valid scan parameters first" : dock.playReason || play.label}
-          disabled={setupBlocked || !dock.play}
+          title={cardImportReason || (setupInvalid ? "Complete valid scan parameters first" : dock.playReason || play.label)}
+          disabled={playBlocked || !dock.play}
           onClick={() => void dispatch(play.command)}
         />
         <DockKey
