@@ -10,6 +10,7 @@
 pub mod devices;
 pub mod reconstruction;
 mod scan;
+mod scan_project;
 mod operations;
 mod device_controls;
 mod software_update;
@@ -837,6 +838,7 @@ impl Engine {
         if self.maintenance_lock && !matches!(command,"snapshot"|"stop"|"xray_off"|"camera_status"|"camera_identity"|"turntable_status"|"turntable_identity"|"xray_status"|"xray_identity") { return Err("SOFTWARE_UPDATE_MAINTENANCE_LOCKED"); }
         if command=="prepare_scan" { return self.prepare_scan(&payload); }
         if command=="set_capture_root" { return self.set_capture_root(&payload); }
+        if command=="open_scan_project" { return self.enqueue_open_scan_project(&payload); }
         if command=="camera_capture_descriptor" { return if self.captures.iter().any(|capture|Some(capture.capture_id.as_str())==payload.get("captureId").and_then(Value::as_str)){Ok(())}else{Err("CAPTURE_NOT_REGISTERED")}; }
 
         if !self.preview {
@@ -1270,12 +1272,18 @@ impl Engine {
                     return Err("RECONSTRUCTION_LOCKED");
                 }
                 if self.reconstruction.is_some() { return Err("RECONSTRUCTION_ACTIVE"); }
+                let options=payload.get("options").map(|value|serde_json::from_value::<reconstruction::spectral::Options>(value.clone()))
+                    .transpose().map_err(|_|"INVALID_RECONSTRUCTION_OPTIONS")?;
                 let method = match payload.get("method").and_then(Value::as_str) {
                     Some("fdk") => ReconstructionMethod::Fdk,
                     Some("sirt") => ReconstructionMethod::Sirt,
                     Some("cgls") => ReconstructionMethod::Cgls,
                     _ => return Err("INVALID_RECONSTRUCTION_METHOD"),
                 };
+                if let Some(options)=&options {
+                    options.validate().map_err(|_|"INVALID_RECONSTRUCTION_OPTIONS")?;
+                    if method!=ReconstructionMethod::Fdk {return Err("INVALID_RECONSTRUCTION_OPTIONS");}
+                }
                 if !reconstruction::available_methods().iter().any(|entry| entry.method == method && entry.enabled) {
                     return Err("RECONSTRUCTION_METHOD_UNAVAILABLE");
                 }
@@ -1289,7 +1297,11 @@ impl Engine {
                     return Err("RECONSTRUCTION_LOCKED");
                 }
                 self.reconstruction_method = Some(method);
-                match reconstruction::cached_result(&scan_dir, method) {
+                let cached=match &options {
+                    Some(options)=>reconstruction::spectral::cached_result(&scan_dir,method,options),
+                    None=>reconstruction::cached_result(&scan_dir,method),
+                };
+                match cached {
                     Ok(Some(result)) => {
                         self.reconstruction_status = "completed";
                         self.reconstruction_percent = 100;
@@ -1303,7 +1315,8 @@ impl Engine {
                     }
                     Ok(None) => {}
                 }
-                let handle = ReconstructionHandle::start(ReconstructionRequest { scan_dir, method })
+                let request=ReconstructionRequest { scan_dir, method };
+                let handle = match options {Some(options)=>ReconstructionHandle::start_with_options(request,options),None=>ReconstructionHandle::start(request)}
                     .map_err(|error| { self.last_error = Some(error); "RECONSTRUCTION_START_FAILED" })?;
                 self.reconstruction = Some(handle);
                 self.reconstruction_status = "running";
@@ -3233,7 +3246,7 @@ mod tests {
             let camera=scripted_camera(ScriptedCameraConfig{exposure_delay:Duration::from_millis(5),transfer_delay:Duration::from_millis(120),..Default::default()});
             let nano=devices::turntable::test_homed_nano();let(xray,_)=devices::xray::test_worker(20.0,100.0);
             let profile=capture_profile::CaptureProfile::from_camera_readback(&camera.health(),camera.profile_readback().unwrap(),None).unwrap();
-            let geometry=ScanGeometry{sod_mm:100.0,object_to_detector_mm:100.0,detector_width_mm:40.0,center_offset_x_mm:0.0,center_offset_y_mm:0.0,rotation_direction:"counterclockwise".into(),mirror_x:false,measurement:"measured".into()};
+            let geometry=ScanGeometry{sod_mm:100.0,object_to_detector_mm:100.0,detector_width_mm:40.0,center_offset_x_mm:0.0,center_offset_y_mm:0.0,rotation_direction:"counterclockwise".into(),mirror_x:false,measurement:"measured".into(),scintillator_layers:vec![]};
             let mut engine=Engine::new_with_storage(false,root.join("engine-data"));engine.parameters=parameters.clone();
             engine.connected=true;engine.preflight=true;engine.homed=true;engine.phase=Phase::Running;
             engine.nano=Some(nano.clone());engine.camera=Some(camera.clone());engine.xray=Some(xray.clone());
@@ -3287,7 +3300,7 @@ mod tests {
         let camera=scripted_camera(ScriptedCameraConfig{exposure_delay:Duration::from_millis(5),transfer_delay:Duration::from_millis(120),..Default::default()});
         let nano=devices::turntable::test_homed_nano();let(xray,_)=devices::xray::test_worker(20.0,100.0);
         let profile=capture_profile::CaptureProfile::from_camera_readback(&camera.health(),camera.profile_readback().unwrap(),None).unwrap();
-        let geometry=ScanGeometry{sod_mm:100.0,object_to_detector_mm:100.0,detector_width_mm:40.0,center_offset_x_mm:0.0,center_offset_y_mm:0.0,rotation_direction:"counterclockwise".into(),mirror_x:false,measurement:"measured".into()};
+        let geometry=ScanGeometry{sod_mm:100.0,object_to_detector_mm:100.0,detector_width_mm:40.0,center_offset_x_mm:0.0,center_offset_y_mm:0.0,rotation_direction:"counterclockwise".into(),mirror_x:false,measurement:"measured".into(),scintillator_layers:vec![]};
         let mut original=Engine::new_with_storage(false,&storage);original.parameters=parameters.clone();original.max_xray_sec=120;original.connected=true;original.preflight=true;original.homed=true;original.phase=Phase::Running;
         original.nano=Some(nano.clone());original.camera=Some(camera.clone());original.xray=Some(xray.clone());
         original.task_registry.register(&parameters).unwrap();

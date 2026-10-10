@@ -30,6 +30,7 @@ import { projectionError, exposureError, minutesToSeconds, secondsToMinutes } fr
 import { hasDeviceSessionEverEstablished, useEngine } from "./engine/useEngine";
 import {
   chooseImageDirectory,
+  chooseScanProjectDirectory,
   exportSessionLog,
   resolveDefaultImageDirectory,
   revealDirectory,
@@ -46,6 +47,7 @@ import { StaticSceneFallback } from "./scene/StaticSceneFallback";
 import { useSceneFallback } from "./scene/useSceneFallback";
 import type { ViewPreset } from "./scene/types";
 import type {
+  DeviceOperation,
   ConsoleLogLine,
   ConsoleFrame,
   DeviceId,
@@ -53,6 +55,7 @@ import type {
   EngineSnapshot,
   ReconstructionGeometry,
   ReconstructionMethodId,
+  ReconstructionOptions,
   ScanPromptStage,
   WorkstationView,
   IndependentCapturedImage,
@@ -725,10 +728,9 @@ function hasConsistentFirstStartProjection(snapshot: EngineSnapshot, ws: Worksta
 }
 
 /**
- * The only neutral disconnected snapshot is a positively identified fresh
- * engine startup. Every signal that can disprove that initial state is checked
- * here, then the caller sends all other disconnected snapshots directly to
- * Fault. Parameter drafts do not count as device readbacks or scan activity,
+ * Fresh startup is one neutral disconnected case; confirmed offline project
+ * viewing is checked separately below. Every signal that can disprove startup
+ * is checked here. Parameter drafts do not count as device readbacks or scan activity,
  * but their duplicated snapshot and workstation values must still agree.
  */
 function isStrictlyInitialDisconnected(
@@ -744,6 +746,32 @@ function isStrictlyInitialDisconnected(
     snapshot.phase === "idle" &&
     hasConsistentFirstStartProjection(snapshot, ws)
   );
+}
+
+/** Historical image counts are data evidence, not evidence of a device session. */
+function isConfirmedOfflineProject(snapshot: EngineSnapshot, ws: WorkstationView): boolean {
+  if (!Array.isArray(snapshot.operations) || !Array.isArray(snapshot.logs) || !Array.isArray(ws.consoleLogs)) return false;
+  const project = snapshot.operations?.filter(op => op.device === "task_project" && op.kind === "open_project" && op.status === "completed" && !op.cancelRequested && op.deviceSessionId === snapshot.engineSessionId).at(-1);
+  const count = snapshot.imageCount;
+  if (snapshot.operations?.some(op => !(op.device === "task_project" && op.kind === "open_project"
+    || op.device === "task_metadata" && op.kind === "metadata_probe"
+    || op.device === "system" && op.kind === "reconstruction_prepare")
+    || !["completed", "cancelled", "rejected"].includes(op.status))) return false;
+  if (!project || !Number.isInteger(count) || count < 3 || count !== snapshot.parameters.projectionCount
+    || snapshot.progress.current !== count || snapshot.progress.percent !== 100 || ws.frames.length !== count
+    || ws.progress.captured !== count || ws.progress.total !== count || ws.progress.percent !== 100
+    || ws.scanFlow.stage !== "completed" || ws.scanFlow.prompt !== null || ws.scanFlow.geometry?.measurement !== "measured"
+    || ws.scanFlow.references.preDark !== 10 || ws.scanFlow.references.preFlat !== 10) return false;
+  // Reuse every device/startup check, excluding confirmed historical metadata,
+  // reconstruction fields and audited data-only receipts. No state is changed.
+  const deviceLogs = snapshot.logs.filter(entry => !(entry.source === "reconstruction" && ["INFO", "PASS"].includes(entry.level)));
+  const consoleLogs = ws.consoleLogs.filter(entry => !(entry.source === "reconstruction" && ["INFO", "PASS"].includes(entry.level)));
+  const view = { ...ws, consoleLogs, frames: [], progress: { ...ws.progress, captured: 0, percent: 0, barLabel: `0 / ${count} · 0%` },
+    scanFlow: { ...ws.scanFlow, stage: "idle" as const, geometry: null, references: { ...ws.scanFlow.references, preDark: 0, preFlat: 0, postDark: 0, postFlat: 0 } },
+    reconstruction: { ...ws.reconstruction, unlocked: false, selectedMethod: null, status: "idle" as const, percent: 0, cachePath: null },
+    summary: { ...ws.summary, acquisition: "No acquisition" } };
+  return hasConsistentFirstStartProjection({ ...snapshot, logs: deviceLogs, imageCount: 0, operationId: null, operations: [],
+    progress: { ...snapshot.progress, current: 0, percent: 0 }, workstation: view }, view);
 }
 
 /**
@@ -838,6 +866,9 @@ export function deriveConsoleFeedback(
   // initial snapshot. No disconnected combination can reach the phase switch or
   // its final ordinary Stopped fallback.
   if (snapshot.connectionState === "disconnected") {
+    if (sessionEverEstablished === false && !stale && isConfirmedOfflineProject(snapshot, ws)) {
+      return { ...offlineFeedback(), detail: "Offline project view · device states unknown" };
+    }
     if (isStrictlyInitialDisconnected(snapshot, ws, stale, sessionEverEstablished)) {
       return offlineFeedback();
     }
@@ -1331,13 +1362,13 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
         </div>
         </>}
         <WorkstationMedia mode={centerView} camera={camera} photo={photo} requestRevision={requestRevision} onClose={onCloseMedia} run={runDevice} controlReason={manualControlReason(snapshot, stale) || (pending ? "Operation pending" : null)} readReason={deviceConnectionReason(snapshot, stale) || (pending ? "Operation pending" : null)} />
-        <ControlDock
+        {centerView === "equipment" && <ControlDock
           snapshot={snapshot}
           ws={ws}
           dispatch={dispatch}
           stale={stale}
           setupInvalid={setupInvalid}
-        />
+        />}
       </div>
     </section>
   );
@@ -1689,7 +1720,7 @@ function reconstructionMessageEn(message: string, status: WorkstationView["recon
   return message;
 }
 
-function BottomConsole({ tab, onTab, ws, production, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction }: { tab: BottomTab; onTab: (tab: BottomTab) => void; ws: WorkstationView; production: boolean; centerView: CenterView; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId) => void }) {
+function BottomConsole({ tab, onTab, ws, projectOperation, openingProject, production, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction }: { tab: BottomTab; onTab: (tab: BottomTab) => void; ws: WorkstationView; projectOperation: DeviceOperation | null; openingProject: boolean; production: boolean; centerView: CenterView; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId, options: ReconstructionOptions) => void }) {
 
   const [follow, setFollow] = useState(true);
   const logs = ws.consoleLogs;
@@ -1718,7 +1749,7 @@ function BottomConsole({ tab, onTab, ws, production, centerView, volumeReady, vo
       </button>)}
     </div>
     <div className="console__body" role="tabpanel">
-      <div className="recon-workspace-mount" hidden={tab !== "reconstruction"}><ReconstructionConsole ws={ws} centerView={centerView} volumeReady={volumeReady} volume3DAvailable={volume3DAvailable} busy={busy} stale={stale} volumeMode={volumeMode} onVolumeMode={onVolumeMode} onResetVolume={onResetVolume} onOpenReconstruction={onOpenReconstruction} onShowEquipment={onShowEquipment} onStartReconstruction={onStartReconstruction} /></div>
+      <div className="recon-workspace-mount" hidden={tab !== "reconstruction"}><ReconstructionConsole ws={ws} projectOperation={projectOperation} openingProject={openingProject} centerView={centerView} volumeReady={volumeReady} volume3DAvailable={volume3DAvailable} busy={busy} stale={stale} volumeMode={volumeMode} onVolumeMode={onVolumeMode} onResetVolume={onResetVolume} onOpenReconstruction={onOpenReconstruction} onShowEquipment={onShowEquipment} onStartReconstruction={onStartReconstruction} /></div>
       {tab !== "reconstruction" && <>
         <div className="console__head"><span>{header}</span>{tab !== "images" && <button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => setFollow(!follow)}>{follow ? "Following latest" : "Resume live log"}</button>}</div>
         {tab === "images" ? <div className="image-strip">
@@ -2037,6 +2068,7 @@ export function App() {
   const auxiliaryRevision = preparationScope.current.revision;
   const [update, setUpdate] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [openingProject, setOpeningProject] = useState(false);
   const [troubleshootingGroup, setTroubleshootingGroup] = useState<string | undefined>(undefined);
   // Dismissal is keyed, never a state wipe: the 400 ms poll cannot re-open a hidden
   // notice, while a new attempt or a new operation produces a new key and re-arms it.
@@ -2106,13 +2138,14 @@ export function App() {
       if (!active) return;
       const [z,y,x] = data.shape ?? [];
       if (![z,y,x].every(value => Number.isSafeInteger(value) && value > 0 && value <= 256) || z*y*x > 256 ** 3 || !Array.isArray(data.voxels) || data.voxels.length !== z*y*x || !Array.isArray(data.spacingMm) || data.spacingMm.length !== 3 || data.spacingMm.some(value => !Number.isFinite(value) || value <= 0) || !Number.isFinite(data.windowMin) || !Number.isFinite(data.windowMax) || data.windowMax <= data.windowMin || data.voxels.some(value => !Number.isInteger(value) || value < 0 || value > 255)) throw new Error("Invalid preview volume data");
+      if (data.colors != null && (!Array.isArray(data.colors) || data.colors.length !== z*y*x*3 || data.colors.some(value => !Number.isInteger(value) || value < 0 || value > 255) || !Array.isArray(data.colorLegend) || data.colorLegend.length < 1 || data.colorLegend.length > 3 || data.colorLegend.some(value => typeof value !== "string") || typeof data.materialLabels !== "boolean")) throw new Error("Invalid colour preview data");
       setPreviewData({ key: previewKey, volume: data });
       if (revision === presentation.current) setCenterView("reconstruction");
     }).catch(reason => { if (active) { setPreviewError(String(reason)); setActionError(`Reconstruction preview: ${String(reason)}`); } });
     return () => { active = false; };
   }, [adapterKind, previewData?.key, previewKey, previewRetry, ws?.reconstruction.selectedMethod]);
   const openReconstruction = () => { if (activeVolume) navigate("reconstruction"); else if (previewKey) { presentation.current += 1; setRequestRevision(presentation.current); setPreviewRetry(value => value + 1); } };
-  const startReconstruction = (method: ReconstructionMethodId) => { setPreviewError(null); setPreviewData(null); navigate("equipment"); void actions.run({ type: "start_reconstruction", method }).catch(reason => setActionError(String(reason))); };
+  const startReconstruction = (method: ReconstructionMethodId, options: ReconstructionOptions) => { setPreviewError(null); setPreviewData(null); navigate("equipment"); void actions.run({ type: "start_reconstruction", method, options }).catch(reason => setActionError(String(reason))); };
   const onPhoto = (result: EngineSnapshot, revision: number) => {
     if (revision !== presentation.current || result.engineSessionId !== latest.current?.engineSessionId) return;
     const record = result.deviceControls.camera?.lastCapturedImage;
@@ -2128,6 +2161,8 @@ export function App() {
     const block = (id: MenuActionId, reason: string) => { result[id] = { available:false,reason }; };
     const unavailable = !snapshot || !ws || stale;
     const occupied = pending || Boolean(snapshot && manualControlReason(snapshot,stale));
+    if (unavailable || occupied || openingProject || adapterKind !== "tauri") block("task.openProject", unavailable ? "Control service unavailable" : openingProject ? "Validating scan project" : occupied ? "Finish or abandon the current task before opening another project" : "Desktop application required");
+    if (openingProject) result["task.openProject"].label = "Opening Scan Project…";
     for (const id of ["task.new","task.prepare","task.resetDraft","devices.turntableHome"] as const) if (unavailable || occupied) block(id,unavailable ? "Control service unavailable" : "Task or device operation occupied");
     if (snapshot?.deviceControls.taskLock.locked) { block("task.new","Retained task locked"); block("task.resetDraft","Retained task locked"); }
     for (const id of ["task.play","task.stop","task.restore","task.abandon","devices.camera","devices.cameraSettings","devices.turntable","devices.turntableBench","devices.xray"] as const) if (unavailable) block(id,"Control service unavailable");
@@ -2144,7 +2179,7 @@ export function App() {
     if (adapterKind !== "tauri") for (const id of ["tools.exportLog","help.checkUpdate"] as const) block(id,"Desktop platform required");
     if (preparationStage !== null) for (const group of MENU_GROUPS) for (const entry of group.entries) if (entry.id !== "task.stop") block(entry.id,"Preparation pending · use Stop before changing the current request");
     return result;
-  }, [snapshot,ws,pending,stale,model.dirty,adapterKind,previewKey,photo,preparationStage]);
+  }, [snapshot,ws,pending,stale,model.dirty,adapterKind,previewKey,photo,preparationStage,openingProject]);
   const handleMenuAction = async (id: MenuActionId): Promise<void> => {
     if (preparationScope.current.pending && id !== "task.stop") return;
     setActionError(null);
@@ -2157,6 +2192,19 @@ export function App() {
         case "help.checkUpdate": setUpdate(true); break;
         case "tools.preferences": setDialog("preferences"); break;
         case "task.new": case "task.resetDraft": setPreparationRevision(value => value + 1); setAuxiliary("prepare"); break;
+        case "task.openProject": {
+          setOpeningProject(true);
+          try {
+            const path = await chooseScanProjectDirectory(ws?.scanSetup.savePath || "");
+            if (!path) break;
+            setBottomTab("reconstruction");
+            await actions.run({ type:"open_scan_project", path });
+            setPreviewData(null); setPreviewError(null); setPhoto(null);
+            setPreparationRevision(value => value + 1);
+            navigate("equipment"); setBottomTab("reconstruction");
+          } finally { setOpeningProject(false); }
+          break;
+        }
         case "task.prepare": openPreparation(); break;
         case "task.restore": case "task.abandon": setAuxiliary("recovery"); break;
         case "task.stop": stop(); break;
@@ -2193,7 +2241,7 @@ export function App() {
     <section className="workspace-body">
       <aside className="col device-column"><CameraPanel snapshot={snapshot} stale={stale} pending={pending} model={model} run={actions.run} onAdvanced={() => setAuxiliary("camera")} onPhoto={onPhoto} mediaRevision={requestRevision} onLive={revision => { if(revision === presentation.current) navigate("live"); }} /><TurntablePanel snapshot={snapshot} stale={stale} pending={pending} run={actions.run} onPreflight={openPreparation} onRecovery={() => setAuxiliary("recovery")} onBench={() => setAuxiliary("bench")} /></aside>
       <section className="main-console"><LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={stale} setupInvalid={setupInvalid} feedbackId={snapshot.updatedAt} centerView={centerView} volume={activeVolume} previewError={previewError} volumeMode={volumeMode} volumeResetRevision={volumeResetRevision} onVolumeAvailable={setVolume3DAvailable} camera={snapshot.deviceControls.camera} photo={photo} requestRevision={requestRevision} onCloseMedia={closeMedia} runDevice={actions.run} pending={pending} /></section>
-      <BottomConsole tab={bottomTab} onTab={setBottomTab} ws={ws} production={adapterKind === "tauri"} centerView={centerView} volumeReady={Boolean(activeVolume)} volume3DAvailable={volume3DAvailable} busy={pending} stale={stale} volumeMode={volumeMode} onVolumeMode={setVolumeMode} onResetVolume={() => setVolumeResetRevision(value => value + 1)} onOpenReconstruction={openReconstruction} onShowEquipment={() => navigate("equipment")} onStartReconstruction={startReconstruction} />
+      <BottomConsole tab={bottomTab} onTab={setBottomTab} ws={ws} projectOperation={snapshot.operations.filter(operation => operation.device === "task_project" && operation.kind === "open_project").at(-1) || null} openingProject={openingProject} production={adapterKind === "tauri"} centerView={centerView} volumeReady={Boolean(activeVolume)} volume3DAvailable={volume3DAvailable} busy={pending} stale={stale} volumeMode={volumeMode} onVolumeMode={setVolumeMode} onResetVolume={() => setVolumeResetRevision(value => value + 1)} onOpenReconstruction={openReconstruction} onShowEquipment={() => navigate("equipment")} onStartReconstruction={startReconstruction} />
       <aside className="col col--right"><XrayPanel ws={ws} busy={pending || stale} dispatch={dispatch} stale={stale} /><OperationPanel snapshot={snapshot} ws={ws} stale={stale} /></aside>
     </section><div className="app-divider" /><footer className="status-bar"><span className="status-bar__left"><i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} /><strong>{stale ? "Control service unavailable · device readings UNKNOWN" : englishDisplayText(snapshot.lastError || ws.dock.playReason || ws.phaseWord)}</strong></span><div className="status-bar__right"><span>{ws.scanSetup.taskId || "No task selected"}</span>{snapshot.mode === "developer_preview" && <span className="badge badge--dev">Offline preview · no hardware</span>}<span className={`badge badge--engine badge--${stale ? "lost" : "connected"}`}>Control service · {stale ? "Unavailable" : "Ready"}</span><div className="theme-toggle" role="group" aria-label="Theme">{(["light","dark"] as const).map(value => <button key={value} className="theme-toggle__seg" aria-pressed={theme === value} onClick={() => setTheme(value)}>{value === "light" ? "Light" : "Dark"}</button>)}</div></div></footer>
     {info}<UpdateDialog open={update} onClose={() => setUpdate(false)} />

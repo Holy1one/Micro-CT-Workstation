@@ -2,7 +2,7 @@
 import type { LineIconName } from "./icons";
 export type TopMenu = "Task" | "Devices" | "View" | "Tools" | "Help";
 export type MenuActionId =
-  | "task.new" | "task.prepare" | "task.restore" | "task.abandon" | "task.openFolder" | "task.resetDraft" | "task.play" | "task.stop"
+  | "task.new" | "task.openProject" | "task.prepare" | "task.restore" | "task.abandon" | "task.openFolder" | "task.resetDraft" | "task.play" | "task.stop"
   | "devices.camera" | "devices.cameraSettings" | "devices.turntable" | "devices.turntableHome" | "devices.turntableBench" | "devices.xray"
   | "view.equipment" | "view.result" | "view.photo" | "view.live" | "view.images" | "view.reconstruction" | "view.logs"
   | "tools.deviceDiagnostics" | "tools.exportLog" | "tools.preferences"
@@ -12,6 +12,7 @@ export interface MenuGroup { label: TopMenu; entries: readonly MenuEntry[] }
 export const MENU_GROUPS: readonly MenuGroup[] = [
   { label: "Task", entries: [
     { id: "task.new", label: "New Scan Task…", icon: "task-new" },
+    { id: "task.openProject", label: "Open Scan Project…", icon: "folder-open" },
     { id: "task.prepare", label: "Scan Preparation / Preflight…", icon: "shield-check" },
     { id: "task.play", label: "Start Scan", icon: "shield-check" },
     { id: "task.stop", label: "Stop", icon: "warning" },

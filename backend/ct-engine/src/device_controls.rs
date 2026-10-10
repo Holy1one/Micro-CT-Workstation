@@ -178,6 +178,13 @@ impl Engine {
         }
     }
     fn record_operation_error(&mut self,id:&str,error:String) {
+        // Reading an invalid project must not alter the selected dataset,
+        // invalidate device evidence or trigger hardware cleanup.
+        if self.operations.history.iter().any(|op|op.operation_id==id&&op.device=="task_project") {
+            self.operations.complete(id,"rejected",Some(error.clone()));
+            self.log("ERR","system",&error);
+            return;
+        }
         let cleanup_unconfirmed=cleanup_unconfirmed_error(&error);
         // Discovery can fail before any serial port is opened (missing USB,
         // descriptor failure or ambiguous identities). Only a never-owned
@@ -746,12 +753,20 @@ impl Engine {
         let method=match payload.get("method").and_then(Value::as_str){Some("fdk")=>ReconstructionMethod::Fdk,Some("sirt")=>ReconstructionMethod::Sirt,Some("cgls")=>ReconstructionMethod::Cgls,_=>return Err("INVALID_RECONSTRUCTION_METHOD")};
         if !reconstruction::available_methods().iter().any(|entry|entry.method==method&&entry.enabled) || self.parameters.projection_count<3 || method==ReconstructionMethod::Sirt&&!reconstruction::sirt_feasible(self.parameters.projection_count){return Err("RECONSTRUCTION_METHOD_UNAVAILABLE");}
         let parameters=self.parameters.clone();
+        let options=payload.get("options").map(|value|serde_json::from_value::<reconstruction::spectral::Options>(value.clone()))
+            .transpose().map_err(|_|"INVALID_RECONSTRUCTION_OPTIONS")?;
+        if let Some(options)=&options {
+            options.validate().map_err(|_|"INVALID_RECONSTRUCTION_OPTIONS")?;
+            if method!=ReconstructionMethod::Fdk {return Err("INVALID_RECONSTRUCTION_OPTIONS");}
+        }
         self.enqueue_device("system","reconstruction_prepare",move |cancel|{
             if !scan::completed_manifest_exists(&parameters){return Err("RECONSTRUCTION_LOCKED".into());}
             let scan_dir=PathBuf::from(parameters.save_path.trim()).join(parameters.task_id.trim());
-            let cached=reconstruction::cached_result(&scan_dir,method)?;
+            let cached=match &options {Some(options)=>reconstruction::spectral::cached_result(&scan_dir,method,options)?,
+                None=>reconstruction::cached_result(&scan_dir,method)?};
             if cancel.load(Ordering::SeqCst){return Err("Reconstruction preparation cancelled".into());}
-            let handle=if cached.is_none(){Some(ReconstructionHandle::start(ReconstructionRequest{scan_dir,method})?)}else{None};
+            let handle=if cached.is_none(){Some(match options {Some(options)=>ReconstructionHandle::start_with_options(ReconstructionRequest{scan_dir,method},options)?,
+                None=>ReconstructionHandle::start(ReconstructionRequest{scan_dir,method})?})}else{None};
             Ok(Box::new(move |engine|{engine.reconstruction_event_sequence=0;engine.reconstruction_method=Some(method);engine.log("INFO","reconstruction","Reconstruction requested from sealed acquisition");if let Some(result)=cached{engine.reconstruction_status="completed";engine.reconstruction_percent=100;engine.reconstruction_message="重构已缓存".into();engine.reconstruction_cache_path=Some(result.cache_path.display().to_string());engine.log("PASS","reconstruction","Verified reconstruction cache loaded");}else{engine.reconstruction=handle;engine.reconstruction_status="running";engine.reconstruction_percent=0;engine.reconstruction_message="准备重构".into();engine.reconstruction_cache_path=None;}Ok(())}))
         })
     }

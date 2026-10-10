@@ -6,7 +6,7 @@ import { cameraDraftChanges, confirmedCameraDraft, validateCameraDraft } from ".
 export type DeviceDispatch = (command: EngineCommand) => Promise<EngineSnapshot | undefined>;
 const TERMINAL = new Set(["completed", "cancelled", "failed", "cleanup_unconfirmed", "rejected"]);
 const SYNCHRONOUS = new Set(["prepare_scan", "set_capture_root", "camera_status", "camera_identity", "xray_status", "xray_identity", "turntable_identity", "preset_list", "preset_load", "preset_compare", "preset_save", "preset_delete", "preset_import", "preset_export"]);
-const ASYNC_REQUIRED = new Set(["camera_connect", "camera_disconnect", "camera_read_properties", "camera_apply_properties", "camera_capture", "camera_test_capture", "camera_live_view_start", "camera_live_view_read", "camera_live_view_configure", "camera_autofocus", "camera_focus", "turntable_connect", "turntable_disconnect", "turntable_home", "turntable_relative", "turntable_to_angle", "preflight", "restore_previous"]);
+const ASYNC_REQUIRED = new Set(["open_scan_project", "camera_connect", "camera_disconnect", "camera_read_properties", "camera_apply_properties", "camera_capture", "camera_test_capture", "camera_live_view_start", "camera_live_view_read", "camera_live_view_configure", "camera_autofocus", "camera_focus", "turntable_connect", "turntable_disconnect", "turntable_home", "turntable_relative", "turntable_to_angle", "preflight", "restore_previous"]);
 
 export async function awaitOperation(ack: EngineSnapshot, operationId: string, current: () => EngineSnapshot | null, timeoutMs = 110_000): Promise<EngineSnapshot> {
   const deadline = performance.now() + timeoutMs;
@@ -47,7 +47,7 @@ export function useDeviceActions(snapshot: EngineSnapshot | null, dispatch: Devi
       if (ack.engineSessionId !== before.engineSessionId) throw new Error("Control session changed during the command");
       if (SYNCHRONOUS.has(command.type)) return ack;
       const operation = ack.operationId && !known.has(ack.operationId) ? ack.operations.find(item => item.operationId === ack.operationId) : null;
-      if (operation) return await awaitOperation(ack, operation.operationId, () => current.current);
+      if (operation) return await awaitOperation(ack, operation.operationId, () => current.current, command.type === "open_scan_project" ? 300_000 : 110_000);
       if (ASYNC_REQUIRED.has(command.type)) throw new Error("No new correlated operation receipt; completion is unconfirmed");
       return ack;
     } catch (reason) {

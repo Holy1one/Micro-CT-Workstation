@@ -48,7 +48,7 @@
       "to": "frontend-contract",
       "type": "consumes-contract",
       "strength": "strong",
-      "reason": "Both adapters implement the snapshot contract, including nullable measured telemetry, on/off/unknown beamState and engine-issued camera property/option support and effective write permissions; failed IPC invalidates displayed readings."
+      "reason": "Both adapters implement the snapshot contract, including nullable measured telemetry, on/off/unknown beamState and engine-issued camera property/option support and effective write permissions; failed IPC invalidates displayed readings. Optional project-operation progress carries verified byte/file counts and an engine-measured ETA, never a UI timer."
     },
     {
       "from": "developer-preview",
@@ -90,14 +90,14 @@
       "to": "desktop-shell",
       "type": "reconstruction-preview-ipc",
       "strength": "strong",
-      "reason": "The reconstruction_preview command accepts only a method ID and returns an engine-registered, hash-verified preview volume for a completed reconstruction."
+      "reason": "The reconstruction_preview command accepts only a method ID and returns an engine-registered, hash-verified preview volume, optional interleaved RGB and calibrated/qualitative legend for a completed reconstruction; session and cache registration are rechecked after reading. start_reconstruction optionally carries monochrome/multicolor and a user-selected measured calibration; the engine validates them against the frozen scintillator stack."
     },
     {
       "from": "desktop-shell",
       "to": "engine-core",
       "type": "jsonl-protocol",
       "strength": "strong",
-      "reason": "JSONL v2 validates request ID/sequence/session and returns complete snapshots plus operation records; Stop/state remain available during background device work. Cancelled or stale ordinary jobs cannot commit; uncancelled complete/abandon/deleted-directory register writes finish atomic persistence and owner commit across repeated Stop."
+      "reason": "JSONL v2 validates request ID/sequence/session and returns complete snapshots plus operation records, including optional scan-project validation progress; Stop/state remain available during background device work. Cancelled or stale ordinary jobs cannot commit; uncancelled complete/abandon/deleted-directory register writes finish atomic persistence and owner commit across repeated Stop."
     },
     {
       "from": "engine-core",

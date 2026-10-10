@@ -4,6 +4,8 @@
 
 ## Source layout
 
+Versioned colour reconstruction is implemented in `reconstruction_channels.rs` (linear CFA registration and native saturation), `reconstruction_spectral.rs` (band selection, shared geometry, sealed artifacts) and `material_decomposition.rs` (measured two-basis inversion). `start_reconstruction.options` selects monochrome/multicolor; this path uses FDK and stores `reconstruction/spectral/v2-<input-hash>/`. Existing method caches keep their original numerical semantics. Scan geometry optionally freezes up to five incident-ordered scintillator layers. RGB observations are not independently resolved layers; quantitative material labels require matching measured calibration and held-out validation. See [strategy and calibration contract](../../docs/decisions/stacked-scintillator-material-imaging.md).
+
 - `src/main.rs`: bounded JSONL stdin/stdout process loop and deterministic shutdown on parent EOF.
 - `src/lib.rs`: public request/response DTOs, domain commands, safety checks, complete snapshots, and top-level engine state.
 - `src/scan.rs`: transactional multi-device projection workflow and manifest persistence.
@@ -37,7 +39,24 @@ records the assertions, remaining scope and required hardware acceptance.
 The native WPD/PTP camera and message-owned device runtime are an offline candidate. Camera JPEG streams use a random user-ACL named pipe; stdio carries protocol-v2 control/snapshot envelopes. Timed tick, monitoring and EOF do not require UI polling. `MICRO_CT_ENGINE_DATA_DIR` isolates offline test state; normal state lives under `LOCALAPPDATA/MicroCTWorkstation`.
 # Offline reconstruction
 
+`Task → Open Scan Project…` selects a completed project folder containing
+`manifest.json`. `scan_project.rs` owns asynchronous, read-only loading: sealed
+metadata, measured geometry, 10 dark/flat references and every NEF size/SHA-256
+are checked with the reconstruction validator before selection is committed.
+The associated operation exposes optional byte/file validation progress and a
+measured-rate remaining-time estimate. Hash reads check cancellation every 64 KiB;
+updates occur every 100 ms or at verified-file boundaries. Worker progress stops
+at 99%; only an owner-confirmed successful selection reports 100%. Cancelled or
+rejected receipts clear the estimate, and late progress cannot change them.
+Unfinished tasks retain their lock; cancelled or invalid loads preserve the
+previous dataset and device evidence. No device connection, HOME, Preflight or
+reference acquisition is performed. Select the original project folder (its name
+must match scanId); original manifest paths must remain valid. Reconstruction
+uses the existing algorithms and verified cache path.
+
 `src/reconstruction.rs` consumes only a sealed scan manifest and hash-verified NEF files. It does not control CT hardware. FDK runs on CPU or on a compatible GPU through `src/fdk.wgsl`: the first view checks GPU output against CPU output and measures the expected runtime; GPU is selected only when the estimate is at least 15% faster. GPU failures restart the full FDK on CPU. A bounded 64³, five-iteration CPU SIRT is available for small scans; larger SIRT jobs and CGLS remain disabled. The science volume is stored as signed float32 and the display preview as uint8 with separate window metadata. Numerical tests use synthetic geometry; D7100 NEF and GPU driver behavior still require validation with actual data and the target machine.
+
+`src/material_decomposition.rs` treats known basis materials as calibration coordinates, not specimen labels. A matched measured calibration may include a broad `materialLibrary`; after basis reconstruction, `reconstruction_spectral.rs` profiles out unknown density amplitude and exports candidate indices, fit residuals, density scale and unknown/ambiguous masks under the result seal. Specimen material and thickness are not input requirements. Only jointly covered voxels are matched; candidate identity remains unverified until independent material validation. Offline model-dependent experiments live in `tools/verify/infer-unknown-materials.py`, separate from the measured calibration contract; see `docs/decisions/stacked-scintillator-material-imaging.md`.
 
 ## Preparation and acquisition admission
 

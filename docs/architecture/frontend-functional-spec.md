@@ -249,6 +249,16 @@ prepare成功的同会话/同任务响应后调用`{type:"preflight",restore?:bo
 
 ## 8. 重构、媒体与日志IPC
 
+`Task → Open Scan Project…` 通过 `open_scan_project {path}` 异步校验已封存项目。Reconstruction 控制区按 `task_project/open_project` 的可选 `progress={processedBytes,totalBytes,verifiedFiles,totalFiles,percent,estimatedRemainingSec}` 显示实际文件校验百分比、已核验文件数及剩余时间；总字节数尚未知时只显示准备条和估算提示。时间来自引擎实测读取速率，超过 10 秒向上取整到 10 秒，10 秒以内显示 **Finishing soon…**。取消、失联不继续显示完成预测；worker 进度最多 99%，只有引擎提交成功才确认 100% 并展示项目数量、启用重构。失败保留原项目。前端不以定时器推进百分比。
+
+首次未连接设备的会话查看已确认历史项目时，Operation Status 显示中性的 **Offline project view · device states unknown**。判定要求同一引擎会话的成功打开回执、完全一致的封存投影数量、实测几何、10 暗/10 空参考，以及仅元数据/项目/重构准备回执；复用首次启动的全部设备未知、无故障和无占用检查，只排除已确认历史数据与重构字段。失联、过往设备会话、真实故障、活动或未知回执仍显示 Fault；图像数量不充当设备连接或射线 OFF 证据。
+
+扫描准备中的 **Stacked scintillator scan** 勾选后展开最多 5 行，按射线入射方向填写材料、发光颜色和厚度；完整行数就是记录层数，空行忽略，半填行禁止 prepare。`ReconstructionGeometry.scintillatorLayers` 为可选字段并由引擎冻结，旧几何无需迁移。
+
+重构入口提供 **Monochrome / Multicolor** 手动选择，`start_reconstruction.options={mode,materialCalibrationPath?}`。默认单色，波段由引擎按实测参考可靠性自动选择；多色按已记录层发光颜色选观测，当前颜色流程只启用 FDK。Multicolor 可选择原生 JSON 标定文件，内容由引擎校验；未标定只显示颜色响应。旧无 options 调用仍保留旧缓存和方法语义。
+
+`reconstruction_preview` 增加可选 `colors:number[]`（逐体素交错 RGB）、`colorLegend:string[]`、`materialLabels:boolean`、`mode`、`selectedBand`。桌面壳验证灰度及谱结果封存哈希、RGB 元数据/字节数/哈希，读完再次核对会话和 cachePath；前端在提交显示前校验所有字节。三切片和 3D 布局不变，MIP 显示灰度峰值处的颜色，避免分别取三个颜色的峰值合成虚假的材料组合。公共量化覆盖外仍显示灰度；图例区分颜色响应与已标定基材料。无 WebGL2 时关闭 3D，只显示状态。
+
 | 功能 | invoke / 参数 | 返回 / 边界 |
 | --- | --- | --- |
 | 扫描投影预览 | `frame_preview {index:number}` | `number[]` JPEG，index必须是snapshot登记的已提交帧；后台复核NEF大小/hash；无任意path |

@@ -13,12 +13,20 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
 #[path = "reconstruction_preprocess.rs"]
 mod preprocessing;
+
+#[path = "reconstruction_spectral.rs"]
+pub mod spectral;
+#[path = "reconstruction_channels.rs"]
+mod channels;
+#[path = "material_decomposition.rs"]
+pub mod material;
 
 const DETECTOR_N: usize = 256;
 const VOLUME_N: usize = 256;
@@ -99,6 +107,16 @@ pub struct ReconstructionHandle {
 
 impl ReconstructionHandle {
     pub fn start(request: ReconstructionRequest) -> Result<Self, String> {
+        Self::start_job(request, None)
+    }
+
+    pub fn start_with_options(request: ReconstructionRequest, options: spectral::Options) -> Result<Self, String> {
+        options.validate()?;
+        if request.method!=ReconstructionMethod::Fdk {return Err("automatic colour processing requires FDK".into());}
+        Self::start_job(request, Some(options))
+    }
+
+    fn start_job(request: ReconstructionRequest, options: Option<spectral::Options>) -> Result<Self, String> {
         if !available_methods().iter().any(|entry| entry.method == request.method && entry.enabled) {
             return Err(format!("{} is not available", request.method.id()));
         }
@@ -111,7 +129,10 @@ impl ReconstructionHandle {
         let worker = thread::Builder::new().name("ct-reconstruction".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    reconstruct(&request, &worker_progress)
+                    match &options {
+                        Some(options) => spectral::reconstruct(&request, options, &worker_progress),
+                        None => reconstruct(&request, &worker_progress),
+                    }
                 })).unwrap_or_else(|_| Err("reconstruction worker panicked".into()));
                 match &result {
                     Ok(_) => set_progress(&worker_progress, "completed", 100, "重构完成"),
@@ -163,6 +184,8 @@ fn set_progress(progress: &Mutex<ReconstructionProgress>, status: &'static str, 
 struct Manifest {
     schema_version: u32,
     #[serde(default)]
+    voltage_kv: f64,
+    #[serde(default)]
     capture_profile: Option<crate::capture_profile::CaptureProfile>,
     completed: bool,
     projection_count: u32,
@@ -182,6 +205,8 @@ struct Geometry {
     rotation_direction: String,
     mirror_x: bool,
     measurement: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scintillator_layers: Vec<spectral::StackLayer>,
 }
 
 #[derive(Deserialize)]
@@ -231,6 +256,8 @@ struct CacheMetadata {
     backend_selection: String,
     geometry: Geometry,
     note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spectral_sha256: Option<String>,
 }
 
 #[derive(Clone)]
@@ -270,6 +297,10 @@ fn cache_dir(scan_dir: &Path, method: ReconstructionMethod) -> PathBuf {
 
 pub fn cached_result(scan_dir: &Path, method: ReconstructionMethod) -> Result<Option<ReconstructionResult>, String> {
     let root = cache_dir(scan_dir, method);
+    cached_result_at(scan_dir, method, &root)
+}
+
+fn cached_result_at(scan_dir: &Path, method: ReconstructionMethod, root: &Path) -> Result<Option<ReconstructionResult>, String> {
     let metadata_path = root.join("result.json");
     if !metadata_path.is_file() { return Ok(None); }
     let Ok(meta) = serde_json::from_reader::<_, CacheMetadata>(
@@ -311,7 +342,11 @@ pub fn cached_result(scan_dir: &Path, method: ReconstructionMethod) -> Result<Op
         || hash_file(&coverage_path)? != (voxels as u64, meta.coverage_sha256) {
         return Ok(None);
     }
-    Ok(Some(ReconstructionResult { method, cache_path: root, volume_path, preview_path }))
+    if let Some(expected) = &meta.spectral_sha256 {
+        let path = root.join("spectral.json");
+        if !path.is_file() || &hash_file(&path)?.1 != expected { return Ok(None); }
+    }
+    Ok(Some(ReconstructionResult { method, cache_path: root.to_owned(), volume_path, preview_path }))
 }
 
 fn read_manifest(scan_dir: &Path) -> Result<(Manifest, String), String> {
@@ -355,7 +390,49 @@ fn read_manifest(scan_dir: &Path) -> Result<(Manifest, String), String> {
     Ok((manifest, digest))
 }
 
+/// Read-only project opening uses exactly the same sealed-data and integrity
+/// checks as reconstruction. Progress measures hashed bytes; cancellation is
+/// observed within each file as well as between files.
+pub(crate) fn validate_scan_project(scan_dir: &Path, cancel: &AtomicBool,
+    mut report: impl FnMut(crate::operations::OperationProgress)) -> Result<(), String> {
+    let (manifest, _) = read_manifest(scan_dir)?;
+    let inputs: Vec<_> = manifest.references.pre_dark.iter().chain(&manifest.references.pre_flat)
+        .map(|f| (f.path.as_str(),f.bytes,f.sha256.as_str()))
+        .chain(manifest.frames.iter().map(|f| (f.path.as_str(),f.bytes,f.sha256.as_str()))).collect();
+    let total_bytes = inputs.iter().try_fold(0u64,|total,input|total.checked_add(input.1)).ok_or("Project byte count overflow")?;
+    let started=Instant::now();let mut last_report=started;
+    let mut progress=crate::operations::OperationProgress { total_bytes,total_files:inputs.len(),..Default::default() };
+    report(progress.clone());
+    for (path,bytes,sha256) in inputs {
+        verified_path_reporting(scan_dir,path,bytes,sha256,|amount| {
+            if cancel.load(Ordering::SeqCst) {return Err("Open scan project cancelled".into());}
+            progress.processed_bytes=progress.processed_bytes.saturating_add(amount);
+            update_project_progress(&mut progress,started.elapsed());
+            if last_report.elapsed()>=Duration::from_millis(100) {report(progress.clone());last_report=Instant::now();}
+            Ok(())
+        })?;
+        progress.verified_files+=1;
+        update_project_progress(&mut progress,started.elapsed());
+        report(progress.clone());last_report=Instant::now();
+    }
+    Ok(())
+}
+
+fn update_project_progress(progress:&mut crate::operations::OperationProgress,elapsed:Duration) {
+    if progress.total_bytes==0 {return;}
+    progress.percent=((progress.processed_bytes as f64/progress.total_bytes as f64*100.).floor() as u8).min(99);
+    progress.estimated_remaining_sec=if progress.processed_bytes>=progress.total_bytes {Some(0)}
+        else if elapsed>=Duration::from_millis(250)&&progress.processed_bytes>0 {
+            Some((elapsed.as_secs_f64()*(progress.total_bytes-progress.processed_bytes) as f64/progress.processed_bytes as f64).ceil() as u64)
+        } else {None};
+}
+
 fn verified_path(scan_dir: &Path, path: &str, bytes: u64, sha256: &str) -> Result<PathBuf, String> {
+    verified_path_reporting(scan_dir,path,bytes,sha256,|_|Ok(()))
+}
+
+fn verified_path_reporting(scan_dir: &Path, path: &str, bytes: u64, sha256: &str,
+    report:impl FnMut(u64)->Result<(),String>) -> Result<PathBuf, String> {
     let canonical_root = scan_dir.canonicalize().map_err(io_error)?;
     let candidate = Path::new(path);
     let candidate = if candidate.is_absolute() || candidate.is_file() {
@@ -368,7 +445,7 @@ fn verified_path(scan_dir: &Path, path: &str, bytes: u64, sha256: &str) -> Resul
         || !canonical.extension().is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("nef")) {
         return Err("manifest frame path leaves the scan directory or is not NEF".into());
     }
-    if hash_file(&canonical)? != (bytes, sha256.to_owned()) {
+    if hash_file_reporting(&canonical,report)? != (bytes, sha256.to_owned()) {
         return Err(format!("NEF size or SHA-256 mismatch: {}", canonical.display()));
     }
     Ok(canonical)
@@ -1018,6 +1095,15 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
         manifest.geometry.mirror_x, progress, &mut completed)?;
     let prepared = prepare_projections(scan_dir, &manifest, &screen, &pre_dark, &pre_flat,
         &cache_dir(scan_dir, request.method), progress)?;
+    reconstruct_prepared(request, progress, allow_gpu, fallback_reason, &manifest,
+        manifest_sha256, &cache_dir(scan_dir, request.method), &prepared, None)
+}
+
+fn reconstruct_prepared(request: &ReconstructionRequest, progress: &Mutex<ReconstructionProgress>,
+    allow_gpu: bool, fallback_reason: Option<String>, manifest: &Manifest,
+    manifest_sha256: String, root: &Path, prepared: &Path,
+    axis_override: Option<preprocessing::AxisEstimate>) -> Result<ReconstructionResult, String> {
+    let scan_dir = &request.scan_dir;
     let stack_bytes=fs::read(&prepared).map_err(io_error)?;
     let stack:Vec<f32>=stack_bytes.chunks_exact(4).map(|b|f32::from_le_bytes(b.try_into().unwrap())).collect();
     drop(stack_bytes);
@@ -1025,14 +1111,15 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
         frame.angle_deg.to_radians()
     }else{-frame.angle_deg.to_radians()}).collect();
     let mut projections = BufReader::new(File::open(prepared).map_err(io_error)?);
-    let mut quality_masks=BufReader::new(File::open(cache_dir(scan_dir,request.method).join("detector-quality.bin")).map_err(io_error)?);
+    let mut quality_masks=BufReader::new(File::open(root.join("detector-quality.bin")).map_err(io_error)?);
     let sod = manifest.geometry.sod_mm;
     let sdd = sod + manifest.geometry.object_to_detector_mm;
     let pitch = manifest.geometry.detector_width_mm * SCREEN_CROP_SCALE / DETECTOR_N as f64;
-    let axis=preprocessing::estimate_axis(&stack,&angles,pitch,sdd,
-        manifest.geometry.center_offset_x_mm,manifest.geometry.center_offset_y_mm);
+    let quantitative_support=axis_override.is_some();
+    let axis=axis_override.unwrap_or_else(|| preprocessing::estimate_axis(&stack,&angles,pitch,sdd,
+        manifest.geometry.center_offset_x_mm,manifest.geometry.center_offset_y_mm));
     drop(stack);
-    write_json(&cache_dir(scan_dir,request.method).join("calibration.json"),&axis)?;
+    write_json(&root.join("calibration.json"),&axis)?;
     let center_u = axis.applied_offset_mm;
     let center_v = manifest.geometry.center_offset_y_mm;
     let voxel = manifest.geometry.detector_width_mm * sod / sdd / VOLUME_N as f64;
@@ -1068,7 +1155,7 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
         set_progress(progress, "running", (50 + (index * 45 / manifest.frames.len())) as u8,
             &format!("重构 {}/{}", index + 1, manifest.frames.len()));
         filter_projection(&mut projection, pitch, sod, sdd, center_u, center_v);
-        projection.extend(flags.iter().map(|f|if matches!(*f,1|2|5) {1.}else{0.}));
+        projection.extend(flags.iter().map(|f|if matches!(*f,1|5) || (!quantitative_support && *f==2) {1.}else{0.}));
         if index == 0 {
             let started = Instant::now();
             backproject(&mut volume, &mut coverage, &projection, angle, pitch, voxel,
@@ -1133,7 +1220,7 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
         selection.cpu_estimated_ms = milliseconds(started.elapsed());
         selection.reason = "CPU only: five-iteration, matched-operator 64^3 SIRT; recorded duration is actual iterative time".into();
         set_progress(progress, "running", 96, "保存结果");
-        return persist_result(scan_dir, &manifest, manifest_sha256, &sirt_volume,
+        return persist_result(scan_dir, root, manifest, manifest_sha256, &sirt_volume,
             &sirt_coverage, sirt_voxel, request.method, &selection);
     }
     if let Some(gpu) = &selected_gpu {
@@ -1148,14 +1235,15 @@ fn reconstruct_inner(request: &ReconstructionRequest, progress: &Mutex<Reconstru
                 drop(selected_gpu.take());
                 drop(volume);
                 drop(coverage);
-                return reconstruct_inner(request, progress, false,
-                    Some("GPU final readback failed; full CPU recomputation".into()));
+                return reconstruct_prepared(request, progress, false,
+                    Some("GPU final readback failed; full CPU recomputation".into()), manifest,
+                    manifest_sha256, root, prepared, Some(axis));
             }
         }
     }
     if volume.iter().any(|value| !value.is_finite()) { return Err("non-finite reconstruction volume".into()); }
     set_progress(progress, "running", 96, "保存结果");
-    persist_result(scan_dir, &manifest, manifest_sha256, &volume, &coverage,
+    persist_result(scan_dir, root, manifest, manifest_sha256, &volume, &coverage,
         voxel, request.method, &selection)
 }
 
@@ -1177,7 +1265,7 @@ fn full_volume_preview(volume:&[f32],n:usize,preview_n:usize,lo:f32,hi:f32)->Res
     Ok(preview)
 }
 
-fn persist_result(scan_dir: &Path, manifest: &Manifest, manifest_sha256: String,
+fn persist_result(scan_dir: &Path, root: &Path, manifest: &Manifest, manifest_sha256: String,
     volume: &[f32], coverage: &[u8], voxel: f64, method: ReconstructionMethod,
     selection: &BackendSelection) -> Result<ReconstructionResult, String> {
     let (volume_n, preview_n) = match method {
@@ -1191,7 +1279,6 @@ fn persist_result(scan_dir: &Path, manifest: &Manifest, manifest_sha256: String,
     if hash_file(&scan_dir.join("manifest.json"))?.1 != manifest_sha256 {
         return Err("scan manifest changed during reconstruction".into());
     }
-    let root = cache_dir(scan_dir, method);
     fs::create_dir_all(&root).map_err(io_error)?;
     let seal = root.join("result.json");
     if seal.exists() { fs::remove_file(&seal).map_err(io_error)?; }
@@ -1238,6 +1325,7 @@ fn persist_result(scan_dir: &Path, manifest: &Manifest, manifest_sha256: String,
         cpu_estimated_ms: selection.cpu_estimated_ms,
         gpu_estimated_ms: selection.gpu_estimated_ms,
         backend_selection: selection.reason.clone(),
+        spectral_sha256: None,
         geometry: Geometry {
             sod_mm: manifest.geometry.sod_mm,
             object_to_detector_mm: manifest.geometry.object_to_detector_mm,
@@ -1247,6 +1335,7 @@ fn persist_result(scan_dir: &Path, manifest: &Manifest, manifest_sha256: String,
             rotation_direction: manifest.geometry.rotation_direction.clone(),
             mirror_x: manifest.geometry.mirror_x,
             measurement: manifest.geometry.measurement.clone(),
+            scintillator_layers: manifest.geometry.scintillator_layers.clone(),
         },
         note: format!("{}; geometry is recorded acquisition geometry, applied axis correction is in calibration.json; full volume preview, coverage is diagnostic only and never clips display; low-gain/censored/partially covered values remain approximate; signed volume is preserved; spacing is computational sampling, not measured resolution",
             if method == ReconstructionMethod::Fdk { "Circular cone-beam FDK approximation" }
@@ -1256,7 +1345,7 @@ fn persist_result(scan_dir: &Path, manifest: &Manifest, manifest_sha256: String,
         return Err("scan manifest changed before cache publication".into());
     }
     fs::rename(&seal_pending, &seal).map_err(io_error)?;
-    Ok(ReconstructionResult { method, cache_path: root, volume_path, preview_path })
+    Ok(ReconstructionResult { method, cache_path: root.to_owned(), volume_path, preview_path })
 }
 
 fn write_bytes_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1277,6 +1366,11 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 }
 
 fn hash_file(path: &Path) -> Result<(u64, String), String> {
+    hash_file_reporting(path,|_|Ok(()))
+}
+
+fn hash_file_reporting(path: &Path,mut report:impl FnMut(u64)->Result<(),String>) -> Result<(u64, String), String> {
+    report(0)?;
     let mut file = BufReader::new(File::open(path).map_err(io_error)?);
     let mut hasher = Sha256::new();
     let mut count = 0u64;
@@ -1286,6 +1380,7 @@ fn hash_file(path: &Path) -> Result<(u64, String), String> {
         if n == 0 { break; }
         count += n as u64;
         hasher.update(&buffer[..n]);
+        report(n as u64)?;
     }
     Ok((count, format!("{:x}", hasher.finalize())))
 }
@@ -1295,6 +1390,39 @@ fn io_error(error: std::io::Error) -> String { error.to_string() }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_eta_follows_measured_byte_rate_and_waits_for_samples() {
+        let mut progress=crate::operations::OperationProgress {total_bytes:1000,..Default::default()};
+        update_project_progress(&mut progress,Duration::from_secs(2));
+        assert_eq!(progress.estimated_remaining_sec,None);
+        progress.processed_bytes=250;
+        update_project_progress(&mut progress,Duration::from_millis(100));
+        assert_eq!(progress.percent,25);assert_eq!(progress.estimated_remaining_sec,None);
+        update_project_progress(&mut progress,Duration::from_secs(10));
+        assert_eq!(progress.estimated_remaining_sec,Some(30));
+        progress.processed_bytes=900;
+        update_project_progress(&mut progress,Duration::from_secs(10));
+        assert_eq!(progress.percent,90);assert_eq!(progress.estimated_remaining_sec,Some(2));
+        progress.processed_bytes=1000;
+        update_project_progress(&mut progress,Duration::from_secs(11));
+        assert_eq!(progress.percent,99);assert_eq!(progress.estimated_remaining_sec,Some(0));
+    }
+
+    #[test]
+    fn project_hashing_reports_chunks_and_can_cancel_inside_a_file() {
+        let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine/project-progress-hash");
+        fs::create_dir_all(&root).unwrap();let path=root.join("chunks.nef");
+        let bytes=vec![7u8;3*64*1024+9];fs::write(&path,&bytes).unwrap();
+        let mut chunks=vec![];
+        let digest=hash_file_reporting(&path,|amount|{chunks.push(amount);Ok(())}).unwrap();
+        assert_eq!(chunks,vec![0,65536,65536,65536,9]);
+        assert_eq!(digest,(bytes.len() as u64,format!("{:x}",Sha256::digest(&bytes))));
+        let mut read=0;
+        let error=hash_file_reporting(&path,|amount|{read+=amount;if read>=65536 {Err("Open scan project cancelled".into())}else{Ok(())}}).unwrap_err();
+        assert!(error.contains("cancelled"));assert_eq!(read,65536);
+        assert_eq!(fs::read(path).unwrap(),bytes);
+    }
 
     #[test]
     fn full_square_crop_contains_all_four_screen_extremes() {

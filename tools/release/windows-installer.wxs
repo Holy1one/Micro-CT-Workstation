@@ -230,8 +230,9 @@
                     Name="{{product_name}}"
                     Description="Runs {{product_name}}"
                     Target="[!Path]"
-                    Icon="ProductIcon"
                     WorkingDirectory="INSTALLDIR">
+                    <!-- Use the target EXE's embedded icon, as the desktop shortcut does.
+                         MSI ProductCode icon-cache paths expire during major upgrades. -->
                     <ShortcutProperty Key="System.AppUserModel.ID" Value="{{bundle_id}}"/>
                 </Shortcut>
                 <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall"/>

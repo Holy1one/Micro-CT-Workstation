@@ -1,4 +1,18 @@
 /** Numeric scan-field parsing. Minutes are a UI unit; engine commands use seconds. */
+import type { ScintillatorLayer } from "./engine/types";
+export interface LayerDraft { materialName: string; emissionColor: string; thicknessMm: string }
+export const blankLayer = (): LayerDraft => ({ materialName: "", emissionColor: "", thicknessMm: "" });
+/** Blank rows are ignored; a partial row invalidates the complete submission. */
+export function parseLayerDrafts(enabled: boolean, rows: LayerDraft[]): ScintillatorLayer[] | null {
+  if (!enabled) return [];
+  if (rows.length > 5) return null;
+  const filled = rows.filter(row => Object.values(row).some(value => value.trim()));
+  if (!filled.length || filled.some(row => !row.materialName.trim() || row.materialName.trim().length > 128
+    || !["red", "green", "blue", "yellow", "other"].includes(row.emissionColor)
+    || !/^(?:\d+\.?\d*|\.\d+)$/.test(row.thicknessMm.trim())
+    || Number(row.thicknessMm) <= 0 || Number(row.thicknessMm) > 100)) return null;
+  return filled.map(row => ({ materialName: row.materialName.trim(), emissionColor: row.emissionColor as ScintillatorLayer["emissionColor"], thicknessMm: Number(row.thicknessMm) }));
+}
 export const MAX_PROJECTIONS = 3600;
 export const D7100_EXPOSURE_MIN_MS = 0.125;
 export const D7100_EXPOSURE_MAX_MS = 30000;

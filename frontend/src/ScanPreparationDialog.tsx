@@ -5,6 +5,7 @@ import type { EngineCommand, EngineSnapshot, ReconstructionGeometry, ScanPrepara
 import { minutesToSeconds, projectionError, secondsToMinutes } from "./scan-input";
 import { displayFailureText, shutterExposureMs } from "./engine/deviceControls";
 import { WorkstationDialog } from "./WorkstationDialog";
+import { ScintillatorStackFields, blankLayer, parseLayerDrafts, type LayerDraft } from "./ScintillatorStackFields";
 
 type PreparationContext = { engineSessionId: string; taskId: string };
 type PreparationRequest = PreparationContext & { revision: number; previousTaskId: string; taskTransitionObserved: boolean };
@@ -107,6 +108,11 @@ export function ScanPreparationDialog({ snapshot, dirtyCamera, submissionError =
   const setup = snapshot.workstation!.scanSetup;
   const [values, setValues] = useState<Record<string, string>>(() => ({ taskId: resetRevision ? "" : setup.taskId, count: resetRevision ? "120" : String(setup.projectionCount || ""), maxXray: resetRevision ? "10" : secondsToMinutes(setup.maxXraySec || 600), sodMm: existing?.sodMm.toString() || "", objectToDetectorMm: existing?.objectToDetectorMm.toString() || "", detectorWidthMm: existing?.detectorWidthMm.toString() || "", centerOffsetXMm: existing?.centerOffsetXMm.toString() || "", centerOffsetYMm: existing?.centerOffsetYMm.toString() || "", mirrorX: existing ? String(existing.mirrorX) : "", measurement: existing?.measurement || "" }));
   const [pending, setPending] = useState(false);
+  const [stacked, setStacked] = useState(Boolean(existing?.scintillatorLayers?.length));
+  const [layers, setLayers] = useState<LayerDraft[]>(() => Array.from({ length: 5 }, (_, index) => {
+    const layer = existing?.scintillatorLayers?.[index];
+    return layer ? { materialName: layer.materialName, emissionColor: layer.emissionColor, thicknessMm: String(layer.thicknessMm) } : blankLayer();
+  }));
   const [error, setError] = useState<string | null>(null);
   const [attemptLogs, setAttemptLogs] = useState<ReadonlySet<string> | null>(null);
   const submitting = useRef(false);
@@ -121,8 +127,11 @@ export function ScanPreparationDialog({ snapshot, dirtyCamera, submissionError =
     if (!maxXraySec || maxXraySec > 600 || !["true", "false"].includes(values.mirrorX) || !["measured", "estimated"].includes(values.measurement)) return null;
     const geometry: ReconstructionGeometry = { sodMm: Number(values.sodMm), objectToDetectorMm: Number(values.objectToDetectorMm), detectorWidthMm: Number(values.detectorWidthMm), centerOffsetXMm: Number(values.centerOffsetXMm), centerOffsetYMm: Number(values.centerOffsetYMm), mirrorX: values.mirrorX === "true", rotationDirection: existing?.rotationDirection || "counterclockwise", measurement: values.measurement as ReconstructionGeometry["measurement"] };
     if (geometry.sodMm <= 0 || geometry.objectToDetectorMm <= 0 || geometry.detectorWidthMm <= 0) return null;
+    const scintillatorLayers = parseLayerDrafts(stacked, layers);
+    if (!scintillatorLayers) return null;
+    if (scintillatorLayers.length) geometry.scintillatorLayers = scintillatorLayers;
     return { taskId: values.taskId.trim(), projectionCount: Number(values.count), maxXraySec, geometry };
-  }, [values, existing?.rotationDirection]);
+  }, [values, existing?.rotationDirection, stacked, layers]);
   const shutter = snapshot.deviceControls.camera?.properties.shutter;
   const exposure = shutter?.confirmed && shutter.actual !== null ? shutterExposureMs(shutter.actual, shutter.code) : null;
   const field = (key: string, label: string, numeric = true) => <label className="scan-geometry-field"><span>{label}</span><input value={values[key]} inputMode={numeric ? "decimal" : "text"} disabled={pending} onChange={event => setValues(current => ({ ...current, [key]: event.target.value }))} /></label>;
@@ -143,6 +152,7 @@ export function ScanPreparationDialog({ snapshot, dirtyCamera, submissionError =
     {(pending || displayedError) && <section className="scan-prep__result" aria-live="polite"><h3>{pending ? "Preflight in progress" : "Preflight needs attention"}</h3><p className={displayedError ? "scan-stage-error" : "scan-prep__stage"}>{displayedError ? displayFailureText(displayedError) : stageText}</p>{recentLogs.length > 0 && <ul className="scan-prep__log">{recentLogs.map(entry => <li key={entry.id}>{displayFailureText(entry.message)}</li>)}</ul>}{pending && <p className="scan-prep__stage">Waiting for engine confirmation. Stop remains available.</p>}</section>}
     <div className="scan-prep">
       <div className="scan-prep__main">
+        <ScintillatorStackFields enabled={stacked} rows={layers} disabled={pending} onEnabled={setStacked} onRows={setLayers} />
         <section className="scan-prep-card"><h3>Task</h3><div className="scan-geometry-grid">{field("taskId", "Task ID", false)}{field("count", "Total projections · 1–3600")}{field("maxXray", "Maximum continuous X-ray · min")}</div></section>
         <section className="scan-prep-card"><h3>Geometry</h3><div className="scan-geometry-grid">{field("sodMm", "Source to axis · mm")}{field("objectToDetectorMm", "Axis to detector · mm")}{field("detectorWidthMm", "Active detector width · mm")}{field("centerOffsetXMm", "Horizontal offset · mm")}{field("centerOffsetYMm", "Vertical offset · mm")}{select("mirrorX", "Mirror image horizontally", [["false", "No"], ["true", "Yes"]])}{select("measurement", "Geometry source", [["measured", "Measured"], ["estimated", "Estimated"]])}</div></section>
         <section className="scan-prep-card"><h3>Storage and exposure</h3><dl className="modal-facts"><div><dt>Image root</dt><dd>{unicodeDisplayText(snapshot.parameters.savePath || "UNKNOWN")}</dd></div><div><dt>Task directory</dt><dd>{snapshot.parameters.savePath && values.taskId.trim() ? `${snapshot.parameters.savePath}/${values.taskId.trim()}` : "Not configured"}</dd></div><div><dt>Confirmed exposure</dt><dd>{exposure === null ? "UNKNOWN" : `${exposure} ms`}</dd></div><div><dt>Prescribed geometry direction</dt><dd>{existing?.rotationDirection || "counterclockwise"}</dd></div></dl></section>

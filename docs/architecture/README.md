@@ -124,4 +124,6 @@ Tauri 更新器只消费匹配的领域报告，再发送 EOF并等待 owned eng
 
 ## 验证记录
 
+叠层颜色重构使用引擎的独立版本目录，原 NEF、旧 manifest 和旧方法缓存保留。预检冻结最多五层的顺序、发光颜色和厚度；自动颜色观测与两基材料反演均由引擎计算，桌面壳只读取经过封存哈希验证的灰度/RGB 预览，场景只读。材料标签需实测标定匹配和独立样点校验；细节见 [叠层成像策略](../decisions/stacked-scintillator-material-imaging.md)。
+
 当前验收摘要见 [validation](../validation/README.md)。架构说明只维护控制边界与执行机制，不承载多轮任务流水。

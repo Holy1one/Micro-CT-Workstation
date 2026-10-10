@@ -272,6 +272,13 @@ device_value_rejection_error(error) =
 
 ## 13. 重新计数方法（可复核）
 
+叠层重构新增：
+
+| 码 | 条件 | 操作建议 |
+|---|---|---|
+| `INVALID_SCINTILLATOR_STACK` | 几何中的叠层超过 5 层，或材料、发光颜色、厚度不合法；`scan.rs::ScanGeometry::validate` | 在 Scan Preparation 按入射顺序补齐；空行不算层；厚度须为正且不超过 100 mm |
+| `INVALID_RECONSTRUCTION_OPTIONS` | 模式字段非法，多色模式同时指定单波段，单色模式指定材料标定，或自动颜色处理选择非 FDK；`device_controls.rs` / `lib.rs` | 选择 FDK 和 Monochrome/Multicolor；材料标定只在 Multicolor 中选择 |
+
 1. 用 `recount.mjs` 以与库存报告不同的解析逻辑重扫 `backend/ct-engine/src/**`、`backend/src-tauri/src/**`：收集所有无空白、含下划线的大写字面量，且出现在 `Err("…")`、`Err("…".into())`、`ok_or("…")`、`map_err(|_|"…")`、`error_code=Some("…".into())`、`error_code:Some("…".into())`、信封 `Some("…")` 选择链、以及 `=> "…",` 码表分支中；再按「`#[cfg(test)] mod tests` 之后」或「紧邻 `#[cfg(test)]` 属性」把站点划为测试站点。
 2. 只要一个码存在任何非 `Err_into` 的站点即为**命令拒绝码**；只有 `Err("…".into())` 站点的是**仅 operation 失败串**；只有测试站点的是**仅测试**。
 3. 本次重算结果与库存报告 `inventory.json.errorCodes` 的集合差为空：总数 130、命令拒绝 125、仅 operation 3、仅测试 2（见 `recount-mine.json` 与本 run 的 `result.json`）。

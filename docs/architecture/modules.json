@@ -10,6 +10,7 @@
         "backend/ct-engine/src/lib.rs",
         "backend/ct-engine/src/main.rs",
         "backend/ct-engine/src/scan.rs",
+        "backend/ct-engine/src/scan_project.rs",
         "backend/ct-engine/src/operations.rs",
         "backend/ct-engine/src/device_controls.rs",
         "backend/ct-engine/src/capture_profile.rs",
@@ -17,6 +18,9 @@
         "backend/ct-engine/src/task_registry.rs",
         "backend/ct-engine/src/reconstruction.rs",
         "backend/ct-engine/src/reconstruction_preprocess.rs",
+        "backend/ct-engine/src/reconstruction_channels.rs",
+        "backend/ct-engine/src/reconstruction_spectral.rs",
+        "backend/ct-engine/src/material_decomposition.rs",
         "backend/ct-engine/src/fdk.wgsl",
         "backend/ct-engine/src/devices/README.md",
         "backend/ct-engine/src/devices/mod.rs",
@@ -197,6 +201,7 @@
         "frontend/src/CameraSettingsDialog.tsx",
         "frontend/src/camera-draft.ts",
         "frontend/src/ScanPreparationDialog.tsx",
+        "frontend/src/ScintillatorStackFields.tsx",
         "frontend/src/TaskRecoveryDialog.tsx",
         "frontend/src/WorkstationMedia.tsx",
         "frontend/src/ReconstructionConsole.tsx",
@@ -278,8 +283,8 @@
         "backend/Cargo.toml"
       ],
       "risk": "medium",
-      "description": "Owns dependency locks, build entry points, contract tests, module-map generation, and impact analysis.",
-      "execution": "Selects deterministic local gates and builds Windows MSI installers via tools/release/build-update-release.mjs; it must not contact real hardware.",
+      "description": "Owns dependency locks, build entry points, contract tests, module-map generation, impact analysis and offline unknown-material spectral experiments.",
+      "execution": "Selects deterministic local gates, runs read-only spectral input analysis via tools/verify/infer-unknown-materials.py and builds Windows MSI installers via tools/release/build-update-release.mjs; it must not contact real hardware.",
       "gates": [
         "npm.cmd run module-map:check",
         "npm.cmd run test:sites"

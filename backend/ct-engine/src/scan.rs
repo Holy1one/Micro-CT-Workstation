@@ -46,10 +46,14 @@ pub struct ScanGeometry {
     pub rotation_direction: String,
     pub mirror_x: bool,
     pub measurement: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scintillator_layers: Vec<crate::reconstruction::spectral::StackLayer>,
 }
 
 impl ScanGeometry {
     pub fn validate(&self) -> Result<(), &'static str> {
+        crate::reconstruction::spectral::validate_layers(&self.scintillator_layers)
+            .map_err(|_| "INVALID_SCINTILLATOR_STACK")?;
         if !self.sod_mm.is_finite()
             || self.sod_mm <= 0.0
             || !self.object_to_detector_mm.is_finite()
@@ -525,22 +529,22 @@ struct ScanManifest<'a> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredScanManifest {
+pub(crate) struct StoredScanManifest {
     schema_version: u32,
     #[serde(default)]
     capture_profile: Option<CaptureProfile>,
     #[serde(default)]
     max_xray_sec: Option<u32>,
-    scan_id: String,
+    pub(crate) scan_id: String,
     completed: bool,
     voltage_kv: f64,
     current_ua: f64,
-    projection_count: u32,
-    exposure_ms: f64,
-    geometry: ScanGeometry,
-    references: ReferenceFrames,
+    pub(crate) projection_count: u32,
+    pub(crate) exposure_ms: f64,
+    pub(crate) geometry: ScanGeometry,
+    pub(crate) references: ReferenceFrames,
     stage: String,
-    frames: Vec<RealFrame>,
+    pub(crate) frames: Vec<RealFrame>,
 }
 
 /// Only the completion bit is needed for command gating. Unknown manifest
@@ -2639,6 +2643,18 @@ fn io_error(error: std::io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scintillator_layers_round_trip_with_geometry_and_legacy_geometry_stays_readable() {
+        let legacy=serde_json::json!({"sodMm":40.0,"objectToDetectorMm":25.0,"detectorWidthMm":40.0,
+            "centerOffsetXMm":0.0,"centerOffsetYMm":0.0,"rotationDirection":"counterclockwise","mirrorX":false,"measurement":"measured"});
+        let mut geometry:ScanGeometry=serde_json::from_value(legacy.clone()).unwrap();
+        assert!(geometry.scintillator_layers.is_empty());assert_eq!(serde_json::to_value(&geometry).unwrap(),legacy);
+        geometry.scintillator_layers=vec![crate::reconstruction::spectral::StackLayer{material_name:"scintillator glass".into(),emission_color:"green".into(),thickness_mm:1.},
+            crate::reconstruction::spectral::StackLayer{material_name:"scintillator glass".into(),emission_color:"blue".into(),thickness_mm:3.}];
+        geometry.validate().unwrap();
+        let frozen:ScanGeometry=serde_json::from_value(serde_json::to_value(&geometry).unwrap()).unwrap();assert_eq!(frozen,geometry);
+        geometry.scintillator_layers[1].thickness_mm=0.;assert_eq!(geometry.validate(),Err("INVALID_SCINTILLATOR_STACK"));
+    }
     use super::*;
     use crate::devices::turntable::{LineTransport, EXPECTED_DEVICE};
     use std::collections::VecDeque;
@@ -2712,6 +2728,7 @@ mod tests {
                 rotation_direction: "clockwise".into(),
                 mirror_x: false,
                 measurement: "measured".into(),
+                scintillator_layers:vec![],
             },
         };
         let mut committed = Vec::new();
@@ -2873,6 +2890,7 @@ mod tests {
                 rotation_direction: "counterclockwise".into(),
                 mirror_x: false,
                 measurement: "measured".into(),
+                scintillator_layers:vec![],
             },
             resume: None,
         };
@@ -3138,6 +3156,7 @@ mod tests {
                 rotation_direction: "counterclockwise".into(),
                 mirror_x: false,
                 measurement: "measured".into(),
+                scintillator_layers:vec![],
             },
             resume: None,
         }

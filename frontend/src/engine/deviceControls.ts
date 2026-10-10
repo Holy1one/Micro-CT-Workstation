@@ -313,6 +313,8 @@ export const FAILURE_ADVICE: Record<string, FailureAdvice> = {
   PREFLIGHT_REQUIRED: { action: "Preflight has not passed for the current settings. Run Task → Scan Preparation / Preflight, resolve every readiness item, then retry.", group: "readiness" },
   SCAN_PREPARATION_REQUIRED: { action: "No prepared geometry exists yet. Complete Scan Preparation, then run Preflight.", group: "readiness" },
   INVALID_SCAN_GEOMETRY: { action: "Geometry must be finite and positive, measured, counterclockwise, with a valid mirror flag. Correct the fields in Scan Preparation.", group: "readiness" },
+  INVALID_SCINTILLATOR_STACK: { action: "Complete up to five scintillator layers in incident order, including material, emission colour and thickness in mm.", group: "readiness" },
+  INVALID_RECONSTRUCTION_OPTIONS: { action: "Select monochrome or multicolor reconstruction. Material calibration requires multicolor mode; automatic colour processing currently uses FDK.", group: "readiness" },
   INVALID_SCAN_PREPARATION: { action: "The prepare payload did not match the required structure. Close and reopen Scan Preparation so the draft is rebuilt from the current contract.", group: "readiness" },
   SCAN_GEOMETRY_REQUIRED: { action: "The engine still needs confirmed geometry or a pending scan prompt is unanswered. Answer the prompt or complete Scan Preparation.", group: "readiness" },
   SCAN_OUTPUT_EXISTS_USE_NEW_TASK: { action: "The task directory already contains output. Choose a new task ID; existing files are never overwritten.", group: "files" },

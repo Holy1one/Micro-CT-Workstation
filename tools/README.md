@@ -2,8 +2,8 @@
 
 - build/：前端资源暂存、Sites 构建组织、引擎副本与固定固件构建。
 - release/：Windows MSI 发行、身份检查、许可证、签名与不可变版本账本。
-- verify/：结构化模块检查、图谱生成、影响分析。
-- lib/：工具共用路径与发行版本校验。
+- verify/：结构化模块检查、图谱生成、影响分析，以及只读扫描输入的离线材料推断实验。
+- lib/：工具共用路径、发行版本校验和离线谱积分/双基匹配计算。
 
 build/run-tauri.mjs 为桌面开发、构建与发行统一设置 backend/src-tauri/ 和仓库根 npm 钩子路径；Cargo 调用显式使用 backend/Cargo.toml，编译产物继续进入根 .cache/cargo/。
 
@@ -12,3 +12,5 @@ build/prepare-windows-icons.py 使用 Pillow 从保留的透明母版重建 Wind
 这些源码是构建或自动约束的必要输入，继续进入 Git。纯测试辅助程序归 tests/，按用户要求本机保留而不跟踪。工具均离线编排，不连接设备、不上传、不自动发布。签名密钥保持既有受保护用户目录，公钥和版本账本继续跟踪。
 
 release/prepare-installer-ui.mjs 使用既有 MSVC/Windows SDK 构建 windows-folder-picker.cpp，并暂存到 backend/src-tauri/gen/。MSI 即时 UI 动作仅选择目录、写入安装会话属性；Windows Shell 提供随 DPI 缩放的目录图标。build/prepare-installer-images.py 仅用于维护安装器品牌 BMP，不参与常规构建。
+
+verify/infer-unknown-materials.py 使用 Method 的材料库、NIST 元素系数和源谱，对封存的双色投影计算未知厚度候选与 Al–Cu 基坐标；lib/material_inference.py 提供边缘感知插值、谱积分、非负基反演和候选轨迹拟合。需要 NumPy/SciPy/Matplotlib；可使用本机已有 pytorch311 环境，常规应用构建不依赖 Python。来源哈希、结果与失败诊断归 `.cache/tests/ct-engine/<run-id>/`，算法假设不得冒充生产标定。运行契约见 `docs/decisions/stacked-scintillator-material-imaging.md`。

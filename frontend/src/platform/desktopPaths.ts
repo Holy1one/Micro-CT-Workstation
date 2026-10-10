@@ -38,6 +38,25 @@ export async function chooseImageDirectory(currentPath: string): Promise<string 
   return typeof selection === "string" ? selection : null;
 }
 
+/** Selects the original completed scan folder; cancellation preserves selection. */
+export async function chooseScanProjectDirectory(currentPath: string): Promise<string | null> {
+  if (!isDesktopRuntime()) throw new Error("Opening a scan project requires the desktop application");
+  const selection = await open({
+    directory: true,
+    multiple: false,
+    defaultPath: currentPath.trim() || undefined,
+    title: "Open Scan Project · select the folder containing manifest.json",
+  });
+  return typeof selection === "string" ? selection : null;
+}
+
+/** Selects measured detector/material calibration; the engine validates its contents. */
+export async function chooseMaterialCalibration(): Promise<string | null> {
+  if (!isDesktopRuntime()) throw new Error("Material calibration requires the desktop application");
+  const selection=await open({multiple:false,title:"Select measured material calibration",filters:[{name:"Calibration JSON",extensions:["json"]}]});
+  return typeof selection === "string" ? selection : null;
+}
+
 /** Reveals an existing directory in Windows Explorer. */
 export async function revealDirectory(path: string): Promise<string> {
   if (!isDesktopRuntime()) {

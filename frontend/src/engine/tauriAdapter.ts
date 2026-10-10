@@ -5,7 +5,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { CameraProperty, EngineAdapter, EngineCommand, EngineSnapshot } from "./types";
+import type { CameraProperty, DeviceOperation, EngineAdapter, EngineCommand, EngineSnapshot } from "./types";
 
 function validLiveControl(property: CameraProperty, key: string): boolean {
   return property?.key === key && property.code === (key === "cameraZoom" ? 0xd1a3 : 0xd061)
@@ -23,12 +23,22 @@ function validLiveControl(property: CameraProperty, key: string): boolean {
     && (!property.supported || (key === "cameraZoom" ? property.dataType >= 1 && property.dataType <= 8 : property.dataType === 2));
 }
 
+function validOperationProgress(progress: DeviceOperation["progress"]): boolean {
+  if (progress === undefined) return true;
+  return Boolean(progress && [progress.processedBytes, progress.totalBytes, progress.verifiedFiles, progress.totalFiles, progress.percent]
+    .every(value => Number.isSafeInteger(value) && value >= 0)
+    && progress.percent <= 100 && progress.verifiedFiles <= progress.totalFiles
+    && (progress.estimatedRemainingSec === null || Number.isSafeInteger(progress.estimatedRemainingSec) && progress.estimatedRemainingSec >= 0));
+}
+
 function assertSnapshot(snapshot: EngineSnapshot): EngineSnapshot {
   if (!snapshot.engineSessionId || !Number.isSafeInteger(snapshot.snapshotSequence) || snapshot.snapshotSequence < 0
     || !(snapshot.operationId === null || typeof snapshot.operationId === "string") || !Array.isArray(snapshot.operations)
     || snapshot.operations.some(op => !op.operationId || !op.deviceSessionId || typeof op.cancelRequested !== "boolean"
       || typeof op.device !== "string" || typeof op.kind !== "string" || typeof op.stage !== "string"
       || typeof op.startedAt !== "string" || typeof op.updatedAt !== "string" || !(op.error === null || typeof op.error === "string")
+      || !validOperationProgress(op.progress)
+      || op.progress?.percent === 100 && op.status !== "completed"
       || !["queued", "running", "cancelling", "completed", "cancelled", "failed", "cleanup_unconfirmed", "rejected"].includes(op.status))
     || !snapshot.deviceControls || typeof snapshot.deviceControls.taskLock?.locked !== "boolean"
     || !Array.isArray(snapshot.deviceControls.presets?.presets) || snapshot.deviceControls.presets.schemaVersion !== 1

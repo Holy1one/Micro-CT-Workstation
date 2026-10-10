@@ -804,11 +804,9 @@ async fn reconstruction_preview(
     if !matches!(method.as_str(), "fdk" | "sirt" | "cgls") {
         return Err("Unknown reconstruction method".into());
     }
-    let snapshot = {
-        let client = state.0.lock().map_err(|_| "Engine client unavailable")?
-            .as_ref().cloned().ok_or("ct-engine is still starting")?;
-        client.request("snapshot", serde_json::json!({}))?
-    };
+    let client = state.0.lock().map_err(|_| "Engine client unavailable")?
+        .as_ref().cloned().ok_or("ct-engine is still starting")?;
+    let snapshot = client.request("snapshot", serde_json::json!({}))?;
     let workstation = snapshot.get("workstation").ok_or("Workstation snapshot missing")?;
     let reconstruction = workstation.get("reconstruction").ok_or("Reconstruction state missing")?;
     if reconstruction.get("unlocked").and_then(Value::as_bool) != Some(true)
@@ -827,6 +825,18 @@ async fn reconstruction_preview(
     if !cache_dir.starts_with(&output_root) || cache_dir == output_root {
         return Err("Reconstruction cache is outside the scan output".into());
     }
+    let preview = tauri::async_runtime::spawn_blocking(move || read_reconstruction_preview(&cache_dir))
+        .await.map_err(|error|error.to_string())??;
+    let current=client.request("snapshot",serde_json::json!({}))?;
+    if state.1.load(Ordering::SeqCst) || snapshot.get("engineSessionId")!=current.get("engineSessionId")
+        || current.pointer("/workstation/reconstruction/status").and_then(Value::as_str)!=Some("completed")
+        || current.pointer("/workstation/reconstruction/cachePath").and_then(Value::as_str)!=Some(path) {
+        return Err("Reconstruction preview became stale during read".into());
+    }
+    Ok(preview)
+}
+
+fn read_reconstruction_preview(cache_dir:&std::path::Path)->Result<Value,String> {
     let metadata_path = std::fs::canonicalize(cache_dir.join("preview.json"))
         .map_err(|error| format!("Preview metadata unavailable: {error}"))?;
     let volume_path = std::fs::canonicalize(cache_dir.join("preview.bin"))
@@ -866,13 +876,53 @@ async fn reconstruction_preview(
     if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
         return Err("Preview volume checksum changed".into());
     }
-    Ok(serde_json::json!({
+    let mut preview=serde_json::json!({
         "shape": shape,
         "spacingMm": spacing,
         "windowMin": window_min,
         "windowMax": window_max,
         "voxels": bytes,
-    }))
+    });
+    let seal:Value=serde_json::from_slice(&std::fs::read(cache_dir.join("result.json")).map_err(|e|e.to_string())?)
+        .map_err(|e|e.to_string())?;
+    if seal["previewSha256"].as_str()!=Some(expected_hash) || seal["previewShape"]!=metadata["shape"] {
+        return Err("Preview does not match the sealed result".into());
+    }
+    if let Some(expected)=seal["spectralSha256"].as_str() {
+        let read=|name:&str|->Result<Vec<u8>,String> {
+            let path=std::fs::canonicalize(cache_dir.join(name)).map_err(|e|e.to_string())?;
+            if !path.starts_with(cache_dir) {return Err("Colour preview escaped its cache directory".into());}
+            std::fs::read(path).map_err(|e|e.to_string())
+        };
+        let report_bytes=read("spectral.json")?;
+        if format!("{:x}",Sha256::digest(&report_bytes))!=expected {return Err("Spectral result checksum changed".into());}
+        let report:Value=serde_json::from_slice(&report_bytes).map_err(|e|e.to_string())?;
+        preview["mode"]=report["options"]["mode"].clone();
+        preview["selectedBand"]=report["selectedBand"].clone();
+        if report["options"]["mode"]=="multicolor" {
+            let checked=|name:&str|->Result<Vec<u8>,String> {
+                let bytes=read(name)?;
+                let expected=report["artifacts"].as_array().ok_or("Colour artifact list missing")?
+                    .iter().find(|item|item["path"]==name).and_then(|item|item["sha256"].as_str())
+                    .ok_or("Colour artifact checksum missing")?;
+                if format!("{:x}",Sha256::digest(&bytes))!=expected {return Err("Colour artifact checksum changed".into());}
+                Ok(bytes)
+            };
+            let color_meta:Value=serde_json::from_slice(&checked("multicolor-preview.json")?).map_err(|e|e.to_string())?;
+            let colors=checked("multicolor-preview.bin")?;
+            if color_meta["shape"]!=metadata["shape"] || color_meta["components"]!=3
+                || colors.len()!=voxel_count*3 || color_meta["sha256"].as_str()!=Some(format!("{:x}",Sha256::digest(&colors)).as_str()) {
+                return Err("Colour preview shape or checksum invalid".into());
+            }
+            if !color_meta["materialLabels"].is_boolean() || color_meta["materialLabels"]!=report["quantitativeMaterials"] {
+                return Err("Colour material labels disagree with the sealed calibration status".into());
+            }
+            preview["colors"]=serde_json::json!(colors);
+            preview["colorLegend"]=color_meta.get("legend").unwrap_or(&color_meta["channels"]).clone();
+            preview["materialLabels"]=color_meta["materialLabels"].clone();
+        }
+    }
+    Ok(preview)
 }
 
 fn embedded_jpeg(nef: &[u8]) -> Option<Vec<u8>> {
@@ -903,6 +953,44 @@ fn embedded_jpeg(nef: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
+    #[test]
+    fn colour_preview_verifies_the_seal_and_rejects_corrupted_or_missing_artifacts() {
+        use sha2::{Digest,Sha256};use serde_json::json;
+        let root=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/desktop")
+            .join(format!("{}-colour-preview",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();let root=root.canonicalize().unwrap();
+        let gray=vec![10u8;8];let colors=vec![20u8;24];
+        let hash=|bytes:&[u8]|format!("{:x}",Sha256::digest(bytes));
+        let write=|name:&str,value:&serde_json::Value|std::fs::write(root.join(name),serde_json::to_vec(value).unwrap()).unwrap();
+        std::fs::write(root.join("preview.bin"),&gray).unwrap();
+        write("preview.json",&json!({"shape":[2,2,2],"spacingMm":[1,1,1],"windowMin":0,"windowMax":1,"sha256":hash(&gray)}));
+        let mut seal=json!({"previewShape":[2,2,2],"previewSha256":hash(&gray)});
+        write("result.json",&seal);
+        assert!(super::read_reconstruction_preview(&root).unwrap().get("colors").is_none());
+        std::fs::write(root.join("multicolor-preview.bin"),&colors).unwrap();
+        write("multicolor-preview.json",&json!({"shape":[2,2,2],"components":3,"sha256":hash(&colors),"channels":["green","blue"],"materialLabels":false}));
+        write("spectral.json",&json!({"options":{"mode":"multicolor"},"selectedBand":"green","quantitativeMaterials":false,"artifacts":[
+            {"path":"multicolor-preview.bin","sha256":hash(&colors)},
+            {"path":"multicolor-preview.json","sha256":hash(&std::fs::read(root.join("multicolor-preview.json")).unwrap())}]}));
+        seal["spectralSha256"]=json!(hash(&std::fs::read(root.join("spectral.json")).unwrap()));write("result.json",&seal);
+        let preview=super::read_reconstruction_preview(&root).unwrap();
+        assert_eq!(preview["colors"].as_array().unwrap().len(),24);assert_eq!(preview["materialLabels"],false);
+        std::fs::write(root.join("multicolor-preview.bin"),[1u8;24]).unwrap();
+        assert!(super::read_reconstruction_preview(&root).unwrap_err().contains("checksum"));
+        std::fs::remove_file(root.join("multicolor-preview.bin")).unwrap();
+        assert!(super::read_reconstruction_preview(&root).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn task4_completed_colour_preview_reads_registered_artifacts_offline() {
+        let root=std::path::PathBuf::from(std::env::var("CT_PREVIEW_CACHE").expect("CT_PREVIEW_CACHE")).canonicalize().unwrap();
+        let preview=super::read_reconstruction_preview(&root).unwrap();
+        assert_eq!(preview["mode"],"multicolor");assert_eq!(preview["materialLabels"],false);
+        assert_eq!(preview["colors"].as_array().unwrap().len(),128usize.pow(3)*3);
+        println!("PASS monochrome and RGB preview hashes, shape and qualitative labels");
+    }
+
     #[tokio::test]
     async fn startup_read_waits_until_bootstrap_settles_instead_of_reporting_a_transport_fault() {
         use super::*;

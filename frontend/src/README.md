@@ -4,6 +4,8 @@
 
 ## Top-level files
 
+`ScintillatorStackFields.tsx` adds a five-row incident-ordered detector stack to Scan Preparation; `scan-input.ts` rejects partial rows and counts only complete rows. `ReconstructionConsole.tsx` offers manual Monochrome/Multicolor and optional measured material calibration, with automatic band processing in the engine. `scene/ReconstructionPreview.tsx` preserves the slice/3D layout and optionally displays validated RGB/legend data; uncalibrated colour responses carry no material labels. Native calibration selection stays in `platform/desktopPaths.ts`. See [strategy](../../docs/decisions/stacked-scintillator-material-imaging.md).
+
 - `main.tsx`: mounts React and imports the global stylesheet.
 - `App.tsx`: composes the workstation panels, menus, controls, dialogs, logs, and image area.
 - `CameraPanel.tsx` / `TurntablePanel.tsx`: permanent independent device connections
@@ -23,6 +25,9 @@
   available; late reads cannot reopen a closed display.
 - `ReconstructionConsole.tsx`: compact algorithm controls; real progress/events
   enter the engine log aggregation instead of a second local event list.
+  Project loading displays engine byte/file validation progress and rounds the
+  measured ETA up to ten seconds; at ten seconds or less it shows Finishing soon.
+  Unknown totals, cancellation and stale transport never invent a countdown.
 - `UpdateDialog.tsx`: signed online/offline release state and explicit installation
   confirmation. Package transport/verification belongs to the desktop host; device
   maintenance authority belongs to the engine.
@@ -33,7 +38,7 @@
   consumes the same single advice table as the banner, so the two cannot drift.
 - `DeviceConsoles.tsx`: auxiliary isolated-turntable bench confirmation dialog;
   it does not create a second camera draft or independent device owner.
-  The 39px title bar, 209.375px aligned bottom panels and 12px gaps share the
+  The 39px title bar, 251.25px aligned bottom panels and 12px gaps share the
   client-filling grid. Only overlays and the log/image console scroll.
 - `tokens.css`: semantic color and state tokens for light/dark and safety states.
 - `styles.css`: workstation layout and component styling.

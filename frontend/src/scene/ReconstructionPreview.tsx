@@ -8,6 +8,11 @@ export interface PreviewVolume {
   windowMin: number;
   windowMax: number;
   voxels: number[];
+  colors?: number[];
+  colorLegend?: string[];
+  materialLabels?: boolean;
+  mode?: "monochrome" | "multicolor";
+  selectedBand?: "red" | "green" | "blue";
 }
 
 type Axis = "z" | "y" | "x";
@@ -35,16 +40,19 @@ function Slice({ volume, axis, position, onPosition }: {
     const pixels = context.createImageData(width, height);
     for (let row = 0; row < height; row += 1) {
       for (let column = 0; column < width; column += 1) {
-        const value = axis === "z"
-          ? voxel(volume, index, ySize - 1 - row, column)
+        const coordinates = axis === "z"
+          ? [index, ySize - 1 - row, column]
           : axis === "y"
-            ? voxel(volume, zSize - 1 - row, index, column)
-            : voxel(volume, zSize - 1 - row, ySize - 1 - column, index);
+            ? [zSize - 1 - row, index, column]
+            : [zSize - 1 - row, ySize - 1 - column, index];
+        const [z,y,x]=coordinates;
+        const value=voxel(volume,z,y,x);
+        const colorOffset=((z*ySize+y)*xSize+x)*3;
         const intensity = Math.round(Math.max(0, Math.min(255, value)));
         const offset = (row * width + column) * 4;
-        pixels.data[offset] = intensity;
-        pixels.data[offset + 1] = intensity;
-        pixels.data[offset + 2] = intensity;
+        pixels.data[offset] = volume.colors?.[colorOffset] ?? intensity;
+        pixels.data[offset + 1] = volume.colors?.[colorOffset+1] ?? intensity;
+        pixels.data[offset + 2] = volume.colors?.[colorOffset+2] ?? intensity;
         pixels.data[offset + 3] = 255;
       }
     }
@@ -92,7 +100,7 @@ void main(){vec2 p=vec2(gl_VertexID==1?3.0:-1.0,gl_VertexID==2?3.0:-1.0);gl_Posi
 // from controls so the scene never observes or changes acquisition state.
 const volumeFragment = `#version 300 es
 precision highp float;precision highp sampler3D;out vec4 color;
-uniform sampler3D volume;uniform float yaw,pitch,span,aspect;uniform vec2 viewport;uniform int mode;
+uniform sampler3D volume;uniform float yaw,pitch,span,aspect;uniform vec2 viewport;uniform int mode,colored;
 void main(){
   vec3 look=normalize(vec3(sin(yaw)*cos(pitch),-cos(yaw)*cos(pitch),sin(pitch)));
   vec3 right=normalize(vec3(cos(yaw),sin(yaw),0.));vec3 up=normalize(cross(look,right));
@@ -105,15 +113,17 @@ void main(){
   float stop=min(min(farSide.x,farSide.y),farSide.z);
   vec3 background=vec3(.025,.055,.087);
   if(stop<t){color=vec4(background,1.);return;}
-  float peak=0.,opacity=0.;vec3 accum=vec3(0.);
+  float peak=0.,opacity=0.;vec3 accum=vec3(0.),peakTone=vec3(0.);
   for(int i=0;i<340;i++){
     if(t>stop||opacity>.985)break;
-    float value=texture(volume,origin+ray*t+vec3(.5)).r;
-    peak=max(peak,value);
-    if(mode==1){float a=smoothstep(.16,.70,value)*.048;vec3 tone=vec3(value*.73,value*.89,value);accum+=(1.-opacity)*a*tone;opacity+=(1.-opacity)*a;}
+    vec4 sampleValue=texture(volume,origin+ray*t+vec3(.5));
+    float value=colored==1?sampleValue.a:sampleValue.r;
+    vec3 tone=colored==1?sampleValue.rgb:vec3(value*.73,value*.89,value);
+    if(value>peak){peak=value;peakTone=colored==1?sampleValue.rgb:vec3(value);}
+    if(mode==1){float a=smoothstep(.16,.70,value)*.048;accum+=(1.-opacity)*a*tone;opacity+=(1.-opacity)*a;}
     t+=1./184.;
   }
-  color=mode==0?vec4(background*(1.-smoothstep(.03,.40,peak))+vec3(peak),1.):vec4(accum+background*(1.-opacity),1.);
+  color=mode==0?vec4(background*(1.-smoothstep(.03,.40,peak))+peakTone,1.):vec4(accum+background*(1.-opacity),1.);
 }`;
 
 function VolumeView({ volume, mode, resetRevision, onVolumeAvailable }: { volume: PreviewVolume; mode: "mip" | "opacity"; resetRevision: number; onVolumeAvailable: (available: boolean) => void }) {
@@ -138,20 +148,7 @@ function VolumeView({ volume, mode, resetRevision, onVolumeAvailable }: { volume
     onVolumeAvailable(false);
     const gl = element.getContext("webgl2", { alpha: false, antialias: false, depth: false });
     if (!gl) {
-      const context = element.getContext("2d", { alpha: false });
-      if (context) {
-        const [z, y, x] = volume.shape;
-        element.width = x; element.height = y;
-        const pixels = context.createImageData(x, y);
-        for (let row = 0; row < y; row += 1) for (let column = 0; column < x; column += 1) {
-          let peak = 0;
-          for (let slice = 0; slice < z; slice += 1) peak = Math.max(peak, voxel(volume, slice, y - 1 - row, column));
-          const offset = (row * x + column) * 4;
-          pixels.data[offset] = peak; pixels.data[offset + 1] = peak; pixels.data[offset + 2] = peak; pixels.data[offset + 3] = 255;
-        }
-        context.putImageData(pixels, 0, 0);
-      }
-      setError("WebGL2 unavailable · static MIP");
+      setError("WebGL2 unavailable · 3D rendering is disabled");
       return;
     }
     let program: WebGLProgram | null = null;
@@ -173,7 +170,10 @@ function VolumeView({ volume, mode, resetRevision, onVolumeAvailable }: { volume
       gl.deleteShader(vs); gl.deleteShader(fs);
       if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) || "Render program linking failed");
       const [z, y, x] = volume.shape;
-      const bytes = Uint8Array.from(volume.voxels);
+      const bytes = volume.colors ? new Uint8Array(volume.voxels.length*4) : Uint8Array.from(volume.voxels);
+      if (volume.colors) for (let i=0;i<volume.voxels.length;i++) {
+        bytes[i*4]=volume.colors[i*3];bytes[i*4+1]=volume.colors[i*3+1];bytes[i*4+2]=volume.colors[i*3+2];bytes[i*4+3]=volume.voxels[i];
+      }
       texture = gl.createTexture();
       if (!texture) throw new Error("Volume texture creation failed");
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, texture);
@@ -181,10 +181,11 @@ function VolumeView({ volume, mode, resetRevision, onVolumeAvailable }: { volume
       gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       for (const wrap of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, wrap, gl.CLAMP_TO_EDGE);
-      gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, x, y, z, 0, gl.RED, gl.UNSIGNED_BYTE, bytes);
+      gl.texImage3D(gl.TEXTURE_3D, 0, volume.colors ? gl.RGBA8 : gl.R8, x, y, z, 0, volume.colors ? gl.RGBA : gl.RED, gl.UNSIGNED_BYTE, bytes);
       if (gl.getError() !== gl.NO_ERROR) throw new Error("Volume texture upload failed");
       gl.useProgram(program);
       gl.uniform1i(gl.getUniformLocation(program, "volume"), 0);
+      gl.uniform1i(gl.getUniformLocation(program, "colored"), volume.colors ? 1 : 0);
       const activeProgram = program;
       const draw = () => {
         frame = 0;
@@ -237,7 +238,7 @@ function VolumeView({ volume, mode, resetRevision, onVolumeAvailable }: { volume
       }} onPointerUp={() => { pose.current.dragging = false; }} onPointerCancel={() => { pose.current.dragging = false; }} onWheel={(event) => { event.preventDefault(); pose.current.span = Math.max(.55, Math.min(2.7, pose.current.span * Math.exp(event.deltaY * .001))); renderer.current?.(); }} onDoubleClick={() => { pose.current.yaw = .55; pose.current.pitch = .35; pose.current.span = 1.15; renderer.current?.(); }} />
       {error && <div className="recon-volume-error" role="status">{englishDisplayText(error)}</div>}
     </div>
-    <div className="recon-volume-tools"><span title="Entire reconstructed volume is shown; no coverage-mask clipping. Low-signal, low-gain and partially covered regions may contain artifacts and are not quantitative. Signed values and coverage diagnostics are saved separately.">WINDOW {volume.windowMin.toFixed(2)}–{volume.windowMax.toFixed(2)} · NOT HU · FULL VOLUME</span></div>
+    <div className="recon-volume-tools"><span title="Entire reconstructed volume is shown; no coverage-mask clipping. Low-signal, low-gain and partially covered regions may contain artifacts and are not quantitative. Signed values and coverage diagnostics are saved separately.">{volume.colors ? `${volume.colorLegend?.map(englishDisplayText).join(" / ")} · ${volume.materialLabels ? "CALIBRATED BASIS" : "MATERIALS UNVERIFIED"}` : `WINDOW ${volume.windowMin.toFixed(2)}–${volume.windowMax.toFixed(2)} · NOT HU · FULL VOLUME`}</span></div>
   </section>;
 }
 

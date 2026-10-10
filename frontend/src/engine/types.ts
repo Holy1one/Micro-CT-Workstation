@@ -55,6 +55,17 @@ export interface ScanProgress {
 }
 
 /** Geometry is recorded with the acquisition, not inferred from the 3D view. */
+export interface ScintillatorLayer {
+  materialName: string;
+  emissionColor: "red" | "green" | "blue" | "yellow" | "other";
+  thicknessMm: number;
+}
+export interface ReconstructionOptions {
+  mode: "monochrome" | "multicolor";
+  /** Omission selects a band from measured reference reliability. */
+  band?: "red" | "green" | "blue";
+  materialCalibrationPath?: string;
+}
 export interface ReconstructionGeometry {
   sodMm: number;
   objectToDetectorMm: number;
@@ -64,6 +75,8 @@ export interface ReconstructionGeometry {
   rotationDirection: "clockwise" | "counterclockwise";
   mirrorX: boolean;
   measurement: "measured" | "estimated";
+  /** Incident X-ray side first; omitted on legacy scans. */
+  scintillatorLayers?: ScintillatorLayer[];
 }
 
 export type ScanPromptStage = "geometry" | "preReferences" | "placeSample";
@@ -200,6 +213,7 @@ export interface SoftwareUpdatePreparation {
 }
 
 export type EngineCommand =
+  | { type: "open_scan_project"; path: string }
   | ({ type: "prepare_scan" } & ScanPreparation)
   | { type: "set_capture_root"; savePath: string }
   | { type: "camera_capture_descriptor"; captureId: string }
@@ -227,7 +241,7 @@ export type EngineCommand =
   | { type: "start_scan" }
   | { type: "confirm_scan_stage"; stage: ScanPromptStage; geometry?: ReconstructionGeometry }
   | { type: "cancel_scan_stage"; stage: ScanPromptStage }
-  | { type: "start_reconstruction"; method: ReconstructionMethodId }
+  | { type: "start_reconstruction"; method: ReconstructionMethodId; options?: ReconstructionOptions }
   | { type: "pause" }
   | { type: "resume" }
   | { type: "restore_previous" }
@@ -331,6 +345,10 @@ export interface DeviceOperation {
   operationId: string; deviceSessionId: string; device: string; kind: string; stage: string;
   cancelRequested: boolean; status: "queued" | "running" | "cancelling" | "completed" | "cancelled" | "failed" | "cleanup_unconfirmed" | "rejected";
   error: string | null; startedAt: string; updatedAt: string;
+  progress?: {
+    processedBytes: number; totalBytes: number; verifiedFiles: number; totalFiles: number;
+    percent: number; estimatedRemainingSec: number | null;
+  };
 }
 /** One record in `DeviceControls.taskLock.retained` (engine `TaskRecord`, camelCase). */
 export interface RetainedTaskRecord {

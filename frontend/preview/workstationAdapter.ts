@@ -8,6 +8,7 @@
 import { FIRMWARE_VERSION, LINK_LABEL } from "./rts9060/protocol";
 import { PreviewDeviceControls } from "./rts9060/deviceControls";
 import { shutterExposureMs } from "../src/engine/deviceControls";
+import { parseLayerDrafts } from "../src/scan-input";
 import { ScanWorkflow, type ConsoleLogEntry, type WorkflowPhase } from "./rts9060/workflow";
 import type {
   ConsoleDataState,
@@ -107,6 +108,7 @@ export class WorkstationAdapter implements EngineAdapter {
     if(command.type==="home"&&this.nativeControls.snapshot().taskLock.locked&&!this.restoreAuthorized)throw new Error("UNFINISHED_TASK_LOCKED");
     if (/^(camera_|turntable_|preset_|abandon_scan)/.test(command.type) && command.type!=="camera_capture_descriptor" && await this.nativeControls.dispatch(command)) return this.buildSnapshot();
     switch (command.type) {
+      case "open_scan_project": throw new Error("Opening a scan project requires the desktop application");
       case "set_capture_root": {
         this.requirePreparationAccess();
         if (!/^(?:[a-z]:[\\/]|[\\/])/i.test(command.savePath.trim()) || command.savePath.includes("\0")) throw new Error("INVALID_CAPTURE_ROOT");
@@ -333,7 +335,8 @@ export class WorkstationAdapter implements EngineAdapter {
       || value.rotationDirection !== "counterclockwise"
       || value.measurement !== "measured"
       || typeof value.mirrorX !== "boolean") throw new Error("Invalid reconstruction geometry");
-    return { ...value };
+    if (value.scintillatorLayers?.length && !parseLayerDrafts(true,value.scintillatorLayers.map(layer=>({materialName:layer.materialName,emissionColor:layer.emissionColor,thicknessMm:String(layer.thicknessMm)})))) throw new Error("INVALID_SCINTILLATOR_STACK");
+    return { ...value, ...(value.scintillatorLayers ? {scintillatorLayers:value.scintillatorLayers.map(layer=>({...layer}))} : {}) };
   }
 
   private async simulateReferences(): Promise<void> {

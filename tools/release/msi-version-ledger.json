@@ -81,6 +81,30 @@
     {
       "appVersion": "0.9.21",
       "productVersion": "0.9.21"
+    },
+    {
+      "appVersion": "0.9.22",
+      "productVersion": "0.9.22"
+    },
+    {
+      "appVersion": "0.9.23",
+      "productVersion": "0.9.23"
+    },
+    {
+      "appVersion": "0.9.24",
+      "productVersion": "0.9.24"
+    },
+    {
+      "appVersion": "0.9.25",
+      "productVersion": "0.9.25"
+    },
+    {
+      "appVersion": "0.9.26",
+      "productVersion": "0.9.26"
+    },
+    {
+      "appVersion": "0.9.27",
+      "productVersion": "0.9.27"
     }
   ]
 }

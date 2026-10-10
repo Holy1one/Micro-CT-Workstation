@@ -2,6 +2,7 @@
 //! No device access; measured references define noise and fixed screen support.
 use super::*;
 
+#[derive(Clone)]
 pub(super) struct ReferenceStats { pub mean: Vec<f32>, pub variance: Vec<f32> }
 
 pub(super) fn references(scan: &Path, frames: &[ReferenceFrame], map: &ScreenMap,
@@ -92,7 +93,7 @@ fn normalized_smooth(input:&[f32],weights:&[f32],n:usize)->Vec<f32> {
     convolve(&weighted).iter().zip(convolve(weights)).map(|(a,w)|if w>1e-6 {a/w}else{0.}).collect()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all="camelCase")]
 pub(super) struct AxisEstimate {
     pub recorded_offset_mm:f64,pub applied_offset_mm:f64,pub candidate_offset_mm:f64,
@@ -150,6 +151,77 @@ pub(super) fn estimate_axis(stack:&[f32],angles:&[f64],pitch:f64,sdd:f64,u0:f64,
     result
 }
 
+/// New versioned pipeline only. Expand a boundary optimum, retain a fixed
+/// common geometric ray set within each stage, and require held-angle evidence.
+/// The archived five-schema pipeline above retains its numerical contract.
+pub(super) fn estimate_axis_extended(stack:&[f32],angles:&[f64],pitch:f64,sdd:f64,u0:f64,v0:f64)->AxisEstimate {
+    let mut fallback=estimate_axis(&[],&[],pitch,sdd,u0,v0);
+    let n=DETECTOR_N;let count=angles.len();let half=(n-1) as f64/2.;
+    if count<60 || stack.len()!=count*n*n || !pitch.is_finite() || pitch<=0. || sdd<=0. {
+        return fallback;
+    }
+    let step=angles[1]-angles[0];
+    if !step.is_finite() || step.abs()<1e-9
+        || (step.abs()*count as f64-2.*PI).abs()>1e-4
+        || angles.windows(2).any(|a|(a[1]-a[0]-step).abs()>1e-7) {
+        fallback.reason="axis estimation requires uniform complete circular angular coverage".into();
+        return fallback;
+    }
+    let row=half+v0/pitch;
+    if row<1. || row>(n-2) as f64 {return fallback;}
+    let sample=|view:usize,col:f64| sample_detector(&stack[view*n*n..(view+1)*n*n],col,row) as f64;
+    for radius in [16usize,32,48] {
+        let candidates:Vec<_>=(-(radius as i32)*4..=radius as i32*4)
+            .map(|i|u0+i as f64*pitch/4.).collect();
+        let baseline=radius*4;
+        let mut errors=vec![(0f64,0f64,0usize,0usize);candidates.len()];
+        for view in 0..count {for col in n/4..n*3/4 {
+            let observed=sample(view,col as f64);
+            if !(0.05..2.5).contains(&observed) {continue;}
+            let mut matches=Vec::with_capacity(candidates.len());
+            for &du in &candidates {
+                let u=(col as f64-half)*pitch-du;
+                let counterpart=(-u+du)/pitch+half;
+                if counterpart<1. || counterpart>(n-2) as f64 {matches.clear();break;}
+                let beta=angles[view]+PI-2.*(u/sdd).atan();
+                let position=((beta-angles[0])/step).rem_euclid(count as f64);
+                let a=position.floor() as usize;let t=position-a as f64;
+                let value=sample(a,counterpart)*(1.-t)+sample((a+1)%count,counterpart)*t;
+                if !value.is_finite() {matches.clear();break;}
+                matches.push(value);
+            }
+            if matches.len()!=candidates.len() {continue;}
+            for (e,value) in errors.iter_mut().zip(matches) {
+                let residual=(value-observed).abs();
+                if view%3==2 {e.1+=residual;e.3+=1;} else {e.0+=residual;e.2+=1;}
+            }
+        }}
+        if errors[baseline].2<300 || errors[baseline].3<150 {
+            fallback.reason=format!("insufficient fixed common rays at radius {radius} pixels");
+            return fallback;
+        }
+        let scores:Vec<_>=errors.iter().map(|e|(e.0/e.2 as f64,e.1/e.3 as f64)).collect();
+        let best=(0..scores.len()).min_by(|a,b|scores[*a].0.total_cmp(&scores[*b].0)).unwrap();
+        let held=(0..scores.len()).min_by(|a,b|scores[*a].1.total_cmp(&scores[*b].1)).unwrap();
+        fallback.candidate_offset_mm=candidates[best];
+        fallback.fit_error_before=scores[baseline].0;fallback.fit_error_after=scores[best].0;
+        fallback.held_error_before=scores[baseline].1;fallback.held_error_after=scores[best].1;
+        fallback.paired_rays=errors[baseline].2+errors[baseline].3;
+        if best<4 || best+4>=scores.len() {
+            fallback.reason=format!("boundary optimum at radius {radius} pixels; recorded geometry retained");
+            continue;
+        }
+        fallback.accepted=best.abs_diff(held)<=8 && scores[best].0<scores[baseline].0*0.9
+            && scores[best].1<scores[baseline].1*0.9;
+        if fallback.accepted {
+            fallback.applied_offset_mm=candidates[best];
+            fallback.reason=format!("radius {radius} pixels, quarter-pixel grid, fixed common rays; fit and held errors improve >10%, optima agree within two pixels");
+        } else {fallback.reason=format!("held-angle confidence gate failed at radius {radius} pixels");}
+        return fallback;
+    }
+    fallback
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,7 +255,7 @@ mod tests {
         let flat=ReferenceStats {mean:vec![140.;len],variance:vec![1.;len]};
         let result=correct(&vec![120.;len],16000.,&dark,&flat,60.,1).unwrap();
         // Low gain (40 < 60) is still usable. Sample above/below the center,
-        // including radius .96 formerly erased by the .94 disk mask.
+        // including radius 0.96 formerly erased by the 0.94 disk mask.
         for row in [6,32,128,224,249] {
             let i=row*n+n/2;
             assert_eq!(result.flags[i],5);
@@ -212,6 +284,28 @@ mod tests {
             let e=estimate_axis(&stack,&angles,pitch,95.,0.,0.);
             assert!(e.accepted,"{} {}",e.reason,e.paired_rays);
             assert!((e.applied_offset_mm-true_offset).abs()<=pitch,"{}",e.applied_offset_mm);
+        }
+    }
+
+    #[test]
+    fn extended_axis_recovers_shift_beyond_the_legacy_boundary() {
+        let n=DETECTOR_N;let pitch=40./n as f64;let truth=28.*pitch;
+        for sign in [-1.,1.] {
+            let angles:Vec<_>=(0..90).map(|i|sign*i as f64*2.*PI/90.).collect();
+            let mut stack=vec![0f32;90*n*n];
+            for (view,theta) in angles.iter().enumerate() {
+                let (s,c)=theta.sin_cos();
+                for col in 0..n {
+                    let u=(col as f64-(n-1) as f64/2.)*pitch-truth;
+                    let norm=95f64.hypot(u);let dx=(-95.*s+u*c)/norm;let dy=(95.*c+u*s)/norm;
+                    let sx=70.*s-2.;let sy=-70.*c-1.;let dot=sx*dx+sy*dy;
+                    let value=0.2*(dot*dot-(sx*sx+sy*sy-36.)).max(0.).sqrt();
+                    for row in 0..n {stack[(view*n+row)*n+col]=value as f32;}
+                }
+            }
+            let e=estimate_axis_extended(&stack,&angles,pitch,95.,0.,0.);
+            assert!(e.accepted,"{}",e.reason);
+            assert!((e.applied_offset_mm-truth).abs()<=pitch);
         }
     }
 }
