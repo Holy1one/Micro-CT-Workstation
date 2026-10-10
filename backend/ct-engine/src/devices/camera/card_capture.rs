@@ -392,23 +392,27 @@ fn confirm_frozen_card_profile(
 /// can accept it, after the frozen card profile is confirmed again. Anything
 /// else is refused by the caller with the property name.
 ///
-/// The shared runtime confirmation is still written for the SDRAM destination,
-/// so a card session refuses such a notification instead of accepting it with a
-/// substituted media value; that is fail-closed and needs a destination-aware
-/// runtime check before real card capture is accepted on hardware.
+/// The card destination owns its runtime confirmation: the shared SDRAM
+/// confirmation requires `recordingMedia=1` and would therefore reject every card
+/// session. Only the advertised read-only runtime diagnostic is accepted here,
+/// through the destination-aware confirmation with the card media value, and the
+/// frozen card profile is confirmed again afterwards. Every other property change
+/// stays refused with its native code.
 fn accept_property_notification(
     camera: &mut NativeCamera,
     expected: &CameraProperties,
     event: &NikonEvent,
     context: &CallContext,
 ) -> Result<bool, CameraError> {
-    match camera.accept_runtime_notification(event.parameter, context) {
-        Ok(true) => confirm_frozen_card_profile(camera, expected, context)
-            .map(|_| true)
-            .map_err(|error| capture_event_error(camera, error.to_string())),
-        Ok(false) => Ok(false),
-        Err(error) => Err(capture_event_error(camera, error.to_string())),
+    if event.parameter != INFO_DISPLAY_ERROR_STATUS as u32 {
+        return Ok(false);
     }
+    camera
+        .confirm_runtime_diagnostic_for(context, 0)
+        .map_err(|error| capture_event_error(camera, error.to_string()))?;
+    confirm_frozen_card_profile(camera, expected, context)
+        .map(|_| true)
+        .map_err(|error| capture_event_error(camera, error.to_string()))
 }
 
 /// Records one consumed event batch in the same capture diagnostics the RAM path

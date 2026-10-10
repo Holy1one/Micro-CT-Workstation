@@ -1016,20 +1016,32 @@ impl NativeCamera {
     /// Validate transport evidence only. No raw value has established clear or
     /// fault semantics, and this status cannot authorize radiation output.
     pub fn confirm_runtime_diagnostic(&mut self, context: &CallContext) -> Result<(), CameraError> {
+        self.confirm_runtime_diagnostic_for(context, 1)
+    }
+    /// Destination-aware runtime confirmation. The host RAM path requires
+    /// `recordingMedia=1` and the card path requires `0`; the descriptor, fresh
+    /// readback and `0xD1B2` evidence rules are identical, so a card session can
+    /// confirm its own runtime status instead of being refused by an SDRAM-only
+    /// assumption.
+    pub fn confirm_runtime_diagnostic_for(
+        &mut self,
+        context: &CallContext,
+        expected_media: i64,
+    ) -> Result<(), CameraError> {
         let media = self
             .health
             .properties
             .get("recordingMedia")
-            .ok_or_else(|| invalid("runtime status requires confirmed SDRAM recording media"))?;
+            .ok_or_else(|| invalid("runtime status requires confirmed recording media"))?;
         if media.code != RECORDING_MEDIA
             || media.data_type != 2
             || !media.confirmed
             || media.error.is_some()
-            || media.actual != Some(CameraValue::Integer(1))
+            || media.actual != Some(CameraValue::Integer(expected_media))
         {
-            return Err(invalid(
-                "runtime status requires confirmed SDRAM recording media=1",
-            ));
+            return Err(invalid(&format!(
+                "runtime status requires confirmed recording media={expected_media}"
+            )));
         }
         let readback = self
             .read_data(GET_PROPERTY, &[RECORDING_MEDIA as u32], 16, context)
@@ -1039,8 +1051,10 @@ impl NativeCamera {
             Ok(actual) => {
                 media.confirmed = true;
                 media.actual = Some(actual.clone());
-                if actual != CameraValue::Integer(1) {
-                    media.error = Some("recording media changed from confirmed SDRAM=1".into());
+                if actual != CameraValue::Integer(expected_media) {
+                    media.error = Some(format!(
+                        "recording media changed from confirmed value {expected_media}"
+                    ));
                     return Err(invalid(
                         "runtime notification cannot confirm changed recording media",
                     ));
