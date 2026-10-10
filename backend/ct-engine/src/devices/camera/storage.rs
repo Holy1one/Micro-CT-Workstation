@@ -186,6 +186,39 @@ pub fn plan_cards(
     })
 }
 
+/// Conservative per-frame byte upper bound for a D7100 14-bit lossless DX NEF.
+/// The Nikon manual's DX 14-bit lossless example is about 28.5 MB; this bound keeps
+/// headroom for a busier scene instead of pretending to know the real file size.
+pub const CONSERVATIVE_NEF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Frames one scan writes to the card: 10 pre-dark + 10 pre-flat references plus
+/// every projection. A card plan must cover all of them, not only the projections.
+pub fn task_card_frames(projection_count: u32) -> u32 {
+    projection_count.saturating_add(20)
+}
+
+/// Validates that the writable card capacity covers a whole task at the
+/// conservative per-frame bound. Capacity is checked before any device action, and
+/// the totals use [`plan_cards`]' checked arithmetic, so a missing second slot is
+/// never assumed to contribute capacity.
+pub fn plan_task_cards(
+    infos: &[StorageInfo],
+    projection_count: u32,
+    per_frame_bytes: u64,
+) -> Result<CardPlan, String> {
+    if projection_count == 0 {
+        return Err("CARD_TASK_EMPTY".into());
+    }
+    if per_frame_bytes == 0 {
+        return Err("CARD_FRAME_BOUND_UNKNOWN".into());
+    }
+    let frames = task_card_frames(projection_count);
+    let required = u64::from(frames)
+        .checked_mul(per_frame_bytes)
+        .ok_or("CARD_CAPACITY_OVERFLOW")?;
+    plan_cards(infos, required, frames)
+}
+
 /// Binds camera-advertised storage ids to parsed `GetStorageInfo` datasets in the
 /// order the camera returned them. A PTP `GetStorageInfo` dataset carries no
 /// StorageID field, so the only proven binding is positional; a count mismatch is
@@ -709,5 +742,97 @@ mod tests {
         let planned = plan_cards(&bound, 64 * GIB, 3000).unwrap();
         assert_eq!(planned.storages.len(), 1);
         assert_eq!(planned.storages[0].id, StorageId(0x0001_0001));
+    }
+
+    fn sized_info(max_bytes: u64, free_images: u32, access: StorageAccess) -> StorageInfo {
+        StorageInfo {
+            id: StorageId(1),
+            access,
+            capacity: StorageCapacity {
+                max_bytes,
+                free_bytes: max_bytes,
+                free_images,
+            },
+            storage_type: 0,
+            filesystem_type: 0,
+            description: String::new(),
+            volume_label: String::new(),
+        }
+    }
+
+    #[test]
+    fn whole_task_card_plan_covers_references_and_projections_or_refuses() {
+        // 10 pre-dark + 10 pre-flat references plus every projection.
+        assert_eq!(task_card_frames(360), 380);
+        let single = [sized_info(64 * GIB, 5000, StorageAccess::ReadWrite)];
+        let plan = plan_task_cards(&single, 360, CONSERVATIVE_NEF_BYTES).unwrap();
+        assert_eq!(plan.storages.len(), 1);
+        assert!(plan.writable_bytes >= 380 * CONSERVATIVE_NEF_BYTES);
+        assert!(plan.writable_images >= 380);
+        // Two cards plan as two writable storages in camera order.
+        let dual = [
+            sized_info(64 * GIB, 5000, StorageAccess::ReadWrite),
+            sized_info(64 * GIB, 5000, StorageAccess::ReadWrite),
+        ];
+        assert_eq!(
+            plan_task_cards(&dual, 360, CONSERVATIVE_NEF_BYTES)
+                .unwrap()
+                .storages
+                .len(),
+            2
+        );
+        // A card that cannot cover the whole task refuses before any device action.
+        assert_eq!(
+            plan_task_cards(
+                &[sized_info(16 * GIB, 500, StorageAccess::ReadWrite)],
+                360,
+                CONSERVATIVE_NEF_BYTES
+            )
+            .unwrap_err(),
+            "CARD_CAPACITY_INSUFFICIENT"
+        );
+        // Read-only and unknown-capacity evidence keep their own codes.
+        assert_eq!(
+            plan_task_cards(
+                &[sized_info(64 * GIB, 5000, StorageAccess::ReadOnly)],
+                360,
+                CONSERVATIVE_NEF_BYTES
+            )
+            .unwrap_err(),
+            "CARD_READ_ONLY"
+        );
+        assert_eq!(
+            plan_task_cards(
+                &[sized_info(0, 0, StorageAccess::ReadWrite)],
+                360,
+                CONSERVATIVE_NEF_BYTES
+            )
+            .unwrap_err(),
+            "CARD_CAPACITY_UNKNOWN"
+        );
+        // The free-image count is part of the evidence, not only the byte capacity.
+        assert_eq!(
+            plan_task_cards(
+                &[sized_info(64 * GIB, 10, StorageAccess::ReadWrite)],
+                360,
+                CONSERVATIVE_NEF_BYTES
+            )
+            .unwrap_err(),
+            "CARD_CAPACITY_INSUFFICIENT"
+        );
+        // Degenerate inputs are refused instead of defaulting a bound.
+        assert_eq!(
+            plan_task_cards(&single, 0, CONSERVATIVE_NEF_BYTES).unwrap_err(),
+            "CARD_TASK_EMPTY"
+        );
+        assert_eq!(
+            plan_task_cards(&single, 360, 0).unwrap_err(),
+            "CARD_FRAME_BOUND_UNKNOWN"
+        );
+        // A huge bound cannot wrap the required total into a passing value.
+        assert_eq!(
+            plan_task_cards(&single, 360, u64::MAX).unwrap_err(),
+            "CARD_CAPACITY_OVERFLOW"
+        );
     }
 }
