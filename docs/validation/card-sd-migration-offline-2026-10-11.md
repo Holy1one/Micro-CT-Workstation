@@ -19,6 +19,19 @@
 | `0171243` | ③ | 全任务卡容量闸门：`CONSERVATIVE_NEF_BYTES`(64 MiB)、`task_card_frames()`（N+20）、`plan_task_cards()`（设备动作前 checked 校验，`CARD_*` 稳定码） |
 | `96e90b3` | 测试夹具 | `card_script`/`scripted_card_adapter` 让扫描协调器用同一 `CameraAdapter` 离线跑卡扫描；脚本传输新增 `0x1004/0x1005/0x1007` 臂与 `set_storages`/`set_object_handles`（仅测试、默认关闭） |
 
+后续批次（同一分支，全部先过门禁再提交）：
+
+| 提交 | 覆盖 | 摘要 |
+| --- | --- | --- |
+| `cf98be5` | 测试夹具 | `ScriptedCameraProbe::set_card_events`：让扫描测试能脚本化卡关联事件（`NikonEvent` 是私有 `pub(crate)`，扫描侧无法构造） |
+| `302231d` | ① | 固件在 `READY`/`INFO` 公布 `MOVE_SETTLE_150MS`，`nano.rs` 提供 `advertises_move_settle_150ms()`；150 ms 契约因此可从**连上的控制器**校验，而不是只信源码常量 |
+| `e324d1e` | 文档 | `execution-flows.md` 新增 D7100 存卡采集流程章节 |
+| `830e983` | ③ ④ | **B4c 扫描协调器存卡接线**：卡目标由冻结 profile 选择；启动即经 owner 线程枚举存储并以 `plan_task_cards` 在设备动作前拒绝；参考与投影走"匹配 READY → 意图入账 → 一次标准 `InitiateCapture` → 一 `ObjectAdded` + 一 `CaptureComplete` → 严格 `GetObjectInfo` receipt → 同 ticket `CAPTURE_DONE` → IDLE"；schema-4 写入器；终态 `AcquiredPendingImport`；域侧登记 `acquired_pending_import`；actor 增 `Request::CardPlan/CaptureCard` |
+| `e9b876a` | ⑥ | 前端消费引擎新增的顶层 `cardAcquisition`（此前首启校验会**拒绝每一个快照**——门禁抓不到，因为前端测试用捕获的 fixture）；按既有附加字段先例改为"存在即严格校验、缺省不判损坏" |
+| `27a1e79` | 文档 | 根与 ct-engine `AGENTS.md` 的"仅 RAM NEF"规则同步为"按冻结 profile 选择 RAM/卡"，并把"不得静默回退到存储卡"精确化为"不得静默回退到另一目标" |
+| `131492e` | ③ ④ | B4c 最终增量：**目的感知清理**（取消的卡操作只由 `0x400d` 证明，永不删除或重拍卡对象）、账本闸门（意图无收据 → `CARD_ACQUISITION_UNRESOLVED` 故障，绝不报已采集；卡扫描拒绝 schema-3 本地续扫）、`card_profile_readback`/`plan_card_storages` 卡向入口、快照 `cardAcquisition` 接线 |
+| `b7730a0` | 加固 | **防漂移门禁**：断言引擎固件身份常量 == `build-config.json` 固定候选，且固件源声明相同 version/build；防止"改了固件源却忘移引擎常量"把过时来源冻进任务证据 |
+
 ## 2 门禁与实测证据
 
 - `npm run verify`（= module-map:check + typecheck + build + test:frontend + test:desktop + cargo workspace + firmware:test）在 B1/B2、B3、B4a、B4b、卡路径修正各批均**退出码 0**；其中 module-map 为 **245 文件 / 16 模块 / 39 目录边界**（PASS 且图谱 current）。
