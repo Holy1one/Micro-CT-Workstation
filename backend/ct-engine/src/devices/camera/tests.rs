@@ -644,6 +644,7 @@ impl CameraTransport for Fake {
                 }
                 vec![]
             }
+            GET_EVENT => {
                 // Reaching the next event poll proves the capture pipeline has
                 // returned from GET_OBJECT and validated its complete NEF.
                 if s.calls.contains(&GET_OBJECT) {
@@ -724,6 +725,15 @@ pub(crate) struct ScriptedCameraConfig {
     /// Number of devices discovery reports. Defaults to 1 so every existing
     /// scripted session keeps seeing exactly one selectable camera.
     pub discovered: usize,
+    /// Additive card mode (default false): negotiate the standard
+    /// `InitiateCapture`/storage operations plus the `ObjectAdded`/
+    /// `CaptureCompleteCard` events, and script the SD destination
+    /// (`recordingMedia = 0`) before Connect. `scripted_camera` never sets this,
+    /// so every existing RAM session is unchanged.
+    pub card_capture: bool,
+    /// Additive: also advertise the `StoreFull`/`StoreRemoved` overflow
+    /// continuation. Ignored unless `card_capture` is set.
+    pub card_overflow: bool,
 }
 impl Default for ScriptedCameraConfig {
     fn default() -> Self {
@@ -736,6 +746,8 @@ impl Default for ScriptedCameraConfig {
             native_exposure_ms: None,
             capture_started_signal: None,
             discovered: 1,
+            card_capture: false,
+            card_overflow: false,
         }
     }
 }
@@ -763,6 +775,18 @@ impl ScriptedCameraProbe {
     pub(crate) fn set_exposure_delay(&self,delay:Duration){self.script.lock().unwrap().exposure_delay=delay;}
     pub(crate) fn set_transfer_delay(&self,delay:Duration){self.script.lock().unwrap().transfer_delay=delay;}
     pub(crate) fn operation_count(&self,opcode:u16)->usize{self.script.lock().unwrap().calls.iter().filter(|code|**code==opcode).count()}
+    /// Additive card mode: answer `GetObjectInfo [handle]` with this exact card
+    /// dataset instead of the single RAM object answer.
+    pub(crate) fn set_card_object(&self,handle:u32,bytes:Vec<u8>){self.script.lock().unwrap().card_object_info.insert(handle,bytes);}
+    /// Replace the event batches released by the next card trigger.
+    pub(crate) fn set_capture_events(&self,batches:Vec<Vec<NikonEvent>>){self.script.lock().unwrap().capture_events=batches;}
+    /// Script the body Live View state a fresh `GET_PROPERTY [LV_STATUS]` reads.
+    pub(crate) fn set_live_view_state(&self,active:bool){self.script.lock().unwrap().lv=active;}
+    pub(crate) fn calls(&self)->Vec<u16>{self.script.lock().unwrap().calls.clone()}
+    pub(crate) fn requests(&self)->Vec<(u16,Vec<u32>)>{self.script.lock().unwrap().requests.clone()}
+    /// Every read phase as `(opcode, max)`. A card operation must show metadata,
+    /// property and event reads only: no `GetObject` and no image-sized read.
+    pub(crate) fn reads(&self)->Vec<(u16,usize)>{self.script.lock().unwrap().reads.clone()}
 }
 pub(crate) fn scripted_camera_with_probe(config: ScriptedCameraConfig) -> (CameraAdapter,ScriptedCameraProbe) {
     let mut script = Script::new();
@@ -790,6 +814,60 @@ pub(crate) fn scripted_camera_with_probe(config: ScriptedCameraConfig) -> (Camer
         script.raw.truncate(170);
     }
     let shared=Arc::new(Mutex::new(script));let camera=connected(shared.clone());(camera,ScriptedCameraProbe{script:shared})
+}
+/// Additive card-capture kit: the real `NativeCamera` over the scripted
+/// transport with the standard card path negotiated, plus the same
+/// probe accessors the RAM kit uses. `scripted_camera_with_probe` keeps
+/// returning the actor proxy for every existing sibling test.
+pub(crate) fn scripted_card_camera(
+    config: ScriptedCameraConfig,
+    session: &str,
+    context: &CallContext,
+) -> (NativeCamera, ScriptedCameraProbe) {
+    let mut script = Script::new();
+    script.exposure_delay = config.exposure_delay;
+    script.transfer_delay = config.transfer_delay;
+    script.close_failure = config.close_failure;
+    script.capture_started_signal = config.capture_started_signal;
+    script.discovered = config.discovered;
+    if config.card_capture || config.card_overflow {
+        script.device_info = Some(device_info_catalog_card(
+            true,
+            10,
+            "extension",
+            true,
+            0xd100,
+            false,
+            false,
+            if config.card_overflow { 2 } else { 1 },
+        ));
+        // A card plan needs a confirmed card destination, so the scripted body
+        // starts on the SD slot. A test that wants the destination refusal
+        // scripts SDRAM back through the probe and re-reads the properties.
+        script.values.insert(RECORDING_MEDIA, CameraValue::Integer(0));
+        // Each card test scripts its own association batches; the RAM defaults
+        // never apply to a card operation.
+        script.capture_events = vec![];
+    }
+    if let Some(ms) = config.native_exposure_ms {
+        assert!((1..=30000).contains(&ms));
+        let value = CameraValue::Integer(if ms % 1000 == 0 {
+            ((ms / 1000) << 16 | 1) as i64
+        } else {
+            (ms << 16 | 1000) as i64
+        });
+        script.values.insert(0xd100, value.clone());
+        script.descriptor_values.insert(0xd100, vec![value]);
+    }
+    if config.omit_exposure_end {
+        script
+            .capture_events
+            .retain(|events| events.iter().all(|e| e.code != CAPTURE_COMPLETE_CARD));
+    }
+    let shared = Arc::new(Mutex::new(script));
+    let mut camera = NativeCamera::new(Box::new(Fake(shared.clone())));
+    camera.connect("fake-camera-1", session, context).unwrap();
+    (camera, ScriptedCameraProbe { script: shared })
 }
 fn device_info_without_property(code:u16)->Vec<u8>{
     // DeviceInfo's property array is the final u16 array before the four strings.
@@ -845,6 +923,33 @@ fn device_info_catalog(
     vendor_discovery: bool,
     standard_properties_only: bool,
 ) -> Vec<u8> {
+    device_info_catalog_card(
+        nikon,
+        vendor,
+        extension,
+        vendor_operations,
+        shutter_code,
+        vendor_discovery,
+        standard_properties_only,
+        0,
+    )
+}
+/// Additive card selection: `0` keeps the original RAM-only operations and
+/// events byte for byte, `1` negociates the standard card capture with the
+/// `ObjectAdded`/`CaptureCompleteCard` association events, and `2` additionally
+/// advertises the `StoreFull`/`StoreRemoved` overflow continuation. Card mode
+/// drops the RAM events, so the scripted body reports `card_capture` without
+/// `host_capture` and the card path cannot borrow RAM evidence.
+fn device_info_catalog_card(
+    nikon: bool,
+    vendor: u32,
+    extension: &str,
+    vendor_operations: bool,
+    shutter_code: u16,
+    vendor_discovery: bool,
+    standard_properties_only: bool,
+    card: u8,
+) -> Vec<u8> {
     let mut b = 100u16.to_le_bytes().to_vec();
     b.extend(vendor.to_le_bytes());
     b.extend(100u16.to_le_bytes());
@@ -872,8 +977,19 @@ fn device_info_catalog(
     if !vendor_operations {
         operations.retain(|code| *code < 0x9000);
     }
+    if card > 0 {
+        operations.extend([INITIATE_CAPTURE, GET_STORAGE_IDS, GET_STORAGE_INFO, GET_OBJECT_HANDLES]);
+    }
     b.extend(array(&operations));
-    b.extend(array(&[OBJECT_RAM, CAPTURE_COMPLETE_RAM]));
+    if card > 0 {
+        let mut events = vec![OBJECT_ADDED, CAPTURE_COMPLETE_CARD];
+        if card > 1 {
+            events.extend([STORE_FULL, STORE_REMOVED]);
+        }
+        b.extend(array(&events));
+    } else {
+        b.extend(array(&[OBJECT_RAM, CAPTURE_COMPLETE_RAM]));
+    }
     let mut properties: Vec<u16> = NIKON_PROPERTIES.iter().map(|p| p.2).collect();
     for code in &mut properties {
         if *code == 0xd100 {

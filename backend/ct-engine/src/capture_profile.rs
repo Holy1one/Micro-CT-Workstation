@@ -67,6 +67,63 @@ pub struct PresetTag {
     pub source: String,
 }
 
+/// Where a frozen acquisition writes its NEF. `HostRam` is the historical path
+/// (profile 1-6); `CameraCard` is the schema-7 SD-card path, where the image never
+/// leaves the camera until the authorized USB import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureDestination {
+    HostRam,
+    CameraCard,
+}
+
+/// Ordinary-move settle policy frozen for a card scan. Kept here so a task records
+/// the exact contract it ran under; the value must match the flashed firmware
+/// `MOVE_SETTLE_MS` and the anchor it is measured from.
+pub const MOVE_SETTLE_MS: u32 = 150;
+pub const MOVE_SETTLE_ANCHOR: &str = "lastStepFallingEdge";
+
+/// Card policy and firmware evidence frozen for one schema-7 acquisition.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CardCapturePolicy {
+    /// `single` or `overflow`; Backup and RAW/JPEG split are not expressible.
+    pub mode: String,
+    pub settle_ms: u32,
+    pub settle_anchor: String,
+    pub firmware_version: String,
+    pub firmware_build: String,
+    pub firmware_source_sha256: String,
+}
+
+impl CardCapturePolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if !matches!(self.mode.as_str(), "single" | "overflow") {
+            return Err("Card policy mode must be single or overflow".into());
+        }
+        if self.settle_ms != MOVE_SETTLE_MS || self.settle_anchor != MOVE_SETTLE_ANCHOR {
+            return Err(
+                "Card policy must freeze the 150 ms last-step-falling-edge settle".into(),
+            );
+        }
+        if self.firmware_version.trim().is_empty() || self.firmware_build.trim().is_empty() {
+            return Err("Card policy requires the controller firmware version and build".into());
+        }
+        if self.firmware_source_sha256.len() != 64
+            || !self
+                .firmware_source_sha256
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
+            return Err(
+                "Card policy requires a lowercase SHA-256 controller firmware source identity"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaptureProfile {
@@ -84,6 +141,12 @@ pub struct CaptureProfile {
     pub readback: CameraProperties,
     pub parameters_hash: String,
     pub preset: Option<PresetTag>,
+    /// Schema 7 only: this frozen acquisition writes the NEF to the camera card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_destination: Option<CaptureDestination>,
+    /// Schema 7 only: frozen card policy and controller firmware evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_policy: Option<CardCapturePolicy>,
 }
 
 #[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
@@ -138,12 +201,74 @@ impl CaptureProfile {
             readback,
             parameters_hash: String::new(),
             preset,
+            capture_destination: None,
+            card_policy: None,
         };
         profile.parameters_hash = profile.canonical_hash()?;
         Ok(profile)
     }
+    /// Builds the schema-7 SD-card scan profile. The card destination and its
+    /// policy are frozen evidence, so an imported task can prove which storage and
+    /// which firmware contract produced it.
+    pub fn from_card_readback(
+        health: &CameraHealth,
+        readback: CameraProperties,
+        preset: Option<PresetTag>,
+        policy: CardCapturePolicy,
+    ) -> Result<Self, String> {
+        policy.validate()?;
+        let identity = health.identity.clone().ok_or("Camera identity is unknown")?;
+        let code = health
+            .properties
+            .get("shutter")
+            .ok_or("Shutter property is unknown")?
+            .code;
+        let issues = scan_camera_issues_for(health, CaptureDestination::CameraCard);
+        if !issues.is_empty() {
+            return Err(serde_json::to_string(&issues)
+                .unwrap_or_else(|_| "Camera card policy blocked".into()));
+        }
+        let mut profile = Self {
+            schema_version: 7,
+            shutter_property_code: Some(code),
+            fixed_policy_support: Some(
+                ["whiteBalance", "activeDLighting", "hdrMode"]
+                    .into_iter()
+                    .map(|key| (key.into(), health.properties.get(key).is_some_and(|p| p.supported)))
+                    .collect(),
+            ),
+            fixed_acquisition_evidence: Some(FixedAcquisitionEvidence {
+                bracketing_property_code: 0xd0c0,
+                active_d_lighting_property_code: 0xd14e,
+                hdr_proof: if readback.contains_key("hdrMode") { "native_off" } else { "nef_exclusion" }.into(),
+                retired_sensor_policy: None,
+                retired_operator_record: None,
+            }),
+            backend: identity.backend.clone(),
+            identity,
+            format: "NEF".into(),
+            parameters: readback.clone(),
+            readback,
+            parameters_hash: String::new(),
+            preset,
+            capture_destination: Some(CaptureDestination::CameraCard),
+            card_policy: Some(policy),
+        };
+        profile.parameters_hash = profile.canonical_hash()?;
+        profile.validate()?;
+        Ok(profile)
+    }
+    /// True when this frozen acquisition writes to the camera card.
+    pub fn is_card_destination(&self) -> bool {
+        self.schema_version == 7
+            && self.capture_destination == Some(CaptureDestination::CameraCard)
+    }
     pub fn validate(&self) -> Result<(), String> {
-        if !matches!(self.schema_version, 1 | 2 | 3 | 4 | 5 | 6)
+        if !matches!(self.schema_version, 1 | 2 | 3 | 4 | 5 | 6 | 7)
+            || (self.schema_version == 7)
+                != (self.capture_destination == Some(CaptureDestination::CameraCard))
+            || (self.schema_version != 7 && self.capture_destination.is_some())
+            || (self.schema_version == 7) != self.card_policy.is_some()
             || (self.schema_version == 1 && self.shutter_property_code.is_some())
             || (self.schema_version >= 2 && !matches!(self.shutter_property_code, Some(0x500d | 0xd100)))
             || self.identity.device_id.is_empty()
@@ -167,10 +292,18 @@ impl CaptureProfile {
             }
         }
         if self.schema_version >= 3 {
-            for key in HOST_CAPTURE_REQUIRED_KEYS {
-                if self.readback.get(*key).and_then(CameraValue::integer) != Some(1) {
-                    return Err(format!("Host-only single capture requires {key}=1 and its readback"));
+            let expected_media = if self.schema_version == 7 { 0 } else { 1 };
+            for (key, expected) in [("recordingMedia", expected_media), ("burstNumber", 1)] {
+                if self.readback.get(key).and_then(CameraValue::integer) != Some(expected) {
+                    return Err(if self.schema_version == 7 {
+                        format!("Card capture requires {key}={expected} and its readback")
+                    } else {
+                        format!("Host-only single capture requires {key}={expected} and its readback")
+                    });
                 }
+            }
+            if let Some(policy) = self.card_policy.as_ref() {
+                policy.validate()?;
             }
         }
         if self.exposure_ms().is_none() {
@@ -221,7 +354,13 @@ impl CaptureProfile {
     }
     pub fn require_current_policy(&self) -> Result<(), String> {
         self.validate()?;
-        if self.schema_version != 6 { return Err("CAPTURE_POLICY_LEGACY_READ_ONLY: retained profile lacks current fixed-policy evidence".into()); }
+        // Profile 6 remains the current RAM contract so existing schema-3 tasks keep
+        // their controlled restore path; profile 7 is the current card contract.
+        if !matches!(self.schema_version, 6 | 7) {
+            return Err(
+                "CAPTURE_POLICY_LEGACY_READ_ONLY: retained profile lacks current fixed-policy evidence".into(),
+            );
+        }
         Ok(())
     }
     pub fn exposure_ms(&self) -> Option<f64> {
@@ -275,6 +414,10 @@ impl CaptureProfile {
             fixed_policy_support:Option<&'a std::collections::BTreeMap<String,bool>>,
             #[serde(skip_serializing_if="Option::is_none")]
             fixed_acquisition_evidence:Option<CanonicalEvidence<'a>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            capture_destination: Option<CaptureDestination>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            card_policy: Option<&'a CardCapturePolicy>,
         }
         let bytes = serde_json::to_vec(&Canonical {
             identity: &self.identity,
@@ -286,6 +429,8 @@ impl CaptureProfile {
             fixed_policy_version:if self.schema_version>=6{Some(3)}else if self.schema_version>=5{Some(2)}else{(self.schema_version>=4).then_some(1)},
             fixed_policy_support:if self.schema_version>=4{self.fixed_policy_support.as_ref()}else{None},
             fixed_acquisition_evidence:if self.schema_version>=5{self.canonical_evidence()}else{None},
+            capture_destination:if self.schema_version==7{self.capture_destination}else{None},
+            card_policy:if self.schema_version==7{self.card_policy.as_ref()}else{None},
         })
         .map_err(|error| error.to_string())?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -313,9 +458,20 @@ pub struct ScanCameraIssue {
     pub remedy: String,
 }
 pub fn scan_camera_issues(health: &CameraHealth) -> Vec<ScanCameraIssue> {
+    scan_camera_issues_for(health, CaptureDestination::HostRam)
+}
+/// The same fixed-policy admission for a chosen destination. The card destination
+/// requires the negotiated card capability and `recordingMedia=0`; the host RAM
+/// destination keeps requiring `scan_nef` and `recordingMedia=1`.
+pub fn scan_camera_issues_for(
+    health: &CameraHealth,
+    destination: CaptureDestination,
+) -> Vec<ScanCameraIssue> {
+    let card = destination == CaptureDestination::CameraCard;
+    let capability_ready = if card { health.capabilities.card_capture } else { health.capabilities.scan_nef };
     let mut issues = Vec::new();
-    if !health.connected || health.isolated || !health.capabilities.scan_nef {
-        issues.push(ScanCameraIssue { key: "session".into(), actual: None, requirement: "Confirmed native D7100 NEF session".into(), remedy: "Connect and explicitly select the camera".into() }); return issues;
+    if !health.connected || health.isolated || !capability_ready {
+        issues.push(ScanCameraIssue { key: "session".into(), actual: None, requirement: if card { "Confirmed native D7100 card-capture session".into() } else { "Confirmed native D7100 NEF session".into() }, remedy: "Connect and explicitly select the camera".into() }); return issues;
     }
     if health.live_view.active { issues.push(ScanCameraIssue { key: "liveView".into(), actual: None, requirement: "Live View OFF".into(), remedy: "Explicitly stop Live View".into() }); }
     for key in PROFILE_REQUIRED_KEYS.iter().copied().chain(HOST_CAPTURE_REQUIRED_KEYS.iter().copied()).chain(["whiteBalance", "activeDLighting", "hdrMode","bracketing"]) {
@@ -327,14 +483,15 @@ pub fn scan_camera_issues(health: &CameraHealth) -> Vec<ScanCameraIssue> {
             "exposureMode" => "Manual exposure (M)", "autoIso" => "Auto ISO OFF",
             "focusMode" => "Hardware MF or software MF", "whiteBalance" => "Confirmed fixed white balance",
             "activeDLighting" | "hdrMode" | "longExposureNoiseReduction" => "OFF",
-            "exposureDelay" => "OFF (native value 3)", "recordingMedia" => "Host RAM (1)",
+            "exposureDelay" => "OFF (native value 3)", "recordingMedia" => if card { "Camera card (0)" } else { "Host RAM (1)" },
             "burstNumber" | "driveMode" => "Single image (1)", "rawFormat" => "NEF only (4)",
             "shutter" => "Confirmed native timed shutter", _ => "Confirmed actual value matching Apply",
         };
         let evidence = p.is_some_and(|p| p.confirmed && p.readable && p.error.is_none() && p.actual.is_some() && p.target.as_ref().is_none_or(|target| Some(target) == p.actual.as_ref()) && match key {"recordingMedia"=>p.code==0xd10b&&p.data_type==2,"burstNumber"=>p.code==0x5018&&p.data_type==4,"bracketing"=>p.code==0xd0c0&&p.data_type==2,"activeDLighting"=>p.code==0xd14e,_=>true});
         let value = actual.as_ref().and_then(CameraValue::integer);
         let fixed = match key {
-            "exposureMode" | "recordingMedia" | "burstNumber" | "driveMode" => value == Some(1),
+            "recordingMedia" => value == Some(if card { 0 } else { 1 }),
+            "exposureMode" | "burstNumber" | "driveMode" => value == Some(1),
             "bracketing" | "autoIso" | "hdrMode" | "longExposureNoiseReduction" => value == Some(0),
             "activeDLighting" => value == Some(4),
             "rawFormat" => value == Some(4), "exposureDelay" => value == Some(3),
@@ -573,5 +730,138 @@ mod tests {
         let mut readback = profile.readback;
         readback.insert("focusPosition".into(), CameraValue::Integer(10));
         assert!(CaptureProfile::from_readback(profile.identity, readback, None, 0xd100).is_err());
+    }
+
+    const FIRMWARE_SHA: &str = "811bae5c1d6e08b318c81ac8d077908df127e00d1e95bf185cf090b5ad1069ec";
+
+    fn card_policy(mode: &str) -> CardCapturePolicy {
+        CardCapturePolicy {
+            mode: mode.into(),
+            settle_ms: MOVE_SETTLE_MS,
+            settle_anchor: MOVE_SETTLE_ANCHOR.into(),
+            firmware_version: "2.2.0".into(),
+            firmware_build: "20261010".into(),
+            firmware_source_sha256: FIRMWARE_SHA.into(),
+        }
+    }
+
+    /// A schema-7 card profile built from the same frozen acquisition as
+    /// `test_profile`, with the card destination and its policy.
+    fn card_profile(mode: &str) -> CaptureProfile {
+        let mut profile = test_profile();
+        profile.schema_version = 7;
+        profile
+            .readback
+            .insert("recordingMedia".into(), CameraValue::Integer(0));
+        profile
+            .parameters
+            .insert("recordingMedia".into(), CameraValue::Integer(0));
+        profile.capture_destination = Some(CaptureDestination::CameraCard);
+        profile.card_policy = Some(card_policy(mode));
+        profile.parameters_hash = profile.canonical_hash().unwrap();
+        profile.validate().unwrap();
+        profile
+    }
+
+    #[test]
+    fn card_profile_is_current_and_covers_the_destination_in_its_hash() {
+        let ram = test_profile();
+        let card = card_profile("single");
+        assert!(card.is_card_destination());
+        assert!(!ram.is_card_destination());
+        card.require_current_policy().unwrap();
+        ram.require_current_policy().unwrap();
+        // The card destination and its policy are part of the frozen hash, so the
+        // same acquisition written to a different destination cannot collide.
+        assert_ne!(card.parameters_hash, ram.parameters_hash);
+        // Identical card evidence still matches across sessions.
+        let again = card_profile("single");
+        card.matches(&again).unwrap();
+        // A different overflow policy is different frozen evidence.
+        assert!(card.matches(&card_profile("overflow")).is_err());
+    }
+
+    #[test]
+    fn card_destination_and_policy_must_agree_with_schema_seven() {
+        let mut missing_policy = card_profile("single");
+        missing_policy.card_policy = None;
+        missing_policy.parameters_hash = missing_policy.canonical_hash().unwrap();
+        assert!(missing_policy.validate().is_err());
+
+        let mut ram_destination = card_profile("single");
+        ram_destination.capture_destination = Some(CaptureDestination::HostRam);
+        ram_destination.parameters_hash = ram_destination.canonical_hash().unwrap();
+        assert!(ram_destination.validate().is_err());
+
+        // A profile 6 task may not claim a card destination.
+        let mut six_with_card = test_profile();
+        six_with_card.capture_destination = Some(CaptureDestination::CameraCard);
+        six_with_card.parameters_hash = six_with_card.canonical_hash().unwrap();
+        assert!(six_with_card.validate().is_err());
+        // Unchanged profile 6 still validates with no destination recorded.
+        assert!(test_profile().validate().is_ok());
+    }
+
+    #[test]
+    fn card_profile_requires_the_card_recording_media() {
+        let mut profile = card_profile("single");
+        profile
+            .readback
+            .insert("recordingMedia".into(), CameraValue::Integer(1));
+        profile
+            .parameters
+            .insert("recordingMedia".into(), CameraValue::Integer(1));
+        profile.parameters_hash = profile.canonical_hash().unwrap();
+        assert!(profile.validate().is_err());
+        // The RAM contract is unchanged: profile 6 still requires the RAM media.
+        let mut ram = test_profile();
+        ram.readback
+            .insert("recordingMedia".into(), CameraValue::Integer(0));
+        ram.parameters
+            .insert("recordingMedia".into(), CameraValue::Integer(0));
+        ram.parameters_hash = ram.canonical_hash().unwrap();
+        assert!(ram.validate().is_err());
+    }
+
+    #[test]
+    fn card_policy_freezes_the_settle_contract_and_the_firmware_identity() {
+        assert!(card_policy("single").validate().is_ok());
+        assert!(card_policy("overflow").validate().is_ok());
+        for mode in ["backup", "raw-jpeg", "", "SINGLE"] {
+            assert!(card_policy(mode).validate().is_err(), "mode {mode}");
+        }
+        let mut slow = card_policy("single");
+        slow.settle_ms = 500;
+        assert!(slow.validate().is_err());
+        let mut wrong_anchor = card_policy("single");
+        wrong_anchor.settle_anchor = "finishPhase".into();
+        assert!(wrong_anchor.validate().is_err());
+        let mut no_version = card_policy("single");
+        no_version.firmware_version = "  ".into();
+        assert!(no_version.validate().is_err());
+        let mut short_hash = card_policy("single");
+        short_hash.firmware_source_sha256 = "811bae5c".into();
+        assert!(short_hash.validate().is_err());
+        let mut uppercase_hash = card_policy("single");
+        uppercase_hash.firmware_source_sha256 = FIRMWARE_SHA.to_uppercase();
+        assert!(uppercase_hash.validate().is_err());
+    }
+
+    #[test]
+    fn current_policy_accepts_six_and_seven_and_rejects_older_profiles() {
+        for version in [1u32, 2, 3, 4, 5] {
+            let mut profile = test_profile();
+            profile.schema_version = version;
+            if version < 4 {
+                profile.fixed_policy_support = None;
+            }
+            profile.parameters_hash = profile.canonical_hash().unwrap();
+            assert!(
+                profile.require_current_policy().is_err(),
+                "profile {version} must stay legacy read-only"
+            );
+        }
+        assert!(test_profile().require_current_policy().is_ok());
+        assert!(card_profile("single").require_current_policy().is_ok());
     }
 }

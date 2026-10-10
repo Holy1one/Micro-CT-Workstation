@@ -3247,6 +3247,7 @@ mod tests {
             native_exposure_ms: None,
             capture_started_signal: None,
             discovered: 1,
+            ..Default::default()
         });
         let (xray, probe) = crate::devices::xray::test_worker(20.0, 100.0);
         let initial = probe.beam_transitions().len();
