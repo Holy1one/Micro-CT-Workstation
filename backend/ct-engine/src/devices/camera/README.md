@@ -43,6 +43,8 @@ and a single host NEF do not prove that this setting is OFF.
 | `nikon.rs` | D7100 capability negotiation, exact native properties and frozen profile readback |
 | `properties.rs` | Descriptor-backed photographic option labels, contextual effectiveness, dependency ordering and capture readiness |
 | `capture.rs` | Correlated SDRAM events, NEF structural completeness, SHA-256 and atomic no-overwrite commit |
+| `storage.rs` | Strict camera storage datasets: GetStorageIDs/GetStorageInfo/GetObjectHandles parsing, positional id binding, 64-bit capacity and offline writable-card planning |
+| `card_capture.rs` | Card-capture transaction and pure association state: one standard InitiateCapture, exactly one ObjectAdded/completion pair, StoreFull/StoreRemoved handling, metadata-only reads (no image transfer, no local file, no hash) |
 | `live_view.rs` | Strict JPEG validation, binary envelope, latest frame slot and current-user-only named pipe |
 | `tests.rs` | Scripted transport through the same production actor and capture implementation |
 

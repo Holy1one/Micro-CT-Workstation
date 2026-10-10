@@ -1,4 +1,4 @@
-﻿/** Browser-only native-device UI model. All capabilities, files and completion
+/** Browser-only native-device UI model. All capabilities, files and completion
  * evidence are explicitly simulated; no OS transport or camera I/O exists here. */
 import type { CameraHealth, CameraProperties, CameraScanReadiness, DeviceControls, DeviceOperation, EngineCommand } from "../../src/engine/types";
 import { cameraSettingDependencyReason, cameraSettingOptionReason, shutterExposureMs, validateCameraDraft } from "../../src/engine/deviceControls";
@@ -19,7 +19,7 @@ export class PreviewDeviceControls {
   camera: CameraHealth = {
     connected: false, backend: "NO HARDWARE · in-memory camera preview", serial: null, transferPolicy: null,
     lastCapture: null, lastError: null, exposureMinMs: 0.125, exposureMaxMs: 30000, identity: null, deviceInfo: null,
-    discovered: [], sessionId: null, lastEventDiagnostic: null, lastCaptureEventDiagnostic: null, capabilities: { properties: false, hostCapture: false, liveView: false,
+    discovered: [], sessionId: null, lastEventDiagnostic: null, lastCaptureEventDiagnostic: null, capabilities: { properties: false, hostCapture: false, cardCapture: false, cardOverflow: false, liveView: false,
       autofocus: false, focusStep: false, scanNef: false, hardwareCertified: false, disabledReasons: { scanNef: "NO HARDWARE · not hardware certified" } },
     properties: {}, runtimeProperties: {}, liveView: { active: false, fresh: false, sessionId: null, sequence: 0, lastFrameAt: null,
       width: null, height: null, fpsLimit: 10, error: null }, isolated: false, cleanupConfirmed: true, busy: false,

@@ -236,6 +236,17 @@ impl std::ops::Deref for CameraRuntimeProperty {
 pub struct CameraCapabilities {
     pub properties: bool,
     pub host_capture: bool,
+    /// Standard card capture is advertised for this identity: `InitiateCapture`,
+    /// `GetStorageIDs`/`GetStorageInfo`/`GetObjectHandles`, and the associated
+    /// ObjectAdded/CaptureComplete events. This is negotiated separately from
+    /// `host_capture`; one never implies the other.
+    #[serde(default)]
+    pub card_capture: bool,
+    /// Overflow continuation across two verified writable storages is advertised
+    /// (`StoreFull`/`StoreRemoved`). Without it only a single-card destination is
+    /// offered instead of guessing which storage received an exposure.
+    #[serde(default)]
+    pub card_overflow: bool,
     pub live_view: bool,
     pub autofocus: bool,
     pub focus_step: bool,

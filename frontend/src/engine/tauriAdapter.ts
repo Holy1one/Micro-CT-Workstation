@@ -91,7 +91,8 @@ function assertSnapshot(snapshot: EngineSnapshot): EngineSnapshot {
     || !camera.capabilities || !camera.liveView || typeof camera.liveView.active !== "boolean"
     || typeof camera.liveView.fresh !== "boolean" || !camera.properties
     || [camera.isolated, camera.cleanupConfirmed, camera.busy, camera.capabilities.properties,
-      camera.capabilities.hostCapture, camera.capabilities.liveView, camera.capabilities.autofocus,
+      camera.capabilities.hostCapture, camera.capabilities.cardCapture, camera.capabilities.cardOverflow,
+      camera.capabilities.liveView, camera.capabilities.autofocus,
       camera.capabilities.focusStep, camera.capabilities.scanNef, camera.capabilities.hardwareCertified].some(value => typeof value !== "boolean")
     || !(camera.sessionId === null || typeof camera.sessionId === "string")
     || !(camera.liveView.sessionId === null || typeof camera.liveView.sessionId === "string")

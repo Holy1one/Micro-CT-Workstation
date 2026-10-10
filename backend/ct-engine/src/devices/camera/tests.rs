@@ -236,6 +236,13 @@ struct Script {
     busy_on_capture: bool,
     complete_after_download: bool,
     poll_after_download_signal: Option<mpsc::Sender<()>>,
+    /// Additive card mode: GetObjectInfo answers keyed by the requested handle.
+    /// Empty in every RAM session, where `object_info` stays the single RAM
+    /// answer for handle `0xffff0001`.
+    card_object_info: BTreeMap<u32, Vec<u8>>,
+    /// Every read phase this transport served as `(opcode, max)`, so a card test
+    /// can prove no image-sized transfer was ever requested.
+    reads: Vec<(u16, usize)>,
 }
 impl Script {
     fn new() -> Self {
@@ -369,6 +376,8 @@ impl Script {
             busy_on_capture: false,
             complete_after_download: false,
             poll_after_download_signal: None,
+            card_object_info: BTreeMap::new(),
+            reads: vec![],
         }
     }
 }
@@ -442,6 +451,9 @@ impl CameraTransport for Fake {
             let mut script = self.0.lock().unwrap();
             script.calls.push(code);
             script.requests.push((code, params.to_vec()));
+            if let DataPhase::Read { max } = &phase {
+                script.reads.push((code, *max));
+            }
             if script.stall.as_ref().is_some_and(|s| s.0 == code) {
                 script.stall.take()
             } else {
@@ -617,7 +629,21 @@ impl CameraTransport for Fake {
                 }
                 vec![]
             }
-            GET_EVENT => {
+            INITIATE_CAPTURE => {
+                // Standard PTP still capture, the only trigger the card path may
+                // send. The private SDRAM code stays asserted above, so a card
+                // test that reached `CAPTURE_RAM` would already fail.
+                assert_eq!(params, [0xffffffff]);
+                let events = s.capture_events.clone();
+                s.events.extend(events);
+                let changes = s.capture_value_changes.clone();
+                s.values.extend(changes);
+                s.capture_started = Some(Instant::now());
+                if let Some(signal) = s.capture_started_signal.as_ref() {
+                    let _ = signal.send(());
+                }
+                vec![]
+            }
                 // Reaching the next event poll proves the capture pipeline has
                 // returned from GET_OBJECT and validated its complete NEF.
                 if s.calls.contains(&GET_OBJECT) {
@@ -637,8 +663,14 @@ impl CameraTransport for Fake {
             }
             DEVICE_READY | AF_DRIVE | FOCUS_DRIVE => vec![],
             GET_OBJECT_INFO => {
-                assert_eq!(params, [0xffff0001]);
-                s.object_info.clone().unwrap_or_else(|| object_info(s.raw.len()))
+                // Additive card mode resolves metadata by the requested handle;
+                // without it the single RAM object answer is unchanged.
+                if let Some(card) = s.card_object_info.get(&params[0]) {
+                    card.clone()
+                } else {
+                    assert_eq!(params, [0xffff0001]);
+                    s.object_info.clone().unwrap_or_else(|| object_info(s.raw.len()))
+                }
             }
             GET_OBJECT => {
                 assert_eq!(params, [0xffff0001]);

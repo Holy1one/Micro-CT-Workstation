@@ -15,6 +15,7 @@ Each device module owns one physical role and exposes message proxies from mod.r
 - nikon.rs contains necessary MIT D7100 operations and property readback, exact native timed shutters, Live View/AF and supported focus steps. Other models receive only described standard capabilities; host capture stays disabled without proof.
 - capture.rs binds exclusive session/operation events, separates ExposureEnded from object/transfer/file completion, verifies complete NEF/length/hash, and commits atomically under cancellation. Elapsed time or file appearance never proves exposure end.
 - live_view.rs holds validated latest-only JPEG envelopes and a random user-ACL pipe. Images never enter JSONL; Stop/session changes/loss revoke live identity. See camera/README.md and THIRD-PARTY-NOTICES.md for event and hardware limits.
+- storage.rs parses strict GetStorageIDs/GetStorageInfo/GetObjectHandles datasets and plans writable SD-card capacity offline; ptp.rs validates card-resident ObjectInfo NEF metadata with a separate strict parser that does not relax the RAM tolerance. Neither path contacts a device, and no card conclusion is drawn without hardware acceptance.
 
 ## turntable/
 

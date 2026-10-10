@@ -410,6 +410,70 @@ fn parse_ram_object_info(bytes: &[u8], d7100: bool) -> Result<ObjectInfo, Camera
     })
 }
 
+/// Strict card-resident ObjectInfo (0x1008) metadata for SD-card capture.
+///
+/// The 52-byte header is the declared PTP order shared with the RAM layout.
+/// `parse_ram_object_info` skips the whole 40-byte numeric block; this parser
+/// reads ParentObject at its PIMA 15740 offset 38 inside that block, so
+/// `parent` is reported evidence rather than a guessed constant. It shares none
+/// of the D7100 RAM compatibility tolerance: a reserved storage id, a
+/// non-NEF/unsafe filename, an unknown object format, an unbounded size,
+/// truncation or trailing bytes are all rejected. The D7100 UTF-16 date form is
+/// reused from `d7100_object_date`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CardObjectInfo {
+    pub storage_id: u32,
+    pub parent: u32,
+    pub format: u16,
+    pub protection: u16,
+    pub size: usize,
+    pub filename: String,
+    pub capture_date: String,
+}
+pub(crate) fn parse_card_object_info(bytes: &[u8]) -> Result<CardObjectInfo, CameraError> {
+    let mut c = Cursor::new(bytes);
+    let storage_id = c.u32()?;
+    let format = c.u16()?;
+    let protection = c.u16()?;
+    let size = c.u32()? as usize;
+    c.take(26)?; // ThumbFormat, ThumbCompressedSize, thumbnail/image extents, ImageBitDepth
+    let parent = c.u32()?;
+    c.take(10)?; // AssociationType, AssociationDesc, SequenceNumber
+    let filename = c.string()?;
+    let capture_date = d7100_object_date(&mut c)?;
+    let _modified = d7100_object_date(&mut c)?;
+    let _keywords = c.string()?;
+    c.finish()?;
+    if storage_id == 0 || storage_id == u32::MAX {
+        return Err(invalid("card object reports a reserved storage id"));
+    }
+    if !(8..=MAX_OBJECT_BYTES).contains(&size) {
+        return Err(invalid("card object size is outside the bounded NEF range"));
+    }
+    if !matches!(format, 0x3000 | 0xb101 | 0x3800) {
+        return Err(invalid("card object format is not a declared NEF format"));
+    }
+    let name_chars = filename.chars().count();
+    if name_chars == 0
+        || name_chars > 255
+        || !filename.to_ascii_lowercase().ends_with(".nef")
+        || filename
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '/' | '\\'))
+    {
+        return Err(invalid("card object filename is not a plain NEF name"));
+    }
+    Ok(CardObjectInfo {
+        storage_id,
+        parent,
+        format,
+        protection,
+        size,
+        filename,
+        capture_date,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NikonEvent {
     pub code: u16,

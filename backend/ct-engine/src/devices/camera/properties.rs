@@ -393,6 +393,46 @@ pub fn property_rejection(
 /// readback and a fresh LV_STATUS read (see `confirm_runtime_diagnostic`), which
 /// by definition cannot be proven before enqueue; those remain worker-only and a
 /// change detected there still fails the operation fail-closed.
+/// Strict, fresh-read evidence that the camera SD card is this capture's destination.
+/// D7100 `recordingMedia` 0 selects the card and 1 selects SDRAM; this gate accepts
+/// only a confirmed 0 and never falls back to RAM. Missing, unreadable, unwritable,
+/// unsupported or drifted evidence fails closed.
+pub(crate) fn require_card_destination(health: &CameraHealth) -> Result<(), CameraError> {
+    if !health.connected || health.isolated {
+        return Err(CameraError::Unsupported("camera is not connected".into()));
+    }
+    if !health.capabilities.card_capture {
+        return Err(CameraError::Unsupported(
+            "card capture operations and association events are not advertised".into(),
+        ));
+    }
+    if health.live_view.active {
+        return Err(CameraError::Unsupported(
+            "Live View must be stopped before a card capture".into(),
+        ));
+    }
+    let property = health
+        .properties
+        .get("recordingMedia")
+        .ok_or_else(|| CameraError::Unsupported("recording media property was not read".into()))?;
+    if !property.readable || !property.writable || !property.confirmed || property.error.is_some() {
+        return Err(CameraError::Unsupported(
+            "recording media destination is not confirmed readback".into(),
+        ));
+    }
+    if !property.supported_values.contains(&CameraValue::Integer(0)) {
+        return Err(CameraError::Unsupported(
+            "this body does not advertise the card destination".into(),
+        ));
+    }
+    if property.actual != Some(CameraValue::Integer(0)) {
+        return Err(CameraError::Unsupported(
+            "recording media is not set to the card destination".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn capture_readiness(health: &CameraHealth) -> Result<(), CameraError> {
     super::nikon::independent_readback(health)?;
     if health.live_view.active {

@@ -12,6 +12,18 @@ use std::time::Duration;
 use std::time::Instant;
 
 pub(crate) const CAPTURE_RAM: u16 = 0x90c0;
+/// Standard PTP card-capture operations. These are the only card path opcodes this
+/// build sends; no Nikon private capture code is used for card capture.
+pub(crate) const INITIATE_CAPTURE: u16 = 0x100e;
+pub(crate) const GET_STORAGE_IDS: u16 = 0x1004;
+pub(crate) const GET_STORAGE_INFO: u16 = 0x1005;
+pub(crate) const GET_OBJECT_HANDLES: u16 = 0x1007;
+/// Standard PTP events used to associate one card exposure with one object.
+pub(crate) const OBJECT_ADDED: u16 = 0x4002;
+pub(crate) const PROPERTY_CHANGED: u16 = 0x4006;
+pub(crate) const STORE_REMOVED: u16 = 0x4005;
+pub(crate) const STORE_FULL: u16 = 0x400a;
+pub(crate) const CAPTURE_COMPLETE_CARD: u16 = 0x400d;
 pub(crate) const AF_DRIVE: u16 = 0x90c1;
 pub(crate) const GET_EVENT: u16 = 0x90c7;
 pub(crate) const DEVICE_READY: u16 = 0x90c8;
@@ -1318,9 +1330,33 @@ fn negotiated_capabilities(info: &DeviceInfo, d7100: bool) -> CameraCapabilities
         .all(|code| has(*code))
         && info.events.contains(&OBJECT_RAM)
         && info.events.contains(&CAPTURE_COMPLETE_RAM);
+    // Card capture is negotiated separately from host RAM capture: it needs the
+    // standard InitiateCapture/storage/object operations plus both association
+    // events. A missing advertisement keeps card capture disabled instead of
+    // probing an unproven opcode.
+    let card_capture = d7100
+        && [
+            INITIATE_CAPTURE,
+            GET_EVENT,
+            DEVICE_READY,
+            GET_OBJECT_INFO,
+            GET_STORAGE_IDS,
+            GET_STORAGE_INFO,
+            GET_OBJECT_HANDLES,
+        ]
+        .iter()
+        .all(|code| has(*code))
+        && info.events.contains(&OBJECT_ADDED)
+        && info.events.contains(&CAPTURE_COMPLETE_CARD);
+    // Overflow continuation additionally needs the storage notifications that
+    // describe a slot change; without them the task stays single-card.
+    let card_overflow =
+        card_capture && info.events.contains(&STORE_FULL) && info.events.contains(&STORE_REMOVED);
     let mut capabilities = CameraCapabilities {
         properties: has(GET_PROPERTY_DESC) && has(GET_PROPERTY),
         host_capture,
+        card_capture,
+        card_overflow,
         live_view: d7100
             && [START_LV, STOP_LV, GET_LV, GET_PROPERTY, DEVICE_READY]
                 .iter()
@@ -1340,6 +1376,14 @@ fn negotiated_capabilities(info: &DeviceInfo, d7100: bool) -> CameraCapabilities
     if !host_capture {
         capabilities.disabled_reasons.insert("capture".into(),
         "Host-only RAM capture and its correlated completion events are not proven for this identity/capability set".into());
+    }
+    if !card_capture {
+        capabilities.disabled_reasons.insert("cardCapture".into(),
+        "Card capture and its ObjectAdded/CaptureComplete association are not advertised for this identity/capability set".into());
+    }
+    if card_capture && !card_overflow {
+        capabilities.disabled_reasons.insert("cardOverflow".into(),
+        "StoreFull/StoreRemoved notifications are not advertised; only one verified writable card is offered".into());
     }
     if !capabilities.live_view {
         capabilities.disabled_reasons.insert(
@@ -1603,4 +1647,146 @@ pub fn exact_shutter_value(
                 "requested exposure has no exact native shutter enum; rounding is forbidden".into(),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CARD_OPS: [u16; 7] = [
+        INITIATE_CAPTURE,
+        GET_EVENT,
+        DEVICE_READY,
+        GET_OBJECT_INFO,
+        GET_STORAGE_IDS,
+        GET_STORAGE_INFO,
+        GET_OBJECT_HANDLES,
+    ];
+    const HOST_OPS: [u16; 7] = [
+        CAPTURE_RAM,
+        GET_EVENT,
+        DEVICE_READY,
+        GET_OBJECT_INFO,
+        GET_OBJECT,
+        GET_PROPERTY,
+        GET_PROPERTY_DESC,
+    ];
+
+    fn device_info(operations: &[u16], events: &[u16]) -> DeviceInfo {
+        DeviceInfo {
+            manufacturer: "Nikon Corporation".into(),
+            model: "NIKON D7100".into(),
+            serial: "8322769".into(),
+            operations: operations.to_vec(),
+            properties: vec![RECORDING_MEDIA],
+            events: events.to_vec(),
+            vendor_id: 0,
+            diagnostic: CameraDeviceInfo::default(),
+        }
+    }
+
+    #[test]
+    fn card_capture_is_negotiated_separately_from_host_capture() {
+        // The RAM host-capture advertisement alone must not enable card capture.
+        let host_only = negotiated_capabilities(
+            &device_info(&HOST_OPS, &[OBJECT_RAM, CAPTURE_COMPLETE_RAM]),
+            true,
+        );
+        assert!(host_only.host_capture && !host_only.card_capture && !host_only.card_overflow);
+        assert!(host_only.disabled_reasons.contains_key("cardCapture"));
+
+        // Either association event missing keeps card capture closed.
+        assert!(!negotiated_capabilities(&device_info(&CARD_OPS, &[OBJECT_ADDED]), true).card_capture);
+        assert!(
+            !negotiated_capabilities(&device_info(&CARD_OPS, &[CAPTURE_COMPLETE_CARD]), true)
+                .card_capture
+        );
+        // One required storage operation missing also keeps it closed.
+        let missing = [
+            INITIATE_CAPTURE,
+            GET_EVENT,
+            DEVICE_READY,
+            GET_OBJECT_INFO,
+            GET_STORAGE_IDS,
+            GET_OBJECT_HANDLES,
+        ];
+        assert!(
+            !negotiated_capabilities(&device_info(&missing, &[OBJECT_ADDED, CAPTURE_COMPLETE_CARD]), true)
+                .card_capture
+        );
+        // A non-D7100 identity never negotiates the D7100 card contract.
+        assert!(
+            !negotiated_capabilities(
+                &device_info(&CARD_OPS, &[OBJECT_ADDED, CAPTURE_COMPLETE_CARD, STORE_FULL, STORE_REMOVED]),
+                false
+            )
+            .card_capture
+        );
+    }
+
+    #[test]
+    fn card_overflow_needs_the_storage_notifications_and_stays_optional() {
+        let single = negotiated_capabilities(
+            &device_info(&CARD_OPS, &[OBJECT_ADDED, CAPTURE_COMPLETE_CARD]),
+            true,
+        );
+        assert!(single.card_capture && !single.card_overflow && !single.host_capture);
+        assert!(single.disabled_reasons.contains_key("cardOverflow"));
+
+        let overflow = negotiated_capabilities(
+            &device_info(
+                &CARD_OPS,
+                &[OBJECT_ADDED, CAPTURE_COMPLETE_CARD, STORE_FULL, STORE_REMOVED],
+            ),
+            true,
+        );
+        assert!(overflow.card_capture && overflow.card_overflow);
+        assert!(!overflow.disabled_reasons.contains_key("cardOverflow"));
+    }
+
+    fn health_with_media(actual: Option<i64>, writable: bool, confirmed: bool) -> CameraHealth {
+        let mut health = CameraHealth::default();
+        health.connected = true;
+        health.capabilities.card_capture = true;
+        let mut property = unknown_property("recordingMedia", "Recording media", RECORDING_MEDIA, "");
+        property.readable = true;
+        property.writable = writable;
+        property.confirmed = confirmed;
+        property.supported_values = vec![CameraValue::Integer(0), CameraValue::Integer(1)];
+        property.actual = actual.map(CameraValue::Integer);
+        health.properties.insert("recordingMedia".into(), property);
+        health
+    }
+
+    #[test]
+    fn card_destination_requires_a_confirmed_card_readback_and_never_falls_back_to_ram() {
+        assert!(require_card_destination(&health_with_media(Some(0), true, true)).is_ok());
+        // SDRAM (1), unconfirmed or unwritable evidence and a missing value fail closed.
+        assert!(require_card_destination(&health_with_media(Some(1), true, true)).is_err());
+        assert!(require_card_destination(&health_with_media(Some(0), false, true)).is_err());
+        assert!(require_card_destination(&health_with_media(Some(0), true, false)).is_err());
+        assert!(require_card_destination(&health_with_media(None, true, true)).is_err());
+        let mut not_advertised = health_with_media(Some(0), true, true);
+        not_advertised.capabilities.card_capture = false;
+        assert!(require_card_destination(&not_advertised).is_err());
+        let mut live_view = health_with_media(Some(0), true, true);
+        live_view.live_view.active = true;
+        assert!(require_card_destination(&live_view).is_err());
+        let mut offline = health_with_media(Some(0), true, true);
+        offline.connected = false;
+        assert!(require_card_destination(&offline).is_err());
+        // A body that does not advertise the card value is refused even when the
+        // current readback happens to be zero.
+        let mut unsupported = health_with_media(Some(0), true, true);
+        unsupported
+            .properties
+            .get_mut("recordingMedia")
+            .unwrap()
+            .supported_values = vec![CameraValue::Integer(1)];
+        assert!(require_card_destination(&unsupported).is_err());
+        // No recording-media evidence at all is not a card destination.
+        let mut missing = health_with_media(Some(0), true, true);
+        missing.properties.clear();
+        assert!(require_card_destination(&missing).is_err());
+    }
 }

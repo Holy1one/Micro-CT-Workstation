@@ -307,7 +307,8 @@ export interface CameraProperty {
   actual: CameraValue | null; target: CameraValue | null; confirmed: boolean; error: string | null;
 }
 export interface CameraCapabilities {
-  properties: boolean; hostCapture: boolean; liveView: boolean; autofocus: boolean; focusStep: boolean;
+  properties: boolean; hostCapture: boolean; cardCapture: boolean; cardOverflow: boolean;
+  liveView: boolean; autofocus: boolean; focusStep: boolean;
   scanNef: boolean; hardwareCertified: boolean; disabledReasons: Record<string, string>;
 }
 export interface CameraLiveView {
