@@ -44,11 +44,18 @@ impl Engine {
         self.manual_control_allowed()?;
         #[derive(serde::Deserialize)]
         #[serde(rename_all="camelCase",deny_unknown_fields)]
-        struct Preparation { #[serde(rename="type")] _command:Option<String>,task_id:String,projection_count:u32,max_xray_sec:u32,geometry:scan::ScanGeometry }
+        struct Preparation { #[serde(rename="type")] _command:Option<String>,task_id:String,projection_count:u32,
+            #[serde(default)] max_xray_sec:Option<u32>,geometry:scan::ScanGeometry }
         let input:Preparation=serde_json::from_value(payload.clone()).map_err(|_|"INVALID_SCAN_PREPARATION")?;
         input.geometry.validate()?;
         if input.geometry.rotation_direction!="counterclockwise"||input.geometry.measurement!="measured"{return Err("INVALID_SCAN_GEOMETRY");}
-        if !crate::scan::scan_xray_seconds_valid(input.max_xray_sec){return Err("INVALID_PARAMETERS");}
+        // An explicit limit for this task is accepted as given. Without one the
+        // domain applies the destination-specific default when it freezes the
+        // profile: 1000 s for a camera-card acquisition, 600 s for host RAM.
+        let max_xray_sec=match input.max_xray_sec{
+            Some(value)=>{if !crate::scan::scan_xray_seconds_valid(value){return Err("INVALID_PARAMETERS");}value}
+            None=>self.max_xray_sec,
+        };
         let exposure=if self.preview{self.parameters.exposure_ms}else{
             let health=self.camera.as_ref().ok_or("CAMERA_NOT_CONNECTED")?.health();
             crate::devices::camera::shutter_property_ms(health.properties.get("shutter").ok_or("CAMERA_SHUTTER_UNCONFIRMED")?).map_err(|_|"CAMERA_SHUTTER_UNCONFIRMED")?
@@ -63,13 +70,37 @@ impl Engine {
         let actual_root=verified_candidate_path(&root).map_err(|_|"SCAN_OUTPUT_UNVERIFIED")?;
         let actual_independent=verified_candidate_path(&independent).map_err(|_|"CAPTURE_DIRECTORY_UNVERIFIED")?;
         if actual_root.components().any(|part|part.as_os_str().to_string_lossy().eq_ignore_ascii_case("CameraCaptures"))||crate::task_registry::lexical_path(&actual_root).starts_with(&crate::task_registry::lexical_path(&actual_independent)){return Err("RESERVED_TASK_DIRECTORY");}
-        self.parameters=parameters;self.max_xray_sec=input.max_xray_sec;self.current=0;self.preflight=false;self.capture_profile=None;self.homed=false;self.phase=Phase::Idle;
+        self.parameters=parameters;self.max_xray_sec=max_xray_sec;self.max_xray_sec_explicit=input.max_xray_sec.is_some();self.current=0;self.preflight=false;self.capture_profile=None;self.homed=false;self.phase=Phase::Idle;
         self.scan_geometry=Some(input.geometry);self.scan_references=scan::ReferenceFrames::default();self.scan_prompt=None;self.scan_stage="idle";self.restored_scan=None;self.restored_frames.clear();self.real_frames.clear();
         self.schedule_metadata_probe();Ok(())
     }
     pub(crate) fn enqueue_task_completed(&mut self)->Result<(),&'static str>{
         let plan=self.task_registry.prepare_completed(&self.parameters).map_err(|_|"TASK_COMPLETION_PREPARATION_FAILED")?;
         self.enqueue_device("task_storage","complete",move|cancel|{plan.execute(&cancel)?;Ok(Box::new(move|engine|{engine.task_registry.commit(plan)?;engine.phase=if engine.task_exit_pending{Phase::Stopping}else{Phase::Completed};engine.scan_stage=if engine.task_exit_pending{"stopping"}else{"completed"};engine.scan_prompt=None;engine.last_error=None;engine.metadata_completed=true;engine.metadata_manifest=true;engine.metadata_resume=false;Ok(())}))})
+    }
+    /// Safe finishing of a card acquisition. The record leaves the active slot, so
+    /// the scan hardware is released and manual controls unlock, but it stays
+    /// retained with its directory reserved and is never completed or
+    /// reconstructable until the authorized USB import is verified. The registry
+    /// itself re-validates the persisted schema-4 manifest (`acquired` plus an open
+    /// data state with real card provenance), so this cannot promote an unproven
+    /// acquisition.
+    pub(crate) fn enqueue_acquired_pending_import(&mut self)->Result<(),&'static str>{
+        let parameters=self.parameters.clone();
+        self.enqueue_device("task_storage","card_pending_import",move|_cancel|{
+            Ok(Box::new(move|engine|{
+                engine.task_registry.mark_acquired_pending_import(&parameters)?;
+                engine.phase=if engine.task_exit_pending{Phase::Stopping}else{Phase::Stopped};
+                engine.scan_stage="pending_import";
+                engine.scan_prompt=None;
+                engine.last_error=None;
+                engine.metadata_manifest=true;
+                engine.metadata_resume=false;
+                engine.metadata_completed=false;
+                engine.log("PASS","system","Card acquisition safely finished; the task is retained as acquired with import required. The NEFs stay on the camera card until the authorized USB import is verified, and reconstruction stays locked.");
+                Ok(())
+            }))
+        })
     }
     pub(crate) fn enqueue_stop_for_shutdown(&mut self)->Result<(),&'static str>{self.enqueue_stop(true,false)}
     pub(crate) fn sync_camera_health(&mut self) {
@@ -698,8 +729,7 @@ impl Engine {
             if scan::manifest_file_exists(&params) && !scan::resume_manifest_exists(&params){return Err("Scan output exists; use a new task".into());}
             if camera.health().live_view.active{return Err("LIVE_VIEW_CAPTURE_FORBIDDEN: explicitly stop Live View".into());}
             camera.read_properties().map_err(|e|e.to_string())?;
-            let readback=camera.profile_readback().map_err(|e|e.to_string())?;
-            let mut profile=crate::capture_profile::CaptureProfile::from_camera_readback(&camera.health(),readback,preset)?;
+            let mut profile=freeze_capture_profile(&camera,&nano,preset)?;
             if let Some(frozen)=frozen_profile.as_ref(){frozen.matches(&profile)?;profile.preset=frozen.preset.clone();}
             if profile.exposure_ms()!=Some(params.exposure_ms){return Err("Camera shutter differs from the shared Exposure target".into());}
             xray.force_off().map_err(|e|format!("OFF unconfirmed during preflight: {e}"))?;
@@ -725,7 +755,13 @@ impl Engine {
             if !reusable{nano.rearm_cancelled(cancel.clone()).map_err(|e|e.to_string())?;}
             if cancel.load(Ordering::SeqCst){return Err("Preflight cancelled".into());}
             let restoring=scan::resume_manifest_exists(&params);
-            Ok(Box::new(move |engine|{engine.capture_profile=Some(profile);engine.cached_camera_health=Some(camera.health());engine.set_kv=health.set_voltage_kv.ok_or("Verified voltage missing")?;engine.set_ua=health.set_current_ua.ok_or("Verified current missing")?;engine.cached_xray_health=Some(health);if recovery{engine.set_kv_confirmed=true;engine.set_ua_confirmed=true;engine.usb_auto_shut_down=false;engine.usb_auto_shut_down_confirmed=true;if let Some(max)=frozen_max{engine.max_xray_sec=max;}}engine.fault_latched=false;engine.preflight=true;engine.homed=reusable;engine.reference_verified_this_process|=reusable;engine.phase=if reusable{Phase::Ready}else{Phase::ReadyForHome};engine.scan_references=scan::ReferenceFrames::default();engine.metadata_resume=restoring;engine.scan_prompt=if restoring||engine.scan_geometry.is_some(){None}else{Some("geometry")};engine.scan_stage=if engine.scan_prompt.is_some(){"geometry"}else{"idle"};engine.last_error=None;if unchanged&&reusable{engine.log("PASS","nano","Operator-confirmed unchanged turntable reference verified; no HOME or movement performed");}Ok(())}))
+            Ok(Box::new(move |engine|{engine.capture_profile=Some(profile.clone());engine.cached_camera_health=Some(camera.health());engine.set_kv=health.set_voltage_kv.ok_or("Verified voltage missing")?;engine.set_ua=health.set_current_ua.ok_or("Verified current missing")?;engine.cached_xray_health=Some(health);if recovery{engine.set_kv_confirmed=true;engine.set_ua_confirmed=true;engine.usb_auto_shut_down=false;engine.usb_auto_shut_down_confirmed=true;if let Some(max)=frozen_max{engine.max_xray_sec=max;}}else if profile.is_card_destination()&&!engine.max_xray_sec_explicit{
+                // A new camera-card acquisition defaults to the unified 1000 s
+                // continuous limit. An explicit value for this task is kept, and a
+                // host-RAM task keeps the 600 s default.
+                engine.max_xray_sec=crate::scan::SCAN_MAX_XRAY_SEC;
+                engine.log("INFO","system",&format!("Camera-card acquisition defaults to the unified {} s continuous X-ray limit; set an explicit limit before Preflight to change it",crate::scan::SCAN_MAX_XRAY_SEC));
+            }engine.fault_latched=false;engine.preflight=true;engine.homed=reusable;engine.reference_verified_this_process|=reusable;engine.phase=if reusable{Phase::Ready}else{Phase::ReadyForHome};engine.scan_references=scan::ReferenceFrames::default();engine.metadata_resume=restoring;engine.scan_prompt=if restoring||engine.scan_geometry.is_some(){None}else{Some("geometry")};engine.scan_stage=if engine.scan_prompt.is_some(){"geometry"}else{"idle"};engine.last_error=None;if unchanged&&reusable{engine.log("PASS","nano","Operator-confirmed unchanged turntable reference verified; no HOME or movement performed");}Ok(())}))
         })
     }
     fn enqueue_restore(&mut self)->Result<(),&'static str> {
@@ -741,7 +777,7 @@ impl Engine {
             if !nano_reference_ready(&nano.status().map_err(|e|e.to_string())?){return Err("HOME_REQUIRED".into());}
             if camera.health().live_view.active{return Err("LIVE_VIEW_CAPTURE_FORBIDDEN".into());}
             camera.read_properties().map_err(|e|e.to_string())?;
-            let actual=crate::capture_profile::CaptureProfile::from_camera_readback(&camera.health(),camera.profile_readback().map_err(|e|e.to_string())?,preset)?;
+            let actual=freeze_capture_profile(&camera,&nano,preset)?;
             let restored=scan::load_resume(&params,kv,ua,&actual)?;
             if cancel.load(Ordering::SeqCst){return Err("Restore cancelled".into());}
             Ok(Box::new(move |engine|{engine.max_xray_sec=restored.max_xray_sec;engine.capture_profile=Some(actual);engine.current=restored.frames.len()as u32;engine.real_frames=restored.frames.iter().map(|f|serde_json::to_value(f).unwrap_or(Value::Null)).collect();engine.scan_geometry=Some(restored.geometry.clone());engine.scan_references=restored.references.clone();engine.restored_frames=restored.frames.clone();engine.restored_scan=Some(restored);engine.scan_prompt=None;engine.scan_stage="idle";engine.phase=Phase::Ready;Ok(())}))
@@ -787,7 +823,7 @@ impl Engine {
             if !nano_reference_ready(&status){return Err("HOME_REQUIRED".into());}
             if camera.health().live_view.active{return Err("LIVE_VIEW_CAPTURE_FORBIDDEN: explicitly stop Live View".into());}
             camera.read_properties().map_err(|e|e.to_string())?;
-            let actual=crate::capture_profile::CaptureProfile::from_camera_readback(&camera.health(),camera.profile_readback().map_err(|e|e.to_string())?,preset)?;
+            let actual=freeze_capture_profile(&camera,&nano,preset)?;
             expected.matches(&actual)?;
             if cancel.load(Ordering::SeqCst){return Err("Scan start cancelled".into());}
             Ok(Box::new(move |engine|{
@@ -1001,6 +1037,49 @@ fn device_value_rejection_error(error:&str)->bool {
         &&!["camera unavailable:","camera I/O failed:","camera timeout:","camera session isolated:","camera operation cancelled","camera busy:","camera capability unavailable:","camera safety check failed:"]
             .iter()
             .any(|marker|error.contains(marker))
+}
+
+/// Freezes the current camera and controller evidence as the profile of the
+/// destination the camera itself confirmed. An unknown destination is refused
+/// instead of being defaulted to either side, and a card profile additionally
+/// requires the pinned card-capture settle firmware identity of the controller.
+fn freeze_capture_profile(
+    camera:&CameraAdapter,
+    nano:&NanoAdapter,
+    preset:Option<crate::capture_profile::PresetTag>,
+)->Result<crate::capture_profile::CaptureProfile,String>{
+    let health=camera.health();
+    let destination=health.properties.get("recordingMedia").and_then(|property|property.actual.as_ref()).and_then(crate::devices::camera::CameraValue::integer);
+    match destination {
+        Some(0) if health.capabilities.card_capture => {
+            // The card readback is the card counterpart of `profile_readback`; the
+            // RAM readback requires the SDRAM destination and would refuse here.
+            let readback=camera.card_profile_readback().map_err(|error|error.to_string())?;
+            let identity=nano.health().identity.ok_or("Turntable identity is unknown; the card-capture settle firmware cannot be frozen")?;
+            let policy=crate::scan::card_capture_policy(&identity,health.capabilities.card_overflow)?;
+            crate::capture_profile::CaptureProfile::from_card_readback(&health,readback,preset,policy)
+        }
+        Some(0)=>Err("CAMERA_CARD_CAPTURE_UNSUPPORTED: the selected camera body does not advertise the standard card-capture operations".into()),
+        Some(1)=>{
+            let readback=camera.profile_readback().map_err(|error|error.to_string())?;
+            crate::capture_profile::CaptureProfile::from_camera_readback(&health,readback,preset)
+        }
+        _=>Err("CAMERA_DESTINATION_UNKNOWN: explicitly Apply Host RAM or camera-card saving, verify the readback, then repeat Preflight".into()),
+    }
+}
+
+/// The continuous X-ray limit a newly frozen acquisition defaults to.
+///
+/// A camera-card acquisition defaults to the unified 1000 s limit because its
+/// per-projection overhead is lower; a host-RAM task keeps the historical 600 s
+/// default. An operator value for this task is never replaced, and a recovered or
+/// restored task keeps its own frozen value because this is only consulted when a
+/// new profile is frozen.
+fn card_default_max_xray_sec(
+    profile:&crate::capture_profile::CaptureProfile,
+    explicit:bool,
+)->Option<u32>{
+    (profile.is_card_destination()&&!explicit).then_some(crate::scan::SCAN_MAX_XRAY_SEC)
 }
 
 fn read_frozen_recovery(parameters:&crate::Parameters)->Result<(f64,f64,u32,crate::capture_profile::CaptureProfile),String> {

@@ -8,10 +8,13 @@
 //! coordinator never changes it. Every exit path still attempts verified beam
 //! OFF and warning OFF before returning.
 
-use crate::capture_profile::CaptureProfile;
-use crate::devices::camera::{CameraAdapter, CameraCaptureEvent, CameraError};
+use crate::capture_profile::{CaptureProfile, CardCapturePolicy};
+use crate::devices::camera::{
+    CameraAdapter, CameraCaptureEvent, CameraError, CardCapturePlan, CardPlan,
+};
 use crate::devices::turntable::{
     plan_projection, verify_fixed_configuration, verify_plan_capture_hold, MoveTicket, NanoAdapter,
+    NanoIdentity,
 };
 use crate::devices::xray::{MoxtekAdapter, XrayError, XrayHealth};
 use crate::{timestamp, Parameters};
@@ -27,13 +30,37 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const CAMERA_TRIGGER_MARGIN: Duration = Duration::from_secs(2);
-// Leave time for camera/transport jitter before the hard 600-second beam cutoff.
+// Leave time for camera/transport jitter before the hard continuous-output cutoff.
 const EXPOSURE_BUDGET_MARGIN: Duration = Duration::from_secs(30);
 const MOVE_BUDGET_MARGIN: Duration = Duration::from_secs(30);
 // Project OFF-interval policy, not a Moxtek-specified five-minute cooldown.
 const XRAY_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const CANCELLED: &str = "scan cancelled";
 const REFERENCE_COUNT: usize = 10;
+/// The controller firmware candidate this workspace builds and pins in
+/// `firmware/rts9060_nano/build-config.json`. A card scan freezes the 150 ms
+/// last-step-falling-edge settle contract of that candidate, so it starts only
+/// when the controller advertises that contract and reports exactly this version
+/// and build. Text cannot prove the flashed image; this is a fail-closed identity
+/// gate, not a certification.
+pub(crate) const CARD_FIRMWARE_VERSION: &str = "2.2.0";
+pub(crate) const CARD_FIRMWARE_BUILD: &str = "20261010";
+pub(crate) const CARD_FIRMWARE_SOURCE_SHA256: &str =
+    "2843f57ecb3d304c47f061f5d342b1b809a807dc2a7980ccc0cf9d14f0ecaa1e";
+/// The advertised capability token the card settle contract requires. It mirrors
+/// `devices::turntable::MOVE_SETTLE_CAPABILITY`, which is not part of the public
+/// turntable surface; the identity accessor is the authority for the check.
+pub(crate) const CARD_SETTLE_CAPABILITY: &str = "MOVE_SETTLE_150MS";
+/// Schema-4 acquisition states that precede safe finishing. `acquired` is only
+/// written once every exposure has its receipt.
+pub(crate) const ACQUISITION_PREPARED: &str = "prepared";
+pub(crate) const ACQUISITION_RUNNING: &str = "running";
+pub(crate) const ACQUISITION_FAULT: &str = "fault";
+/// The card cleanup ledger: one line per persisted exposure intent and one per
+/// persisted receipt, so a crash between the two is detectable afterwards.
+pub(crate) const CARD_JOURNAL_FILE: &str = "acquisition-journal.jsonl";
+const CARD_JOURNAL_KIND_INTENT: &str = "intent";
+const CARD_JOURNAL_KIND_RECEIPT: &str = "receipt";
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -148,6 +175,11 @@ struct PromptGate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanCompletion {
     Completed,
+    /// A card acquisition finished safely: every exposure has its card receipt,
+    /// the beam is confirmed OFF and the ledger is persisted. The NEFs are still on
+    /// the camera card, so this is never reported as a completed project; the
+    /// domain moves the task to the retained `acquired_pending_import` state.
+    AcquiredPendingImport,
     Stopped,
 }
 
@@ -286,6 +318,171 @@ pub(crate) fn schema_four_completion_consistent(
             .all(|record| card_data_status_valid(&record.state) && card_record_is_reconstructable(record))
 }
 
+/// The card acquisition ledger, one JSON line per persisted exposure intent and
+/// one per persisted receipt. The intent is written BEFORE the trigger and the
+/// receipt AFTER it, so a crash between the two leaves an intent with no receipt:
+/// that window is detectable afterwards, and an intent without a receipt never
+/// becomes a `CardCaptureRecord` and never lets the acquisition report `acquired`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CardJournalEntry {
+    /// `intent` or `receipt`.
+    pub kind: String,
+    pub index: u32,
+    /// `projection`, `preDark` or `preFlat`.
+    pub group: String,
+    pub angle_deg: f64,
+    pub exposure_ms: f64,
+    pub operation_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_pulse_position: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file_name: Option<String>,
+    pub recorded_at: String,
+}
+
+fn card_journal_path(root: &Path) -> std::path::PathBuf {
+    root.join(CARD_JOURNAL_FILE)
+}
+
+/// Appends one durable intent or receipt line. The intent is only ever written by
+/// the coordinator before it triggers, and the receipt only after the camera
+/// returned an associated object.
+pub(crate) fn append_card_journal(root: &Path, entry: &CardJournalEntry) -> Result<(), String> {
+    fs::create_dir_all(root).map_err(io_error)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(card_journal_path(root))
+        .map_err(io_error)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, entry).map_err(|error| error.to_string())?;
+    writer.write_all(b"\n").map_err(io_error)?;
+    writer.flush().map_err(io_error)?;
+    writer.get_ref().sync_all().map_err(io_error)
+}
+
+/// Reads the ledger. A malformed line refuses the whole ledger instead of dropping
+/// evidence: an unreadable window must never look like "no unresolved intent".
+pub(crate) fn read_card_journal(root: &Path) -> Result<Vec<CardJournalEntry>, String> {
+    let path = card_journal_path(root);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path).map_err(io_error)?;
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<CardJournalEntry>(line)
+                .map_err(|error| format!("card acquisition journal is invalid: {error}"))
+        })
+        .collect()
+}
+
+/// The crash window: intents whose operation never produced a receipt. The card
+/// object of such an intent is never counted as acquired, is never deleted and is
+/// never re-shot; it requires an explicit reconciliation.
+pub(crate) fn unresolved_card_intents(root: &Path) -> Result<Vec<CardJournalEntry>, String> {
+    let entries = read_card_journal(root)?;
+    Ok(entries
+        .iter()
+        .filter(|entry| entry.kind == CARD_JOURNAL_KIND_INTENT)
+        .filter(|intent| {
+            !entries.iter().any(|entry| {
+                entry.kind == CARD_JOURNAL_KIND_RECEIPT
+                    && entry.operation_id == intent.operation_id
+            })
+        })
+        .cloned()
+        .collect())
+}
+
+/// Safe finishing of a card acquisition requires that no persisted exposure
+/// intent is left without its receipt. The crash window between the two is the
+/// only place a card exposure could otherwise be counted without proof, so this
+/// gate is the single rule the terminal path uses before it may report the
+/// acquisition as acquired.
+pub(crate) fn card_acquisition_finish_gate(root: &Path) -> Result<(), String> {
+    let unresolved = unresolved_card_intents(root)
+        .map_err(|error| format!("card acquisition journal cannot be verified: {error}"))?;
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "CARD_EXPOSURE_UNRESOLVED: {} persisted card exposure intent(s) have no receipt; the card object is not counted as acquired and requires reconciliation",
+        unresolved.len()
+    ))
+}
+
+/// The frozen card policy of a new card acquisition. The connected controller must
+/// advertise the unified 150 ms last-step-falling-edge settle contract and report
+/// exactly the version and build of the firmware candidate this workspace pins;
+/// the policy then freezes that settle contract plus the pinned source identity.
+/// A controller without the contract keeps working for host-RAM scans with its
+/// longer wait, but no card scan may claim the contract for it. Advertised text is
+/// required evidence here, and it is never treated as proof of the flashed image.
+pub(crate) fn card_capture_policy(
+    identity: &NanoIdentity,
+    overflow_advertised: bool,
+) -> Result<CardCapturePolicy, String> {
+    if !identity.advertises_move_settle_150ms() {
+        return Err(format!(
+            "CARD_FIRMWARE_UNVERIFIED: the controller does not advertise {}; the card-scan settle contract is unproven",
+            CARD_SETTLE_CAPABILITY
+        ));
+    }
+    if identity.version.trim() != CARD_FIRMWARE_VERSION
+        || identity.build.trim() != CARD_FIRMWARE_BUILD
+    {
+        return Err(format!(
+            "CARD_FIRMWARE_UNVERIFIED: the controller reports {} / {} and does not prove the pinned card-capture settle firmware {} / {}",
+            identity.version.trim(),
+            identity.build.trim(),
+            CARD_FIRMWARE_VERSION,
+            CARD_FIRMWARE_BUILD
+        ));
+    }
+    let policy = CardCapturePolicy {
+        mode: if overflow_advertised { "overflow" } else { "single" }.into(),
+        settle_ms: crate::capture_profile::MOVE_SETTLE_MS,
+        settle_anchor: crate::capture_profile::MOVE_SETTLE_ANCHOR.into(),
+        firmware_version: CARD_FIRMWARE_VERSION.into(),
+        firmware_build: CARD_FIRMWARE_BUILD.into(),
+        firmware_source_sha256: CARD_FIRMWARE_SOURCE_SHA256.into(),
+    };
+    policy.validate()?;
+    Ok(policy)
+}
+
+/// Derives this scan's card plan from the freshly enumerated storage evidence.
+///
+/// Only the storages the camera itself reported as writable are planned, in the
+/// camera's order. The overflow continuation is allowed only when the frozen
+/// policy permits it, the body advertised the continuation events, and at least
+/// two writable storages exist; a single writable card stays a complete plan.
+/// Exactly one object per exposure is planned.
+pub(crate) fn card_capture_plan(
+    planned: &CardPlan,
+    policy: &CardCapturePolicy,
+    overflow_advertised: bool,
+) -> Result<CardCapturePlan, String> {
+    if planned.storages.is_empty() {
+        return Err("CARD_READ_ONLY: no writable card storage was advertised".into());
+    }
+    Ok(CardCapturePlan {
+        storages: planned.storages.iter().map(|storage| storage.id).collect(),
+        allow_overflow: policy.mode == "overflow"
+            && overflow_advertised
+            && planned.storages.len() >= 2,
+        expected_objects: 1,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanMessage {
     pub timestamp: String,
@@ -303,6 +500,15 @@ pub struct RealScanProgress {
     pub beam_on: bool,
     pub frames: Vec<RealFrame>,
     pub references: ReferenceFrames,
+    /// Card destination only: one receipt per reference and projection. A host-RAM
+    /// scan never fills it, and a card scan never fills `frames`/`references`.
+    pub card_records: Vec<CardCaptureRecord>,
+    /// Card destination only: the schema-4 acquisition state. It stays before
+    /// `acquired` until every exposure has its receipt and safe finishing is done.
+    pub card_acquisition_status: Option<&'static str>,
+    /// Card destination only: the schema-4 data state (`pendingImport` until an
+    /// authorized import is verified).
+    pub card_data_status: Option<&'static str>,
     pub stage: &'static str,
     pub prompt: Option<&'static str>,
     pub messages: Vec<ScanMessage>,
@@ -332,6 +538,9 @@ impl Default for RealScanProgress {
             beam_on: false,
             frames: Vec::new(),
             references: ReferenceFrames::default(),
+            card_records: Vec::new(),
+            card_acquisition_status: None,
+            card_data_status: None,
             stage: "idle",
             prompt: None,
             messages: Vec::new(),
@@ -1033,11 +1242,24 @@ fn run_scan(
     // alone cannot label the outcome. Reporting a fault as "Scan ended by operator" would
     // hide the real cause from the operator and from the record; the worker owns the live
     // device evidence here, so it decides which of the two actually happened.
-    let completion = match finish_scan_result(
-        result,
-        off.map(|_| ()).map_err(|e| e.to_string()),
-        warning_off.map_err(|e| e.to_string()),
-    ) {
+    let card_scan = config.capture_profile.is_card_destination();
+    let success = if card_scan {
+        ScanCompletion::AcquiredPendingImport
+    } else {
+        ScanCompletion::Completed
+    };
+    let off_result = off.map(|_| ()).map_err(|e| e.to_string());
+    let warning_result = warning_off.map_err(|e| e.to_string());
+    let completion = match if card_scan {
+        finish_scan_result_for(
+            result,
+            off_result,
+            warning_result,
+            ScanCompletion::AcquiredPendingImport,
+        )
+    } else {
+        finish_scan_result(result, off_result, warning_result)
+    } {
         Ok(ScanCompletion::Stopped) => match device_fault_evidence(camera, xray) {
             Some(reason) => Err(reason),
             None => Ok(ScanCompletion::Stopped),
@@ -1045,23 +1267,58 @@ fn run_scan(
         other => other,
     };
     let root = Path::new(config.parameters.save_path.trim()).join(config.parameters.task_id.trim());
+    // Safe finishing of a card acquisition additionally requires that no persisted
+    // exposure intent is left without its receipt. An unresolved intent is the
+    // crash window between the intent and the object confirmation: the object is
+    // never counted as acquired, never deleted and never re-shot, and the
+    // acquisition is reported as a fault that needs reconciliation instead.
+    let completion = if card_scan && completion == Ok(ScanCompletion::AcquiredPendingImport) {
+        match card_acquisition_finish_gate(&root) {
+            Ok(()) => Ok(ScanCompletion::AcquiredPendingImport),
+            Err(detail) => {
+                update(progress, |value| {
+                    value.phase = "fault";
+                    value.error = Some(detail.clone());
+                });
+                push_message(progress, "ERR", "camera", detail.clone());
+                Err(detail)
+            }
+        }
+    } else {
+        completion
+    };
     let owned = progress
         .lock()
         .expect("scan progress mutex poisoned")
         .output_dir_owned;
     let checkpoint = if owned {
         let stage = progress.lock().expect("scan progress mutex poisoned").stage;
+        let finished = completion == Ok(success);
+        if card_scan {
+            let (acquisition, data) = match &completion {
+                Ok(ScanCompletion::AcquiredPendingImport) => {
+                    (ACQUISITION_ACQUIRED, DATA_PENDING_IMPORT)
+                }
+                Ok(ScanCompletion::Stopped) => ("stopped", DATA_PENDING_IMPORT),
+                _ => (ACQUISITION_FAULT, DATA_PENDING_IMPORT),
+            };
+            set_card_acquisition(progress, acquisition, data);
+        }
         persist_progress(
             &root,
             &config.parameters,
             config,
             progress,
-            if completion == Ok(ScanCompletion::Completed) {
-                "completed"
+            if finished {
+                if card_scan {
+                    "finalizing"
+                } else {
+                    "completed"
+                }
             } else {
                 stage
             },
-            completion == Ok(ScanCompletion::Completed),
+            finished,
         )
     } else {
         Ok(())
@@ -1086,6 +1343,32 @@ fn run_scan(
             format!(
                 "Real scan complete · {} projections · X-ray OFF",
                 frame_count
+            ),
+        );
+    }
+    if completion == Ok(ScanCompletion::AcquiredPendingImport) {
+        update_phase(progress, "finishing");
+        let (projections, references) = {
+            let state = progress.lock().expect("scan progress mutex poisoned");
+            (
+                state
+                    .card_records
+                    .iter()
+                    .filter(|record| record.kind == "projection")
+                    .count(),
+                state
+                    .card_records
+                    .iter()
+                    .filter(|record| record.kind != "projection")
+                    .count(),
+            )
+        };
+        push_message(
+            progress,
+            "PASS",
+            "system",
+            format!(
+                "Card acquisition safely finished · {projections} projections + {references} references on the camera card · X-ray OFF · USB import required"
             ),
         );
     }
@@ -1129,6 +1412,17 @@ fn finish_scan_result(
     off: Result<(), String>,
     warning: Result<(), String>,
 ) -> Result<ScanCompletion, String> {
+    finish_scan_result_for(result, off, warning, ScanCompletion::Completed)
+}
+
+/// The same terminal rule for a chosen success outcome: a card acquisition
+/// finishes safely as `AcquiredPendingImport`, never as a completed project.
+fn finish_scan_result_for(
+    result: Result<(), String>,
+    off: Result<(), String>,
+    warning: Result<(), String>,
+    success: ScanCompletion,
+) -> Result<ScanCompletion, String> {
     let stopped = matches!(&result, Err(error) if error == CANCELLED);
     let mut errors = Vec::new();
     if let Err(error) = result {
@@ -1147,7 +1441,7 @@ fn finish_scan_result(
     } else if stopped {
         Ok(ScanCompletion::Stopped)
     } else {
-        Ok(ScanCompletion::Completed)
+        Ok(success)
     }
 }
 
@@ -1172,10 +1466,21 @@ fn run_scan_inner(
         return Err("Continuous X-ray limit differs from the frozen acquisition".into());
     }
     let root = Path::new(parameters.save_path.trim()).join(parameters.task_id.trim());
-    let resume_count = config
-        .resume
-        .as_ref()
-        .map_or(0, |resume| resume.frames.len());
+    let card_scan = config.capture_profile.is_card_destination();
+    // A card acquisition has no local file to restore: its exposures live in the
+    // schema-4 manifest and on the card itself, so a schema-3 checkpoint can never
+    // continue one. Refusing here also means no device action is taken.
+    let resume_count = if card_scan {
+        if config.resume.is_some() {
+            return Err("CARD_ACQUISITION_NO_LOCAL_RESUME: a card acquisition cannot continue from a local file checkpoint".into());
+        }
+        0
+    } else {
+        config
+            .resume
+            .as_ref()
+            .map_or(0, |resume| resume.frames.len())
+    };
     if config.resume.is_none() {
         if root.exists() {
             let entries = fs::read_dir(&root)
@@ -1194,7 +1499,13 @@ fn run_scan_inner(
                 ));
             }
         }
-        fs::create_dir_all(root.join("frames")).map_err(io_error)?;
+        if card_scan {
+            // The card task keeps only its manifest, ledger and log on the host;
+            // no frames/ directory is created because no image reaches the host.
+            fs::create_dir_all(&root).map_err(io_error)?;
+        } else {
+            fs::create_dir_all(root.join("frames")).map_err(io_error)?;
+        }
     } else if load_resume(
         parameters,
         config.voltage_kv,
@@ -1226,13 +1537,32 @@ fn run_scan_inner(
     camera
         .read_properties()
         .map_err(|error| format!("Camera profile readback failed: {error}"))?;
-    let actual_profile = CaptureProfile::from_camera_readback(
-        &camera.health(),
-        camera
-            .profile_readback()
-            .map_err(|error| error.to_string())?,
-        config.capture_profile.preset.clone(),
-    )?;
+    // The frozen destination owns its own readback rule: a card acquisition proves
+    // the card destination (`recordingMedia=0`) instead of the host SDRAM value, so
+    // a RAM profile can never silently describe a card scan or the reverse.
+    let actual_profile = if card_scan {
+        let readback = camera
+            .card_profile_readback()
+            .map_err(|error| error.to_string())?;
+        CaptureProfile::from_card_readback(
+            &camera.health(),
+            readback,
+            config.capture_profile.preset.clone(),
+            config
+                .capture_profile
+                .card_policy
+                .clone()
+                .ok_or("CARD_POLICY_MISSING: the frozen card acquisition has no card policy")?,
+        )?
+    } else {
+        CaptureProfile::from_camera_readback(
+            &camera.health(),
+            camera
+                .profile_readback()
+                .map_err(|error| error.to_string())?,
+            config.capture_profile.preset.clone(),
+        )?
+    };
     config.capture_profile.matches(&actual_profile)?;
     if actual_profile.exposure_ms() != Some(parameters.exposure_ms) {
         return Err(
@@ -1245,6 +1575,46 @@ fn run_scan_inner(
         "camera",
         format!("D7100 native shutter verified at {:.6} ms",parameters.exposure_ms),
     );
+    // A card scan enumerates the advertised storages exactly once, here, before any
+    // exposure, movement or beam: the whole task (10 pre-dark + 10 pre-flat
+    // references plus every projection at the conservative per-frame bound) must
+    // fit the writable evidence, and no earlier exposure intent may be unresolved.
+    // A refusal carries the stable storage code and precedes every device action.
+    let card_plan = if card_scan {
+        let unresolved = unresolved_card_intents(&root)?;
+        if !unresolved.is_empty() {
+            return Err(format!(
+                "CARD_ACQUISITION_UNRESOLVED: {} persisted card exposure intent(s) have no receipt; the card object is never re-shot and this task requires reconciliation before another card scan",
+                unresolved.len()
+            ));
+        }
+        let planned = camera
+            .plan_card_storages(parameters.projection_count)
+            .map_err(|error| format!("CARD_STORAGE_PLAN_REFUSED: {error}"))?;
+        let policy = config
+            .capture_profile
+            .card_policy
+            .as_ref()
+            .ok_or("CARD_POLICY_MISSING: the frozen card acquisition has no card policy")?;
+        let plan = card_capture_plan(&planned, policy, camera.health().capabilities.card_overflow)
+            .map_err(|error| format!("CARD_STORAGE_PLAN_REFUSED: {error}"))?;
+        push_message(
+            progress,
+            "PASS",
+            "camera",
+            format!(
+                "Card storage planned · {} writable storage(s) · {} bytes free · {} free images · overflow {} · one object per exposure",
+                planned.storages.len(),
+                planned.writable_bytes,
+                planned.writable_images,
+                if plan.allow_overflow { "permitted" } else { "not permitted" }
+            ),
+        );
+        set_card_acquisition(progress, ACQUISITION_RUNNING, DATA_PENDING_IMPORT);
+        Some(plan)
+    } else {
+        None
+    };
     xray.set_parameters(config.voltage_kv, config.current_ua)
         .map_err(|error| format!("Moxtek setpoint configuration failed: {error}"))?;
     set_xray_health(progress, xray.health());
@@ -1282,12 +1652,45 @@ fn run_scan_inner(
         if pre_references_incomplete {
             wait_for_prompt(nano, xray, progress, prompt_gate, cancel, "preReferences")?;
         }
-        capture_reference_group(
-            nano, camera, xray, config, cancel, progress, &root, "pre-dark", "preDark", false,
-        )?;
-        capture_reference_group(
-            nano, camera, xray, config, cancel, progress, &root, "pre-flat", "preFlat", true,
-        )?;
+        if card_scan {
+            capture_card_reference_group(
+                nano,
+                camera,
+                xray,
+                config,
+                cancel,
+                progress,
+                &root,
+                card_plan
+                    .as_ref()
+                    .expect("a card scan planned its storages before any exposure"),
+                "pre-dark",
+                "preDark",
+                false,
+            )?;
+            capture_card_reference_group(
+                nano,
+                camera,
+                xray,
+                config,
+                cancel,
+                progress,
+                &root,
+                card_plan
+                    .as_ref()
+                    .expect("a card scan planned its storages before any exposure"),
+                "pre-flat",
+                "preFlat",
+                true,
+            )?;
+        } else {
+            capture_reference_group(
+                nano, camera, xray, config, cancel, progress, &root, "pre-dark", "preDark", false,
+            )?;
+            capture_reference_group(
+                nano, camera, xray, config, cancel, progress, &root, "pre-flat", "preFlat", true,
+            )?;
+        }
         if resume_count < parameters.projection_count as usize {
             update(progress, |value| value.stage = "placeSample");
             persist_progress(&root, parameters, config, progress, "placeSample", false)?;
@@ -1431,9 +1834,6 @@ fn run_scan_inner(
 
         let frame_index = job.index;
         let final_projection = frame_index == parameters.projection_count;
-        let mut abort_reason = None;
-        let mut last_xray_poll = Instant::now();
-        let mut transfer_announced = false;
         let camera_for_capture = camera.clone();
         let capture_session = camera
             .health()
@@ -1445,6 +1845,252 @@ fn run_scan_inner(
             frame_index,
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
+        if card_scan {
+            // MOVE and the matched READY(ticket) verification already happened above.
+            // The order from here is fixed: persist the intent, one card exposure
+            // (one object + one completion), persist the receipt, CAPTURE_DONE with
+            // the same ticket, then the next MOVE. No GET_OBJECT, no local file, no
+            // hash and no extra sleep: the coordinator advances only on matched
+            // device evidence.
+            let plan = card_plan
+                .as_ref()
+                .expect("a card scan planned its storages before any exposure");
+            let intent = CardJournalEntry {
+                kind: CARD_JOURNAL_KIND_INTENT.into(),
+                index: frame_index,
+                group: "projection".into(),
+                angle_deg: job.angle_deg,
+                exposure_ms: parameters.exposure_ms,
+                operation_id: capture_operation.clone(),
+                session_id: capture_session.clone(),
+                planned_pulse_position: Some(ticket.position_pulses),
+                handle: None,
+                storage_id: None,
+                source_file_name: None,
+                recorded_at: timestamp(),
+            };
+            append_card_journal(&root, &intent).map_err(|error| {
+                format!("card exposure intent could not be persisted; the exposure was not triggered: {error}")
+            })?;
+            let mut abort_reason = None;
+            let mut last_xray_poll = Instant::now();
+            let mut evidence =
+                ExposureEvidence::new(capture_session.clone(), capture_operation.clone());
+            let plan_for_worker = plan.clone();
+            let worker_operation = capture_operation.clone();
+            let capture_result = thread::scope(|scope| {
+                let (capture_sender, capture_receiver) = mpsc::channel();
+                let (event_sender, event_receiver) = mpsc::channel();
+                scope.spawn(move || {
+                    let result = camera_for_capture.capture_to_card(
+                        plan_for_worker,
+                        &worker_operation,
+                        cancel,
+                        Some(event_sender),
+                    );
+                    let _ = capture_sender.send(result);
+                });
+                loop {
+                    for event in event_receiver.try_iter() {
+                        if let Err(error) = evidence.observe(&event) {
+                            abort_reason = Some(error);
+                            cancel.store(true, Ordering::SeqCst);
+                            let _ = xray.force_off();
+                            let _ = nano.stop();
+                        }
+                    }
+                    match capture_receiver.recv_timeout(Duration::from_millis(25)) {
+                        Ok(result) => {
+                            for event in event_receiver.try_iter() {
+                                if let Err(error) = evidence.observe(&event) {
+                                    abort_reason = Some(error);
+                                }
+                            }
+                            break result;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if abort_reason.is_none()
+                                && beam_started.is_some()
+                                && last_xray_poll.elapsed() >= Duration::from_millis(250)
+                            {
+                                last_xray_poll = Instant::now();
+                                match refresh_emission_monitored(xray, progress, cancel) {
+                                    Ok(health) => {
+                                        if let Some(warning) = health.telemetry_warning.clone() {
+                                            push_message(progress, "WARN", "xray", warning);
+                                        }
+                                        set_xray_health(progress, health);
+                                    }
+                                    Err(error) => {
+                                        abort_reason = Some(xray_operation_error(
+                                            error,
+                                            "Moxtek emission monitor failed",
+                                        ));
+                                        cancel.store(true, Ordering::SeqCst);
+                                        set_xray_health(progress, xray.health());
+                                        let _ = warning_after_off(nano, xray);
+                                        set_beam(progress, xray.health().beam_on);
+                                        let _ = nano.stop();
+                                    }
+                                }
+                            }
+                            if abort_reason.is_none() && cancel.load(Ordering::SeqCst) {
+                                abort_reason = Some(CANCELLED.into());
+                                let _ = xray.force_off();
+                                set_xray_health(progress, xray.health());
+                                let _ = warning_after_off(nano, xray);
+                                set_beam(progress, xray.health().beam_on);
+                                let _ = nano.stop();
+                            }
+                            if abort_reason.is_none() {
+                                let exposure_complete = evidence.exposure_ended;
+                                let limit_reached = beam_started
+                                    .is_some_and(|started| started.elapsed() >= block_limit);
+                                if limit_reached && !exposure_complete {
+                                    abort_reason = Some(format!(
+                                        "continuous X-ray limit of {} s reached before exposure completion",
+                                        config.max_xray_sec
+                                    ));
+                                    cancel.store(true, Ordering::SeqCst);
+                                    let _ = xray.force_off();
+                                    set_xray_health(progress, xray.health());
+                                    set_beam(progress, xray.health().beam_on);
+                                    let _ = warning_after_off(nano, xray);
+                                    let _ = nano.stop();
+                                }
+                                let pause_requested = pause.load(Ordering::SeqCst);
+                                if abort_reason.is_none()
+                                    && exposure_complete
+                                    && beam_started.is_some()
+                                    && (limit_reached || final_projection || pause_requested)
+                                {
+                                    let reason = if limit_reached {
+                                        "Continuous X-ray limit reached after current exposure"
+                                    } else if final_projection {
+                                        "Final projection exposure complete"
+                                    } else {
+                                        "Pause requested after current exposure"
+                                    };
+                                    match close_scan_beam(
+                                        nano,
+                                        xray,
+                                        progress,
+                                        &mut beam_started,
+                                        reason,
+                                    ) {
+                                        Ok(_) => {
+                                            if limit_reached && !final_projection {
+                                                cooldown_until =
+                                                    Some(Instant::now() + XRAY_COOLDOWN);
+                                                update(progress, |value| {
+                                                    value.cooldown_until = cooldown_until
+                                                });
+                                            }
+                                        }
+                                        Err(error) => {
+                                            abort_reason = Some(error);
+                                            cancel.store(true, Ordering::SeqCst);
+                                            let _ = nano.stop();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break Err(CameraError::Io(
+                                "camera card capture worker terminated without a result".into(),
+                            ));
+                        }
+                    }
+                }
+            });
+            if let Some(reason) = abort_reason {
+                return Err(reason);
+            }
+            check_cancel(cancel)?;
+            let outcome =
+                capture_result.map_err(|error| format!("D7100 card capture failed: {error}"))?;
+            if outcome.receipt.session_id != capture_session
+                || outcome.receipt.operation_id != capture_operation
+                || !outcome.exposure_ended
+                || !evidence.exposure_ended
+            {
+                return Err(
+                    "Card capture completed without this operation's reliable ExposureEnded event and card object association"
+                        .into(),
+                );
+            }
+            let limit_reached = beam_started.is_some_and(|started| started.elapsed() >= block_limit);
+            if beam_started.is_some()
+                && (limit_reached || final_projection || pause.load(Ordering::SeqCst))
+            {
+                let reason = if limit_reached {
+                    "Continuous X-ray limit reached after completed exposure"
+                } else if final_projection {
+                    "Final projection capture complete"
+                } else {
+                    "Pause requested after completed exposure"
+                };
+                close_scan_beam(nano, xray, progress, &mut beam_started, reason)?;
+                if limit_reached && !final_projection {
+                    cooldown_until = Some(Instant::now() + XRAY_COOLDOWN);
+                    update(progress, |value| value.cooldown_until = cooldown_until);
+                }
+            }
+            // The durable receipt is persisted BEFORE the same-ticket CAPTURE_DONE,
+            // so a crash after the object confirmation can never lose the mapping
+            // between this angle and the card object.
+            let record = CardCaptureRecord::from_receipt(
+                frame_index,
+                "projection",
+                job.angle_deg,
+                parameters.exposure_ms,
+                &outcome.receipt,
+            );
+            update(progress, |value| {
+                value.card_records.push(record.clone());
+                value.card_data_status = Some(DATA_PENDING_IMPORT);
+            });
+            persist_progress(&root, parameters, config, progress, "projections", false)?;
+            append_card_journal(
+                &root,
+                &card_receipt_journal_entry(&record, "projection", &capture_operation, &capture_session, timestamp()),
+            )
+            .map_err(|error| format!("card receipt could not be persisted: {error}"))?;
+            nano.capture_done_cancelled(ticket.command_id, cancel.clone())
+                .map_err(|error| format!("CAPTURE_DONE view {} failed: {error}", job.index))?;
+            check_cancel(cancel)?;
+            update(progress, |value| {
+                record_projection_sample(value, frame_index, Instant::now())
+            });
+            push_message(
+                progress,
+                "PASS",
+                "nano",
+                format!(
+                    "CAPTURE_DONE view={} id={} · card object released",
+                    job.index, ticket.command_id
+                ),
+            );
+            push_message(
+                progress,
+                "PASS",
+                "camera",
+                format!(
+                    "Card projection receipt · view={} · storage 0x{:08X} · handle 0x{:08X} · {} · {} bytes (no local file)",
+                    record.index,
+                    record.storage_id,
+                    record.handle,
+                    record.source_file_name,
+                    record.size
+                ),
+            );
+            continue;
+        }
+
+        let mut abort_reason = None;
+        let mut last_xray_poll = Instant::now();
+        let mut transfer_announced = false;
         let mut evidence =
             ExposureEvidence::new(capture_session.clone(), capture_operation.clone());
         let capture_result = thread::scope(|scope| {
@@ -2066,6 +2712,329 @@ fn capture_reference_group(
     Ok(())
 }
 
+/// One durable receipt line for a card record. It closes exactly one intent of the
+/// same operation, which is what makes the intent-without-receipt window
+/// detectable instead of invisible.
+fn card_receipt_journal_entry(
+    record: &CardCaptureRecord,
+    group: &str,
+    operation_id: &str,
+    session_id: &str,
+    recorded_at: String,
+) -> CardJournalEntry {
+    CardJournalEntry {
+        kind: CARD_JOURNAL_KIND_RECEIPT.into(),
+        index: record.index,
+        group: group.into(),
+        angle_deg: record.angle_deg,
+        exposure_ms: record.exposure_ms,
+        operation_id: operation_id.into(),
+        session_id: session_id.into(),
+        planned_pulse_position: None,
+        handle: Some(record.handle),
+        storage_id: Some(record.storage_id),
+        source_file_name: Some(record.source_file_name.clone()),
+        recorded_at,
+    }
+}
+
+fn card_group_kind(group: &str) -> &'static str {
+    if group == "pre-dark" {
+        "preDark"
+    } else {
+        "preFlat"
+    }
+}
+
+/// One card reference group (10 pre-dark or 10 pre-flat exposures) with the same
+/// beam, interlock, cancellation and continuous-limit discipline as the host-RAM
+/// group. The difference is the transaction itself: each reference is one card
+/// exposure whose intent is persisted before the trigger and whose receipt is
+/// persisted after it. Nothing is downloaded, hashed or written locally, and the
+/// card objects are never deleted or re-shot.
+#[allow(clippy::too_many_arguments)]
+fn capture_card_reference_group(
+    nano: &NanoAdapter,
+    camera: &CameraAdapter,
+    xray: &mut MoxtekAdapter,
+    config: &RealScanConfig,
+    cancel: &Arc<AtomicBool>,
+    progress: &Mutex<RealScanProgress>,
+    root: &Path,
+    plan: &CardCapturePlan,
+    group: &'static str,
+    stage: &'static str,
+    flat: bool,
+) -> Result<(), String> {
+    let kind = card_group_kind(group);
+    let starting_at = progress
+        .lock()
+        .expect("scan progress mutex poisoned")
+        .card_records
+        .iter()
+        .filter(|record| record.kind == kind)
+        .count();
+    if starting_at >= REFERENCE_COUNT {
+        return Ok(());
+    }
+    update(progress, |state| state.stage = stage);
+    persist_progress(root, &config.parameters, config, progress, stage, false)?;
+    // Every dark image is taken only after verified OFF; no warning is asserted.
+    if !flat {
+        xray.force_off()
+            .map_err(|error| format!("{group} beam OFF failed: {error}"))?;
+        warning_after_off(nano, xray)
+            .map_err(|error| format!("{group} warning OFF failed: {error}"))?;
+        set_xray_health(progress, xray.health());
+        set_beam(progress, false);
+    }
+    let block_limit = Duration::from_secs(u64::from(config.max_xray_sec));
+    let exposure_timeout = Duration::from_secs_f64(config.parameters.exposure_ms / 1000.0)
+        .saturating_add(CAMERA_TRIGGER_MARGIN);
+    let flat_started_at = if flat {
+        check_cancel(cancel)?;
+        nano.set_xray_warning(true)
+            .map_err(|error| format!("{group} warning ON failed: {error}"))?;
+        let started = Instant::now();
+        xray.beam_on_shared(cancel.clone(), started + block_limit)
+            .map_err(|error| format!("{group} beam ON failed: {error}"))?;
+        set_xray_health(progress, xray.health());
+        set_beam(progress, true);
+        push_message(
+            progress,
+            "ACTION",
+            "xray",
+            format!(
+                "{group} continuous beam confirmed ON · remaining card references {}",
+                REFERENCE_COUNT - starting_at
+            ),
+        );
+        Some(started)
+    } else {
+        None
+    };
+    for index in starting_at as u32 + 1..=REFERENCE_COUNT as u32 {
+        check_cancel(cancel)?;
+        if !flat {
+            let health = xray
+                .refresh_status()
+                .map_err(|error| format!("{group} dark capture X-ray status failed: {error}"))?;
+            if !health.beam_off_confirmed || health.beam_on {
+                return Err(format!("{group} dark capture requires confirmed X-ray OFF"));
+            }
+            set_xray_health(progress, health);
+        } else {
+            let started = flat_started_at.expect("flat group has one continuous beam block");
+            if started
+                .elapsed()
+                .saturating_add(exposure_timeout)
+                .saturating_add(EXPOSURE_BUDGET_MARGIN)
+                >= block_limit
+            {
+                return Err(format!(
+                    "{group} cannot start card reference {index}: continuous X-ray limit would be exceeded"
+                ));
+            }
+            let health = refresh_emission_monitored(xray, progress, cancel).map_err(|error| {
+                xray_operation_error(
+                    error,
+                    &format!("{group} emission check before card reference {index} failed"),
+                )
+            })?;
+            set_xray_health(progress, health);
+        }
+        let session = camera
+            .health()
+            .session_id
+            .ok_or("Capture session is unknown")?;
+        let operation_id = format!(
+            "scan-{}-{}-{}-{}",
+            config.parameters.task_id,
+            kind,
+            index,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        append_card_journal(
+            root,
+            &CardJournalEntry {
+                kind: CARD_JOURNAL_KIND_INTENT.into(),
+                index,
+                group: kind.into(),
+                angle_deg: 0.0,
+                exposure_ms: config.parameters.exposure_ms,
+                operation_id: operation_id.clone(),
+                session_id: session.clone(),
+                planned_pulse_position: None,
+                handle: None,
+                storage_id: None,
+                source_file_name: None,
+                recorded_at: timestamp(),
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "{group} card reference {index} intent could not be persisted; the exposure was not triggered: {error}"
+            )
+        })?;
+        let mut abort: Option<String> = None;
+        let mut beam_shutdown_attempted = false;
+        let plan_for_worker = plan.clone();
+        let worker_operation = operation_id.clone();
+        let camera_for_capture = camera.clone();
+        let capture_result = thread::scope(|scope| {
+            let (sender, receiver) = mpsc::channel();
+            scope.spawn(move || {
+                let result = camera_for_capture.capture_to_card(
+                    plan_for_worker,
+                    &worker_operation,
+                    cancel,
+                    None,
+                );
+                let _ = sender.send(result);
+            });
+            let mut last_poll = Instant::now();
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(25)) {
+                    Ok(result) => break result,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(CameraError::Io(
+                            "card reference capture worker disconnected".into(),
+                        ))
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if cancel.load(Ordering::SeqCst) && abort.is_none() {
+                    abort = Some(CANCELLED.to_owned());
+                }
+                if !flat && last_poll.elapsed() >= Duration::from_millis(250) && abort.is_none() {
+                    last_poll = Instant::now();
+                    match xray.refresh_status() {
+                        Ok(health) if health.beam_off_confirmed && !health.beam_on => {
+                            set_xray_health(progress, health);
+                        }
+                        Ok(health) => {
+                            set_xray_health(progress, health);
+                            abort = Some(format!("{group} dark capture lost confirmed X-ray OFF"));
+                        }
+                        Err(error) => {
+                            abort =
+                                Some(format!("{group} dark capture X-ray status failed: {error}"));
+                        }
+                    }
+                    if abort.is_some() {
+                        cancel.store(true, Ordering::SeqCst);
+                        let _ = xray.force_off();
+                        set_xray_health(progress, xray.health());
+                        set_beam(progress, xray.health().beam_on);
+                        let _ = nano.stop();
+                    }
+                }
+                if flat {
+                    if last_poll.elapsed() >= Duration::from_millis(250) && abort.is_none() {
+                        last_poll = Instant::now();
+                        if let Err(error) = refresh_emission_monitored(xray, progress, cancel) {
+                            abort = Some(xray_operation_error(
+                                error,
+                                &format!("{group} emission monitor failed"),
+                            ));
+                            cancel.store(true, Ordering::SeqCst);
+                        } else {
+                            set_xray_health(progress, xray.health());
+                        }
+                    }
+                    if abort.is_none()
+                        && flat_started_at.is_some_and(|started| started.elapsed() >= block_limit)
+                    {
+                        abort = Some(format!(
+                            "{group} continuous X-ray limit reached during card reference {index}"
+                        ));
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                    if abort.is_some() && !beam_shutdown_attempted {
+                        beam_shutdown_attempted = true;
+                        let off = xray.force_off();
+                        let warning_off = warning_after_off(nano, xray);
+                        set_xray_health(progress, xray.health());
+                        set_beam(progress, xray.health().beam_on);
+                        if let Err(error) = off {
+                            abort = Some(format!("{group} beam OFF failed: {error}"));
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                        if let Err(error) = warning_off {
+                            abort = Some(format!("{group} warning OFF failed: {error}"));
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        });
+        if let Some(error) = abort {
+            return Err(error);
+        }
+        check_cancel(cancel)?;
+        let outcome = capture_result
+            .map_err(|error| format!("{group} card capture {index} failed: {error}"))?;
+        if outcome.receipt.session_id != session
+            || outcome.receipt.operation_id != operation_id
+            || !outcome.exposure_ended
+        {
+            return Err(format!(
+                "{group} card reference {index} lacks its own session, operation, exposure-end and object evidence"
+            ));
+        }
+        if flat && index == REFERENCE_COUNT as u32 {
+            let off = xray
+                .force_off()
+                .map_err(|error| format!("{group} beam OFF failed: {error}"))?;
+            set_xray_health(progress, off);
+            warning_after_off(nano, xray)
+                .map_err(|error| format!("{group} warning OFF failed: {error}"))?;
+            set_beam(progress, false);
+            push_message(
+                progress,
+                "PASS",
+                "xray",
+                format!(
+                    "{group} continuous beam OFF confirmed after {REFERENCE_COUNT} card references"
+                ),
+            );
+        }
+        let record = CardCaptureRecord::from_receipt(
+            index,
+            kind,
+            0.0,
+            config.parameters.exposure_ms,
+            &outcome.receipt,
+        );
+        update(progress, |state| {
+            state.card_records.push(record.clone());
+            state.card_data_status = Some(DATA_PENDING_IMPORT);
+        });
+        persist_progress(root, &config.parameters, config, progress, stage, false)?;
+        append_card_journal(
+            root,
+            &card_receipt_journal_entry(
+                &record,
+                kind,
+                &operation_id,
+                &session,
+                timestamp(),
+            ),
+        )
+        .map_err(|error| format!("{group} card receipt {index} could not be persisted: {error}"))?;
+        push_message(
+            progress,
+            "PASS",
+            "camera",
+            format!(
+                "{group} card reference {index}/{REFERENCE_COUNT} confirmed on storage 0x{:08X} · {} · no local file",
+                record.storage_id, record.source_file_name
+            ),
+        );
+    }
+    Ok(())
+}
+
 fn record_projection_sample(value: &mut RealScanProgress, index: u32, now: Instant) {
     if let Some(started) = value.projection_started.take() {
         let active = now
@@ -2604,6 +3573,7 @@ fn write_scan_log(
     }
     let outcome = match result {
         Ok(ScanCompletion::Completed) => "COMPLETED".to_owned(),
+        Ok(ScanCompletion::AcquiredPendingImport) => "ACQUIRED_PENDING_IMPORT".to_owned(),
         Ok(ScanCompletion::Stopped) => "STOPPED".to_owned(),
         Err(error) => format!("FAULT: {}", error.replace(['\r', '\n'], " ")),
     };
@@ -2754,6 +3724,88 @@ fn replace_manifest(staging: &Path, destination: &Path) -> Result<(), String> {
     fs::rename(staging, destination).map_err(io_error)
 }
 
+/// Schema-4 manifest of a card scan. It deliberately mirrors the schema-3 field
+/// set so the frozen acquisition stays comparable, and adds the card destination,
+/// the two independent acquisition/data states and one receipt per exposure. It
+/// carries no local `frames` and no `references`: until the authorized USB import
+/// is verified there is no local file identity to claim.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CardScanManifest<'a> {
+    schema_version: u32,
+    capture_profile: &'a CaptureProfile,
+    max_xray_sec: u32,
+    scan_id: &'a str,
+    created_at: String,
+    completed: bool,
+    voltage_kv: f64,
+    current_ua: f64,
+    projection_count: u32,
+    exposure_ms: f64,
+    geometry: &'a ScanGeometry,
+    references: &'a ReferenceFrames,
+    stage: &'a str,
+    frames: &'a [RealFrame],
+    capture_destination: crate::capture_profile::CaptureDestination,
+    acquisition_status: &'a str,
+    data_status: &'a str,
+    capture_records: &'a [CardCaptureRecord],
+}
+
+/// Writes the schema-4 card manifest used only by card scans. The schema-2/3
+/// `persist` writer stays byte-identical for host-RAM scans.
+///
+/// `completed` is always written `false`: the acquisition path can prove safe
+/// finishing, never a verified import, so only the import path may ever seal a
+/// schema-4 manifest.
+#[allow(clippy::too_many_arguments)]
+fn persist_card(
+    root: &Path,
+    parameters: &Parameters,
+    config: &RealScanConfig,
+    records: &[CardCaptureRecord],
+    stage: &str,
+    acquisition_status: &str,
+    data_status: &str,
+) -> Result<(), String> {
+    let reference_frames = ReferenceFrames::default();
+    let local_frames: [RealFrame; 0] = [];
+    let manifest = CardScanManifest {
+        schema_version: 4,
+        capture_profile: &config.capture_profile,
+        max_xray_sec: config.max_xray_sec,
+        scan_id: &parameters.task_id,
+        created_at: timestamp(),
+        completed: false,
+        voltage_kv: config.voltage_kv,
+        current_ua: config.current_ua,
+        projection_count: parameters.projection_count,
+        exposure_ms: parameters.exposure_ms,
+        geometry: &config.geometry,
+        references: &reference_frames,
+        stage,
+        frames: &local_frames,
+        capture_destination: crate::capture_profile::CaptureDestination::CameraCard,
+        acquisition_status,
+        data_status,
+        capture_records: records,
+    };
+    let staging_path = root.join("manifest.next.json");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&staging_path)
+        .map_err(io_error)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, &manifest).map_err(|error| error.to_string())?;
+    writer.write_all(b"\n").map_err(io_error)?;
+    writer.flush().map_err(io_error)?;
+    writer.get_ref().sync_all().map_err(io_error)?;
+    drop(writer);
+    replace_manifest(&staging_path, &root.join("manifest.json"))
+}
+
 fn persist_progress(
     root: &Path,
     parameters: &Parameters,
@@ -2766,6 +3818,20 @@ fn persist_progress(
         .lock()
         .expect("scan progress mutex poisoned")
         .clone();
+    if config.capture_profile.is_card_destination() {
+        // A card manifest is never sealed completed by the acquisition path, and
+        // `acquired` is only claimed once safe finishing is explicitly recorded.
+        let _ = completed;
+        return persist_card(
+            root,
+            parameters,
+            config,
+            &state.card_records,
+            stage,
+            state.card_acquisition_status.unwrap_or(ACQUISITION_PREPARED),
+            state.card_data_status.unwrap_or(DATA_PENDING_IMPORT),
+        );
+    }
     persist(
         root,
         parameters,
@@ -2775,6 +3841,18 @@ fn persist_progress(
         stage,
         completed,
     )
+}
+
+/// Records the card acquisition state that the next manifest write persists.
+fn set_card_acquisition(
+    progress: &Mutex<RealScanProgress>,
+    acquisition: &'static str,
+    data: &'static str,
+) {
+    update(progress, |value| {
+        value.card_acquisition_status = Some(acquisition);
+        value.card_data_status = Some(data);
+    });
 }
 
 fn io_error(error: std::io::Error) -> String {
@@ -4284,5 +5362,788 @@ mod tests {
         assert!(card_data_status_valid(DATA_VERIFIED));
         assert!(!card_data_status_valid("import-unknown"));
         assert!(!card_data_status_valid(""));
+    }
+
+    // ---- Card acquisition (schema 4 / profile 7) -------------------------------
+    // Every card test runs the production coordinator and the real camera COM
+    // owner over the scripted card session: only the physical WPD boundary and the
+    // controllers are scripted, and no device is contacted. PTP opcodes are spelled
+    // out because the vendor protocol constants are private to the camera module.
+
+    const CARD_TEST_GIB: u64 = 1024 * 1024 * 1024;
+    const CARD_OP_GET_OBJECT: u16 = 0x1009;
+    const CARD_OP_GET_PARTIAL_OBJECT: u16 = 0x101b;
+    const CARD_OP_GET_THUMB: u16 = 0x100a;
+    const CARD_OP_INITIATE_CAPTURE: u16 = 0x100e;
+    const CARD_OP_GET_OBJECT_INFO: u16 = 0x1008;
+    const CARD_OP_GET_STORAGE_IDS: u16 = 0x1004;
+    const CARD_OP_GET_STORAGE_INFO: u16 = 0x1005;
+    const CARD_OP_GET_EVENT: u16 = 0x90c7;
+    const CARD_OP_GET_PROPERTY: u16 = 0x1015;
+    const CARD_OP_GET_PROPERTY_DESC: u16 = 0x1014;
+    /// The largest object dataset a card operation may request. A larger read
+    /// would be an image-sized transfer, which a card scan must never issue.
+    const CARD_OBJECT_INFO_MAX: usize = 64 * 1024;
+
+    macro_rules! card_scripted_camera {
+        () => {
+            crate::devices::camera::scripted_camera_with_probe(
+                crate::devices::camera::ScriptedCameraConfig {
+                    card_capture: true,
+                    exposure_delay: Duration::from_millis(2),
+                    ..Default::default()
+                },
+            )
+        };
+    }
+
+    /// Every read a card scan may request after it started: control, event,
+    /// property and bounded object/storage metadata. An image read refuses the
+    /// assertion; the connect-time identity read is excluded by the caller's mark.
+    macro_rules! assert_card_reads_are_metadata_only {
+        ($reads:expr) => {{
+            for &(code, max) in $reads {
+                assert!(
+                    matches!(
+                        code,
+                        CARD_OP_GET_EVENT | CARD_OP_GET_PROPERTY | CARD_OP_GET_PROPERTY_DESC
+                    ) || code == CARD_OP_GET_OBJECT_INFO && max == CARD_OBJECT_INFO_MAX
+                        || matches!(code, CARD_OP_GET_STORAGE_IDS | CARD_OP_GET_STORAGE_INFO),
+                    "card scan requested an unplanned read: opcode=0x{code:04X} max={max}"
+                );
+            }
+        }};
+    }
+
+    /// No image payload operation may ever be issued by a card scan.
+    macro_rules! assert_no_card_image_operation {
+        ($probe:expr) => {{
+            for opcode in [
+                CARD_OP_GET_OBJECT,
+                CARD_OP_GET_PARTIAL_OBJECT,
+                CARD_OP_GET_THUMB,
+            ] {
+                assert_eq!(
+                    $probe.operation_count(opcode),
+                    0,
+                    "no image payload operation is permitted during a card scan (0x{opcode:04X})"
+                );
+            }
+        }};
+    }
+
+    fn card_run(topic: &str, task: &str) -> (std::path::PathBuf, std::path::PathBuf, Parameters) {
+        let run = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.cache/tests/ct-engine")
+            .join(format!(
+                "{}-card-scan-{topic}-{}",
+                chrono::Local::now().format("%Y%m%d-%H%M%S"),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            ));
+        fs::create_dir_all(&run).unwrap();
+        let _ = fs::write(
+            run.join("command.txt"),
+            "cargo test -p ct-engine scan::tests::card -- --nocapture\nScripted card session only; no real device is contacted.\n",
+        );
+        let parameters = Parameters {
+            task_id: task.into(),
+            save_path: run.to_string_lossy().into(),
+            projection_count: 3,
+            angle_step_deg: 120.0,
+            exposure_ms: 200.0,
+        };
+        let root = run.join(task);
+        (run, root, parameters)
+    }
+
+    fn card_profile(camera: &CameraAdapter, overflow: bool) -> CaptureProfile {
+        let policy = card_capture_policy(&card_controller_identity(), overflow).unwrap();
+        CaptureProfile::from_card_readback(
+            &camera.health(),
+            camera.card_profile_readback().unwrap(),
+            None,
+            policy,
+        )
+        .unwrap()
+    }
+
+    /// The pinned controller identity a new card acquisition freezes. The
+    /// scan-level tests pass the profile directly, so only the policy provenance
+    /// depends on this fixture.
+    fn card_controller_identity() -> NanoIdentity {
+        NanoIdentity {
+            device: "RTS9060_NANO".into(),
+            version: CARD_FIRMWARE_VERSION.into(),
+            protocol: 2,
+            build: CARD_FIRMWARE_BUILD.into(),
+            buzzer_installed: true,
+            capabilities: vec![
+                "HEARTBEAT_ACK".into(),
+                "XRAY_WARNING".into(),
+                CARD_SETTLE_CAPABILITY.into(),
+            ],
+        }
+    }
+
+    fn card_scan_config(
+        run: &Path,
+        parameters: &Parameters,
+        camera: &CameraAdapter,
+        overflow: bool,
+    ) -> RealScanConfig {
+        let _ = run;
+        RealScanConfig {
+            parameters: parameters.clone(),
+            capture_profile: card_profile(camera, overflow),
+            max_xray_sec: SCAN_MAX_XRAY_SEC,
+            voltage_kv: 20.0,
+            current_ua: 100.0,
+            geometry: ScanGeometry {
+                sod_mm: 100.0,
+                object_to_detector_mm: 100.0,
+                detector_width_mm: 40.0,
+                center_offset_x_mm: 0.0,
+                center_offset_y_mm: 0.0,
+                rotation_direction: "counterclockwise".into(),
+                mirror_x: false,
+                measurement: "measured".into(),
+                scintillator_layers: vec![],
+            },
+            resume: None,
+        }
+    }
+
+    /// A PTP string: UINT8 count of UTF-16 units including the NUL terminator.
+    fn card_ptp_string(text: &str) -> Vec<u8> {
+        let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        let mut bytes = vec![units.len() as u8];
+        bytes.extend(units.into_iter().flat_map(u16::to_le_bytes));
+        bytes
+    }
+
+    /// Card ObjectInfo metadata of one NEF object in the declared PTP field order:
+    /// storage, format, protection, size, the 26-byte thumbnail block, parent, the
+    /// 10-byte association block, filename and the D7100 date strings.
+    fn card_nef_object(storage_id: u32, filename: &str) -> Vec<u8> {
+        let mut bytes = storage_id.to_le_bytes().to_vec();
+        bytes.extend(0x3800u16.to_le_bytes());
+        bytes.extend(0u16.to_le_bytes());
+        bytes.extend(26_673_241u32.to_le_bytes());
+        bytes.extend([0u8; 26]);
+        bytes.extend(0x0002_0005u32.to_le_bytes());
+        bytes.extend([0u8; 10]);
+        bytes.extend(card_ptp_string(filename));
+        bytes.extend(card_ptp_string("20261011T120000"));
+        bytes.extend(card_ptp_string("20261011T120000"));
+        bytes.extend(card_ptp_string(""));
+        bytes
+    }
+
+    /// Scripts one complete card exposure association for every trigger: the card
+    /// object metadata the handle answers plus the `ObjectAdded`/card-completion
+    /// batches the trigger releases.
+    macro_rules! script_card_exposure {
+        ($probe:expr, $storage:expr, $handle:expr, $filename:expr) => {{
+            $probe.set_card_object($handle, card_nef_object($storage, $filename));
+            $probe.set_card_events(vec![
+                vec![(0x4002 /*ObjectAdded*/, $handle)],
+                vec![(0x400d /*CaptureCompleteCard*/, 0)],
+            ]);
+        }};
+    }
+
+    /// The task directory of a card scan holds only its manifest and ledger: no
+    /// `frames/` directory, no local image and no copied NEF may appear.
+    fn assert_no_local_card_file(root: &Path) {
+        assert!(
+            !root.join("frames").exists(),
+            "a card scan must not create a local frames/ directory"
+        );
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            assert!(
+                !name.ends_with(".nef") && !name.ends_with(".tif") && !name.ends_with(".raw"),
+                "a card scan wrote a local image: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn card_scan_end_to_end_keeps_every_image_on_the_card_and_registers_pending_import() {
+        let (run, root, parameters) = card_run("end-to-end", "card-task");
+        let (camera, probe) = card_scripted_camera!();
+        const HANDLE: u32 = 0x000b_0001;
+        script_card_exposure!(probe, 1, HANDLE, "DSC_0001.NEF");
+        // The durable registration exists before the acquisition, exactly like the
+        // domain path, so the registry transition is evaluated against a real record.
+        let mut registry = crate::task_registry::TaskRegistry::load(run.join("active-task.json"));
+        registry.register(&parameters).unwrap();
+        let (nano, _nano_state) = pipeline_nano();
+        let (xray, xray_probe) = crate::devices::xray::test_worker(20.0, 100.0);
+        let config = card_scan_config(&run, &parameters, &camera, false);
+        let read_mark = probe.reads().len();
+        let mut handle = RealScanHandle::start(nano, camera, xray, config);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let outcome = loop {
+            if let Some(stage) = handle.progress().prompt {
+                let _ = handle.confirm_stage(stage);
+            }
+            if let Some(outcome) = handle.try_finish() {
+                break outcome.unwrap();
+            }
+            if Instant::now() >= deadline {
+                handle.cancel_only();
+                panic!("card scan did not finish: {:?}", handle.progress());
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(
+            outcome.result.as_ref().unwrap(),
+            &ScanCompletion::AcquiredPendingImport,
+            "a card acquisition finishes as pending import, never as a completed project"
+        );
+        assert!(!outcome.xray.health().beam_on, "the beam must end OFF");
+        assert!(outcome.xray.health().beam_off_confirmed);
+        assert!(!xray_probe.output_enabled());
+        let progress = handle.progress();
+        let records = progress.card_records.clone();
+        assert_eq!(
+            records.iter().filter(|record| record.kind == "projection").count(),
+            3
+        );
+        assert_eq!(
+            records.iter().filter(|record| record.kind == "preDark").count(),
+            10
+        );
+        assert_eq!(
+            records.iter().filter(|record| record.kind == "preFlat").count(),
+            10
+        );
+        assert!(records.iter().all(|record| {
+            record.state == DATA_PENDING_IMPORT
+                && record.imported_file.is_none()
+                && record.storage_id != 0
+                && record.handle != 0
+                && !record.source_file_name.is_empty()
+                && !record.operation_id.is_empty()
+        }));
+        // A card scan keeps no local frame and no local reference record.
+        assert!(progress.frames.is_empty());
+        assert!(progress.references.pre_dark.is_empty());
+        assert!(progress.references.pre_flat.is_empty());
+        let manifest: serde_json::Value =
+            serde_json::from_reader(File::open(root.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["schemaVersion"], 4);
+        assert_eq!(manifest["captureDestination"], "cameraCard");
+        assert_eq!(manifest["acquisitionStatus"], ACQUISITION_ACQUIRED);
+        assert_eq!(manifest["dataStatus"], DATA_PENDING_IMPORT);
+        assert_eq!(manifest["completed"], false);
+        assert!(manifest["frames"].as_array().unwrap().is_empty());
+        assert!(manifest["references"]["preDark"].as_array().unwrap().is_empty());
+        assert_eq!(manifest["captureRecords"].as_array().unwrap().len(), 23);
+        assert!(manifest["captureRecords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["state"] == DATA_PENDING_IMPORT
+                && record.get("importedFile").is_none()));
+        // One intent and one receipt per exposure: no crash window remains.
+        let ledger = read_card_journal(&root).unwrap();
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|entry| entry.kind == CARD_JOURNAL_KIND_INTENT)
+                .count(),
+            23
+        );
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|entry| entry.kind == CARD_JOURNAL_KIND_RECEIPT)
+                .count(),
+            23
+        );
+        assert!(unresolved_card_intents(&root).unwrap().is_empty());
+        assert!(card_acquisition_finish_gate(&root).is_ok());
+        // Zero image transfer for the whole scan: no GetObject/GetPartialObject/
+        // GetThumb, one bounded metadata read per exposure, no local file at all.
+        assert_no_card_image_operation!(probe);
+        let reads = probe.reads();
+        assert_card_reads_are_metadata_only!(&reads[read_mark..]);
+        assert_eq!(
+            reads[read_mark..]
+                .iter()
+                .filter(|(code, _)| *code == CARD_OP_GET_OBJECT_INFO)
+                .count(),
+            23,
+            "one bounded card metadata read per exposure"
+        );
+        assert_no_local_card_file(&root);
+        assert!(!completed_manifest_exists(&parameters));
+        // The domain transition: the task leaves the active slot, the directory
+        // stays reserved, no hardware lock remains and nothing is completed.
+        registry.mark_acquired_pending_import(&parameters).unwrap();
+        assert!(!registry.locked(), "safe finishing releases the scan lock");
+        assert_eq!(registry.pending_import_tasks().len(), 1);
+        assert!(registry.check_retained_location(&parameters).unwrap());
+        assert_eq!(
+            registry.snapshot()["retained"][0]["status"],
+            crate::task_registry::TASK_STATUS_ACQUIRED_PENDING_IMPORT
+        );
+        assert_ne!(registry.snapshot()["retained"][0]["status"], "completed");
+        assert!(registry.mark_import_verified(&parameters).is_err());
+    }
+
+    #[test]
+    fn a_stop_during_a_card_projection_leaves_that_object_unresolved_and_the_task_retained() {
+        let (run, root, parameters) = card_run("stop", "card-task");
+        let (camera, probe) = card_scripted_camera!();
+        const HANDLE: u32 = 0x000b_0001;
+        script_card_exposure!(probe, 1, HANDLE, "DSC_0001.NEF");
+        let mut registry = crate::task_registry::TaskRegistry::load(run.join("active-task.json"));
+        registry.register(&parameters).unwrap();
+        let (nano, _nano_state) = pipeline_nano();
+        let (xray, xray_probe) = crate::devices::xray::test_worker(20.0, 100.0);
+        let config = card_scan_config(&run, &parameters, &camera, false);
+        let mut handle = RealScanHandle::start(nano, camera.clone(), xray, config);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let projection_prefix = format!("scan-{}-1-", parameters.task_id);
+        let mut delayed = false;
+        let mut stopped = false;
+        let outcome = loop {
+            let progress = handle.progress();
+            if let Some(stage) = progress.prompt {
+                let _ = handle.confirm_stage(stage);
+            }
+            // Slow the projection exposure down once the projection stage starts,
+            // so the operator Stop deterministically lands inside it.
+            if !delayed && progress.stage == "projections" {
+                probe.set_exposure_delay(Duration::from_millis(900));
+                delayed = true;
+            }
+            if delayed && !stopped {
+                let health = camera.health();
+                if health
+                    .busy
+                    && health
+                        .operation_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with(&projection_prefix))
+                {
+                    handle.request_stop().unwrap();
+                    stopped = true;
+                }
+            }
+            if let Some(outcome) = handle.try_finish() {
+                break outcome.unwrap();
+            }
+            if Instant::now() >= deadline {
+                handle.cancel_only();
+                panic!("card stop test did not terminate: {:?}", handle.progress());
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert!(stopped, "the Stop must land inside a card projection exposure");
+        // Never a completed or safely finished acquisition: the interrupted
+        // exposure has an intent and no receipt.
+        match &outcome.result {
+            Ok(ScanCompletion::Stopped) => {}
+            Err(error) => assert!(
+                error.contains("isolated") || error.contains("unconfirmed"),
+                "unexpected card stop outcome: {error}"
+            ),
+            Ok(other) => panic!("a stopped card scan must not report {other:?}"),
+        }
+        assert!(!outcome.xray.health().beam_on, "beam OFF is mandatory");
+        assert!(outcome.xray.health().beam_off_confirmed);
+        assert!(!xray_probe.output_enabled());
+        let unresolved = unresolved_card_intents(&root).unwrap();
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "exactly the interrupted exposure stays unresolved: {unresolved:?}"
+        );
+        assert_eq!(unresolved[0].group, "projection");
+        let interrupted = unresolved[0].index;
+        let manifest: serde_json::Value =
+            serde_json::from_reader(File::open(root.join("manifest.json")).unwrap()).unwrap();
+        assert_ne!(manifest["acquisitionStatus"], ACQUISITION_ACQUIRED);
+        assert_eq!(manifest["completed"], false);
+        assert!(
+            !manifest["captureRecords"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| record["kind"] == "projection" && record["index"] == interrupted),
+            "the interrupted projection must never receive a receipt"
+        );
+        assert!(manifest["captureRecords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["kind"] != "projection"));
+        // The task keeps its lock: a stopped card acquisition is never promoted to
+        // pending import, and nothing can be reconstructed from it.
+        assert!(registry.locked(), "a stopped card task stays retained and locked");
+        assert!(registry.pending_import_tasks().is_empty());
+        assert!(registry.mark_acquired_pending_import(&parameters).is_err());
+        assert!(registry.error().is_none());
+        assert!(!completed_manifest_exists(&parameters));
+        // No image payload, no local file and no local frame appeared.
+        assert_no_card_image_operation!(probe);
+        assert_no_local_card_file(&root);
+    }
+
+    #[test]
+    fn card_storage_plan_is_refused_before_any_device_action() {
+        // Read-only, insufficient capacity, unknown capacity and insufficient free
+        // images are all refused with their stable code, and the scan never
+        // triggers, moves or opens the beam.
+        for (topic, storage, code) in [
+            (
+                "read-only",
+                (1u32, 1u16, 64 * CARD_TEST_GIB, 64 * CARD_TEST_GIB, 5000u32),
+                "CARD_READ_ONLY",
+            ),
+            (
+                "insufficient-bytes",
+                (1, 0, 512 * 1024 * 1024, 512 * 1024 * 1024, 5000),
+                "CARD_CAPACITY_INSUFFICIENT",
+            ),
+            (
+                "insufficient-images",
+                (1, 0, 64 * CARD_TEST_GIB, 64 * CARD_TEST_GIB, 5),
+                "CARD_CAPACITY_INSUFFICIENT",
+            ),
+            ("unknown-capacity", (1, 0, 0, 0, 0), "CARD_CAPACITY_UNKNOWN"),
+        ] {
+            let (run, root, parameters) = card_run(topic, "card-task");
+            let (camera, probe) = card_scripted_camera!();
+            probe.set_storages(&[storage]);
+            let (nano, nano_state) = pipeline_nano();
+            let (xray, xray_probe) = crate::devices::xray::test_worker(20.0, 100.0);
+            let config = card_scan_config(&run, &parameters, &camera, false);
+            let read_mark = probe.reads().len();
+            let beam_mark = xray_probe.beam_transitions().len();
+            let mut handle = RealScanHandle::start(nano, camera, xray, config);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let outcome = loop {
+                if let Some(stage) = handle.progress().prompt {
+                    let _ = handle.confirm_stage(stage);
+                }
+                if let Some(outcome) = handle.try_finish() {
+                    break outcome.unwrap();
+                }
+                if Instant::now() >= deadline {
+                    handle.cancel_only();
+                    panic!(
+                        "refused card plan did not terminate: {:?}",
+                        handle.progress()
+                    );
+                }
+                thread::sleep(Duration::from_millis(2));
+            };
+            let error = outcome
+                .result
+                .err()
+                .unwrap_or_else(|| panic!("{topic}: a storage-refused card scan must not report success"));
+            assert!(error.contains(code), "{topic}: {error}");
+            assert!(error.contains("CARD_STORAGE_PLAN_REFUSED"), "{topic}: {error}");
+            // The enumeration itself is the only card-specific request; no
+            // exposure, movement or beam was ever issued.
+            assert_eq!(
+                probe.operation_count(CARD_OP_INITIATE_CAPTURE),
+                0,
+                "{topic}: no trigger may be sent"
+            );
+            assert_eq!(
+                probe.operation_count(CARD_OP_GET_STORAGE_IDS),
+                1,
+                "{topic}: the advertised storages are enumerated exactly once at scan start"
+            );
+            assert!(probe.operation_count(CARD_OP_GET_STORAGE_INFO) >= 1);
+            let reads = probe.reads();
+            assert_card_reads_are_metadata_only!(&reads[read_mark..]);
+            assert_no_card_image_operation!(probe);
+            let writes = nano_state.lock().unwrap().writes.clone();
+            assert!(
+                !writes.iter().any(|line| line.starts_with("MOVE_REL ")
+                    || line.starts_with("MOVE_ABS ")
+                    || line.starts_with("HOME ")
+                    || line.starts_with("CAPTURE_DONE ")),
+                "{topic}: no motion may be issued for a refused card plan: {writes:?}"
+            );
+            let transitions = xray_probe.beam_transitions();
+            // A refused card plan must never switch the beam ON. A safety OFF
+            // before the refusal is allowed (and desirable), so only an ON
+            // transition violates this invariant.
+            assert!(
+                transitions[beam_mark..].iter().all(|(on, _)| !on),
+                "{topic}: no beam ON may happen for a refused card plan: {:?}",
+                &transitions[beam_mark..]
+            );
+            assert!(!xray_probe.output_enabled(), "{topic}: output stays OFF");
+            assert!(
+                !root.join(CARD_JOURNAL_FILE).exists(),
+                "{topic}: a refused plan must not persist an exposure intent"
+            );
+            // A refused plan is never an acquisition: whatever checkpoint the
+            // failure path leaves behind stays unacquired with no card record, and
+            // it can never be read as a completed task.
+            assert!(!completed_manifest_exists(&parameters), "{topic}");
+            if root.join("manifest.json").is_file() {
+                let manifest: serde_json::Value =
+                    serde_json::from_reader(File::open(root.join("manifest.json")).unwrap())
+                        .unwrap();
+                assert_ne!(manifest["acquisitionStatus"], ACQUISITION_ACQUIRED, "{topic}");
+                assert_eq!(manifest["completed"], false, "{topic}");
+                assert!(
+                    manifest["captureRecords"].as_array().unwrap().is_empty(),
+                    "{topic}: no card receipt may exist for a refused plan"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn card_intent_without_receipt_is_detected_and_never_counted_as_acquired() {
+        let (run, root, parameters) = card_run("crash-window", "card-task");
+        let (camera, _probe) = card_scripted_camera!();
+        let config = card_scan_config(&run, &parameters, &camera, false);
+        // The durable registration exists before any acquisition file, exactly like
+        // the domain path, so the crash window is evaluated against a real record.
+        let mut registry = crate::task_registry::TaskRegistry::load(run.join("active-task.json"));
+        registry.register(&parameters).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let session = "card-crash-session";
+        let operation = "scan-card-task-1-1";
+        let intent = CardJournalEntry {
+            kind: CARD_JOURNAL_KIND_INTENT.into(),
+            index: 1,
+            group: "projection".into(),
+            angle_deg: 0.0,
+            exposure_ms: 200.0,
+            operation_id: operation.into(),
+            session_id: session.into(),
+            planned_pulse_position: Some(0),
+            handle: None,
+            storage_id: None,
+            source_file_name: None,
+            recorded_at: timestamp(),
+        };
+        append_card_journal(&root, &intent).unwrap();
+        // The intent is persisted before the trigger, so it is the only trace of an
+        // exposure whose receipt never arrived.
+        let unresolved = unresolved_card_intents(&root).unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].operation_id, operation);
+        let gate = card_acquisition_finish_gate(&root).unwrap_err();
+        assert!(gate.contains("CARD_EXPOSURE_UNRESOLVED"), "{gate}");
+        // Even a manifest that claims `acquired` cannot be registered while that
+        // intent has no receipt: the exposure is never counted as acquired.
+        persist_card(
+            &root,
+            &parameters,
+            &config,
+            &[],
+            "projections",
+            ACQUISITION_ACQUIRED,
+            DATA_PENDING_IMPORT,
+        )
+        .unwrap();
+        assert!(registry.mark_acquired_pending_import(&parameters).is_err());
+        assert!(registry.locked(), "the crashed card task stays locked");
+        assert!(registry.pending_import_tasks().is_empty());
+        // A receipt for the same operation resolves the window; the ledger keeps
+        // both lines as the acquisition provenance.
+        append_card_journal(
+            &root,
+            &CardJournalEntry {
+                kind: CARD_JOURNAL_KIND_RECEIPT.into(),
+                operation_id: operation.into(),
+                handle: Some(0x0000_0101),
+                storage_id: Some(1),
+                source_file_name: Some("DSC_0101.NEF".into()),
+                recorded_at: timestamp(),
+                ..intent.clone()
+            },
+        )
+        .unwrap();
+        assert!(unresolved_card_intents(&root).unwrap().is_empty());
+        assert!(card_acquisition_finish_gate(&root).is_ok());
+        let ledger = read_card_journal(&root).unwrap();
+        assert_eq!(ledger.len(), 2, "the ledger keeps the intent and its receipt");
+    }
+
+    #[test]
+    fn card_plan_allows_overflow_only_with_the_policy_evidence_and_two_writable_storages() {
+        use crate::devices::camera::{
+            CardPlan, StorageAccess, StorageCapacity, StorageId, StorageInfo,
+        };
+        let info = |id: u32, access: StorageAccess| StorageInfo {
+            id: StorageId(id),
+            access,
+            capacity: StorageCapacity {
+                max_bytes: 64 * CARD_TEST_GIB,
+                free_bytes: 64 * CARD_TEST_GIB,
+                free_images: 5000,
+            },
+            storage_type: 4,
+            filesystem_type: 2,
+            description: "SD card".into(),
+            volume_label: String::new(),
+        };
+        let plan = |storages: Vec<StorageInfo>| CardPlan {
+            writable_bytes: 64 * CARD_TEST_GIB * storages.len() as u64,
+            writable_images: 5000 * storages.len() as u32,
+            storages,
+        };
+        let single = plan(vec![info(1, StorageAccess::ReadWrite)]);
+        let dual = plan(vec![
+            info(1, StorageAccess::ReadWrite),
+            info(2, StorageAccess::ReadWrite),
+        ]);
+        // A single writable card is a complete plan and never claims overflow.
+        let single_plan = card_capture_plan(&single, &card_policy("single"), false).unwrap();
+        assert_eq!(single_plan.expected_objects, 1);
+        assert!(!single_plan.allow_overflow);
+        assert_eq!(single_plan.storages, vec![StorageId(1)]);
+        // Overflow needs the frozen policy, the advertised continuation events and
+        // a second writable storage.
+        assert!(card_capture_plan(&dual, &card_policy("overflow"), true)
+            .unwrap()
+            .allow_overflow);
+        assert!(
+            !card_capture_plan(&single, &card_policy("overflow"), true)
+                .unwrap()
+                .allow_overflow
+        );
+        assert!(
+            !card_capture_plan(&dual, &card_policy("single"), false)
+                .unwrap()
+                .allow_overflow
+        );
+        assert!(
+            !card_capture_plan(&dual, &card_policy("overflow"), false)
+                .unwrap()
+                .allow_overflow
+        );
+        // No writable storage is refused with the stable code.
+        assert_eq!(
+            card_capture_plan(&plan(vec![]), &card_policy("single"), false).unwrap_err(),
+            "CARD_READ_ONLY: no writable card storage was advertised"
+        );
+    }
+
+    fn card_policy(mode: &str) -> CardCapturePolicy {
+        CardCapturePolicy {
+            mode: mode.into(),
+            settle_ms: crate::capture_profile::MOVE_SETTLE_MS,
+            settle_anchor: crate::capture_profile::MOVE_SETTLE_ANCHOR.into(),
+            firmware_version: CARD_FIRMWARE_VERSION.into(),
+            firmware_build: CARD_FIRMWARE_BUILD.into(),
+            firmware_source_sha256: CARD_FIRMWARE_SOURCE_SHA256.into(),
+        }
+    }
+
+    #[test]
+    fn card_policy_requires_the_pinned_settle_firmware_identity() {
+        let identity = card_controller_identity();
+        let policy = card_capture_policy(&identity, true).unwrap();
+        assert_eq!(policy.mode, "overflow");
+        assert_eq!(policy.settle_ms, 150);
+        assert_eq!(policy.settle_anchor, "lastStepFallingEdge");
+        assert_eq!(policy.firmware_source_sha256, CARD_FIRMWARE_SOURCE_SHA256);
+        assert_eq!(card_capture_policy(&identity, false).unwrap().mode, "single");
+        // A controller that does not advertise the unified settle contract cannot
+        // freeze a card policy: the 150 ms contract would be unproven.
+        let mut no_settle = identity.clone();
+        no_settle
+            .capabilities
+            .retain(|capability| capability != CARD_SETTLE_CAPABILITY);
+        let error = card_capture_policy(&no_settle, false).unwrap_err();
+        assert!(error.contains("CARD_FIRMWARE_UNVERIFIED"), "{error}");
+        assert!(error.contains(CARD_SETTLE_CAPABILITY), "{error}");
+        // A different version or build cannot be pinned to this source identity.
+        for (version, build) in [("2.1.0", CARD_FIRMWARE_BUILD), (CARD_FIRMWARE_VERSION, "offline-test")] {
+            let mut drifted = identity.clone();
+            drifted.version = version.into();
+            drifted.build = build.into();
+            let error = card_capture_policy(&drifted, false).unwrap_err();
+            assert!(error.contains("CARD_FIRMWARE_UNVERIFIED"), "{error}");
+        }
+    }
+
+    #[test]
+    fn schema_four_manifest_writer_records_the_card_destination_without_local_frames() {
+        let (run, root, parameters) = card_run("manifest", "card-task");
+        let (camera, _probe) = card_scripted_camera!();
+        let config = card_scan_config(&run, &parameters, &camera, false);
+        fs::create_dir_all(&root).unwrap();
+        let records: Vec<CardCaptureRecord> = (1..=3)
+            .map(|index| card_record(index, "projection", DATA_PENDING_IMPORT, false))
+            .chain((1..=2).map(|index| card_record(index, "preDark", DATA_PENDING_IMPORT, false)))
+            .collect();
+        persist_card(
+            &root,
+            &parameters,
+            &config,
+            &records,
+            "finalizing",
+            ACQUISITION_ACQUIRED,
+            DATA_PENDING_IMPORT,
+        )
+        .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_reader(File::open(root.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["schemaVersion"], 4);
+        assert_eq!(manifest["captureDestination"], "cameraCard");
+        assert_eq!(manifest["acquisitionStatus"], ACQUISITION_ACQUIRED);
+        assert_eq!(manifest["dataStatus"], DATA_PENDING_IMPORT);
+        assert_eq!(manifest["completed"], false);
+        assert_eq!(manifest["stage"], "finalizing");
+        assert!(manifest["frames"].as_array().unwrap().is_empty());
+        assert!(manifest["references"]["preDark"].as_array().unwrap().is_empty());
+        assert!(manifest["references"]["preFlat"].as_array().unwrap().is_empty());
+        assert_eq!(manifest["captureRecords"].as_array().unwrap().len(), 5);
+        assert!(manifest["captureRecords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["state"] == DATA_PENDING_IMPORT
+                && record.get("importedFile").is_none()));
+        assert_eq!(manifest["maxXraySec"], SCAN_MAX_XRAY_SEC);
+        // A pending-import card task is never a completed or reconstructable
+        // project, and the schema-4 reader agrees.
+        assert!(!completed_manifest_exists(&parameters));
+        assert!(!card_record_is_reconstructable(&records[0]));
+        // The host-RAM writer is untouched by the card writer: the same call for a
+        // RAM profile still writes schema 3 without card fields.
+        let (ram_camera, _) =
+            crate::devices::camera::scripted_camera_with_probe(Default::default());
+        let ram_config = pipeline_config(&run, "ram-task", &ram_camera);
+        let ram_root = run.join("ram-task");
+        fs::create_dir_all(ram_root.join("frames")).unwrap();
+        persist(
+            &ram_root,
+            &ram_config.parameters,
+            &ram_config,
+            &[],
+            &ReferenceFrames::default(),
+            "preDark",
+            false,
+        )
+        .unwrap();
+        let ram_manifest: serde_json::Value =
+            serde_json::from_reader(File::open(ram_root.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(ram_manifest["schemaVersion"], 3);
+        assert!(ram_manifest.get("captureDestination").is_none());
+        assert!(ram_manifest.get("captureRecords").is_none());
     }
 }

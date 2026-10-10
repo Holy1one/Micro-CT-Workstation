@@ -297,6 +297,11 @@ pub struct Engine {
     phase: Phase,
     parameters: Parameters,
     max_xray_sec: u32,
+    /// True once this task's continuous X-ray limit was chosen explicitly. A
+    /// destination-specific default (1000 s for a camera-card acquisition) must
+    /// never override an operator value, and a host-RAM task keeps its 600 s
+    /// default. A new scan preparation re-evaluates this from its own request.
+    max_xray_sec_explicit: bool,
     current: u32,
     sequence: u64,
     request_sequence: u64,
@@ -383,6 +388,7 @@ impl Engine {
             phase: Phase::Idle,
             parameters: Parameters::default(),
             max_xray_sec: 600,
+            max_xray_sec_explicit: false,
             current: 0,
             sequence: 0,
             request_sequence: 0,
@@ -571,6 +577,50 @@ impl Engine {
                         self.last_error = None;
                         if self.task_exit_pending {self.phase=Phase::Stopping;}
                         self.log("INFO", "system", "Scan worker stopped; saved projections retained, waiting for confirmed cleanup and task closure");
+                    }
+                    // A safely finished card acquisition is NOT a completed
+                    // project: the NEFs are still on the camera card. Safe
+                    // finishing requires the joined worker, confirmed beam OFF,
+                    // a resolved camera cleanup and the persisted ledger before
+                    // the task may leave the active slot as a retained
+                    // `acquired_pending_import` record.
+                    Ok(ScanCompletion::AcquiredPendingImport)
+                        if !self.fault_latched && !self.scan_stop_requested =>
+                    {
+                        let camera_cleanup_unresolved = self
+                            .cached_camera_health
+                            .as_ref()
+                            .is_some_and(|health| health.isolated && !health.cleanup_confirmed);
+                        if camera_cleanup_unresolved {
+                            self.fault_latched = true;
+                            self.preflight = false;
+                            self.phase = Phase::Fault;
+                            self.scan_stage = "fault";
+                            self.last_error = Some(
+                                "Card acquisition finished with an unresolved camera cleanup; the task stays locked"
+                                    .into(),
+                            );
+                            self.log("ERR", "system", "Card acquisition cannot be registered as pending import while the camera cleanup is unconfirmed");
+                        } else {
+                            self.phase = Phase::Finishing;
+                            self.scan_stage = "pending_import";
+                            self.scan_prompt = None;
+                            self.last_error = None;
+                            if let Err(error) = self.enqueue_acquired_pending_import() {
+                                self.fault_latched = true;
+                                self.phase = Phase::Fault;
+                                self.last_error = Some(error.into());
+                            }
+                        }
+                    }
+                    Ok(ScanCompletion::AcquiredPendingImport)
+                        if self.scan_stop_requested && !self.fault_latched =>
+                    {
+                        self.invalidate(Phase::Stopped);
+                        self.scan_stage = "pending_import";
+                        self.scan_prompt = None;
+                        if self.task_exit_pending {self.phase=Phase::Stopping;}
+                        self.log("INFO","system","Stop superseded a late card acquisition finish; the card records are retained for reconciliation and the task is not marked completed");
                     }
                     Ok(ScanCompletion::Completed) if self.scan_stop_requested&&!self.fault_latched=>{
                         self.invalidate(Phase::Stopped);self.scan_stage="stopped";self.scan_prompt=None;
@@ -1008,6 +1058,11 @@ impl Engine {
                 }
                 self.parameters = parameters;
                 self.max_xray_sec = max_xray_sec;
+                if setup.max_xray_sec.is_some() {
+                    // An explicit limit is never silently replaced by a
+                    // destination default; omitting it keeps the last choice.
+                    self.max_xray_sec_explicit = true;
+                }
                 self.schedule_metadata_probe();
                 self.current = 0;
                 self.restored_scan = None;
@@ -2341,6 +2396,33 @@ impl Engine {
         })
     }
 
+    /// The camera-card acquisition state, kept separate from the RAM `dataState`:
+    /// a safely finished card acquisition is never completed, never
+    /// reconstructable and always visible as an import requirement.
+    fn card_acquisition_snapshot(&self) -> Value {
+        let card_profile = self
+            .capture_profile
+            .as_ref()
+            .is_some_and(capture_profile::CaptureProfile::is_card_destination);
+        let progress = self.real_scan.as_ref().map(|scan| scan.progress());
+        let acquisition = progress.as_ref().and_then(|value| value.card_acquisition_status);
+        let data = progress.as_ref().and_then(|value| value.card_data_status);
+        let records = progress
+            .as_ref()
+            .map_or(0, |value| value.card_records.len());
+        let pending = self.task_registry.pending_import_tasks();
+        json!({
+            "destination": if card_profile { "cameraCard" } else if self.capture_profile.is_some() { "hostRam" } else { "unknown" },
+            "active": card_profile,
+            "acquisitionStatus": acquisition,
+            "dataStatus": data,
+            "recordCount": records,
+            "pendingImportTasks": pending.len(),
+            "currentTaskPendingImport": pending.iter().any(|record| record.parameters == self.parameters),
+            "importRequired": card_profile && acquisition == Some(scan::ACQUISITION_ACQUIRED),
+        })
+    }
+
     pub fn snapshot(&self) -> Value {
         let (phase, label) = self.phase.value();
         let mode = if self.preview { "developer_preview" } else { "production_locked" };
@@ -2443,6 +2525,7 @@ impl Engine {
                 "etaSeconds":self.estimated_remaining_seconds()
             },
             "imageCount":self.real_frames.len(),"logs":self.logs,"lastError":self.last_error,"updatedAt":timestamp(),
+            "cardAcquisition":self.card_acquisition_snapshot(),
             "workstation":self.workstation_view()
         })
     }

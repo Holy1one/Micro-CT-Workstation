@@ -3,10 +3,15 @@
 //! state reads and its late return cannot publish, capture or reopen Live View.
 
 use super::capture::capture_with_policy;
+use super::card_capture::{capture_to_card, CardCaptureOutcome, CardCapturePlan};
 use super::live_view::*;
 use super::nikon::*;
-use super::properties::{refresh_property_controls,clear_live_view_controls};
+use super::properties::{refresh_property_controls,clear_live_view_controls,require_card_destination};
 use super::ptp::*;
+use super::storage::{
+    bind_storage_ids, parse_storage_ids, parse_storage_info, plan_task_cards, CardPlan,
+    CONSERVATIVE_NEF_BYTES,
+};
 use super::types::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,6 +21,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+/// Ceiling for one card-storage metadata dataset. `GetStorageIDs` is a count
+/// plus at most 64 ids and `GetStorageInfo` is a fixed numeric block plus two
+/// bounded strings, so this bound can never describe image data.
+const CARD_STORAGE_DATASET_MAX: usize = 64 * 1024;
 /// Budget for a Live View control transaction (controls readback / configure).
 /// These run on the single camera worker, so a Live View transaction that hangs
 /// blocks every queued command behind it — including the Stop path's end-of-Live-
@@ -40,6 +49,21 @@ enum Request {
         events: Option<mpsc::Sender<CameraCaptureEvent>>,
         scan_policy: bool,
     },
+    /// Card storage enumeration: `GetStorageIDs` plus one bounded
+    /// `GetStorageInfo` per advertised id, then the whole-task capacity gate
+    /// (references included). Read-only device metadata, no image byte and no
+    /// state change.
+    CardPlan {
+        projection_count: u32,
+    },
+    /// One card exposure: the plan was frozen by the scan coordinator, and the
+    /// transaction sends exactly one standard `InitiateCapture` and reads only
+    /// object metadata. No local file exists for this request.
+    CaptureCard {
+        plan: CardCapturePlan,
+        operation_id: String,
+        events: Option<mpsc::Sender<CameraCaptureEvent>>,
+    },
     LvStart(u64),
     LvStop,
     LvRead(String,u64),
@@ -53,6 +77,8 @@ enum Reply {
     Properties(BTreeMap<String, CameraProperty>),
     Applied(PropertyApplyResult),
     Captured(CapturedImage),
+    CardPlan(CardPlan),
+    CardCaptured(CardCaptureOutcome),
     Done,
 }
 struct Message {
@@ -69,6 +95,12 @@ struct Control {
     commit_gate: Mutex<()>,
     deadline: Mutex<Option<(u64, Instant)>>,
     shutter_target: Mutex<Option<CameraValue>>,
+    /// True while the unresolved pending capture was triggered as a card
+    /// operation. It only selects the termination-evidence code in `cleanup`:
+    /// a card exposure is proved by the associated card completion, never by the
+    /// host-RAM `0xc102` completion, and the card object itself is never deleted
+    /// or re-shot because no local file exists for it.
+    card_capture_pending: AtomicBool,
 }
 #[derive(Clone)]
 pub struct CameraAdapter {
@@ -102,6 +134,7 @@ impl CameraAdapter {
             commit_gate: Mutex::new(()),
             deadline: Mutex::new(None),
             shutter_target: Mutex::new(None),
+            card_capture_pending: AtomicBool::new(false),
         });
         let worker_control = control.clone();
         thread::Builder::new()
@@ -290,6 +323,68 @@ impl CameraAdapter {
     pub fn profile_readback(&self) -> Result<CameraProperties, CameraError> {
         profile_readback(&self.health())
     }
+    /// The confirmed card-destination acquisition readback of this session: the
+    /// card counterpart of [`Self::profile_readback`].
+    ///
+    /// The host-RAM readback requires the SDRAM destination and the `scan_nef`
+    /// capability, so it always refuses a card session. This readback freezes the
+    /// same required keys and supported readable values with the same
+    /// confirmed/actual/target rules, and requires the confirmed card destination
+    /// (`recordingMedia = 0`) instead. Only values the camera actually reported are
+    /// returned; nothing is substituted or defaulted, and an unknown or drifted
+    /// value refuses the readback.
+    pub fn card_profile_readback(&self) -> Result<CameraProperties, CameraError> {
+        let health = self.health();
+        if !health.connected || health.isolated || health.live_view.active {
+            return Err(invalid("confirmed card capture session required"));
+        }
+        require_card_destination(&health)?;
+        let mut values = CameraProperties::new();
+        for key in PROFILE_REQUIRED_KEYS {
+            let property = health
+                .properties
+                .get(*key)
+                .ok_or_else(|| invalid(&format!("card capture profile lacks {key}")))?;
+            if !property.confirmed || property.error.is_some() || property.actual.is_none() {
+                return Err(invalid(&format!(
+                    "card capture profile readback {key} is unknown or failed"
+                )));
+            }
+            if property
+                .target
+                .as_ref()
+                .is_some_and(|target| Some(target) != property.actual.as_ref())
+            {
+                return Err(invalid(&format!(
+                    "card capture profile readback {key} does not match its applied target"
+                )));
+            }
+            values.insert((*key).into(), property.actual.clone().unwrap());
+        }
+        for (key, property) in &health.properties {
+            if !property.readable {
+                continue;
+            }
+            if !property.confirmed || property.actual.is_none() {
+                return Err(invalid(&format!(
+                    "supported capture parameter {key} is unknown"
+                )));
+            }
+            if property
+                .target
+                .as_ref()
+                .is_some_and(|target| Some(target) != property.actual.as_ref())
+            {
+                return Err(invalid(&format!(
+                    "supported capture parameter {key} differs from its applied target"
+                )));
+            }
+            values.insert(key.clone(), property.actual.clone().unwrap());
+        }
+        values.insert("recordingMedia".into(), CameraValue::Integer(0));
+        values.insert("burstNumber".into(), CameraValue::Integer(1));
+        Ok(values)
+    }
     pub fn set_exposure_ms(&self, milliseconds: f64) -> Result<String, CameraError> {
         let value = exact_shutter_value(&self.health(), milliseconds)?;
         let applied =
@@ -339,6 +434,9 @@ impl CameraAdapter {
         if self.health().live_view.active {
             return Err(invalid("capture prohibited while Live View is active"));
         }
+        self.control
+            .card_capture_pending
+            .store(false, Ordering::Release);
         match self.call(
             Request::Capture {
                 path: path.into(),
@@ -350,6 +448,49 @@ impl CameraAdapter {
             Some(cancel),
         )? {
             Reply::Captured(image) => Ok(image),
+            _ => unreachable!(),
+        }
+    }
+    /// Enumerates the advertised card storages on the single COM owner thread and
+    /// applies the whole-task capacity gate for `projection_count` projections plus
+    /// the 20 pre-scan references at the documented conservative per-frame bound.
+    /// Read-only metadata only: `GetStorageIDs` and one bounded `GetStorageInfo`
+    /// per advertised id, bound positionally, then the shared offline card
+    /// planner. A plan that cannot cover the whole task is refused with its stable
+    /// `CARD_*` code, so the coordinator can refuse the scan before any exposure,
+    /// movement or beam. Two cards are never assumed to total 128 GB.
+    pub fn plan_card_storages(&self, projection_count: u32) -> Result<CardPlan, CameraError> {
+        match self.call(Request::CardPlan { projection_count }, COMMAND_TIMEOUT, None)? {
+            Reply::CardPlan(plan) => Ok(plan),
+            _ => unreachable!(),
+        }
+    }
+    /// One card exposure through the same single COM owner, the same cancellation
+    /// generations, the same shared deadline discipline and the same one-capture-
+    /// in-flight rule as `Request::Capture`. The image stays on the card: the
+    /// reply is one object receipt with no local path and no local hash. A
+    /// cancellation retires the session exactly like a host-RAM capture, and no
+    /// cleanup path may delete or re-shoot the card object.
+    pub fn capture_to_card(
+        &self,
+        plan: CardCapturePlan,
+        operation_id: &str,
+        cancel: &AtomicBool,
+        events: Option<mpsc::Sender<CameraCaptureEvent>>,
+    ) -> Result<CardCaptureOutcome, CameraError> {
+        if self.health().live_view.active {
+            return Err(invalid("capture prohibited while Live View is active"));
+        }
+        match self.call(
+            Request::CaptureCard {
+                plan,
+                operation_id: operation_id.into(),
+                events,
+            },
+            CAPTURE_TIMEOUT,
+            Some(cancel),
+        )? {
+            Reply::CardCaptured(outcome) => Ok(outcome),
             _ => unreachable!(),
         }
     }
@@ -588,8 +729,20 @@ fn cleanup(camera: &mut NativeCamera, control: &Control, epoch: u64) {
     }
     diagnostic.io_cancel_confirmed = cancelled;
     if camera.capture_pending && camera.d7100 {
-        // Discard cancelled objects. Only the reliable termination event can
-        // clear an exposure whose start was accepted or uncertain.
+        // The destination of the unresolved exposure decides which completion can
+        // end it: a card exposure is proved by the associated standard card
+        // completion, never by the host-RAM `0xc102` event, and a host-RAM
+        // exposure is never proved by a card completion. `card_capture_pending`
+        // follows the lifetime of `pending_capture`, so a cancelled card
+        // operation keeps its card verdict. This loop clears local pending state
+        // only: a cancelled card object stays on the card untouched (there is no
+        // local file, and nothing here may delete or re-shoot it).
+        let card_operation = control.card_capture_pending.load(Ordering::Acquire);
+        let expected_completion = if card_operation {
+            CAPTURE_COMPLETE_CARD
+        } else {
+            CAPTURE_COMPLETE_RAM
+        };
         let mut associated = camera.pending_capture.as_ref().is_some_and(|receipt| {
             receipt.queue_drained && Some(&receipt.session_id) == session.as_ref()
         });
@@ -620,13 +773,30 @@ fn cleanup(camera: &mut NativeCamera, control: &Control, epoch: u64) {
                     }
                     let completions = events
                         .iter()
-                        .filter(|event| event.code == CAPTURE_COMPLETE_RAM)
+                        .filter(|event| event.code == expected_completion)
                         .count();
+                    // Only the events that may legitimately accompany this
+                    // destination's termination are admissible. For a card
+                    // operation that is the card completion, the associated card
+                    // object arrival, an overflow notice, a property notification
+                    // and Nikon's obsolete-event marker; a storage removal, host
+                    // RAM evidence or any unassociated event refuses the proof.
                     let unrelated = events.iter().any(|event| {
-                        !matches!(
-                            event.code,
-                            CAPTURE_COMPLETE_RAM | OBJECT_RAM | 0x4006 | 0xc104
-                        )
+                        if card_operation {
+                            !matches!(
+                                event.code,
+                                CAPTURE_COMPLETE_CARD
+                                    | OBJECT_ADDED
+                                    | STORE_FULL
+                                    | PROPERTY_CHANGED
+                                    | 0xc104
+                            )
+                        } else {
+                            !matches!(
+                                event.code,
+                                CAPTURE_COMPLETE_RAM | OBJECT_RAM | 0x4006 | 0xc104
+                            )
+                        }
                     });
                     if unrelated || completions > 1 {
                         associated = false;
@@ -653,7 +823,8 @@ fn cleanup(camera: &mut NativeCamera, control: &Control, epoch: u64) {
                 .as_ref()
                 .is_some_and(|receipt| receipt.accepted);
             diagnostic.error = Some(format!(
-                "associated C102 absent for {} trigger; exposure termination remains unknown",
+                "associated {} absent for {} trigger; exposure termination remains unknown",
+                if card_operation { "card completion 0x400d" } else { "C102" },
                 if accepted { "accepted" } else { "uncertain" }
             ));
         }
@@ -662,6 +833,12 @@ fn cleanup(camera: &mut NativeCamera, control: &Control, epoch: u64) {
     camera.transport_open = false;
     diagnostic.close_confirmed = closed;
     diagnostic.elapsed_ms = started.elapsed().as_millis() as u64;
+    if !camera.capture_pending {
+        // No unresolved exposure remains, so the card/host-RAM verdict of the
+        // retired session is complete. A still-pending capture keeps its
+        // destination verdict for the next cleanup attempt.
+        control.card_capture_pending.store(false, Ordering::Release);
+    }
     if !cancelled || !closed || !lv_stopped {
         // Preserve any capture-termination error already recorded and append the
         // real Live View transport error, so the one diagnostic field never hides
@@ -809,7 +986,8 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
                         continue;
                     }
                     let op = match &message.request {
-                        Request::Capture { operation_id, .. } => Some(operation_id.clone()),
+                        Request::Capture { operation_id, .. }
+                        | Request::CaptureCard { operation_id, .. } => Some(operation_id.clone()),
                         _ => None,
                     };
                     camera.health.busy = true;
@@ -847,6 +1025,7 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
                             || matches!(
                                 message.request,
                                 Request::Capture { .. }
+                                    | Request::CaptureCard { .. }
                                     | Request::Connect(_)
                                     | Request::LvStart(_)
                                     | Request::LvStop
@@ -1180,6 +1359,55 @@ fn execute(
             )?;
             camera.health.last_capture = Some(image.path.display().to_string());
             Ok(Reply::Captured(image))
+        }
+        Request::CardPlan { projection_count } => {
+            camera.ensure_connected()?;
+            // Only a session whose destination is the confirmed card may enumerate
+            // and plan card storage: a host-RAM session is refused here instead of
+            // being probed with storage reads it has no reason to answer.
+            require_card_destination(&camera.health)?;
+            let ids = parse_storage_ids(&camera.read_data(
+                GET_STORAGE_IDS,
+                &[],
+                CARD_STORAGE_DATASET_MAX,
+                context,
+            )?)?;
+            let mut infos = Vec::with_capacity(ids.len());
+            for id in &ids {
+                infos.push(parse_storage_info(&camera.read_data(
+                    GET_STORAGE_INFO,
+                    &[id.0],
+                    CARD_STORAGE_DATASET_MAX,
+                    context,
+                )?)?);
+            }
+            let bound = bind_storage_ids(&ids, infos)?;
+            let plan = plan_task_cards(&bound, *projection_count, CONSERVATIVE_NEF_BYTES)
+                .map_err(|code| {
+                    invalid(&format!(
+                        "{code}: the advertised card storage cannot cover the whole task"
+                    ))
+                })?;
+            Ok(Reply::CardPlan(plan))
+        }
+        Request::CaptureCard {
+            plan,
+            operation_id,
+            events,
+        } => {
+            // The card destination is re-proved inside `capture_to_card`; the flag
+            // below only selects the cleanup termination evidence and follows the
+            // pending-capture lifetime, so a cancelled card operation keeps its
+            // card verdict instead of being proved by host-RAM evidence.
+            control.card_capture_pending.store(true, Ordering::Release);
+            let outcome = capture_to_card(camera, plan, operation_id, events, context);
+            if !camera.capture_pending {
+                control.card_capture_pending.store(false, Ordering::Release);
+            }
+            // `last_capture` keeps meaning "the last host file"; a card object has
+            // no local path, so it is never written there. The receipt is the
+            // evidence, and the card operation's own diagnostics already carry it.
+            Ok(Reply::CardCaptured(outcome?))
         }
         Request::LvStart(live_epoch) => {
             camera.ensure_connected()?;
