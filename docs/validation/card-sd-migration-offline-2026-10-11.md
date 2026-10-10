@@ -69,9 +69,9 @@ npm.cmd run firmware:test
 ```
 证据日志按批保存在 `.cache/tests/verify/20261010-batch*/`（缓存不提交）；固件构建与 harness 证据保存在 `.cache/tests/turntable/<run-id>/result.json`。
 
-## 6 交付状态（截至 HEAD `ea2a215`）
+## 6 交付状态（截至 HEAD `e8b1c48`）
 
-全量 `npm run verify` 在本轮尖端**退出码 0**：module-map PASS（246 文件 / 16 模块 / 39 边界）、typecheck、build、`test:frontend` 193 通过、`test:desktop` 27 通过、`cargo test --workspace` **412 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**、`firmware:test` host harness **8443 断言**。
+全量 `npm run verify` 在最终尖端**退出码 0**：module-map PASS（246 文件 / 16 模块 / 39 边界）、typecheck、build、`test:frontend` 193 通过、`test:desktop` 27 通过、`cargo test --workspace` **414 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**、`firmware:test` host harness **8443 断言**。
 
 | 目标项 | 状态 | 说明 |
 | --- | --- | --- |
@@ -79,12 +79,14 @@ npm.cmd run firmware:test
 | ② 扫描上限 1000 秒 | **PASS（离线）** | `scan::SCAN_MAX_XRAY_SEC` 统一十处判据；旧冻结值与手动 600 秒不变；前端 mm:ss 精确换算（1000 s = 16:40） |
 | ③ 单卡/Overflow 存卡采集 | **PASS（离线，协议语义待实机）** | 能力分离、严格存储/卡对象解析、标准 `InitiateCapture` + 唯一元数据读取、零图像载荷（opcode 级证据）、目的感知清理与取消 |
 | ④ schema 4 / profile 7 / 意图与 receipt / 状态与占用分离 / 崩溃窗口 | **PASS（离线）** | schema-4 清单与完成规则、`acquired_pending_import`、账本闸门（意图无收据即故障）、暂停/Stop/崩溃窗口测试 |
-| ⑤ USB 批量导入与校验封存 | **BLOCKED（未实施）** | 导入模块、重连唯一绑定、续导/取消、路径安全与封存尚未实现；重构准入对未验证任务的拒绝已在域/前端侧就位 |
-| ⑥ 前端类型/快照/计数/状态/文案 | **PASS（部分）** | `cardAcquisition` 契约（类型/严格校验/预览一致）、状态与计数呈现、SD 模式媒体、导入对话框、重构准入已落地；导入进度/取消/续导入口与"卡目标 1000 秒默认"仍待收尾 |
+| ⑤ USB 批量导入与校验封存 | **BLOCKED（未实施）** | 已完成可独立验证的**唯一绑定**（`bind_expected_objects`：缺/多候选/意外/重复期望全部拒绝，采集期 handle 不作身份）与**目标文件名安全**（拒绝分隔符、`..`、盘符/UNC、控制字符、Windows 保留名、结尾点空格、超长）；仍缺：经 owner 线程的对象下载、流式 SHA-256 与 NEF 校验、原子不覆盖封存、续导/取消、域服务与 schema-4 封存、前端已定的 `start_card_import`/`cancel_card_import` 命令与 8 个导入快照字段 |
+| ⑥ 前端类型/快照/计数/状态/文案 | **PASS（离线；引擎侧对齐待 ⑤）** | 类型与严格校验（兼容"基础 8 键"与"基础+8 导入键"两种形态，避免引擎只发基础块时被判 Fault）、状态词与三计数、SD 模式不取缩略图并提示 "Images are on the camera SD card"、导入对话框与进度/取消/续导入口、运行期禁用拍摄/LV/改参数/新扫描、重构三处准入拒绝；**未做**真实浏览器 1920×1080 目视核对 |
 | 故障注入与 180/360/720 全链 | **BLOCKED（未实施）** | 投影取整/无重复端点/末张不多转的专门用例尚未补 |
 
 **FAIL：无。**
 
+**引擎侧必须对齐前端的两点**：命令名 `start_card_import`（带 `taskId`）/`cancel_card_import`（无参）；一次性发布完整 16 键的 `cardAcquisition`（前端已同时兼容 8 键与 16 键，故不会再出现启动 Fault）。
+
 **待授权实机验收（P2/P5/P6）**：步骤见第 4 节，未授权前不得执行；`hardwareCertified` 保持 false，本候选只能标记为**仅离线验证**。
 
-**已知需在交付说明中同时声明的事项**：卡清理等待仍复用"曝光 + 2 s"（SD 实测界限属 P2）；容量上界为 64 MiB/张的保守估算而非实测 NEF 尺寸；策略中的固件源哈希是候选 provenance，不证明控制器当前刷入的镜像。
+**已知需在交付说明中同时声明的事项**：卡清理等待仍复用"曝光 + 2 s"（SD 实测界限属 P2）；容量上界为 64 MiB/张的保守估算而非实测 NEF 尺寸；策略中的固件源哈希是候选 provenance，不证明控制器当前刷入的镜像；卡策略还要求控制器公布 `MOVE_SETTLE_150MS`，否则以 `CARD_FIRMWARE_UNVERIFIED` 拒绝。
