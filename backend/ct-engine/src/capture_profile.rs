@@ -891,4 +891,36 @@ mod tests {
         assert!(test_profile().require_current_policy().is_ok());
         assert!(card_profile("single").require_current_policy().is_ok());
     }
+
+    #[test]
+    fn the_card_policy_pins_the_firmware_identity_the_build_config_freezes() {
+        // A card policy records the controller firmware provenance. It must match
+        // the pinned candidate and the firmware source, otherwise a task would
+        // freeze a stale identity (this drifted once when a capability token was
+        // added to the source without moving the engine constant).
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("firmware/rts9060_nano/build-config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config["candidate"]["sha256"].as_str().unwrap(),
+            crate::scan::CARD_FIRMWARE_SOURCE_SHA256,
+            "the engine card policy and the pinned firmware source identity differ"
+        );
+        assert_eq!(
+            config["candidate"]["version"].as_str().unwrap(),
+            crate::scan::CARD_FIRMWARE_VERSION
+        );
+        let source =
+            std::fs::read_to_string(root.join("firmware/rts9060_nano/rts9060_nano.ino")).unwrap();
+        assert!(source.contains(&format!(
+            "#define FIRMWARE_VERSION_TEXT \"{}\"",
+            crate::scan::CARD_FIRMWARE_VERSION
+        )));
+        assert!(source.contains(&format!(
+            "#define FIRMWARE_BUILD_TEXT \"{}\"",
+            crate::scan::CARD_FIRMWARE_BUILD
+        )));
+    }
 }
