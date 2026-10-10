@@ -10,7 +10,7 @@ export function formatProjectRemainingTime(seconds: number | null | undefined): 
   if (seconds <= 10) return "Finishing soon…";
   return `About ${Math.ceil(seconds / 10) * 10}s remaining`;
 }
-export function ReconstructionConsole({ ws, projectOperation = null, openingProject = false, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction }: { ws: WorkstationView; projectOperation?: DeviceOperation | null; openingProject?: boolean; centerView: string; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId, options: ReconstructionOptions) => void }) {
+export function ReconstructionConsole({ ws, projectOperation = null, openingProject = false, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction, cardGateReason = null }: { ws: WorkstationView; projectOperation?: DeviceOperation | null; openingProject?: boolean; centerView: string; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId, options: ReconstructionOptions) => void; cardGateReason?: string | null }) {
   const reconstruction = ws.reconstruction;
   const [method, setMethod] = useState<ReconstructionMethodId>("fdk");
   const [changing, setChanging] = useState(false);
@@ -37,7 +37,10 @@ export function ReconstructionConsole({ ws, projectOperation = null, openingProj
   const running = reconstruction.status === "running";
   const completed = reconstruction.status === "completed";
   const failed = reconstruction.status === "failed";
-  const canChoose = reconstruction.unlocked && !loadingProject && !running && (!completed || changing) && !busy && !stale && !pickingCalibration;
+  // A camera-card task whose data is not imported and verified is refused here
+  // with its explicit reason, independent of the engine's unlocked flag.
+  const cardBlocked = Boolean(cardGateReason) && !loadingProject;
+  const canChoose = reconstruction.unlocked && !loadingProject && !running && (!completed || changing) && !busy && !stale && !pickingCalibration && !cardGateReason;
   const canStart = canChoose && method === "fdk" && reconstruction.methods.some(entry => entry.id === method && entry.enabled);
   const volumeControls = !loadingProject && completed && centerView === "reconstruction" && volumeReady && volume3DAvailable;
   const percent = completed ? 100 : Math.max(0, Math.min(100, reconstruction.percent));
@@ -51,10 +54,12 @@ export function ReconstructionConsole({ ws, projectOperation = null, openingProj
     : projectOperation?.status === "cancelling" ? "Cancelling project validation…"
     : "Verifying project files…";
   const title = loadingProject ? "Opening scan project…" : projectFailed ? "Scan project could not be opened" : projectCancelled ? "Project opening cancelled"
+    : cardBlocked ? "Verified card import required"
     : failed ? "Reconstruction failed" : running ? `Reconstructing · ${percent}%` : completed ? "Result cached" : reconstruction.unlocked ? "Ready to reconstruct" : noDataset ? "No scan project loaded" : "Awaiting sealed scan";
   return <div className="recon-workspace" aria-busy={loadingProject}>
     <section className="recon-workspace__facts">
-      <strong className={projectFailed || failed ? "tone-danger" : ""} role="status">{title}</strong>
+      <strong className={projectFailed || failed || cardBlocked ? "tone-danger" : ""} role="status">{title}</strong>
+      {cardBlocked && <p className="recon-workspace__gate" role="status">{cardGateReason}</p>}
       <div><span>Dataset</span><b title={loadingProject || noDataset ? undefined : `${ws.scanSetup.savePath}/${ws.scanSetup.taskId}`}>{loadingProject ? "Validating saved files…" : noDataset ? "Not loaded" : `${ws.progress.captured} / ${ws.scanSetup.projectionCount} projections`}</b></div>
       <div><span>References</span><b>{loadingProject ? "Validation pending" : noDataset ? "—" : `Dark ${ws.scanFlow.references.preDark} · Flat ${ws.scanFlow.references.preFlat}`}</b></div>
       <div><span>Compute</span><b>{method === "sirt" ? "SIRT · CPU" : "Auto CPU / GPU"}</b></div>
@@ -64,6 +69,7 @@ export function ReconstructionConsole({ ws, projectOperation = null, openingProj
         <div className="recon-workspace__load-summary"><span>{loadDeterminate ? `${projectProgress!.verifiedFiles} / ${projectProgress!.totalFiles} files verified` : "Reading project metadata…"}</span><b role="status">{loadTime}</b></div>
       </div>
         : projectFailed ? <div className="recon-workspace__progress"><span>{noDataset ? "No dataset loaded" : "Previous dataset unchanged"}</span><button onClick={() => setDetails("project")}>Project error details…</button></div>
+        : cardBlocked ? <div className="recon-workspace__progress"><span>{cardGateReason}</span></div>
         : noDataset ? <div className="recon-workspace__progress"><span>Open a completed project from Task → Open Scan Project…</span></div>
         : <div className="recon-workspace__progress" role="progressbar" aria-label="Reconstruction progress" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}><span className="recon-workspace__progress-track"><i style={{ width: `${percent}%` }} /></span><b>{percent}%</b></div>}
     </section>
@@ -73,7 +79,7 @@ export function ReconstructionConsole({ ws, projectOperation = null, openingProj
       <h3>Method</h3><div className="recon-workspace__methods" role="radiogroup" aria-label="Reconstruction method">{reconstruction.methods.map(entry => <button key={entry.id} role="radio" aria-checked={method === entry.id} disabled={!canChoose || !entry.enabled || entry.id !== "fdk"} title={entry.id !== "fdk" ? "Automatic colour processing currently requires FDK" : englishDisplayText(entry.reason || entry.label)} className={method === entry.id ? "is-selected" : ""} onClick={() => setMethod(entry.id)}>{englishDisplayText(entry.label)}</button>)}</div>
     </section>
     <section className="recon-workspace__actions-group">
-      <button className="recon-workspace__primary" disabled={!canStart} onClick={() => { setChanging(false); onStartReconstruction(method, {mode, ...(mode === "multicolor" && calibration ? {materialCalibrationPath: calibration} : {})}); }}>{loadingProject ? "Validating project…" : running ? "Reconstructing…" : completed && !changing ? "Reconstruction complete" : failed ? "Retry reconstruction" : "Start reconstruction"}</button>
+      <button className="recon-workspace__primary" disabled={!canStart} onClick={() => { setChanging(false); onStartReconstruction(method, {mode, ...(mode === "multicolor" && calibration ? {materialCalibrationPath: calibration} : {})}); }}>{loadingProject ? "Validating project…" : running ? "Reconstructing…" : completed && !changing ? "Reconstruction complete" : failed ? "Retry reconstruction" : cardBlocked ? "Import and verify card data first" : "Start reconstruction"}</button>
       {mode === "multicolor" && <div className="recon-workspace__calibration"><button disabled={!canChoose} title={calibration || "Optional measured two-basis calibration; without it colours show camera responses only"} onClick={selectCalibration}>{pickingCalibration ? "Selecting…" : calibration ? "Clear calibration" : "Material calibration…"}</button><span role="status">{calibrationError ? englishDisplayText(calibrationError) : calibration ? "Engine will validate calibration" : "Colour responses · materials unverified"}</span></div>}
       <button disabled={loadingProject || (!completed && !failed)} onClick={() => { if (failed) setDetails("reconstruction"); else setChanging(value => !value); }}>{failed ? "Error details…" : changing ? "Cancel method change" : "Change method"}</button>
       <div className="recon-workspace__view-controls"><button onClick={onShowEquipment} aria-pressed={centerView === "equipment"}>Equipment</button><button disabled={loadingProject || !completed} onClick={onOpenReconstruction} aria-pressed={centerView === "reconstruction"}>Result</button><button disabled={!volumeControls} onClick={() => onVolumeMode("mip")} aria-pressed={volumeControls && volumeMode === "mip"}>MIP</button><button disabled={!volumeControls} onClick={() => onVolumeMode("opacity")} aria-pressed={volumeControls && volumeMode === "opacity"}>Opacity</button><button disabled={!volumeControls} onClick={onResetVolume}>Reset view</button></div>

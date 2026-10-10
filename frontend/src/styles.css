@@ -1792,3 +1792,26 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 .recon-workspace__band-note{margin:5px 0 8px;font-size:var(--fontSizeLabel);color:var(--textMuted)}
 .recon-workspace__calibration{display:flex;flex-direction:column;gap:3px;font-size:var(--fontSizeLabel);color:var(--textMuted)}
 .recon-workspace__calibration button{min-height:28px;padding:3px 5px;background:var(--neutralSoft);color:var(--textPrimary)}
+
+/* ---------- camera-card acquisition and USB import ----------
+   Card state is additive: these rows exist only when the engine publishes
+   `cardAcquisition`. Nothing here scrolls inside a fixed console column. */
+.op-card{flex:0 0 auto;display:flex;flex-direction:column;gap:4px;margin:8px 12px 0;padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:var(--neutralSoft)}
+.op-card__row{display:flex;align-items:center;gap:8px;min-width:0}
+.op-card__tag{font-family:var(--fontMono);font-size:var(--fontSizeHint);font-weight:600;letter-spacing:.04em;color:var(--textMuted);white-space:nowrap}
+.op-card__row strong{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--fontSizeHint);color:var(--textPrimary)}
+.op-card__row button{flex:0 0 auto;min-height:22px;padding:2px 7px;font-size:var(--fontSizeHint)}
+.op-card__counts{display:flex;flex-wrap:wrap;gap:3px 12px;font-size:var(--fontSizeHint);color:var(--textMuted);white-space:nowrap}
+.op-card__counts b{font-family:var(--fontMono);color:var(--textPrimary)}
+.image-strip__card-note{grid-column:1 / -1;display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--neutralSoft);font-size:var(--fontSizeHint);color:var(--textMuted)}
+.image-strip__card-note strong{color:var(--textPrimary)}
+.image-strip__card-note button{min-height:24px;padding:2px 8px}
+.card-import__status{margin:0 0 10px;padding:7px 10px;border:1px solid var(--line);border-radius:7px;background:var(--neutralSoft);font-weight:600;color:var(--textPrimary)}
+.card-import__status.is-verified{border-color:var(--accent);background:var(--accentSoft)}
+.card-import__status.is-running{border-color:var(--accent);background:var(--accentSoft)}
+.card-import__progress{display:flex;flex-direction:column;gap:5px;margin:10px 0;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--accentSoft)}
+.card-import__task{display:flex;align-items:center;gap:8px;margin:8px 0}
+.card-import__task select{flex:1 1 auto;min-width:0;min-height:28px;padding:3px 6px;font:inherit;background:var(--neutralSoft);color:var(--textPrimary);border:1px solid var(--lineField);border-radius:7px}
+.card-import__note{margin:6px 0 0;font-size:var(--fontSizeLabel);color:var(--textMuted)}
+.card-import__error{margin:8px 0 0;color:var(--danger)}
+.recon-workspace__gate{margin:6px 0 0;color:var(--danger);font-size:var(--fontSizeLabel);line-height:1.4}

@@ -23,6 +23,7 @@ import { WorkstationMedia, type WorkstationMediaMode } from "./WorkstationMedia"
 import { ReconstructionConsole } from "./ReconstructionConsole";
 import { useCameraDraft, useDeviceActions } from "./camera-draft";
 import { UpdateDialog } from "./UpdateDialog";
+import { WorkstationDialog } from "./WorkstationDialog";
 import { getApplicationVersion } from "./platform/updater";
 import { deriveFailureReport, deviceConnectionReason, manualControlReason } from "./engine/deviceControls";
 import { LineIcon, type LineIconName } from "./icons";
@@ -1395,7 +1396,7 @@ function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: 
   );
 }
 
-function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbackId, centerView, volume, previewError, volumeMode, volumeResetRevision, onVolumeAvailable, camera, photo, requestRevision, onCloseMedia, runDevice, pending }: { snapshot: EngineSnapshot; ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string; centerView: CenterView; volume: PreviewVolume | null; previewError: string | null; volumeMode: "mip" | "opacity"; volumeResetRevision: number; onVolumeAvailable: (available: boolean) => void; camera: CameraHealth | null; photo: IndependentCapturedImage | null; requestRevision: number; onCloseMedia: () => void; runDevice: (c: EngineCommand) => Promise<EngineSnapshot>; pending: boolean }) {
+function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbackId, centerView, volume, previewError, volumeMode, volumeResetRevision, onVolumeAvailable, camera, photo, requestRevision, onCloseMedia, runDevice, pending, liveBlockedReason = null }: { snapshot: EngineSnapshot; ws: WorkstationView; theme: Theme; dispatch: (c: EngineCommand) => void; stale: boolean; setupInvalid: boolean; feedbackId: string; centerView: CenterView; volume: PreviewVolume | null; previewError: string | null; volumeMode: "mip" | "opacity"; volumeResetRevision: number; onVolumeAvailable: (available: boolean) => void; camera: CameraHealth | null; photo: IndependentCapturedImage | null; requestRevision: number; onCloseMedia: () => void; runDevice: (c: EngineCommand) => Promise<EngineSnapshot>; pending: boolean; liveBlockedReason?: string | null }) {
   const [viewPreset, setViewPreset] = useState<ViewPreset>("iso");
   const [presetRevision, setPresetRevision] = useState(0);
   const fallback = useSceneFallback();
@@ -1455,7 +1456,7 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
           </span>
         </div>
         </>}
-        <WorkstationMedia mode={centerView} camera={camera} photo={photo} requestRevision={requestRevision} onClose={onCloseMedia} run={runDevice} controlReason={manualControlReason(snapshot, stale) || (pending ? "Operation pending" : null)} readReason={deviceConnectionReason(snapshot, stale) || (pending ? "Operation pending" : null)} />
+        <WorkstationMedia mode={centerView} camera={camera} photo={photo} requestRevision={requestRevision} onClose={onCloseMedia} run={runDevice} controlReason={manualControlReason(snapshot, stale) || (pending ? "Operation pending" : null)} readReason={deviceConnectionReason(snapshot, stale) || (pending ? "Operation pending" : null)} liveBlockedReason={liveBlockedReason} />
         {centerView === "equipment" && <ControlDock
           snapshot={snapshot}
           ws={ws}
@@ -1911,7 +1912,7 @@ function reconstructionMessageEn(message: string, status: WorkstationView["recon
   return message;
 }
 
-function BottomConsole({ tab, onTab, ws, projectOperation, openingProject, production, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction }: { tab: BottomTab; onTab: (tab: BottomTab) => void; ws: WorkstationView; projectOperation: DeviceOperation | null; openingProject: boolean; production: boolean; centerView: CenterView; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId, options: ReconstructionOptions) => void }) {
+function BottomConsole({ tab, onTab, ws, card, projectOperation, openingProject, production, centerView, volumeReady, volume3DAvailable, busy, stale, volumeMode, onVolumeMode, onResetVolume, onOpenReconstruction, onShowEquipment, onStartReconstruction, onCardImport, cardGateReason }: { tab: BottomTab; onTab: (tab: BottomTab) => void; ws: WorkstationView; card?: CardAcquisition; projectOperation: DeviceOperation | null; openingProject: boolean; production: boolean; centerView: CenterView; volumeReady: boolean; volume3DAvailable: boolean; busy: boolean; stale: boolean; volumeMode: "mip" | "opacity"; onVolumeMode: (mode: "mip" | "opacity") => void; onResetVolume: () => void; onOpenReconstruction: () => void; onShowEquipment: () => void; onStartReconstruction: (method: ReconstructionMethodId, options: ReconstructionOptions) => void; onCardImport: () => void; cardGateReason: string | null }) {
 
   const [follow, setFollow] = useState(true);
   const logs = ws.consoleLogs;
@@ -1928,6 +1929,13 @@ function BottomConsole({ tab, onTab, ws, projectOperation, openingProject, produ
     images: ws.frames.length,
     reconstruction: ws.reconstruction.status === "completed" ? 1 : 0,
   }), [logs, ws.frames.length, ws.reconstruction.status]);
+  // While the acquisition data is still on the card, only frames the engine has
+  // already imported and verified may be requested and shown. A frame without a
+  // verified local file is never fetched and no thumbnail is fabricated from
+  // Live View or any other live source.
+  const cardPending = card?.destination === "cameraCard" && card.importStatus !== "verified";
+  const unverifiedFrames = cardPending ? frames.filter(frame => frame.index > card!.verifiedProjectionCount) : [];
+  const visibleFrames = cardPending ? frames.filter(frame => frame.index <= card!.verifiedProjectionCount) : frames;
   const header = tab === "images"
     ? `CAPTURED IMAGES · ${ws.scanSetup.taskId} · ${ws.progress.captured} / ${ws.progress.total} VIEWS · ${ws.scanSetup.angleStepDeg.toFixed(2)}° STEP · ${ws.scanSetup.exposureMs} ms`
     : tab === "aggregate" ? "SESSION EVENTS · ALL SOURCES"
@@ -1940,12 +1948,19 @@ function BottomConsole({ tab, onTab, ws, projectOperation, openingProject, produ
       </button>)}
     </div>
     <div className="console__body" role="tabpanel">
-      <div className="recon-workspace-mount" hidden={tab !== "reconstruction"}><ReconstructionConsole ws={ws} projectOperation={projectOperation} openingProject={openingProject} centerView={centerView} volumeReady={volumeReady} volume3DAvailable={volume3DAvailable} busy={busy} stale={stale} volumeMode={volumeMode} onVolumeMode={onVolumeMode} onResetVolume={onResetVolume} onOpenReconstruction={onOpenReconstruction} onShowEquipment={onShowEquipment} onStartReconstruction={onStartReconstruction} /></div>
+      <div className="recon-workspace-mount" hidden={tab !== "reconstruction"}><ReconstructionConsole ws={ws} projectOperation={projectOperation} openingProject={openingProject} centerView={centerView} volumeReady={volumeReady} volume3DAvailable={volume3DAvailable} busy={busy} stale={stale} volumeMode={volumeMode} onVolumeMode={onVolumeMode} onResetVolume={onResetVolume} onOpenReconstruction={onOpenReconstruction} onShowEquipment={onShowEquipment} onStartReconstruction={onStartReconstruction} cardGateReason={cardGateReason} /></div>
       {tab !== "reconstruction" && <>
         <div className="console__head"><span>{header}</span>{tab !== "images" && <button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => setFollow(!follow)}>{follow ? "Following latest" : "Resume live log"}</button>}</div>
         {tab === "images" ? <div className="image-strip">
-          {frames.length === 0 && <div className="image-strip__empty">No projections yet. Configure a scan task to view its image sequence.</div>}
-          {frames.map(frame => <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} />)}
+          {cardPending && <div className="image-strip__card-note" role="status">
+            <strong>Images are on the camera SD card</strong>
+            <span>{`Acquired ${card!.acquiredProjectionCount} · imported ${card!.importedProjectionCount} · verified ${card!.verifiedProjectionCount}`}</span>
+            {unverifiedFrames.length > 0 && <span>{`${unverifiedFrames.length} captured view${unverifiedFrames.length === 1 ? "" : "s"} have no verified local file yet and show no thumbnail.`}</span>}
+            <button type="button" disabled={card!.importStatus === "running" || stale} onClick={onCardImport}>{card!.importStatus === "running" ? "Import running…" : "Card import…"}</button>
+          </div>}
+          {visibleFrames.length === 0 && !cardPending && <div className="image-strip__empty">No projections yet. Configure a scan task to view its image sequence.</div>}
+          {visibleFrames.length === 0 && cardPending && unverifiedFrames.length === 0 && <div className="image-strip__empty">No projection is registered locally yet. Import the card data to preview it.</div>}
+          {visibleFrames.map(frame => <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} />)}
         </div> : <LogLines logs={filtered} follow={follow} onFollow={setFollow} />}
       </>}
     </div>
@@ -2245,7 +2260,7 @@ export function App() {
   const [theme, setTheme] = useTheme();
   const [version, setVersion] = useState("Version unavailable");
   const [dialog, setDialog] = useState<DialogKind | null>(null);
-  const [auxiliary, updateAuxiliary] = useState<"camera" | "bench" | "prepare" | "recovery" | null>(null);
+  const [auxiliary, updateAuxiliary] = useState<"camera" | "bench" | "prepare" | "recovery" | "card" | null>(null);
   const preparationScope = useRef(createPreparationRequestScope());
   const [preparationStage, setPreparationStage] = useState<PreparationStage>(null);
   const [preparationError, setPreparationError] = useState<string | null>(null);
@@ -2298,6 +2313,9 @@ export function App() {
   const previewKey = ws?.reconstruction.status === "completed" && ws.reconstruction.cachePath && ws.reconstruction.selectedMethod ? `${ws.reconstruction.selectedMethod}|${ws.reconstruction.cachePath}` : null;
   const activeVolume = previewKey && previewData?.key === previewKey ? previewData.volume : null;
   const setupInvalid = model.dirty || !snapshot?.cameraScanReadiness?.ready;
+  const card = snapshot?.cardAcquisition;
+  const cardImportReason = cardImportLockReason(card);
+  const cardGateReason = cardReconstructionGate(card);
   const navigate = (view: CenterView) => { presentation.current += 1; setRequestRevision(presentation.current); setCenterView(view); };
   useEffect(() => { let active = true; void getApplicationVersion().then(value => { if (active) setVersion(value); }).catch(() => {}); return () => { active = false; }; }, []);
   useEffect(() => { const resize = () => setCanvasLayout(computeCanvasLayout(window.innerWidth, window.innerHeight)); resize(); window.addEventListener("resize", resize); return () => window.removeEventListener("resize", resize); }, []);
@@ -2320,8 +2338,8 @@ export function App() {
   }, [stale]);
   useEffect(() => () => { preparationScope.current.invalidate(); }, []);
   useEffect(() => {
-    if (centerView === "live" && (!snapshot?.deviceControls.camera?.liveView.active || !snapshot.deviceControls.camera.connected || snapshot.deviceControls.camera.isolated || !snapshot.deviceControls.camera.cleanupConfirmed || stale)) navigate("equipment");
-  }, [snapshot?.deviceControls.camera?.liveView.active, snapshot?.deviceControls.camera?.connected, snapshot?.deviceControls.camera?.isolated, snapshot?.deviceControls.camera?.cleanupConfirmed, stale]);
+    if (centerView === "live" && (cardImportReason !== null || !snapshot?.deviceControls.camera?.liveView.active || !snapshot.deviceControls.camera.connected || snapshot.deviceControls.camera.isolated || !snapshot.deviceControls.camera.cleanupConfirmed || stale)) navigate("equipment");
+  }, [snapshot?.deviceControls.camera?.liveView.active, snapshot?.deviceControls.camera?.connected, snapshot?.deviceControls.camera?.isolated, snapshot?.deviceControls.camera?.cleanupConfirmed, stale, cardImportReason]);
   useEffect(() => {
     if (!previewKey || adapterKind !== "tauri" || previewData?.key === previewKey) return;
     let active = true; const revision = presentation.current; setPreviewError(null);
@@ -2336,7 +2354,12 @@ export function App() {
     return () => { active = false; };
   }, [adapterKind, previewData?.key, previewKey, previewRetry, ws?.reconstruction.selectedMethod]);
   const openReconstruction = () => { if (activeVolume) navigate("reconstruction"); else if (previewKey) { presentation.current += 1; setRequestRevision(presentation.current); setPreviewRetry(value => value + 1); } };
-  const startReconstruction = (method: ReconstructionMethodId, options: ReconstructionOptions) => { setPreviewError(null); setPreviewData(null); navigate("equipment"); void actions.run({ type: "start_reconstruction", method, options }).catch(reason => setActionError(String(reason))); };
+  const startReconstruction = (method: ReconstructionMethodId, options: ReconstructionOptions) => {
+    // A card acquisition that is not imported and verified is never reconstructable,
+    // even if a stale entry point is reached.
+    if (cardGateReason) { setActionError(cardGateReason); return; }
+    setPreviewError(null); setPreviewData(null); navigate("equipment"); void actions.run({ type: "start_reconstruction", method, options }).catch(reason => setActionError(String(reason)));
+  };
   const onPhoto = (result: EngineSnapshot, revision: number) => {
     if (revision !== presentation.current || result.engineSessionId !== latest.current?.engineSessionId) return;
     const record = result.deviceControls.camera?.lastCapturedImage;
@@ -2369,8 +2392,12 @@ export function App() {
     if (!ws) for (const id of ["view.images","view.reconstruction","view.logs","tools.exportLog","tools.deviceDiagnostics"] as const) block(id,"No engine data available");
     if (adapterKind !== "tauri") for (const id of ["tools.exportLog","help.checkUpdate"] as const) block(id,"Desktop platform required");
     if (preparationStage !== null) for (const group of MENU_GROUPS) for (const entry of group.entries) if (entry.id !== "task.stop") block(entry.id,"Preparation pending · use Stop before changing the current request");
+    // A running USB card import owns the camera: no single capture, Live View,
+    // parameter write or new scan against the same camera is offered.
+    if (cardImportReason) for (const id of ["task.play","task.prepare","task.new","task.resetDraft","devices.camera","devices.cameraSettings","view.live"] as const) block(id, cardImportReason);
+    if (cardGateReason && card?.destination === "cameraCard") block("view.result", cardGateReason);
     return result;
-  }, [snapshot,ws,pending,stale,model.dirty,adapterKind,previewKey,photo,preparationStage,openingProject]);
+  }, [snapshot,ws,pending,stale,model.dirty,adapterKind,previewKey,photo,preparationStage,openingProject,cardImportReason,cardGateReason,card]);
   const handleMenuAction = async (id: MenuActionId): Promise<void> => {
     if (preparationScope.current.pending && id !== "task.stop") return;
     setActionError(null);
@@ -2388,6 +2415,10 @@ export function App() {
           try {
             const path = await chooseScanProjectDirectory(ws?.scanSetup.savePath || "");
             if (!path) break;
+            // A task whose data is still on the camera card is not a sealed project.
+            // Refuse it here with the same reason the reconstruction entry uses; the
+            // engine still validates the chosen directory for every other case.
+            if (cardGateReason && sameTaskDirectory(path, ws?.scanSetup.savePath || "", ws?.scanSetup.taskId || "")) { setActionError(cardGateReason); break; }
             setBottomTab("reconstruction");
             await actions.run({ type:"open_scan_project", path });
             setPreviewData(null); setPreviewError(null); setPhoto(null);
@@ -2430,16 +2461,17 @@ export function App() {
   return <main className="viewport-shell"><div className="design-canvas" style={{zoom:canvasLayout.zoom,width:`${canvasLayout.designWidth}px`,height:`${canvasLayout.designHeight}px`}}><MenuBar theme={theme} availability={availability} onAction={id => void handleMenuAction(id)} version={version} /><div className="app-divider" />
     {failureBanner}
     <section className="workspace-body">
-      <aside className="col device-column"><CameraPanel snapshot={snapshot} stale={stale} pending={pending} model={model} run={actions.run} onAdvanced={() => setAuxiliary("camera")} onPhoto={onPhoto} mediaRevision={requestRevision} onLive={revision => { if(revision === presentation.current) navigate("live"); }} /><TurntablePanel snapshot={snapshot} stale={stale} pending={pending} run={actions.run} onPreflight={openPreparation} onRecovery={() => setAuxiliary("recovery")} onBench={() => setAuxiliary("bench")} /></aside>
-      <section className="main-console"><LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={stale} setupInvalid={setupInvalid} feedbackId={snapshot.updatedAt} centerView={centerView} volume={activeVolume} previewError={previewError} volumeMode={volumeMode} volumeResetRevision={volumeResetRevision} onVolumeAvailable={setVolume3DAvailable} camera={snapshot.deviceControls.camera} photo={photo} requestRevision={requestRevision} onCloseMedia={closeMedia} runDevice={actions.run} pending={pending} /></section>
-      <BottomConsole tab={bottomTab} onTab={setBottomTab} ws={ws} projectOperation={snapshot.operations.filter(operation => operation.device === "task_project" && operation.kind === "open_project").at(-1) || null} openingProject={openingProject} production={adapterKind === "tauri"} centerView={centerView} volumeReady={Boolean(activeVolume)} volume3DAvailable={volume3DAvailable} busy={pending} stale={stale} volumeMode={volumeMode} onVolumeMode={setVolumeMode} onResetVolume={() => setVolumeResetRevision(value => value + 1)} onOpenReconstruction={openReconstruction} onShowEquipment={() => navigate("equipment")} onStartReconstruction={startReconstruction} />
-      <aside className="col col--right"><XrayPanel ws={ws} busy={pending || stale} dispatch={dispatch} stale={stale} /><OperationPanel snapshot={snapshot} ws={ws} stale={stale} /></aside>
+      <aside className="col device-column"><CameraPanel snapshot={snapshot} stale={stale} pending={pending} model={model} run={actions.run} cardImportReason={cardImportReason} onAdvanced={() => setAuxiliary("camera")} onPhoto={onPhoto} mediaRevision={requestRevision} onLive={revision => { if(revision === presentation.current) navigate("live"); }} /><TurntablePanel snapshot={snapshot} stale={stale} pending={pending} run={actions.run} onPreflight={openPreparation} onRecovery={() => setAuxiliary("recovery")} onBench={() => setAuxiliary("bench")} /></aside>
+      <section className="main-console"><LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={stale} setupInvalid={setupInvalid} feedbackId={snapshot.updatedAt} centerView={centerView} volume={activeVolume} previewError={previewError} volumeMode={volumeMode} volumeResetRevision={volumeResetRevision} onVolumeAvailable={setVolume3DAvailable} camera={snapshot.deviceControls.camera} photo={photo} requestRevision={requestRevision} onCloseMedia={closeMedia} runDevice={actions.run} pending={pending} liveBlockedReason={cardImportReason} /></section>
+      <BottomConsole tab={bottomTab} onTab={setBottomTab} ws={ws} card={card} projectOperation={snapshot.operations.filter(operation => operation.device === "task_project" && operation.kind === "open_project").at(-1) || null} openingProject={openingProject} production={adapterKind === "tauri"} centerView={centerView} volumeReady={Boolean(activeVolume)} volume3DAvailable={volume3DAvailable} busy={pending} stale={stale} volumeMode={volumeMode} onVolumeMode={setVolumeMode} onResetVolume={() => setVolumeResetRevision(value => value + 1)} onOpenReconstruction={openReconstruction} onShowEquipment={() => navigate("equipment")} onStartReconstruction={startReconstruction} onCardImport={() => setAuxiliary("card")} cardGateReason={cardGateReason} />
+      <aside className="col col--right"><XrayPanel ws={ws} busy={pending || stale} dispatch={dispatch} stale={stale} /><OperationPanel snapshot={snapshot} ws={ws} stale={stale} onImport={() => setAuxiliary("card")} /></aside>
     </section><div className="app-divider" /><footer className="status-bar"><span className="status-bar__left"><i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} /><strong>{stale ? "Control service unavailable · device readings UNKNOWN" : englishDisplayText(snapshot.lastError || ws.dock.playReason || ws.phaseWord)}</strong></span><div className="status-bar__right"><span>{ws.scanSetup.taskId || "No task selected"}</span>{snapshot.mode === "developer_preview" && <span className="badge badge--dev">Offline preview · no hardware</span>}<span className={`badge badge--engine badge--${stale ? "lost" : "connected"}`}>Control service · {stale ? "Unavailable" : "Ready"}</span><div className="theme-toggle" role="group" aria-label="Theme">{(["light","dark"] as const).map(value => <button key={value} className="theme-toggle__seg" aria-pressed={theme === value} onClick={() => setTheme(value)}>{value === "light" ? "Light" : "Dark"}</button>)}</div></div></footer>
     {info}<UpdateDialog open={update} onClose={() => setUpdate(false)} />
     {auxiliary === "camera" && <CameraSettingsDialog snapshot={snapshot} pending={pending} stale={stale} model={model} run={actions.run} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}
     {auxiliary === "bench" && <TurntableBenchDialog snapshot={snapshot} pending={pending} stale={stale} run={actions.run} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}
     {auxiliary === "recovery" && <TaskRecoveryDialog snapshot={snapshot} pending={pending} stale={stale} run={actions.run} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}
     {auxiliary === "prepare" && <ScanPreparationDialog key={preparationRevision} snapshot={snapshot} dirtyCamera={model.dirty} resetRevision={preparationRevision} stage={preparationStage} submissionError={(preparationNotice && failure ? `${failure.reason}\n${failure.nextAction}` : null) || preparationError} onSubmit={submitPreparation} onClose={() => setAuxiliary(null, auxiliaryRevision)} onAdvanced={() => setAuxiliary("camera", auxiliaryRevision)} onStop={stop} />}
+    {auxiliary === "card" && <CardImportDialog snapshot={snapshot} pending={pending} stale={stale} run={dispatch} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}
     {ws.scanFlow.prompt && <ScanStageDialog key={`${ws.scanSetup.taskId}:${ws.scanFlow.prompt.stage}`} stage={ws.scanFlow.prompt.stage} recorded={ws.scanFlow.geometry} beamState={ws.xray.beamState} busy={pending} onConfirm={geometry => dispatch({ type:"confirm_scan_stage",stage:ws.scanFlow.prompt!.stage,geometry })} onCancel={() => dispatch({ type:"cancel_scan_stage",stage:ws.scanFlow.prompt!.stage })} />}
   </div></main>;
 }
