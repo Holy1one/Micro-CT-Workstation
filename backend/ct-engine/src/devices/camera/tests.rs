@@ -243,8 +243,44 @@ struct Script {
     /// Every read phase this transport served as `(opcode, max)`, so a card test
     /// can prove no image-sized transfer was ever requested.
     reads: Vec<(u16, usize)>,
+    /// Additive storage scripting: the `GetStorageIDs` payload and the per-id
+    /// `GetStorageInfo` payloads. Empty in every RAM session, where storage
+    /// operations stay unsupported instead of inventing a card.
+    storage_ids: Vec<u8>,
+    storage_infos: BTreeMap<u32, Vec<u8>>,
+    /// Additive: per-storage `GetObjectHandles` payloads.
+    object_handles: BTreeMap<u32, Vec<u8>>,
 }
 impl Script {
+    /// Scripts the advertised storages as `(id, access capability, max bytes, free
+    /// bytes, free images)`. Access 0 is read-write and 1/2 read-only, matching the
+    /// production parser.
+    fn script_storages(&mut self, cards: &[(u32, u16, u64, u64, u32)]) {
+        let mut ids = (cards.len() as u32).to_le_bytes().to_vec();
+        self.storage_infos.clear();
+        for (id, access, max_bytes, free_bytes, free_images) in cards {
+            ids.extend(id.to_le_bytes());
+            let mut info = Vec::new();
+            info.extend((0u16).to_le_bytes()); // StorageType fixed disk
+            info.extend((2u16).to_le_bytes()); // FilesystemType DCF
+            info.extend(access.to_le_bytes());
+            info.extend(max_bytes.to_le_bytes());
+            info.extend(free_bytes.to_le_bytes());
+            info.extend(free_images.to_le_bytes());
+            info.extend(ptp_string("SD card"));
+            info.extend(ptp_string(""));
+            self.storage_infos.insert(*id, info);
+        }
+        self.storage_ids = ids;
+    }
+    /// Scripts one storage's object listing.
+    fn script_object_handles(&mut self, id: u32, handles: &[u32]) {
+        let mut payload = (handles.len() as u32).to_le_bytes().to_vec();
+        for handle in handles {
+            payload.extend(handle.to_le_bytes());
+        }
+        self.object_handles.insert(id, payload);
+    }
     fn new() -> Self {
         let default = |key: &str| match key {
             "shutter" => 0x10005,
@@ -377,6 +413,9 @@ impl Script {
             complete_after_download: false,
             poll_after_download_signal: None,
             card_object_info: BTreeMap::new(),
+            storage_ids: Vec::new(),
+            storage_infos: BTreeMap::new(),
+            object_handles: BTreeMap::new(),
             reads: vec![],
         }
     }
@@ -673,6 +712,29 @@ impl CameraTransport for Fake {
                     s.object_info.clone().unwrap_or_else(|| object_info(s.raw.len()))
                 }
             }
+            GET_STORAGE_IDS => {
+                assert!(params.is_empty());
+                if s.storage_ids.is_empty() {
+                    return Err(CameraError::Unsupported(
+                        "scripted storage enumeration is not scripted".into(),
+                    ));
+                }
+                s.storage_ids.clone()
+            }
+            GET_STORAGE_INFO => s
+                .storage_infos
+                .get(&params[0])
+                .cloned()
+                .ok_or_else(|| {
+                    CameraError::Unsupported("scripted storage info is not scripted".into())
+                })?,
+            GET_OBJECT_HANDLES => s
+                .object_handles
+                .get(&params[0])
+                .cloned()
+                .ok_or_else(|| {
+                    CameraError::Unsupported("scripted object handles are not scripted".into())
+                })?,
             GET_OBJECT => {
                 assert_eq!(params, [0xffff0001]);
                 if s.complete_after_download {
@@ -775,6 +837,15 @@ impl ScriptedCameraProbe {
     pub(crate) fn set_exposure_delay(&self,delay:Duration){self.script.lock().unwrap().exposure_delay=delay;}
     pub(crate) fn set_transfer_delay(&self,delay:Duration){self.script.lock().unwrap().transfer_delay=delay;}
     pub(crate) fn operation_count(&self,opcode:u16)->usize{self.script.lock().unwrap().calls.iter().filter(|code|**code==opcode).count()}
+    /// Scripts the advertised card set: `(id, access, max bytes, free bytes, free
+    /// images)`. Access 0 is read-write, 1/2 read-only.
+    pub(crate) fn set_storages(&self, cards: &[(u32, u16, u64, u64, u32)]) {
+        self.script.lock().unwrap().script_storages(cards);
+    }
+    /// Scripts one storage's object listing.
+    pub(crate) fn set_object_handles(&self, id: u32, handles: &[u32]) {
+        self.script.lock().unwrap().script_object_handles(id, handles);
+    }
     /// Additive card mode: answer `GetObjectInfo [handle]` with this exact card
     /// dataset instead of the single RAM object answer.
     pub(crate) fn set_card_object(&self,handle:u32,bytes:Vec<u8>){self.script.lock().unwrap().card_object_info.insert(handle,bytes);}
@@ -789,6 +860,12 @@ impl ScriptedCameraProbe {
     pub(crate) fn reads(&self)->Vec<(u16,usize)>{self.script.lock().unwrap().reads.clone()}
 }
 pub(crate) fn scripted_camera_with_probe(config: ScriptedCameraConfig) -> (CameraAdapter,ScriptedCameraProbe) {
+    // A card configuration must produce a card-negotiated session: the RAM script
+    // below advertises no InitiateCapture/storage operations and recordingMedia=1,
+    // which the card destination gate always refuses.
+    if config.card_capture || config.card_overflow {
+        return scripted_card_adapter(config);
+    }
     let mut script = Script::new();
     script.exposure_delay = config.exposure_delay;
     script.transfer_delay = config.transfer_delay;
@@ -815,15 +892,11 @@ pub(crate) fn scripted_camera_with_probe(config: ScriptedCameraConfig) -> (Camer
     }
     let shared=Arc::new(Mutex::new(script));let camera=connected(shared.clone());(camera,ScriptedCameraProbe{script:shared})
 }
-/// Additive card-capture kit: the real `NativeCamera` over the scripted
-/// transport with the standard card path negotiated, plus the same
-/// probe accessors the RAM kit uses. `scripted_camera_with_probe` keeps
-/// returning the actor proxy for every existing sibling test.
-pub(crate) fn scripted_card_camera(
-    config: ScriptedCameraConfig,
-    session: &str,
-    context: &CallContext,
-) -> (NativeCamera, ScriptedCameraProbe) {
+/// Builds the additive card-capture script shared by both card kits: the standard
+/// card path negotiated, the SD destination scripted, no RAM association batches,
+/// and a scripted single writable 64 GB card. Every RAM kit keeps its own
+/// unchanged script.
+fn card_script(config: ScriptedCameraConfig) -> Script {
     let mut script = Script::new();
     script.exposure_delay = config.exposure_delay;
     script.transfer_delay = config.transfer_delay;
@@ -848,6 +921,18 @@ pub(crate) fn scripted_card_camera(
         // Each card test scripts its own association batches; the RAM defaults
         // never apply to a card operation.
         script.capture_events = vec![];
+        // A scripted 64 GB writable card (two for overflow) covers a whole scan; a
+        // test that needs another capacity or a read-only card re-scripts it
+        // through the probe.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        if config.card_overflow {
+            script.script_storages(&[
+                (1, 0, 64 * GIB, 64 * GIB, 5000),
+                (2, 0, 64 * GIB, 64 * GIB, 5000),
+            ]);
+        } else {
+            script.script_storages(&[(1, 0, 64 * GIB, 64 * GIB, 5000)]);
+        }
     }
     if let Some(ms) = config.native_exposure_ms {
         assert!((1..=30000).contains(&ms));
@@ -864,7 +949,27 @@ pub(crate) fn scripted_card_camera(
             .capture_events
             .retain(|events| events.iter().all(|e| e.code != CAPTURE_COMPLETE_CARD));
     }
-    let shared = Arc::new(Mutex::new(script));
+    if config.truncate_raw {
+        script.raw.truncate(170);
+    }
+    script
+}
+/// The actor-proxy card kit, so a scan coordinator can run a card scan offline
+/// through the same `CameraAdapter` every scan test uses.
+pub(crate) fn scripted_card_adapter(config: ScriptedCameraConfig) -> (CameraAdapter, ScriptedCameraProbe) {
+    let shared = Arc::new(Mutex::new(card_script(config)));
+    (connected(shared.clone()), ScriptedCameraProbe { script: shared })
+}
+/// Additive card-capture kit: the real `NativeCamera` over the scripted
+/// transport with the standard card path negotiated, plus the same
+/// probe accessors the RAM kit uses. `scripted_camera_with_probe` keeps
+/// returning the actor proxy for every existing sibling test.
+pub(crate) fn scripted_card_camera(
+    config: ScriptedCameraConfig,
+    session: &str,
+    context: &CallContext,
+) -> (NativeCamera, ScriptedCameraProbe) {
+    let shared = Arc::new(Mutex::new(card_script(config)));
     let mut camera = NativeCamera::new(Box::new(Fake(shared.clone())));
     camera.connect("fake-camera-1", session, context).unwrap();
     (camera, ScriptedCameraProbe { script: shared })

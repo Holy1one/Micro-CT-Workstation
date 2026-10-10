@@ -31,4 +31,4 @@ pub use types::*;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(crate) use tests::{scripted_camera,scripted_camera_with_probe,ScriptedCameraConfig};
+pub(crate) use tests::{scripted_camera,scripted_camera_with_probe,scripted_card_adapter,ScriptedCameraConfig};
