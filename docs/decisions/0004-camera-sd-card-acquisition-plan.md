@@ -430,3 +430,21 @@ cargo test --manifest-path backend/Cargo.toml --workspace
 | `firmware/rts9060_nano/rts9060_nano.ino` | `ECADF6220E53954CB303E0E40FB85710F73735EBE5271A127C8A4BA93BD84423` |
 
 Nikon 官方手册本次读取副本保存在 `.cache/debug/camera/sd-planning-20261010/D7100_EN.pdf`，SHA-256 为 `66B8D2425F5EEA7C2E942BA4F6048ED976DF5214A776C8CEA7E31EAC63B04A12`。缓存不提交，在线来源链接保留在本规划中。
+
+## 13 实施进度记录（2026-10-10，仅离线）
+
+本节只记录执行状态与证据，不改变第 1–12 节已冻结的边界与结论；分支 `native-device-controls-offline`。所有提交都先跑完整离线门禁再提交。
+
+| 提交 | 覆盖 | 内容 | 门禁证据 |
+| --- | --- | --- | --- |
+| `e209ed1` | P1 / P3 子集 | 固件 2.2.0：普通移动 150 ms 从**末 STEP 下降沿**起算并消除隐含尾周期，零位移同等待；扫描上限 `scan::SCAN_MAX_XRAY_SEC=1000` 统一十处判据，前端改 mm:ss 精确换算（1000 s = 16:40），旧冻结值与手动 600 秒不变 | `npm run verify` 退出 0；host harness 8443 断言；AVR flash 14160 / RAM 1476 |
+| `f5f6404` | P1 | `cardCapture/cardOverflow` 能力分离（缺广告即关闭）、`require_card_destination`（只认鲜读 `recordingMedia=0`）、`storage.rs` 严格存储解析与 `bind_storage_ids` 位置绑定、`ptp.rs` 严格卡对象解析、存卡事务骨架 | `verify` 0；module-map 245/16/39 |
+| `ed7fcff` | P3 | schema-7 SD profile：`CaptureDestination`、`CardCapturePolicy`（150 ms 契约 + 固件 version/build/源哈希）、`scan_camera_issues_for(destination)`；`require_current_policy` 同时接受 6 与 7，1–5 仍只读，旧 profile 哈希不变 | profile 16/16；`verify` 0 |
+| `17eec7b` | P3 | schema-4 卡清单：`CardCaptureRecord` 保留卡对象原始身份、显式数据状态词表、完成规则要求**已封存导入**（安全收尾但导入未完成绝不报 completed） | `verify` 0；cargo 398+2+56 |
+| `e1cf968` | P1 修正 | 修复存卡事务**不可达**：改用卡向冻结读回；触发仅一次标准 `InitiateCapture`；唯一数据读取是 64 KiB `GetObjectInfo` 元数据；23 项剧本测试，含触发后 opcode 日志级"零图像载荷"证明 | `verify` 0；cargo 401+2+56 |
+| `8608971` | P3 | `acquired_pending_import` 版本化状态：安全收尾后离开 active 槽（释放扫描占用与手动锁）但目录保留不可复用；`mark_acquired_pending_import` 要求完整卡证据；`mark_import_verified` 只在清单已证明封存导入时封为 completed | registry 14/14；`verify` 0 |
+| `f7495c8` | P1 修正 | `confirm_runtime_diagnostic_for` 目的感知：卡会话用 `recordingMedia=0` 确认 0xD1B2 运行时状态，RAM 路径委托为原值 1 不变 | `cargo test --workspace` 退出 0 |
+
+**已记录的教训**：存卡事务曾复用 SDRAM 专用的 `profile_readback` 与 `confirm_runtime_diagnostic`（二者硬要求 `recordingMedia=1`），使卡路径永不可达，而 9 个纯状态机单测仍全绿。因此本迁移的验收要求是"端到端剧本测试 + opcode 级零图像载荷证据"，不接受仅有纯单测通过。
+
+**仍待完成（离线）**：B4c 扫描协调器存卡接线与 schema-4 写入器（参考与投影同目标、拍摄意图预写、卡任务默认 1000 秒、安全收尾后登记 `acquired_pending_import`）、B5 USB 批量导入与校验封存、B6 前端状态/计数/UI 与重构准入、B7 文档同步与全量门禁交付报告。**真实设备项（P2/P5/P6）仍为 BLOCKED**，需另行授权后按第 10 节步骤验收。
