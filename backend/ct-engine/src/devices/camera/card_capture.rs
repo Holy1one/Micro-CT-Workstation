@@ -27,6 +27,84 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 
+/// The acquisition provenance of one expected card object, re-derived from the
+/// task's records when the USB import reconnects. It deliberately carries no
+/// handle: a handle from the acquisition session is not a permanent identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedCardObject {
+    pub record_index: u32,
+    pub storage_id: u32,
+    pub filename: String,
+    pub size: u64,
+    pub capture_date: String,
+}
+
+/// One expected record bound to the card object the reconnected camera advertises.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardObjectBinding {
+    pub record_index: u32,
+    pub storage_id: u32,
+    pub handle: u32,
+    pub filename: String,
+    pub size: u64,
+}
+
+/// Binds every expected record to exactly one advertised card object. The only
+/// proven identity is the acquisition provenance (storage, source file name, size
+/// and capture date), so a missing, ambiguous, duplicated or extra object refuses
+/// the whole import instead of guessing a mapping. `objects` are the
+/// `(handle, ObjectInfo)` pairs a fresh enumeration produced.
+pub(crate) fn bind_expected_objects(
+    expected: &[ExpectedCardObject],
+    objects: &[(u32, CardObjectInfo)],
+) -> Result<Vec<CardObjectBinding>, String> {
+    let mut seen: Vec<&ExpectedCardObject> = Vec::with_capacity(expected.len());
+    for item in expected {
+        if seen.iter().any(|other| same_provenance(other, item)) {
+            return Err("IMPORT_EXPECTATION_DUPLICATE".into());
+        }
+        seen.push(item);
+    }
+    let mut claimed = vec![false; objects.len()];
+    let mut bindings = Vec::with_capacity(expected.len());
+    for item in expected {
+        let mut matches = objects.iter().enumerate().filter(|(_, (_, object))| {
+            object.storage_id == item.storage_id
+                && object.filename == item.filename
+                && object.size as u64 == item.size
+                && object.capture_date == item.capture_date
+        });
+        let Some((index, (handle, object))) = matches.next() else {
+            return Err(format!("IMPORT_OBJECT_MISSING: record {}", item.record_index));
+        };
+        if matches.next().is_some() {
+            return Err(format!(
+                "IMPORT_OBJECT_AMBIGUOUS: record {}",
+                item.record_index
+            ));
+        }
+        claimed[index] = true;
+        bindings.push(CardObjectBinding {
+            record_index: item.record_index,
+            storage_id: object.storage_id,
+            handle: *handle,
+            filename: object.filename.clone(),
+            size: object.size as u64,
+        });
+    }
+    if claimed.iter().any(|value| !value) {
+        return Err("IMPORT_OBJECT_UNEXPECTED".into());
+    }
+    Ok(bindings)
+}
+
+fn same_provenance(first: &ExpectedCardObject, second: &ExpectedCardObject) -> bool {
+    first.storage_id == second.storage_id
+        && first.filename == second.filename
+        && first.size == second.size
+        && first.capture_date == second.capture_date
+}
+
 /// Bound for the metadata-only `GetObjectInfo` read. The card dataset is a
 /// 52-byte header plus two bounded strings; this is a ceiling, never an image.
 const CARD_OBJECT_INFO_MAX: usize = 64 * 1024;
@@ -1402,5 +1480,100 @@ mod tests {
         assert!(error.to_string().contains("session missing"), "{error}");
         assert_eq!(trigger_count(&probe), 0);
         assert!(!camera.capture_pending);
+    }
+
+    fn expected_object(index: u32, storage: u32, name: &str, size: u64) -> ExpectedCardObject {
+        ExpectedCardObject {
+            record_index: index,
+            storage_id: storage,
+            filename: name.into(),
+            size,
+            capture_date: "20261010T120000".into(),
+        }
+    }
+
+    fn advertised(handle: u32, storage: u32, name: &str, size: u64) -> (u32, CardObjectInfo) {
+        (
+            handle,
+            CardObjectInfo {
+                storage_id: storage,
+                parent: 1,
+                format: 0x3000,
+                protection: 0,
+                size: size as usize,
+                filename: name.into(),
+                capture_date: "20261010T120000".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn import_binding_requires_exactly_one_provenance_match_per_record() {
+        let expected = [
+            expected_object(1, 1, "DSC_0001.NEF", 40),
+            expected_object(2, 2, "DSC_0002.NEF", 41),
+        ];
+        let objects = [
+            advertised(0x100, 1, "DSC_0001.NEF", 40),
+            advertised(0x101, 2, "DSC_0002.NEF", 41),
+        ];
+        let bound = bind_expected_objects(&expected, &objects).unwrap();
+        assert_eq!(bound.len(), 2);
+        assert_eq!(bound[0].handle, 0x100);
+        assert_eq!(bound[0].record_index, 1);
+        assert_eq!(bound[1].handle, 0x101);
+        assert_eq!(bound[1].record_index, 2);
+        // A missing object, a size mismatch and an extra object all refuse.
+        assert_eq!(
+            bind_expected_objects(&expected, &objects[..1]).unwrap_err(),
+            "IMPORT_OBJECT_MISSING: record 2"
+        );
+        assert_eq!(
+            bind_expected_objects(
+                &expected,
+                &[
+                    advertised(0x100, 1, "DSC_0001.NEF", 40),
+                    advertised(0x101, 2, "DSC_0002.NEF", 99),
+                ]
+            )
+            .unwrap_err(),
+            "IMPORT_OBJECT_MISSING: record 2"
+        );
+        assert_eq!(
+            bind_expected_objects(
+                &expected,
+                &[
+                    objects[0].clone(),
+                    objects[1].clone(),
+                    advertised(0x102, 1, "DSC_0009.NEF", 40),
+                ]
+            )
+            .unwrap_err(),
+            "IMPORT_OBJECT_UNEXPECTED"
+        );
+        // Two objects with the same provenance cannot be disambiguated.
+        assert_eq!(
+            bind_expected_objects(
+                &expected,
+                &[objects[0].clone(), objects[0].clone(), objects[1].clone()]
+            )
+            .unwrap_err(),
+            "IMPORT_OBJECT_AMBIGUOUS: record 1"
+        );
+        // The same expected provenance twice is a task-evidence defect.
+        let duplicated = [
+            expected_object(1, 1, "DSC_0001.NEF", 40),
+            expected_object(2, 1, "DSC_0001.NEF", 40),
+        ];
+        assert_eq!(
+            bind_expected_objects(&duplicated, &objects).unwrap_err(),
+            "IMPORT_EXPECTATION_DUPLICATE"
+        );
+        // Empty evidence binds to nothing, and no object matches an empty camera.
+        assert!(bind_expected_objects(&[], &[]).unwrap().is_empty());
+        assert_eq!(
+            bind_expected_objects(&expected, &[]).unwrap_err(),
+            "IMPORT_OBJECT_MISSING: record 1"
+        );
     }
 }
