@@ -68,3 +68,23 @@ npm.cmd run firmware:build
 npm.cmd run firmware:test
 ```
 证据日志按批保存在 `.cache/tests/verify/20261010-batch*/`（缓存不提交）；固件构建与 harness 证据保存在 `.cache/tests/turntable/<run-id>/result.json`。
+
+## 6 交付状态（截至 HEAD `ea2a215`）
+
+全量 `npm run verify` 在本轮尖端**退出码 0**：module-map PASS（246 文件 / 16 模块 / 39 边界）、typecheck、build、`test:frontend` 193 通过、`test:desktop` 27 通过、`cargo test --workspace` **412 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**、`firmware:test` host harness **8443 断言**。
+
+| 目标项 | 状态 | 说明 |
+| --- | --- | --- |
+| ① 固件 150 ms 末 STEP 下降沿握手 | **PASS（离线）** | 2.2.0；含 `MOVE_SETTLE_150MS` 能力令牌与 `advertises_move_settle_150ms()`；HOME/曲线/脉宽/方向/心跳/Stop/同 ID 释放不变；harness 覆盖末下降沿窗口、未满 150 ms STOP、零位移、单次 READY、micros/millis 回绕 |
+| ② 扫描上限 1000 秒 | **PASS（离线）** | `scan::SCAN_MAX_XRAY_SEC` 统一十处判据；旧冻结值与手动 600 秒不变；前端 mm:ss 精确换算（1000 s = 16:40） |
+| ③ 单卡/Overflow 存卡采集 | **PASS（离线，协议语义待实机）** | 能力分离、严格存储/卡对象解析、标准 `InitiateCapture` + 唯一元数据读取、零图像载荷（opcode 级证据）、目的感知清理与取消 |
+| ④ schema 4 / profile 7 / 意图与 receipt / 状态与占用分离 / 崩溃窗口 | **PASS（离线）** | schema-4 清单与完成规则、`acquired_pending_import`、账本闸门（意图无收据即故障）、暂停/Stop/崩溃窗口测试 |
+| ⑤ USB 批量导入与校验封存 | **BLOCKED（未实施）** | 导入模块、重连唯一绑定、续导/取消、路径安全与封存尚未实现；重构准入对未验证任务的拒绝已在域/前端侧就位 |
+| ⑥ 前端类型/快照/计数/状态/文案 | **PASS（部分）** | `cardAcquisition` 契约（类型/严格校验/预览一致）、状态与计数呈现、SD 模式媒体、导入对话框、重构准入已落地；导入进度/取消/续导入口与"卡目标 1000 秒默认"仍待收尾 |
+| 故障注入与 180/360/720 全链 | **BLOCKED（未实施）** | 投影取整/无重复端点/末张不多转的专门用例尚未补 |
+
+**FAIL：无。**
+
+**待授权实机验收（P2/P5/P6）**：步骤见第 4 节，未授权前不得执行；`hardwareCertified` 保持 false，本候选只能标记为**仅离线验证**。
+
+**已知需在交付说明中同时声明的事项**：卡清理等待仍复用"曝光 + 2 s"（SD 实测界限属 P2）；容量上界为 64 MiB/张的保守估算而非实测 NEF 尺寸；策略中的固件源哈希是候选 provenance，不证明控制器当前刷入的镜像。
