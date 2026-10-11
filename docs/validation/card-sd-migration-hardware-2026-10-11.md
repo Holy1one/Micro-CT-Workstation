@@ -69,7 +69,7 @@ schema-7 卡 profile；控制器固件门禁也只在预检被拒后才可见。
 | D7100 发现与显式选择、能力协商、属性读回 | **PASS（实机）** | 含 `cardCapture`/`cardOverflow` 协商 |
 | 固件候选构建、烧录与读回校验 | **PASS（实机）** | 14196 字节写入并两次校验通过，回滚镜像已留 |
 | 卡策略固件门禁 + 目的感知就绪度 | **PASS（实机）** | 经生产引擎复核 |
-| 150 ms 末脉冲下降沿实测间隔 | **BLOCKED** | 已授权请求四次小角度运动，全部被引擎以"需要已确认 IDLE + HOME + 有效参考"拒绝；未发生机械动作，需先授权 HOME |
+| 150 ms 末脉冲下降沿实测间隔 | **部分 PASS（实机）** | HOME 后 1°/1°/2°/5° 相对运动全部完成并到达 CAPTURE_HOLD→IDLE；实测脉冲速率 ≈2.01 ms/脉冲（≈497 脉冲/秒），零脉冲截距 ≈1319 ms（协议与稳定等待的上界）。**150 ms 本身仍无法与协议开销分离**，见第 8 节 |
 | 单卡/Overflow 触发、结束与续存、Stop/心跳、图像质量 | **BLOCKED** | 需授权拍摄与运动 |
 | 主机 RAM 单张真实拍摄 | **FAIL（实机）** | 机身完成曝光（`PropertyChanged 0xD1B4`）但未在截止时间内给出曝光结束/完成事件，无 NEF；引擎按 fail-closed 隔离会话并退出码 1。见第 7 节 |
 | 存卡扫描端到端、1000 秒截止、温度/OFF/联锁、采集至重构全链、RAM/SD 对照提速 | **BLOCKED** | 射线源本次未连接、未上电 |
@@ -126,3 +126,29 @@ parameter=0x0B000001; session retired`。
 **当前设备状态（需人工处置）**：相机会话处于隔离状态，机身 SDRAM 中可能残留一张未取回的图像。
 在再次尝试前建议**断电重启相机**（或另行授权清理该 RAM 缓冲对象）；转台停在 `LOCKED`、
 `positionPulses=0`、`homed=false`、`referenceValid=false`，未发生任何运动。
+
+## 8 HOME 与转台运动实测（授权后完成）
+
+授权 HOME 后执行：`turntable_connect` → `turntable_bench_mode {enabled:true,
+physicallyIsolated:true}` → **`turntable_home`** → 1°/1°/2°/5° 相对运动。注意 `home`（恢复变体）
+会以 `PREFLIGHT_REQUIRED` 拒绝，台架独立 HOME 必须用 `turntable_home`。
+
+| 操作 | 实测时长 | 结果 |
+| --- | --- | --- |
+| `turntable_home` | **4796 ms** | `stage=confirmed`；完成后 `homed=true`、`referenceValid=true`、`hallActive=true`、`rearmed=true`、`state=IDLE`、`positionPulses=targetPulses=-2400` |
+| `turntable_relative` 1°（267 脉冲） | 1844 ms / 1868 ms | 完成；`verify_plan_capture_hold` 与 `verify_plan_released` 均通过 |
+| `turntable_relative` 2°（533 脉冲） | 2407 ms | 同上 |
+| `turntable_relative` 5°（1333 脉冲） | 4001 ms | 同上 |
+
+由 267/533/1333 脉冲三点拟合：**≈2.01 ms/脉冲（≈497 脉冲/秒）**，零脉冲截距 **≈1319 ms**。
+该截距包含 MOVE 受理、固件 150 ms 稳定等待、`READY_TO_CAPTURE`、`CAPTURE_DONE`、引擎侧多次
+`STATUS` 往返与调度——**150 ms 稳定时间落在其中但无法用本协议分离**：固件只在
+`READY_TO_CAPTURE <id> POS=<pos>` 里回报结果，不回报末脉冲下降沿或稳定耗时，而引擎在运动期间
+被 worker 占用，外部也无法在 SETTLING 窗口内采样。
+
+因此本项的**实机结论**是：HOME、参考建立、生产方向相对运动、CAPTURE_HOLD 握手与释放全部在真实
+控制器上成立（这已经排除了"运动完成判据只靠 ACK"的风险）；而"末脉冲下降沿 → 150 ms → READY"
+的**严格隔离测量仍为 BLOCKED**，需要固件侧诊断字段或串口级跟踪（属新的实现批次）。
+
+证据：`.cache/tests/hardware/20261011-home-settle/`（`plan-home.json`、`responses-home.jsonl`，
+含被拒的 `home` 变体与成功路径的完整请求/响应）。
