@@ -71,7 +71,7 @@ schema-7 卡 profile；控制器固件门禁也只在预检被拒后才可见。
 | 卡策略固件门禁 + 目的感知就绪度 | **PASS（实机）** | 经生产引擎复核 |
 | 150 ms 末脉冲下降沿实测间隔 | **部分 PASS（实机）** | HOME 后 1°/1°/2°/5° 相对运动全部完成并到达 CAPTURE_HOLD→IDLE；实测脉冲速率 ≈2.01 ms/脉冲（≈497 脉冲/秒），零脉冲截距 ≈1319 ms（协议与稳定等待的上界）。**150 ms 本身仍无法与协议开销分离**，见第 8 节 |
 | 单卡/Overflow 触发、结束与续存、Stop/心跳、图像质量 | **BLOCKED** | 需授权拍摄与运动 |
-| 主机 RAM 单张真实拍摄 | **PASS（实机，含一处残留问题）** | 修完完成判据后：`camera_capture: completed`，写入并登记 27,308,012 字节 NEF（sha256 `c33242ab…`），`exposureObserved=true`、`captureCompleteCount=0`、`exposureEndedObserved=false`；随后迟到的 `0xC102` 在空闲期被判为未关联事件而退役会话（fail-closed，但需修）。见第 9 节 |
+| 主机 RAM 单张真实拍摄 | **PASS（实机）** | 完成判据改为关联 `0xC101` 后：写入并登记 27,308,012 字节 NEF（sha256 `c33242ab…`）；随后迟到的 `0xC102` 造成的会话隔离已由提交后排空窗口修复，并实机复测"连拍两张不重连"通过。见第 9、10 节 |
 | 存卡扫描端到端、1000 秒截止、温度/OFF/联锁、采集至重构全链、RAM/SD 对照提速 | **BLOCKED** | 射线源本次未连接、未上电 |
 
 **未验证即不得声称**：真实 `InitiateCapture`/`ObjectAdded`/`CaptureComplete`/`StoreFull` 语义、
@@ -195,3 +195,31 @@ parameter=0x00000000; session retired`，会话被退役（`isolated=true`，`cl
 相机 SD 卡；本迁移的扫描路径因此不请求任何图像载荷（只发一次 `0x100E` 与一次 64 KiB 级
 `GetObjectInfo` 收据），任务以 `acquired_pending_import` 结束并保持重构关闭；只有操作员显式发起
 USB 导入时才传输、校验并封存。
+
+## 10 残留隔离问题已修复并实机复测（连拍两张不重连）
+
+修法（`154dccd`）：提交成功后开一个 **5 s 的提交后排空窗口**（编译期断言 ≥1 s 且 < 75 s owner
+截止），窗口内到达的、**属于该已提交操作**的 `0xC102` 记为迟到完成证据（新增
+`lateCompletionAbsorbedCount`/`lateCompletionParameter` 诊断字段），**只写诊断**：不置
+`exposure_ended`、不发 `ExposureEnded`、不给提交信用、不触发传输或新拍摄；窗口外的 `0xC102`、
+没有已提交操作的 `0xC102`、窗口内重复的第二个 `0xC102`，以及任何 `0xC101` 对象事件，全部保持
+原 fail-closed 退役。窗口在 cleanup 时丢弃，永不跨会话。
+
+实机复测（相机在存卡模式下开始，测试中切到 SDRAM，结束后写回存卡）：
+
+| 观测 | 值 |
+| --- | --- |
+| 连续两次 `camera_capture`（中间**不重连**） | 两次都 `stage=confirmed`、`status=completed`（10,164 ms / 10,117 ms） |
+| 输出 | `…-op-6.nef` 21,948,627 字节；`…-op-7.nef` 21,554,548 字节（两张不同尺寸的真实曝光） |
+| 会话状态 | `connected=true`、**`isolated=false`**、`cleanupConfirmed=true`、`phase=idle`、`lastError` 为空 |
+| 迟到完成吸收 | `lateCompletionAbsorbedCount=1`、`lateCompletionParameter=0` |
+| 拍摄期诊断 | `exposureObserved=true`、`captureCompleteCount=0`（真机确实不发 `0xC102`） |
+| 同会话内切回存卡 | `camera_apply_properties {recordingMedia:0}` 接受，读回 `actual=0`、`confirmed=true` |
+| 引擎退出 | 0，`camera cleanup=true`、`STOP confirmed=true` |
+
+结论：**"拍完不能接着拍"这一可用性缺陷已在真机闭环**——连续拍摄、切换存储目的都不需要重连；
+而真正的未知事件仍然 fail-closed。证据：`.cache/tests/hardware/20261011-capture-twice/`。
+
+**仍需声明**：5 s 窗口是依据参考实现秒级等待的工程选择（库本身没有拍摄截止），若某机身把
+`0xC102` 推迟到 5 s 之后，会话仍会 fail-closed 退役（可用性问题可能重现，但不会误提交）；
+`0xC102` 与 `0xC101` 的确切语义仍属实机观察，不是厂商文档保证。
