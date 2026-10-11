@@ -69,8 +69,9 @@ schema-7 卡 profile；控制器固件门禁也只在预检被拒后才可见。
 | D7100 发现与显式选择、能力协商、属性读回 | **PASS（实机）** | 含 `cardCapture`/`cardOverflow` 协商 |
 | 固件候选构建、烧录与读回校验 | **PASS（实机）** | 14196 字节写入并两次校验通过，回滚镜像已留 |
 | 卡策略固件门禁 + 目的感知就绪度 | **PASS（实机）** | 经生产引擎复核 |
-| 150 ms 末脉冲下降沿实测间隔 | **BLOCKED** | 需授权转台运动；本次未运动 |
+| 150 ms 末脉冲下降沿实测间隔 | **BLOCKED** | 已授权请求四次小角度运动，全部被引擎以"需要已确认 IDLE + HOME + 有效参考"拒绝；未发生机械动作，需先授权 HOME |
 | 单卡/Overflow 触发、结束与续存、Stop/心跳、图像质量 | **BLOCKED** | 需授权拍摄与运动 |
+| 主机 RAM 单张真实拍摄 | **FAIL（实机）** | 机身完成曝光（`PropertyChanged 0xD1B4`）但未在截止时间内给出曝光结束/完成事件，无 NEF；引擎按 fail-closed 隔离会话并退出码 1。见第 7 节 |
 | 存卡扫描端到端、1000 秒截止、温度/OFF/联锁、采集至重构全链、RAM/SD 对照提速 | **BLOCKED** | 射线源本次未连接、未上电 |
 
 **未验证即不得声称**：真实 `InitiateCapture`/`ObjectAdded`/`CaptureComplete`/`StoreFull` 语义、
@@ -79,3 +80,49 @@ schema-7 卡 profile；控制器固件门禁也只在预检被拒后才可见。
 
 **回滚**：如需回到烧录前镜像，用 `before-flash.hex` 以同一 avrdude 参数执行
 `-U flash:w:<backup>:i`；该文件是本机唯一证据，删除前须确认已被长期保留。
+
+## 6 转台运动与 150 ms 时序实测（已授权，被引擎拒绝）
+
+授权后以 `turntable_relative` 请求 1°/1°/2°/5° 四次小角度运动。四次请求都被**引擎自身的安全
+判据拒绝**（操作 `stage=failed`，日志 `safety error: motion requires confirmed IDLE, HOME and
+valid reference`），每次拒绝后引擎按既定策略补发 `stop`。`plan_relative` 在任何串口 MOVE 之前
+就返回错误，因此**没有任何机械动作**发生。证据：`.cache/tests/hardware/20261011-motion-settle/`
+（含请求/响应 JSONL、拒绝日志，以及随后只读复核的状态）。
+
+原因与结论：烧录前那次只读连接看到的 `homed=false`/`referenceValid=false`/`state=LOCKED` 仍然
+成立，而生产运动入口要求已确认 IDLE + HOME + 有效参考。因此：
+
+- **150 ms 末脉冲下降沿实测间隔仍为 BLOCKED**：必须先执行 HOME（台架模式需操作员确认射线物理
+  隔离；本次射线未连接）才能做任何运动，HOME 是另一次需要单独授权的机械动作。
+- 该拒绝本身是**正确的 fail-closed 行为**（不是缺陷）：引擎在没有可信参考时拒绝相对运动。
+- 另需注意：拒绝后的 `stop` 使控制器回到 `LOCKED` 且脉冲计数归零（`positionPulses=0`，
+  原先为 -95733）。这不代表发生了运动，但说明该计数在无有效参考时不可作为位置证据。
+
+## 7 单张真实拍摄（主机 RAM，不出束）：实机 FAIL，已定位
+
+授权后做了两次尝试。第一次因驱动在操作仍在运行时关闭 stdin 而被中止（相机实际已完成一次曝光，
+但引擎未能接收其事件）；第二次在**等操作排空后**再关闭 stdin，得到了完整证据链。
+
+| 观测 | 值 |
+| --- | --- |
+| `camera_apply_properties {recordingMedia:1}` | 接受，属性读回确认 |
+| `camera_capture` 操作终态 | `cleanup_unconfirmed`，`error = camera timeout: camera owner deadline; COM session isolated; cleanup unconfirmed` |
+| 事件诊断 `lastCaptureEventDiagnostic` | `operationCode=37063 (0x90C7)`、`responseCode=8193 (0x2001 OK)`、`eventCount=1`、`captureCompleteCount=0`、`exposureEndedObserved=false` |
+| 收到的事件 | `code=16390 (0x4006 PropertyChanged)`、`parameter=53684 (0xD1B4 连拍计数)` —— **机身确实完成了一次曝光** |
+| 输出文件 | `CameraCaptures/` 为空，**没有 NEF** |
+| 会话结果 | `isolated=true`、`cleanupConfirmed=false`，引擎按 fail-closed 隔离会话并以退出码 1 结束（`EOF safety cleanup unconfirmed`） |
+
+第一次尝试留下的孤立事件（后续连接时被判定为故障）为
+`camera safety check failed: unassociated capture or device event while idle: code=0xC101,
+parameter=0x0B000001; session retired`。
+
+**结论（必须写入交付说明）**：真实 D7100 在主机 RAM 拍摄路径上，本引擎等待的曝光结束/完成事件
+在截止时间内**没有到达**（`exposureEndedObserved=false`、`captureCompleteCount=0`），而机身以
+`0x4006 PropertyChanged(0xD1B4)` 表示已曝光、并（在第一次尝试中）以 **`0xC101`** 一类 RAM 对象
+事件表示结果——与脚本化模型假设的 `0x400D`/曝光结束语义不一致。引擎的处置是正确的
+（超时即隔离、清理未确认即失败退出），但**主机 RAM 单拍在本机身上尚不可用**；这属于
+**实机 FAIL**，不是离线可发现的问题。下一步需要事件级跟踪与（或）完成判据修正，属于新的实现批次。
+
+**当前设备状态（需人工处置）**：相机会话处于隔离状态，机身 SDRAM 中可能残留一张未取回的图像。
+在再次尝试前建议**断电重启相机**（或另行授权清理该 RAM 缓冲对象）；转台停在 `LOCKED`、
+`positionPulses=0`、`homed=false`、`referenceValid=false`，未发生任何运动。
