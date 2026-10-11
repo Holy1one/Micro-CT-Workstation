@@ -71,7 +71,7 @@ schema-7 卡 profile；控制器固件门禁也只在预检被拒后才可见。
 | 卡策略固件门禁 + 目的感知就绪度 | **PASS（实机）** | 经生产引擎复核 |
 | 150 ms 末脉冲下降沿实测间隔 | **部分 PASS（实机）** | HOME 后 1°/1°/2°/5° 相对运动全部完成并到达 CAPTURE_HOLD→IDLE；实测脉冲速率 ≈2.01 ms/脉冲（≈497 脉冲/秒），零脉冲截距 ≈1319 ms（协议与稳定等待的上界）。**150 ms 本身仍无法与协议开销分离**，见第 8 节 |
 | 单卡/Overflow 触发、结束与续存、Stop/心跳、图像质量 | **BLOCKED** | 需授权拍摄与运动 |
-| 主机 RAM 单张真实拍摄 | **FAIL（实机）** | 机身完成曝光（`PropertyChanged 0xD1B4`）但未在截止时间内给出曝光结束/完成事件，无 NEF；引擎按 fail-closed 隔离会话并退出码 1。见第 7 节 |
+| 主机 RAM 单张真实拍摄 | **PASS（实机，含一处残留问题）** | 修完完成判据后：`camera_capture: completed`，写入并登记 27,308,012 字节 NEF（sha256 `c33242ab…`），`exposureObserved=true`、`captureCompleteCount=0`、`exposureEndedObserved=false`；随后迟到的 `0xC102` 在空闲期被判为未关联事件而退役会话（fail-closed，但需修）。见第 9 节 |
 | 存卡扫描端到端、1000 秒截止、温度/OFF/联锁、采集至重构全链、RAM/SD 对照提速 | **BLOCKED** | 射线源本次未连接、未上电 |
 
 **未验证即不得声称**：真实 `InitiateCapture`/`ObjectAdded`/`CaptureComplete`/`StoreFull` 语义、
@@ -152,3 +152,36 @@ physicallyIsolated:true}` → **`turntable_home`** → 1°/1°/2°/5° 相对运
 
 证据：`.cache/tests/hardware/20261011-home-settle/`（`plan-home.json`、`responses-home.jsonl`，
 含被拒的 `home` 变体与成功路径的完整请求/响应）。
+
+## 9 主机 RAM 单张拍摄复测（PASS，含一处残留问题）
+
+依据 digiCamControl 对照结论（`docs/validation/d7100-capture-semantics-digicamcontrol-2026-10-11.md`）
+把完成判据从"必须 `0xC102`"改为"**与本操作关联的 `0xC101` 即充分**"，并加 30 s 对象到达窗口
+（`dffbde1`）。相机断电重启后复测：`retry_device` → `camera_connect` → `camera_read_properties`
+→ `camera_apply_properties {recordingMedia:1}` → `camera_read_properties` → `set_capture_root`
+→ `camera_capture`。
+
+| 观测 | 值 |
+| --- | --- |
+| 操作终态 | `camera_capture: completed`，`stage=confirmed` |
+| 输出 | `CameraCaptures/7189499f…-op-6.nef`，**27,308,012 字节**，SHA-256 `c33242ab34a9d3c8e314c48f77e15ac37c6569854965c24d89c80cda5f724bc8` |
+| 引擎日志 | `[PASS] Single host NEF output saved and registered with complete file/hash evidence` |
+| 事件批次 4 | `[{0x4006,0xD1B4}, {49409 = 0xC101, 0x0B000001}, {0x4006,0xD1A4}]` |
+| 诊断 | `exposureObserved=true`、`captureCompleteCount=0`、`exposureEndedObserved=false` |
+| 引擎退出 | **0**，`camera cleanup=true`、`STOP confirmed=true` |
+
+**这证实了对照研究的推断**：真实 D7100 在 SDRAM 拍摄中**从不发送 `0xC102`/`0x400D`**，图像可用信号
+就是关联的 `0xC101`；旧判据等一个永不出现的事件，所以必然超时。修复后单张拍摄在真机上闭环。
+
+**残留问题（fail-closed 但应修）**：本次会话在拍摄成功、文件登记之后收到**迟到的 `0xC102`**
+（参数 `0x00000000`），空闲期判据把它当作"未关联的拍摄/设备事件"，于是
+`lastError = camera safety check failed: unassociated capture or device event while idle: code=0xC102,
+parameter=0x00000000; session retired`，会话被退役（`isolated=true`，`cleanupConfirmed=true`，
+进程仍正常退出）。后果是：**每次成功单拍后相机都会进入隔离态**，操作员必须再点一次重连。
+安全上仍是 fail-closed（没有错误提交、没有开束、没有丢文件），但可用性受损。
+
+**建议的后续修法（保守）**：提交成功后保留一个短的"提交后排空窗口"，在该窗口内到达的
+`0xC102`（可选完成信号）按"该操作的迟到完成证据"记录，而不是按未关联事件退役会话；窗口之外的
+事件、以及 `0xC101` 一类**对象**事件，继续保持今天的 fail-closed 处置。
+
+证据：`.cache/tests/hardware/20261011-capture-retest/`（计划、请求/响应、引擎哈希与 git rev）。
