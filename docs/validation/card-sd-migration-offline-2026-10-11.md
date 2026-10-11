@@ -34,7 +34,7 @@
 
 ## 2 门禁与实测证据
 
-- `npm run verify`（= module-map:check + typecheck + build + test:frontend + test:desktop + cargo workspace + firmware:test）在 B1/B2、B3、B4a、B4b、卡路径修正、⑤ 导入与实机就绪度修正各批均**退出码 0**；其中 module-map 为 **248 文件 / 16 模块 / 39 目录边界**（PASS 且图谱 current）。
+- `npm run verify`（= module-map:check + typecheck + build + test:frontend + test:desktop + cargo workspace + firmware:test）在 B1/B2、B3、B4a、B4b、卡路径修正、⑤ 导入与实机就绪度修正各批均**退出码 0**；其中 module-map 为 **249 文件 / 16 模块 / 39 目录边界**（PASS 且图谱 current）。
 - `cargo test --manifest-path backend/Cargo.toml --workspace`：最新一次为 **428 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**。
 - 前端：`test:frontend` **193 通过 / 0 失败**；`test:desktop` **27 通过 / 0 失败**；`typecheck` 无错误。
 - 固件：`firmware:build` PASS，`flash=14196 / 30720`、`RAM=1476 / 2048`；`firmware:test` PASS，host harness **8443 断言**。
@@ -72,7 +72,7 @@ npm.cmd run firmware:test
 
 ## 6 交付状态（截至代码尖端 `399aa55`；其后为文档提交）
 
-全量 `npm run verify` 在最终尖端**退出码 0**：module-map PASS（248 文件 / 16 模块 / 39 边界）、typecheck、build、`test:frontend` 193 通过、`test:desktop` 27 通过、`cargo test --workspace` **428 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**、`firmware:test` host harness **8443 断言**。
+全量 `npm run verify` 在最终尖端**退出码 0**：module-map PASS（249 文件 / 16 模块 / 39 边界）、typecheck、build、`test:frontend` 193 通过、`test:desktop` 27 通过、`cargo test --workspace` **428 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**、`firmware:test` host harness **8443 断言**。
 
 | 目标项 | 状态 | 说明 |
 | --- | --- | --- |
