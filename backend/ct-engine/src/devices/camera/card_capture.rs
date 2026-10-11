@@ -475,6 +475,11 @@ fn record_event_batch(
         event_count,
         capture_complete_count: completion_count,
         exposure_ended_observed: exposure_ended,
+        // The continuous-shooting-counter diagnostic describes the host-RAM path
+        // this card operation never uses; the card association is proved by the
+        // standard `ObjectAdded`/`CaptureComplete` pair below and never by a
+        // `0x4006` property notification.
+        exposure_observed: false,
         event_batches: event_batches.clone(),
         response: camera
             .health
@@ -571,8 +576,11 @@ pub(crate) fn capture_to_card(
         queue_drained: true,
         accepted: false,
     });
-    // The standard PTP still-capture operation. A Nikon private capture code is
-    // never sent on the card path, and an unproven opcode is never probed.
+    // The standard PTP still-capture operation, with parameter `0xFFFFFFFF` and
+    // zero image payload. The reference library's card path sends exactly this
+    // opcode (`CameraControl.Devices/BaseMTPCamera.cs:82` constant, used at
+    // `Nikon/NikonBase.cs:1872`); a Nikon private capture code is never sent on
+    // the card path, and an unproven opcode is never probed.
     camera
         .transport
         .execute(INITIATE_CAPTURE, &[0xffffffff], DataPhase::None, context)?
@@ -900,7 +908,11 @@ mod tests {
         // did, and the outcome carries no local image evidence at all.
         assert!(!camera.capture_pending);
         assert!(camera.pending_capture.is_none());
-        // Exactly one standard still capture, never the private SDRAM trigger.
+        // Exactly one standard still capture with parameter `0xFFFFFFFF`, never the
+        // private SDRAM trigger: the reference library's card path sends
+        // `InitiateCapture 0x100E` (`CameraControl.Devices/BaseMTPCamera.cs:82`,
+        // used at `Nikon/NikonBase.cs:1872`) and its host/SDRAM path is the one that
+        // sends `0x90C0` (`NikonBase.cs:61`).
         let calls = probe.calls()[call_mark..].to_vec();
         assert_eq!(
             calls.iter().filter(|code| **code == INITIATE_CAPTURE).count(),
@@ -908,6 +920,11 @@ mod tests {
         );
         assert!(!calls.contains(&CAPTURE_RAM));
         assert!(calls.iter().all(|code| !NEVER_READ.contains(code)));
+        // No image-payload opcode may appear on a card operation: no whole-object
+        // `GetObject 0x1009` and no `0x101b` partial object (the reference never
+        // sends the latter at all).
+        assert!(!calls.contains(&GET_OBJECT));
+        assert!(!calls.contains(&0x101b));
         let requests = probe.requests();
         let trigger: Vec<_> = requests[call_mark..]
             .iter()

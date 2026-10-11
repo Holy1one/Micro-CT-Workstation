@@ -1,8 +1,11 @@
 //! Nikon SDRAM capture, correlated events and complete atomic host-file commit.
-//! Timing and file appearance never substitute for an associated capture-end event.
-//! Independent capture validates one host NEF output; it does not infer a
-//! physical exposure count from one object/C102. Scans additionally require
-//! profile evidence for a single fixed physical acquisition.
+//! The associated RAM object event is this transaction's "image available"
+//! evidence and the only thing that starts ObjectInfo/transfer; the SDRAM
+//! completion is optional. Timing and file appearance never substitute for the
+//! associated object, and a `0x4006`/`0xD1B4` property notification is a
+//! diagnostic only. Independent capture validates one host NEF output; it does
+//! not infer a physical exposure count from one object/C102. Scans additionally
+//! require profile evidence for a single fixed physical acquisition.
 
 use super::nikon::*;
 use super::ptp::*;
@@ -13,7 +16,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{mpsc::Sender, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn emit(
     sender: &Option<Sender<CameraCaptureEvent>>,
@@ -32,6 +35,35 @@ fn capture_event_error(camera: &mut NativeCamera, message: impl Into<String>) ->
         batch.response.error = Some(error.to_string());
     }
     error
+}
+/// The bounded object-arrival window elapsed with no object associated with this
+/// operation. It stays a timeout-class refusal (isolate, never commit) so the
+/// existing fail-closed handling is unchanged; elapsed time never substitutes for
+/// the associated object evidence.
+fn capture_window_error(camera: &mut NativeCamera, message: impl Into<String>) -> CameraError {
+    let error = CameraError::Timeout(message.into());
+    if let Some(batch) = camera.health.last_capture_event_diagnostic.as_mut() {
+        batch.response.error = Some(error.to_string());
+    }
+    error
+}
+/// Records the independent "one exposure observed" diagnostic: the body published
+/// a Nikon `PropertyChanged (0x4006)` notification for the continuous-shooting
+/// counter `0xD1B4`. The reference library treats `0x4006` purely as "refresh this
+/// property" (`Nikon/NikonBase.cs:2326-2328`) and defines no `0xD1B4`, so this is
+/// reported next to the associated RAM object and never as a substitute for it.
+fn note_exposure_observation(
+    camera: &mut NativeCamera,
+    parameter: u32,
+    exposure_observed: &mut bool,
+) {
+    if parameter != CONTINUOUS_SHOOTING_COUNT as u32 {
+        return;
+    }
+    *exposure_observed = true;
+    if let Some(batch) = camera.health.last_capture_event_diagnostic.as_mut() {
+        batch.exposure_observed = true;
+    }
 }
 fn confirm_frozen_capture(
     camera: &mut NativeCamera,
@@ -182,17 +214,44 @@ pub(crate) fn capture_with_policy(
         queue_drained: true,
         accepted: false,
     });
+    // The destination is already frozen and re-confirmed above: host RAM requires
+    // the confirmed `recordingMedia = 1` readback, so this is the RAM path only.
+    // The trigger is the Nikon-private SDRAM opcode `0x90C0
+    // InitiateCaptureRecInSdram` with parameter `0xFFFFFFFF`, exactly as the
+    // reference library's host/SDRAM path does (digiCamControl
+    // `CameraControl.Devices/Nikon/NikonBase.cs:61` constant, `:1871` non-Live-View
+    // branch, `:1908` Live-View branch). Its card path sends the standard `0x100E
+    // InitiateCapture` instead (`BaseMTPCamera.cs:82`), which this module never
+    // sends — `card_capture.rs` owns that opcode. The private code is reachable
+    // only through the already-negotiated host-capture capability above
+    // (`negotiated_capabilities` requires the advertised `0x90C0` operation), so
+    // no unadvertised private operation is ever probed; without that advertisement
+    // the earlier capability check fails closed and nothing is sent.
     camera
         .transport
         .execute(CAPTURE_RAM, &[0xffffffff], DataPhase::None, context)?
         .success()?;
     camera.pending_capture.as_mut().unwrap().accepted = true;
+    // Bounded, second-scale window for the object that this accepted exposure must
+    // produce, and it stays inside the camera owner's `CAPTURE_TIMEOUT`
+    // (`actor.rs`, where the compile-time assertion also lives). Reaching it
+    // without an associated object refuses the file (timeout-class, fail closed);
+    // it never removes or shortens the owner deadline.
+    let object_arrival_deadline =
+        (Instant::now() + super::actor::OBJECT_ARRIVAL_WINDOW).min(context.deadline);
     let mut object = None;
     let mut downloaded = None;
     let mut exposure_ended = false;
+    let mut exposure_observed = false;
     let mut batch_sequence = 0;
     let mut event_batches = Vec::new();
     loop {
+        if object.is_none() && Instant::now() >= object_arrival_deadline {
+            return Err(capture_window_error(
+                camera,
+                "host RAM object evidence did not arrive inside the bounded object-arrival window; no object is associated with this operation; file commit refused; session isolated",
+            ));
+        }
         context.check()?;
         let result = camera.events(context);
         let nonempty = result.as_ref().is_ok_and(|events| !events.is_empty())
@@ -226,6 +285,7 @@ pub(crate) fn capture_with_policy(
                         .count()
                 }),
                 exposure_ended_observed: exposure_ended,
+                exposure_observed,
                 event_batches: event_batches.clone(),
                 response: camera
                     .health
@@ -293,6 +353,7 @@ pub(crate) fn capture_with_policy(
                     return Err(capture_event_error(camera,format!("unassociated/card capture or store-full event during host RAM capture: code=0x{:04X}, parameter=0x{:08X}",event.code,event.parameter)))
                 }
                 0x4006 => {
+                    note_exposure_observation(camera, event.parameter, &mut exposure_observed);
                     if accept_automatic_output_notification(camera,event.parameter,&expected_profile,context,scan_policy)?{continue;}
                     match camera.accept_runtime_notification(event.parameter, context) {
                         Ok(true) => {
@@ -313,9 +374,15 @@ pub(crate) fn capture_with_policy(
                 }
             }
         }
-        // The MIT Nikon event path starts ObjectInfo/transfer on C101, while
-        // C102 is independent. Keep bounded data private until both proofs
-        // exist; transfer completion never synthesizes ExposureEnded.
+        // The reference library's "image available" trigger is the object event
+        // (`0x4002`/`0xC101`): it immediately calls `GetObjectInfo(0x1008)` and then
+        // transfers with `GetObject(0x1009)` (`CameraControl.Devices/Nikon/
+        // NikonBase.cs:2330-2367`) and never waits for the SDRAM completion, which
+        // only reaches `OnCaptureCompleted` for bracketing/CLI consumers
+        // (`:2369-2375`). So an object associated with this running operation is
+        // sufficient evidence to retrieve and commit it, and the completion stays
+        // optional. The object may never be inferred from elapsed time, from the
+        // `0x4006`/`0xD1B4` diagnostic above, or from a card event.
         if downloaded.is_none() {
             if let Some(handle) = object {
                 downloaded = Some(download_current_ram(
@@ -326,9 +393,14 @@ pub(crate) fn capture_with_policy(
                     sender,
                     context,
                 )?);
+                // This operation's own object proves the exposure that produced it
+                // has physically ended, so no unresolved pending exposure remains
+                // for cleanup. A later `0xC102` is absorbed at the boundary below.
+                camera.capture_pending = false;
+                camera.pending_capture = None;
             }
         }
-        if exposure_ended && downloaded.is_some() {
+        if downloaded.is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -341,6 +413,14 @@ pub(crate) fn capture_with_policy(
     context.check()?;
     // DeviceReady and an empty event queue finish this operation's association
     // boundary. A late/duplicate event never becomes a later frame's evidence.
+    //
+    // The SDRAM completion is optional here and may arrive early, late or never
+    // (`Nikon/NikonBase.cs:2369-2375` consumes it only for `OnCaptureCompleted`,
+    // and `:2330-2367` transfers without it), so exactly one completion for this
+    // unchanged session is absorbed as this operation's own exposure-end
+    // observation. A duplicate completion, a completion for a changed session, or
+    // any other extra event still refuses the boundary instead of being credited
+    // to this file or to a later one.
     camera.device_ready(context)?;
     let mut boundary_empty = false;
     for _ in 0..8 {
@@ -370,6 +450,7 @@ pub(crate) fn capture_with_policy(
                 .filter(|event| event.code == CAPTURE_COMPLETE_RAM)
                 .count(),
             exposure_ended_observed: exposure_ended,
+            exposure_observed,
             event_batches: event_batches.clone(),
             response: camera
                 .health
@@ -379,6 +460,7 @@ pub(crate) fn capture_with_policy(
         });
         for event in events {
             if event.code == 0x4006 {
+                note_exposure_observation(camera, event.parameter, &mut exposure_observed);
                 if accept_automatic_output_notification(camera,event.parameter,&expected_profile,context,scan_policy)?{continue;}
                 match camera.accept_runtime_notification(event.parameter, context) {
                     Ok(true) => {
@@ -392,6 +474,29 @@ pub(crate) fn capture_with_policy(
                     Ok(false) => (),
                     Err(error) => return Err(capture_event_error(camera, error.to_string())),
                 }
+            }
+            if event.code == CAPTURE_COMPLETE_RAM {
+                if exposure_ended || camera.health.session_id.as_deref() != Some(session.as_str()) {
+                    return Err(capture_event_error(camera, format!(
+                        "duplicate/foreign SDRAM capture complete event after transfer: code=0x{:04X}, parameter=0x{:08X}; association boundary unresolved",
+                        event.code, event.parameter
+                    )));
+                }
+                exposure_ended = true;
+                camera.capture_pending = false;
+                camera.pending_capture = None;
+                if let Some(batch) = camera.health.last_capture_event_diagnostic.as_mut() {
+                    batch.exposure_ended_observed = true;
+                }
+                emit(
+                    sender,
+                    CameraCaptureEvent::ExposureEnded {
+                        session_id: session.clone(),
+                        operation_id: operation_id.into(),
+                    },
+                    context,
+                )?;
+                continue;
             }
             return Err(capture_event_error(camera, format!(
                 "extra capture event after transfer: code=0x{:04X}, parameter=0x{:08X}; association boundary unresolved",
@@ -437,6 +542,11 @@ pub(crate) fn capture_with_policy(
             size: bytes.len() as u64,
             format: "NEF".into(),
             sha256: digest,
+            // This flag marks the committed transaction, not the optional SDRAM
+            // completion: the file exists only because an object associated with
+            // this operation was retrieved with complete length/identity evidence.
+            // Whether the optional `0xC102` was also observed is reported
+            // separately by `exposureEndedObserved` in the capture diagnostic.
             exposure_ended: true,
         };
         // Serialize cancellation acceptance with the final atomic rename only.

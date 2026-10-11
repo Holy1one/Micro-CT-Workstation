@@ -52,7 +52,9 @@ and a single host NEF do not prove that this setting is OFF.
 The verified D7100 NEF-only RAM ObjectInfo path accepts the measured `0x3800`
 image format and date fields with contiguous trailing NUL padding. Filename,
 keywords, identity and property strings remain strict; nonzero date padding is
-rejected. Complete NEF validation and associated C102 completion remain required.
+rejected. Complete NEF validation and an object associated with the running
+operation remain required; the SDRAM completion is optional (see the capture
+evidence section below).
 
 `CameraAdapter` is a cloneable Send + Sync message proxy; it contains no COM
 interface. The transport factory runs inside the dedicated camera thread.
@@ -245,16 +247,28 @@ frozen capture values, RAM/single-image settings and Live View OFF. All raw
 runtime values remain semantically unknown and provide no completion evidence.
 
 The actor confirms current properties and Live View off, confirms DeviceReady,
-and requires an empty event queue before triggering `0x90C0` into SDRAM without
-AF. One capture is in flight. SDRAM `0xC102` produces `ExposureEnded`; `0xC101`
-identifies its RAM object. Standard/card, duplicate, unexpected and unresolved
-events are refused. A completion event is never inferred from elapsed exposure,
-temporary files, process exit, object appearance, or the end of transfer.
-The MIT Nikon event path reads ObjectInfo when C101 arrives and processes C102
-independently. This adapter likewise downloads the associated bounded object
-into private memory on C101, then continues waiting for C102. No file is staged
-or committed until reliable completion, validated NEF data and an empty event
-queue are all confirmed. This separates transfer order from exposure evidence.
+and requires an empty event queue before triggering the Nikon-private SDRAM
+opcode `0x90C0 InitiateCaptureRecInSdram` with parameter `0xFFFFFFFF` (the
+reference library's host/SDRAM path, `Nikon/NikonBase.cs:61`/`:1871`/`:1908`;
+its card path sends standard `0x100E` instead, `BaseMTPCamera.cs:82`). Host RAM
+is the only destination this module triggers, and the private code is reachable
+only after capability negotiation already required the advertised `0x90C0`;
+without that advertisement capture is refused before any send. One capture is in
+flight. SDRAM `0xC101` identifies an object for this operation and is sufficient
+"image available" evidence: ObjectInfo is read and the bounded object is
+downloaded immediately, exactly as the reference does
+(`Nikon/NikonBase.cs:2330-2367`). `0xC102` is optional — it may arrive before,
+after or never (`:2369-2375` only raises `OnCaptureCompleted`) — and produces
+`ExposureEnded` when it is observed; its absence never blocks commit and its late
+arrival is absorbed once for the same operation. Standard/card, duplicate,
+unexpected and unresolved events are refused. Neither a completion nor a file is
+ever inferred from elapsed exposure, temporary files, process exit, object
+appearance, the end of transfer, or a `0x4006`/`0xD1B4` property notification.
+No file is staged or committed until the associated object's validated NEF data,
+an unchanged session and an empty event queue are all confirmed. This separates
+transfer order from exposure evidence. Object arrival is bounded by a
+second-scale window inside the unchanged 75 s owner deadline; reaching it without
+an associated object is a timeout-class, fail-closed refusal.
 
 GetObjectInfo length and format, the complete GetObject response, TIFF directory
 extents, D7100 identity and CFA raw extents are validated. This is file-completeness
@@ -285,8 +299,11 @@ without UI polling.
 Pending-capture cleanup uses a separate finite I/O context on the original
 physical session, so repeated Stop generations cannot cancel its C102 consumer.
 Its bound is the trigger's frozen timed exposure plus two seconds; time is only
-a waiting limit. Exactly one associated C102 after the drained trigger is still
-required to clear pending exposure. Cancelled objects are not downloaded or
+a waiting limit. The associated RAM object of the accepted operation already
+clears the pending exposure (the object is the operation's own capture
+evidence), so cleanup no longer needs a completion to consider the termination
+proven; a completion is still consumed as optional exposure-end evidence when it
+arrives. Cancelled objects are not downloaded or
 committed. Busy polling retries within this bound, and Close follows the wait.
 An attempted Close retires the interface even when Close fails; subsequent Stop
 does not poll that dead interface or reinterpret a no-op Close as confirmation.
@@ -313,8 +330,10 @@ succeeds; unknown event codes remain fail-closed and include code/parameter.
 64 payload bytes and first 16 event records for diagnosis. A new successful
 connection clears this previous-session error evidence.
 `lastCaptureEventDiagnostic` independently retains the last nonempty capture
-batch with its session/operation, batch sequence/counts, bounded raw evidence
-and exposure-ended flag. Capture and cleanup diagnostics also keep `eventBatches`,
+batch with its session/operation, batch sequence/counts, bounded raw evidence,
+the optional exposure-ended flag and the independent `exposureObserved` flag
+(one `0x4006`/`0xD1B4` notification, diagnostic only, never commit evidence).
+Capture and cleanup diagnostics also keep `eventBatches`,
 the last 16 nonempty batches, with monotonic sequence and bounded response
 metadata. Empty polls cannot erase this history; no image bytes are recorded.
 Idle and cleanup polling cannot overwrite the capture diagnostic. A batch
@@ -441,6 +460,6 @@ synthetic integrity fixtures, not acquired NEF or scientific calibration data.
 
 Scan admission additionally requires confirmed fixed WB, bracketing OFF from a currently advertised `0xD0C0` UINT8 descriptor and fresh readback, and ADL OFF=4. Missing or failed ADL evidence blocks D7100 scanning. HDR requires native OFF=0 when advertised; only an unadvertised HDR property can use confirmed NEF incompatibility as equivalent exclusion. Profile v6 freezes these proofs and the confirmed acquisition parameters. Profiles 1–5 remain read-only and retain their original canonical hashes; retired fields are decoded solely to verify those historical hashes.
 
-`capture_to_path` remains the fixed scan transaction path. `capture_independent_to_path` allows the confirmed photographic exposure modes, Auto ISO, auto WB and supported AF mode without implicitly triggering AF. Only ISO/shutter/aperture outputs governed by their confirmed automatic mode may vary; identity, session, RAM, format, single host-output count and fixed transaction conditions stay checked. Both paths explicitly refuse active Live View and retain associated C102 completion, complete NEF length/hash, cancellation and atomic no-replace commit. The independent path produces one validated host NEF. Independent captures never infer completion from shutter duration; their native event wait remains bounded.
+`capture_to_path` remains the fixed scan transaction path. `capture_independent_to_path` allows the confirmed photographic exposure modes, Auto ISO, auto WB and supported AF mode without implicitly triggering AF. Only ISO/shutter/aperture outputs governed by their confirmed automatic mode may vary; identity, session, RAM, format, single host-output count and fixed transaction conditions stay checked. Both paths explicitly refuse active Live View and require the operation's own associated RAM object with complete NEF length/hash, cancellation and atomic no-replace commit; the optional SDRAM completion may arrive early, late or never. The independent path produces one validated host NEF. Independent captures never infer completion from shutter duration; their native event wait remains bounded.
 
 Preflight/start/recovery issue reads only for core camera configuration; they never stop Live View or invoke `configure_host_capture`/shutter writes. Explicit Apply owns all configuration writes. Live View cleanup and photographs keep their existing ownership and cancellation evidence.

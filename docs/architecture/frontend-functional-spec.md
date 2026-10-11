@@ -140,7 +140,7 @@ Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些�
 
 当前完整主机捕获仅D7100 RAM NEF。独立入口可用已确认M/P/A/S、自动ISO/WB及有证据AF模式，不隐式AF；只保证单个验证完整host NEF，未承诺一次物理曝光。多重曝光没有当前运行时状态字段或准入门禁；Scan Preparation 显示机身检查提示，不能把USB连接或菜单变灰解释为OFF。Live View开启期间严格拒捕获，不能自动停预览→拍摄→恢复。
 
-90C0、一个C101对象、关联可靠C102、完整NEF长度/hash、超时、多对象拒绝、取消及原子不覆盖门禁由相机/引擎保持。`deviceControls.camera.lastCapturedImage`登记`captureId/sessionId/operationId/path/bytes/sha256/format:"NEF"/exposureEnded`，不能从临时路径或计时推断完成。JSONL保存图像证据，不传实时像素。登记是本次引擎生命周期内最多128项的有界集合，重启后或被淘汰的captureId不可据文件路径重新授权预览；原始NEF仍保留。
+90C0、一个与本操作关联的C101对象（C102完成可选：可早到、迟到或不到）、完整NEF长度/hash、秒级对象窗口、多对象拒绝、取消及原子不覆盖门禁由相机/引擎保持。`deviceControls.camera.lastCapturedImage`登记`captureId/sessionId/operationId/path/bytes/sha256/format:"NEF"/exposureEnded`，不能从临时路径或计时推断完成。JSONL保存图像证据，不传实时像素。登记是本次引擎生命周期内最多128项的有界集合，重启后或被淘汰的captureId不可据文件路径重新授权预览；原始NEF仍保留。
 
 不开放未适配JPEG/TIFF/RAW+JPEG多对象、Bulb/Time、视频、9205区域AF或完整Picture Control编辑。未知型号不试发Nikon私有操作。
 

@@ -138,6 +138,15 @@ pub struct CameraCaptureEventDiagnostic {
     pub event_count: usize,
     pub capture_complete_count: usize,
     pub exposure_ended_observed: bool,
+    /// Independent diagnostic of one observed exposure, never commit evidence.
+    /// True when the body published a Nikon `PropertyChanged (0x4006)` notification
+    /// for the continuous-shooting counter `0xD1B4` during this operation. The
+    /// reference library handles `0x4006` purely as "refresh this property"
+    /// (`Nikon/NikonBase.cs:2326-2328`) and recognises neither `0xD1B4` nor any
+    /// exposure-end meaning for it, so this field is reported next to — and never
+    /// instead of — the associated RAM object and its complete file/hash evidence.
+    #[serde(default)]
+    pub exposure_observed: bool,
     #[serde(default)]
     pub event_batches: Vec<CameraEventBatchDiagnostic>,
     #[serde(flatten)]

@@ -63,7 +63,7 @@ NEF 校正、FDK/SIRT、叠层颜色与材料处理：引擎离线重构
 1. 明确 Apply 写入并读回相机参数；扫描准备提交任务、投影数、几何和 `maxXraySec`；预检鲜读比较，不隐式修复参数。
 2. 必要时受控 HOME；Start 后拍 10 张前暗场，连续开束拍 10 张前空场并关束，装样确认后开始投影。
 3. 每个投影通过负方向规划到角度，取得 `READY_TO_CAPTURE`、匹配运动 ticket、设备位置和 `CAPTURE_HOLD`。
-4. 相机当前固定 `recordingMedia=1`；`0x90C0` RAM 捕获；关联 `0xC101` 对象与 `0xC102` 完成事件。
+4. 相机当前固定 `recordingMedia=1`；`0x90C0` RAM 捕获；关联 `0xC101` 对象（`0xC102` 完成事件可选，可早到、迟到或不到）。
 5. GetObjectInfo → GetObject 下载 → NEF 结构与长度检查 → 写文件、SHA-256、flush、原子不覆盖提交。
 6. 扫描提交再次读取文件计算哈希，发送同 ticket 的 `CAPTURE_DONE`、确认 IDLE、写 manifest，再推进计数。
 7. 最后投影/暂停在关联 ExposureEnded 后关束；完整文件和事务提交完成后才报告终态。完成后不再拍后参考，不额外 HOME 或转完最后 1°。

@@ -108,7 +108,7 @@ Live View全链使用内存：原生最新帧槽、named pipe和前端有界JPEG
 
 相机属性快照分别提供本机supported、原生nativeWritable、当前effective/writable、disabledReason及每个options条目的supported/enabled/reason。属性描述和当前确认读回是依据；前端只消费这些结果，枚举用下拉菜单，无效或不支持的属性/选项变灰。模式、图像格式、白平衡、测光等父属性Apply后重新读取描述与实际值，再判定子属性。自动ISO开启时手动ISO仍控制基准值，NEF+JPEG尺寸仍控制JPEG部分，HDR在NEF下只允许OFF。功能对照及证据见[native-camera-capability-matrix.md](native-camera-capability-matrix.md)。
 
-相机与转台独立连接、自检；两者使用常驻栏目，相机高级设置与基本栏共用会话草稿。扫描保存至根目录/任务 ID；正常独立单拍仅保存至同一根目录/`CameraCaptures`，不增加扫描帧数或 manifest。保留目录名、已有清单、目录别名与原子不覆盖检查；诊断 `camera_test_capture` 才可传显式隔离目录。扫描要求固定 M、Auto ISO OFF、MF、固定 WB，以及包围/ADL/HDR的严格关闭或等价证明；独立单拍允许已确认的 P/A/S、自动 ISO/WB 和支持的 AF 模式，但不隐式触发 AF，仍要求单个主机 RAM NEF输出、关联C102完成、完整文件及 hash。Live View 开启时拒绝拍摄。完整登记后 `deviceControls.camera.lastCapturedImage` 提供 capture ID、会话、操作、大小与哈希；Tauri 的照片预览只接收 capture ID，由引擎 descriptor 解析并复核大小/hash，不接受 renderer 任意路径。HOME 内部保留固件有界反向退让；台架物理隔离确认仍显示射线 UNKNOWN，禁止开束。
+相机与转台独立连接、自检；两者使用常驻栏目，相机高级设置与基本栏共用会话草稿。扫描保存至根目录/任务 ID；正常独立单拍仅保存至同一根目录/`CameraCaptures`，不增加扫描帧数或 manifest。保留目录名、已有清单、目录别名与原子不覆盖检查；诊断 `camera_test_capture` 才可传显式隔离目录。扫描要求固定 M、Auto ISO OFF、MF、固定 WB，以及包围/ADL/HDR的严格关闭或等价证明；独立单拍允许已确认的 P/A/S、自动 ISO/WB 和支持的 AF 模式，但不隐式触发 AF，仍要求单个主机 RAM NEF输出、与本操作关联的C101对象（C102完成可选）、完整文件及 hash。Live View 开启时拒绝拍摄。完整登记后 `deviceControls.camera.lastCapturedImage` 提供 capture ID、会话、操作、大小与哈希；Tauri 的照片预览只接收 capture ID，由引擎 descriptor 解析并复核大小/hash，不接受 renderer 任意路径。HOME 内部保留固件有界反向退让；台架物理隔离确认仍显示射线 UNKNOWN，禁止开束。
 
 持久任务登记锁跨重启和 taskId 切换保留，允许连接修复和只读状态；参数、对焦与普通运动仍锁定。同一任务的受控恢复预检需明确确认本次 USB 自动关断释放，按 schema 3 冻结 V/I、Exposure、maxXraySec 和实际相机 profile 重建会话，随后受控 HOME 和文件哈希校验。缺失/坏登记 fail closed；可识别任务仅在完整清理后显式放弃，保留文件与原目录。schema 2 继续只读重构及版本 5 合法缓存校验，新后端拒绝续扫。
 

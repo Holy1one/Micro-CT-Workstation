@@ -50,6 +50,13 @@ pub(crate) const RECORDING_MEDIA: u16 = 0xd10b;
 pub(crate) const BURST_NUMBER: u16 = 0x5018;
 pub(crate) const BRACKETING_ENABLE:u16=0xd0c0;
 pub(crate) const INFO_DISPLAY_ERROR_STATUS: u16 = 0xd1b2;
+/// Continuous shooting count. The real D7100 reported one completed exposure on
+/// this property (`0x4006 PropertyChanged, parameter 0xD1B4`) for a host RAM
+/// capture whose capture-complete event never arrived
+/// (`docs/validation/card-sd-migration-hardware-2026-10-11.md` section 7). The
+/// reference library defines neither this code nor any exposure meaning for a
+/// `0x4006` notification, so it stays a diagnostic.
+pub(crate) const CONTINUOUS_SHOOTING_COUNT: u16 = 0xd1b4;
 const RUNTIME_ERROR_KEY: &str = "infoDisplayErrorStatus";
 const LV_PROHIBIT_KEY: &str = "liveViewProhibitCondition";
 // Exact documented display/counter IDs. Indicator scalar type is proven by
@@ -97,7 +104,7 @@ pub(crate) const RUNTIME_DIAGNOSTICS: &[(&str, &str, u16, Option<u16>)] = &[
     (
         "continuousShootingCount",
         "Continuous shooting count (read-only counter; not BurstNumber)",
-        0xd1b4,
+        CONTINUOUS_SHOOTING_COUNT,
         Some(2),
     ),
 ];

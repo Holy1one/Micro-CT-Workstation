@@ -1817,6 +1817,29 @@ mod tests{
         let camera=engine.camera.as_ref().unwrap().clone();camera.start_live_view().unwrap();let count=engine.captures.len();assert_eq!(engine.device_command("camera_capture",json!({})).unwrap(),Err("LIVE_VIEW_CAPTURE_FORBIDDEN"));assert!(camera.health().live_view.active);assert_eq!(engine.captures.len(),count);camera.stop_live_view().unwrap();
     }
     #[test]
+    fn independent_capture_registers_with_only_the_associated_ram_object_event(){
+        // The real D7100 host RAM capture produced no exposure-end/completion event
+        // and no NEF (docs/validation/card-sd-migration-hardware-2026-10-11.md
+        // section 7). The reference library treats the associated RAM object
+        // (`0xC101`) as "image available" and transfers on it, leaving the SDRAM
+        // completion optional (digiCamControl Nikon/NikonBase.cs:2330-2367 and
+        // :2369-2375), so this operation must register its complete file/hash
+        // evidence without any completion event.
+        let mut engine=Engine::new(false);
+        let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(Default::default());
+        probe.set_capture_event_codes(vec![vec![(0xc101,0xffff0001)]]);
+        engine.camera=Some(camera);
+        let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-object-only-register",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        engine.set_capture_root(&json!({"savePath":root.to_string_lossy()})).unwrap();
+        engine.device_command("camera_capture",json!({})).unwrap().unwrap();pump(&mut engine);
+        let capture=engine.captures.back().expect("object-only capture must register");
+        assert!(capture.path.starts_with(root.join("CameraCaptures")));
+        assert_eq!(std::fs::metadata(&capture.path).unwrap().len(),capture.bytes);
+        assert!(capture.bytes>0&&capture.sha256.len()==64&&capture.exposure_ended);
+        assert!(!engine.fault_latched);
+        assert!(engine.snapshot()["deviceControls"]["camera"]["lastCapturedImage"]["bytes"].is_u64());
+    }
+    #[test]
     fn cancelled_transfer_does_not_register_or_commit_an_independent_image(){
         let mut engine=Engine::new(false);let(tx,rx)=mpsc::channel();engine.camera=Some(scripted_camera(ScriptedCameraConfig{capture_started_signal:Some(tx),transfer_delay:Duration::from_millis(200),..Default::default()}));
         let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-capture-cancel-register",chrono::Utc::now().timestamp_nanos_opt().unwrap()));engine.parameters.save_path=root.to_string_lossy().into();

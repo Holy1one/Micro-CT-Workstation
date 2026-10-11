@@ -873,10 +873,10 @@ impl ScriptedCameraProbe {
     pub(crate) fn set_object_handles(&self, id: u32, handles: &[u32]) {
         self.script.lock().unwrap().script_object_handles(id, handles);
     }
-    /// Scripts the event batches the next card trigger releases, as
-    /// `(code, parameter)` pairs per batch. `scan.rs` cannot name the private
-    /// `NikonEvent`, so the card scan tests script the association this way.
-    pub(crate) fn set_card_events(&self, batches: Vec<Vec<(u16, u32)>>) {
+    /// Replace the event batches released by the next trigger, as
+    /// `(code, parameter)` pairs. `scan.rs` and the domain tests cannot name the
+    /// private `NikonEvent`, so they script the association this way.
+    pub(crate) fn set_capture_event_codes(&self, batches: Vec<Vec<(u16, u32)>>) {
         self.script.lock().unwrap().capture_events = batches
             .into_iter()
             .map(|batch| {
@@ -886,6 +886,11 @@ impl ScriptedCameraProbe {
                     .collect()
             })
             .collect();
+    }
+    /// Scripts the event batches the next card trigger releases, as
+    /// `(code, parameter)` pairs per batch.
+    pub(crate) fn set_card_events(&self, batches: Vec<Vec<(u16, u32)>>) {
+        self.set_capture_event_codes(batches)
     }
     /// Additive card mode: answer `GetObjectInfo [handle]` with this exact card
     /// dataset instead of the single RAM object answer.
@@ -1325,7 +1330,11 @@ fn measured_d7100_object_info() -> Vec<u8> {
 }
 
 #[test]
-fn d7100_padded_object_info_still_requires_valid_nef_and_c102() {
+fn d7100_padded_object_info_still_requires_valid_nef_and_associated_object_evidence() {
+    // Renamed 2026-10-11 only for accuracy: the SDRAM completion is optional and
+    // the associated RAM object is the commit evidence (digiCamControl
+    // Nikon/NikonBase.cs:2330-2367), so this test still proves that a padded
+    // ObjectInfo never relaxes NEF completeness.
     for valid_nef in [false, true] {
         let mut s = Script::new();
         if !valid_nef { s.raw[0] = 0; }
@@ -1449,78 +1458,255 @@ fn runtime_status_cluster_and_object_before_completion_preserve_commit_and_histo
 }
 
 #[test]
-fn downloaded_nef_without_c102_never_commits_or_reports_exposure_completion() {
+fn host_ram_object_event_alone_completes_and_registers_one_complete_file() {
+    // Expectation changed 2026-10-11: the associated RAM object is sufficient
+    // "image available" evidence and the SDRAM completion became optional, because
+    // the reference library starts ObjectInfo/transfer on the object event and only
+    // feeds OnCaptureCompleted from the completion (digiCamControl
+    // Nikon/NikonBase.cs:2330-2367 and :2369-2375).
     let mut s = Script::new();
     let mut metadata = measured_d7100_object_info();
     metadata[8..12].copy_from_slice(&(s.raw.len() as u32).to_le_bytes());
     s.object_info = Some(metadata);
+    // Only `0xC101`: no `0xC102` RAM completion and no `0x400D` card completion.
     s.capture_events = vec![vec![NikonEvent {
         code: OBJECT_RAM,
         parameter: 0xffff0001,
     }]];
-    assert!(validate_nef(&s.raw).is_ok());
     let expected_size = s.raw.len() as u64;
-    let (downloaded, receive) = mpsc::channel();
-    s.poll_after_download_signal = Some(downloaded);
+    assert!(validate_nef(&s.raw).is_ok());
     let script = Arc::new(Mutex::new(s));
     let a = connected(script.clone());
     let session = a.health().session_id.unwrap();
-    let path = output("downloaded-nef-missing-c102");
-    let capture_path = path.clone();
-    let capture = a.clone();
-    let (tx, rx) = mpsc::channel();
-    let job = std::thread::spawn(move || {
-        capture.capture_to_path(
-            &capture_path,
-            "downloaded-without-c102",
-            &AtomicBool::new(false),
-            Some(tx),
-        )
-    });
-    receive.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(!path.exists());
-    let cancelled = a.request_cancel();
-    assert!(cancelled.isolated && !cancelled.cleanup_confirmed);
-    let deadline = Instant::now() + Duration::from_secs(4);
-    while a.health().phase != "cleanup_unconfirmed" && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+    let path = output("host-ram-object-only");
+    let image = a
+        .capture_independent_to_path(&path, "object-only", &AtomicBool::new(false))
+        .unwrap();
+    assert!(path.exists());
+    assert_eq!(image.path, path);
+    assert_eq!(image.session_id, session);
+    assert_eq!(image.operation_id, "object-only");
+    assert_eq!(image.object_handle, 0xffff0001);
+    assert_eq!(image.format, "NEF");
+    assert_eq!(image.size, std::fs::metadata(&path).unwrap().len());
+    assert_eq!(image.size, expected_size);
+    assert_eq!(
+        image.sha256,
+        format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(std::fs::read(&path).unwrap()))
+    );
+    {
+        // Exactly one object was requested and transferred; no partial file
+        // remains and no image-payload alternative opcode was used.
+        let s = script.lock().unwrap();
+        assert_eq!(s.calls.iter().filter(|code| **code == GET_OBJECT_INFO).count(), 1);
+        assert_eq!(s.calls.iter().filter(|code| **code == GET_OBJECT).count(), 1);
+        assert!(!s.calls.contains(&0x101b));
     }
-    assert!(matches!(job.join().unwrap(), Err(CameraError::Cancelled)));
-    let events: Vec<_> = rx.try_iter().collect();
-    assert!(events.iter().any(|event| matches!(event,
-        CameraCaptureEvent::ObjectAdded { session_id, operation_id, handle }
-            if session_id == &session && operation_id == "downloaded-without-c102"
-                && *handle == 0xffff0001)));
-    assert!(events.iter().any(|event| matches!(event,
-        CameraCaptureEvent::TransferStarted { size, .. } if *size == expected_size)));
-    assert!(!events.iter().any(|event| matches!(event,
-        CameraCaptureEvent::ExposureEnded { .. } | CameraCaptureEvent::FileComplete { .. })));
-    assert!(!path.exists());
-    assert!(std::fs::read_dir(path.parent().unwrap())
-        .unwrap()
-        .all(|entry| !matches!(
+    assert!(std::fs::read_dir(path.parent().unwrap()).unwrap().all(|entry| {
+        !matches!(
             entry.unwrap().path().extension().and_then(|ext| ext.to_str()),
-            Some("nef" | "part")
-        )));
-    let h = a.health();
-    assert_eq!(h.phase, "cleanup_unconfirmed");
-    assert!(h.isolated && !h.connected && !h.cleanup_confirmed);
-    let cleanup = h.last_cleanup_diagnostic.unwrap();
-    assert!(cleanup.pending_at_start && !cleanup.exposure_ended_observed);
-    assert!(cleanup.event_batches.is_empty());
-    let diagnostic = h.last_capture_event_diagnostic.unwrap();
+            Some("part")
+        )
+    }));
+    let health = a.health();
+    assert!(health.connected && !health.isolated && health.cleanup_confirmed);
+    // The committed host file is registered for this session and operation.
+    assert_eq!(health.last_capture.as_deref(), Some(path.to_string_lossy().as_ref()));
+    let diagnostic = health.last_capture_event_diagnostic.unwrap();
     assert_eq!(diagnostic.session_id, session);
-    assert_eq!(diagnostic.operation_id, "downloaded-without-c102");
+    assert_eq!(diagnostic.operation_id, "object-only");
+    assert_eq!(diagnostic.capture_complete_count, 0);
+    assert!(!diagnostic.exposure_ended_observed);
+    assert!(!diagnostic.exposure_observed);
+    assert_eq!(diagnostic.event_batches.len(), 1);
+    assert_eq!(diagnostic.event_batches[0].response.events[0].code, OBJECT_RAM);
+}
+
+#[test]
+fn late_ram_completion_after_the_object_transfers_and_commits_exactly_once() {
+    // The optional SDRAM completion may arrive after the object and its transfer
+    // (digiCamControl Nikon/NikonBase.cs:2330-2367 transfers on the object event;
+    // :2369-2375 consumes the completion only for OnCaptureCompleted), so a single
+    // late completion for this same operation is absorbed and must never double
+    // the transfer or the commit.
+    let mut s = Script::new();
+    s.capture_events = vec![
+        vec![NikonEvent {
+            code: OBJECT_RAM,
+            parameter: 0xffff0001,
+        }],
+        vec![NikonEvent {
+            code: CAPTURE_COMPLETE_RAM,
+            parameter: 0,
+        }],
+    ];
+    let script = Arc::new(Mutex::new(s));
+    let a = connected(script.clone());
+    let session = a.health().session_id.unwrap();
+    let path = output("late-ram-completion");
+    let (tx, rx) = mpsc::channel();
+    let image = a
+        .capture_to_path(&path, "late-completion", &AtomicBool::new(false), Some(tx))
+        .unwrap();
+    assert!(path.exists() && image.exposure_ended);
+    assert_eq!(image.size, std::fs::metadata(&path).unwrap().len());
+    let events: Vec<_> = rx.try_iter().collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, CameraCaptureEvent::ObjectAdded { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, CameraCaptureEvent::TransferStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, CameraCaptureEvent::ExposureEnded { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, CameraCaptureEvent::FileComplete { .. }))
+            .count(),
+        1
+    );
+    // One object, one transfer, one file: the late completion added no second
+    // retrieval and no second commit.
+    {
+        let s = script.lock().unwrap();
+        assert_eq!(s.calls.iter().filter(|code| **code == GET_OBJECT_INFO).count(), 1);
+        assert_eq!(s.calls.iter().filter(|code| **code == GET_OBJECT).count(), 1);
+    }
+    assert_eq!(
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|ext| ext == "nef"))
+            .count(),
+        1
+    );
+    let diagnostic = a.health().last_capture_event_diagnostic.unwrap();
+    assert_eq!(diagnostic.session_id, session);
+    assert_eq!(diagnostic.operation_id, "late-completion");
+    assert_eq!(diagnostic.capture_complete_count, 1);
+    assert!(diagnostic.exposure_ended_observed);
+    assert!(!diagnostic.exposure_observed);
+    assert_eq!(
+        diagnostic
+            .event_batches
+            .last()
+            .unwrap()
+            .response
+            .events[0]
+            .code,
+        CAPTURE_COMPLETE_RAM
+    );
+}
+
+#[test]
+fn property_only_exposure_notification_never_completes_or_commits_a_capture() {
+    // The real D7100 reported one exposure only as `0x4006 PropertyChanged
+    // (0xD1B4)` for a host RAM capture that produced no object in the engine's
+    // window (docs/validation/card-sd-migration-hardware-2026-10-11.md section 7).
+    // The reference library treats `0x4006` purely as "refresh this property"
+    // (digiCamControl Nikon/NikonBase.cs:2326-2328) and defines no `0xD1B4`, so
+    // this notification is a diagnostic and never commit evidence.
+    let context = CallContext {
+        deadline: Instant::now() + Duration::from_millis(300),
+        epoch: 1,
+        generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+    };
+    let mut s = Script::new();
+    s.capture_events = vec![vec![NikonEvent {
+        code: PROPERTY_CHANGED,
+        parameter: CONTINUOUS_SHOOTING_COUNT as u32,
+    }]];
+    let script = Arc::new(Mutex::new(s));
+    let mut camera = NativeCamera::new(Box::new(Fake(script.clone())));
+    camera
+        .connect(
+            "fake-camera-1",
+            "00112233445566778899aabbccddeeff",
+            &context,
+        )
+        .unwrap();
+    let destination = output("property-only-exposure");
+    let result = super::capture::capture(
+        &mut camera,
+        &destination,
+        "property-only",
+        &None,
+        &context,
+        &Mutex::new(()),
+    );
+    // Timeout-class refusal: no object, no file, and the pending exposure stays
+    // unresolved so the session is never reported as a successful capture.
+    assert!(matches!(result, Err(CameraError::Timeout(_))), "{result:?}");
+    assert!(!destination.exists());
+    assert!(camera.capture_pending && camera.pending_capture.is_some());
+    assert!(!script.lock().unwrap().calls.contains(&GET_OBJECT));
+    let diagnostic = camera.health.last_capture_event_diagnostic.unwrap();
+    assert!(diagnostic.exposure_observed);
     assert!(!diagnostic.exposure_ended_observed);
     assert_eq!(diagnostic.capture_complete_count, 0);
-    assert_eq!(diagnostic.event_batches.len(), 1);
-    let batch = &diagnostic.event_batches[0];
-    assert_eq!(batch.event_count, 1);
-    assert_eq!(batch.response.events[0].code, OBJECT_RAM);
-    assert_eq!(batch.response.events[0].parameter, 0xffff0001);
-    let s = script.lock().unwrap();
-    assert_eq!(s.calls.iter().filter(|code| **code == GET_OBJECT).count(), 1);
-    assert!(!s.complete_after_download);
+    assert_eq!(
+        diagnostic.event_batches[0].response.events[0].parameter,
+        CONTINUOUS_SHOOTING_COUNT as u32
+    );
+}
+
+#[test]
+fn host_ram_path_sends_one_private_sdram_trigger_and_never_the_card_trigger() {
+    // The reference library's host/SDRAM path sends the Nikon-private
+    // `0x90C0 InitiateCaptureRecInSdram` with parameter `0xFFFFFFFF`
+    // (digiCamControl Nikon/NikonBase.cs:61, :1871, :1908); its card path sends
+    // standard `0x100E InitiateCapture` instead (BaseMTPCamera.cs:82). This host
+    // RAM transaction must send exactly the former (with zero image payload in the
+    // trigger itself) and never the latter.
+    let (camera, probe) = scripted_camera_with_probe(ScriptedCameraConfig {
+        omit_exposure_end: true,
+        ..Default::default()
+    });
+    let path = output("host-ram-trigger-opcode");
+    let image = camera
+        .capture_independent_to_path(&path, "ram-trigger", &AtomicBool::new(false))
+        .unwrap();
+    assert!(path.exists() && image.exposure_ended);
+    let requests = probe.requests();
+    let triggers: Vec<_> = requests
+        .iter()
+        .filter(|(code, _)| *code == CAPTURE_RAM)
+        .collect();
+    assert_eq!(triggers.len(), 1, "{requests:X?}");
+    assert_eq!(triggers[0].1, vec![0xffffffff]);
+    assert_eq!(probe.operation_count(INITIATE_CAPTURE), 0);
+    assert_eq!(probe.operation_count(GET_OBJECT_INFO), 1);
+    assert_eq!(probe.operation_count(GET_OBJECT), 1);
+    // No partial-object opcode is ever used: the reference transfers the whole
+    // object with `0x1009 GetObject` and never sends `0x101B`.
+    assert!(!probe.calls().contains(&0x101b));
+    assert!(probe
+        .requests()
+        .iter()
+        .all(|(code, _)| *code != 0x101b));
+}
+
+#[test]
+fn host_ram_object_window_is_second_scale_inside_the_owner_deadline() {
+    // The object-arrival window must stay a real second-scale wait; `actor.rs`
+    // asserts at compile time that it also stays strictly inside the unchanged
+    // 75 s camera-owner deadline.
+    let window = super::actor::OBJECT_ARRIVAL_WINDOW;
+    assert!(window >= Duration::from_secs(1), "{window:?}");
+    assert!(window.as_secs() < 75, "{window:?}");
 }
 
 #[test]
@@ -1798,15 +1984,19 @@ fn detached_cleanup_survives_repeated_stop_and_confirms_only_same_session_c102()
 }
 
 #[test]
-fn detached_cleanup_without_c102_stays_unknown_and_closed_transport_cannot_fake_recovery() {
+fn detached_cleanup_without_associated_object_stays_unknown_and_closed_transport_cannot_fake_recovery() {
+    // Expectation narrowed 2026-10-11: the associated RAM object, not the SDRAM
+    // completion, is what resolves a pending exposure (digiCamControl
+    // Nikon/NikonBase.cs:2330-2367 retrieves/commits on the object; :2369-2375
+    // makes the completion optional), so the unresolved case this test must keep
+    // proving is a cancelled exposure with no associated object at all.
     let mut s = Script::new();
-    s.capture_events
-        .retain(|batch| batch.iter().all(|event| event.code != CAPTURE_COMPLETE_RAM));
+    s.capture_events = vec![];
     let (started, receive) = mpsc::channel();
     s.capture_started_signal = Some(started);
     let script = Arc::new(Mutex::new(s));
     let a = connected(script.clone());
-    let path = output("detached-missing-c102");
+    let path = output("detached-missing-object");
     let capture_path = path.clone();
     let capture = a.clone();
     let job = std::thread::spawn(move || {
@@ -3381,6 +3571,42 @@ fn idle_unknown_event_retirement_keeps_code_parameter_and_raw_response_until_rec
     assert!(fresh.last_event_diagnostic.is_none());
 }
 #[test]
+fn idle_unassociated_ram_object_event_stays_fail_closed_and_grants_no_capture_credit() {
+    // The real hardware left an orphan `0xC101` (`parameter=0x0B000001`) that the
+    // next session had to judge while idle (docs/validation/
+    // card-sd-migration-hardware-2026-10-11.md section 7). It stays fail-closed and
+    // isolated, and only the wording names it as a RAM object event with an
+    // unverified parameter rather than the standard `0x400D` completion.
+    let script = Arc::new(Mutex::new(Script::new()));
+    let a = connected(script.clone());
+    let session = a.health().session_id;
+    script.lock().unwrap().events.push_back(vec![NikonEvent {
+        code: OBJECT_RAM,
+        parameter: 0x0b00_0001,
+    }]);
+    std::thread::sleep(Duration::from_millis(400));
+    let health = a.health();
+    assert!(!health.connected);
+    assert!(health.isolated);
+    assert!(health.cleanup_confirmed);
+    assert!(health.last_capture.is_none());
+    let error = health.last_error.unwrap();
+    assert!(error.contains("0xC101"), "{error}");
+    assert!(error.contains("0x0B000001"), "{error}");
+    assert!(error.contains("0x400D"), "{error}");
+    assert!(error.contains("unverified"), "{error}");
+    let event = health.last_event_diagnostic.unwrap();
+    assert_eq!(event.events[0].code, OBJECT_RAM);
+    assert_eq!(event.events[0].parameter, 0x0b00_0001);
+    assert_eq!(event.response_code, Some(OK));
+    // A fresh explicit selection still starts a clean session.
+    let fresh = a.connect_selected("fake-camera-1").unwrap();
+    assert!(fresh.connected && !fresh.isolated);
+    assert!(fresh.last_error.is_none());
+    assert_ne!(fresh.session_id, session);
+}
+
+#[test]
 fn idle_apply_from_card_and_runtime_raw_one_preserves_diagnostics_and_allows_evidenced_capture() {
     for raw_value in [0, 1] {
         let mut s = Script::new();
@@ -4007,6 +4233,11 @@ fn duplicate_or_unassociated_events_and_truncated_raw_never_commit() {
 }
 #[test]
 fn missing_exposure_event_is_not_accepted_by_elapsed_time() {
+    // Expectation narrowed 2026-10-11: the object event, not the SDRAM completion,
+    // is the transfer/commit evidence (digiCamControl Nikon/NikonBase.cs:2330-2367
+    // transfers on the object and :2369-2375 only reports the completion), so the
+    // stream that must never be accepted by elapsed time is one with no capture
+    // evidence at all.
     let generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let context = CallContext {
         deadline: Instant::now() + Duration::from_millis(40),
@@ -4014,10 +4245,7 @@ fn missing_exposure_event_is_not_accepted_by_elapsed_time() {
         generation,
     };
     let mut s = Script::new();
-    s.capture_events = vec![vec![NikonEvent {
-        code: OBJECT_RAM,
-        parameter: 0xffff0001,
-    }]];
+    s.capture_events = vec![];
     let mut camera = NativeCamera::new(Box::new(Fake(Arc::new(Mutex::new(s)))));
     camera
         .connect(
@@ -4037,6 +4265,7 @@ fn missing_exposure_event_is_not_accepted_by_elapsed_time() {
     );
     assert!(matches!(result, Err(CameraError::Timeout(_))));
     assert!(!destination.exists());
+    assert!(camera.capture_pending);
 }
 #[test]
 fn stalled_native_call_does_not_block_status_or_stop_acceptance() {

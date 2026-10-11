@@ -38,6 +38,22 @@ const CARD_STORAGE_DATASET_MAX: usize = 64 * 1024;
 /// budget well under the Stop pre-emption budget is what prevents that.
 const LV_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(75);
+/// Second-scale window for the host-RAM object ("image available") evidence of
+/// one accepted exposure, measured from the accepted trigger and always inside
+/// [`CAPTURE_TIMEOUT`].
+///
+/// Reference: digiCamControl has **no** capture deadline at all — it polls
+/// `GetEvent` every 100 ms (`CameraControl.Devices/Nikon/NikonBase.cs:348`) and
+/// lets its callers wait in second-scale units (1500/2000/5000/30000 ms,
+/// `CameraControl.Core/Classes/CameraHelper.cs:165-174`). The value is therefore
+/// an engineering choice in that magnitude, **not** a library proof; the owner
+/// deadline above is deliberately kept and never shortened to sub-second.
+pub(crate) const OBJECT_ARRIVAL_WINDOW: Duration = Duration::from_secs(30);
+/// The object window must stay a real second-scale wait and must stay strictly
+/// inside the camera-owner deadline, whatever the two values become.
+const _: () = assert!(
+    OBJECT_ARRIVAL_WINDOW.as_secs() >= 1 && OBJECT_ARRIVAL_WINDOW.as_secs() < CAPTURE_TIMEOUT.as_secs()
+);
 /// Metadata-only enumeration budget for one authorized import. The work is
 /// bounded per object by the shared deadline and by the cancellation generation,
 /// so a wedged card cannot delay Stop; the budget only has to cover a large card
@@ -1275,6 +1291,14 @@ fn poll_idle_health(camera: &mut NativeCamera, context: &CallContext) -> Result<
                     }
                 }
                 0xc104 => (),
+                // An orphan Nikon RAM object event keeps this session fail-closed
+                // exactly as before; only the wording is explicit so it cannot be
+                // read as the standard `0x400D` CaptureComplete/ExposureEnded
+                // semantics. `0xC101` carries an unverified parameter value (the
+                // reference library uses it as a handle without any shape check,
+                // `Nikon/NikonBase.cs:2333-2334`) and is never credit for an
+                // unassociated exposure.
+                OBJECT_RAM => return Err(CameraError::Safety(format!("unassociated Nikon RAM object event while idle (0xC101 ObjectAddedInSdram, parameter 0x{:08X} unverified object value); this is not a standard 0x400D capture-complete/ExposureEnded and grants no capture credit; session retired", event.parameter))),
                 _ => return Err(CameraError::Safety(format!("unassociated capture or device event while idle: code=0x{:04X}, parameter=0x{:08X}; session retired", event.code, event.parameter))),
             }
         }

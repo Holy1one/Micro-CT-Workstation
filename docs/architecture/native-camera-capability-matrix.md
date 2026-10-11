@@ -113,7 +113,7 @@ UM p.144只明确说正在记录多重曝光时“部分菜单项”会变灰，
 | --- | --- | --- |
 | 显式发现、选择、连接、断开 | 已实现 | `actor`与`wpd`；无参数连接拒绝隐式选择；未知型号仅标准已描述能力。无 `deviceId` 的 `camera_connect`（含 `retry_device{device:"camera"}`）只做发现，operation kind 为 `camera_discover`，受理记录不声明已连接；有明确 `deviceId` 才为 `connect`；清理未确认时需显式 `acknowledgeUnconfirmedCleanup` |
 | DeviceInfo、vendor属性扩展 | 已实现 | `nikon::connect`仅在D7100身份绑定且90CA被声明时读取，保留原始/有效列表和诊断哈希 |
-| 单拍RAM NEF、CT捕获 | 事务已实现；P0独立照片已分项验证；完整CT联动仍待实机验收 | 固定扫描与独立摄影有不同admission；两者均校验单host NEF、LV OFF、session/operation、C101/C102、完整文件/hash和原子不覆盖。多重曝光已退出运行时准入，预检前在机身确认关闭；USB连接不证明它关闭。一个host文件不证明一次物理曝光；新的独立自动模式与完整CT联动仍未由P0证明。未就绪（`captureReady`/`independent_readback` 未通过）时 `camera_capture` 在入队前拒绝为 `CAMERA_CAPTURE_UNQUALIFIED`，不置 Fault、不断开会话 |
+| 单拍RAM NEF、CT捕获 | 事务已实现；P0独立照片已分项验证；完整CT联动仍待实机验收 | 固定扫描与独立摄影有不同admission；两者均校验单host NEF、LV OFF、session/operation、与本操作关联的C101对象（C102完成可选）、完整文件/hash和原子不覆盖。多重曝光已退出运行时准入，预检前在机身确认关闭；USB连接不证明它关闭。一个host文件不证明一次物理曝光；新的独立自动模式与完整CT联动仍未由P0证明。未就绪（`captureReady`/`independent_readback` 未通过）时 `camera_capture` 在入队前拒绝为 `CAMERA_CAPTURE_UNQUALIFIED`，不置 Fault、不断开会话 |
 | 独立JPEG/TIFF、RAW+JPEG双对象采集 | 禁用 | 当前对象解析与提交仅接受NEF，缺少多对象关联和格式确认事务；更改格式不会扩展捕获能力 |
 | AF | 已实现候选；新增LV资格仅离线 | NB `AutoFocus` 1853–1858、90C1；实际操作列表及DeviceReady门禁；LV需fresh lensSort=1、照片selector=0、D061 mode0；物理MF/AF-F/未知镜头资格禁用，不以lensSort单项推断motor。能力未广告时 `camera_autofocus` 入队前拒绝为 `CAMERA_AUTOFOCUS_UNQUALIFIED` |
 | 镜头步进 | 已实现候选；新增LV资格仅离线 | NB 1799–1807、9204；LV开启、步数有界、fresh lensSort1/selector0/D061 mode0或4及实际操作支持；AF-F2禁止有界motor、hardMF3禁写motor；不将脉冲计数当绝对焦点。LV未激活或 `focusStep` 未广告时 `camera_focus` 入队前拒绝为 `CAMERA_FOCUS_UNQUALIFIED` |
@@ -163,7 +163,7 @@ Advanced的preset Compare只把supported/readable/confirmed、无error的actual�
 
 相机核心参数只有明确 Apply 才串行写入并读回；`prepare_scan` 只原子提交任务与完整几何，用确认快门派生曝光。预检、开始、恢复和扫描事务鲜读比较，不自动停 LV、不写快门/RAM/burst。当前清单 schema 3 中的 profile 版本为 6，冻结 WB、C0/ADL/HDR 证明及实际采集参数，规范 hash 纳入固定策略版本 3。旧 profile 1–5 原 hash 和只读重构保持，拒绝追加投影。HDR 只有未广告时可使用已确认 NEF=4 的互斥证明；已广告的 ON、错误或矛盾读回仍拒绝。
 
-独立摄影允许已确认的M/P/A/S、自动ISO/WB及支持的AF模式；不会隐式触发AF。只有实际自动模式决定的ISO/快门/光圈输出可变化；RAM介质、NEF格式、单host输出数量、会话及C102/文件证据仍严格校验。此入口保证一个验证完整的主机 NEF。90C0、一C101、关联可靠C102、完整长度/hash、超时、多对象拒绝和取消门禁保持。Bulb/Time、JPEG和多对象采集不会因此开放。
+独立摄影允许已确认的M/P/A/S、自动ISO/WB及支持的AF模式；不会隐式触发AF。只有实际自动模式决定的ISO/快门/光圈输出可变化；RAM介质、NEF格式、单host输出数量、会话及C101对象/文件证据仍严格校验。此入口保证一个验证完整的主机 NEF。90C0、一个与本操作关联的C101对象、完整长度/hash、秒级对象窗口、多对象拒绝和取消门禁保持（C102完成可选：可早到、迟到或不到，且仅作诊断）。Bulb/Time、JPEG和多对象采集不会因此开放。
 
 正常 `camera_capture` 从唯一 `Parameters.savePath`根目录派生 `CameraCaptures`子目录，renderer不能换成任意路径；显式目录仅用于诊断 `camera_test_capture`且仍检查已有扫描清单、目录别名和不覆盖。完整文件提交后登记 capture ID、会话、operation ID、bytes及hash。照片预览只接收 capture ID，Tauri再次核对登记、大小/hash，复用 NEF内嵌 JPEG；无内嵌 JPEG时报预览不可用，不另写 JPEG临时文件。浏览器模拟只报告 NO HARDWARE，不登记或制造真实照片。
 
