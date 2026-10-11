@@ -286,6 +286,11 @@ pub(crate) fn capture_with_policy(
                 }),
                 exposure_ended_observed: exposure_ended,
                 exposure_observed,
+                // A fresh capture diagnostic starts with no late completion
+                // absorbed; the post-commit drain window can only add to this
+                // operation's diagnostic after its file commit.
+                late_completion_absorbed_count: 0,
+                late_completion_parameter: None,
                 event_batches: event_batches.clone(),
                 response: camera
                     .health
@@ -451,6 +456,11 @@ pub(crate) fn capture_with_policy(
                 .count(),
             exposure_ended_observed: exposure_ended,
             exposure_observed,
+            // A fresh capture diagnostic starts with no late completion
+            // absorbed; the post-commit drain window can only add to this
+            // operation's diagnostic after its file commit.
+            late_completion_absorbed_count: 0,
+            late_completion_parameter: None,
             event_batches: event_batches.clone(),
             response: camera
                 .health

@@ -147,6 +147,20 @@ pub struct CameraCaptureEventDiagnostic {
     /// instead of — the associated RAM object and its complete file/hash evidence.
     #[serde(default)]
     pub exposure_observed: bool,
+    /// How many optional late `0xC102` RAM completions of this operation were
+    /// recognised by its post-commit drain window after the file had already been
+    /// committed and registered. The real D7100 delivered that completion after the
+    /// file boundary while the camera was idle
+    /// (`docs/validation/card-sd-migration-hardware-2026-10-11.md` section 9), where
+    /// it used to retire the session. Diagnostic only: an absorbed late completion
+    /// is never capture credit and never completes, commits or resurrects an
+    /// operation; a later unassociated event still fails closed.
+    #[serde(default)]
+    pub late_completion_absorbed_count: usize,
+    /// Parameter of the last absorbed late `0xC102`, retained so the raw device
+    /// value stays visible next to the count instead of being dropped.
+    #[serde(default)]
+    pub late_completion_parameter: Option<u32>,
     #[serde(default)]
     pub event_batches: Vec<CameraEventBatchDiagnostic>,
     #[serde(flatten)]

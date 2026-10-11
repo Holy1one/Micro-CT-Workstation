@@ -1612,6 +1612,269 @@ fn late_ram_completion_after_the_object_transfers_and_commits_exactly_once() {
 }
 
 #[test]
+fn post_commit_drain_window_is_second_scale_inside_the_owner_deadline() {
+    // The late-completion window must stay a real second-scale wait and stay well
+    // under the unchanged 75 s camera-owner deadline; `actor.rs` asserts that
+    // relationship at compile time (a broken relation cannot build), and the
+    // object-arrival window it follows carries the same compile-time assertion.
+    let window = super::actor::POST_COMMIT_DRAIN_WINDOW;
+    assert!(window >= Duration::from_secs(1), "{window:?}");
+    assert!(window.as_secs() < 75, "{window:?}");
+    assert!(
+        window < super::actor::OBJECT_ARRIVAL_WINDOW,
+        "{window:?} {:?}",
+        super::actor::OBJECT_ARRIVAL_WINDOW
+    );
+}
+
+/// Scripts one host-RAM exposure that is proved by its associated object alone:
+/// no in-capture `0xC102`, so any completion seen later is exactly the optional
+/// late one. Returns the connected adapter and its script.
+fn object_only_capture_session() -> (CameraAdapter, Arc<Mutex<Script>>) {
+    let mut s = Script::new();
+    s.capture_events = vec![vec![NikonEvent {
+        code: OBJECT_RAM,
+        parameter: 0xffff0001,
+    }]];
+    let script = Arc::new(Mutex::new(s));
+    let a = connected(script.clone());
+    (a, script)
+}
+
+#[test]
+fn committed_host_ram_capture_absorbs_one_late_ram_completion_while_idle() {
+    // Real hardware: `0xC102, parameter=0x00000000` arrived after a successful
+    // host-RAM capture had committed and registered its file, while the camera was
+    // idle, and the idle guard retired the session for it
+    // (docs/validation/card-sd-migration-hardware-2026-10-11.md section 9). The
+    // bounded post-commit drain window records it as that one operation's optional
+    // late completion instead of isolating the camera after every success, and it
+    // still grants no capture credit.
+    let (a, script) = object_only_capture_session();
+    let session = a.health().session_id.unwrap();
+    let path = output("post-commit-late-c102-absorbed");
+    let image = a
+        .capture_to_path(&path, "late-c102", &AtomicBool::new(false), None)
+        .unwrap();
+    let committed = std::fs::read(&path).unwrap();
+    assert_eq!(image.size, committed.len() as u64);
+    assert_eq!(
+        image.sha256,
+        format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&committed))
+    );
+    let before = a.health().last_capture_event_diagnostic.unwrap();
+    assert_eq!(before.late_completion_absorbed_count, 0);
+    assert_eq!(before.late_completion_parameter, None);
+    assert!(!before.exposure_ended_observed);
+    // The optional late RAM completion now arrives while the camera is idle.
+    script.lock().unwrap().events.push_back(vec![NikonEvent {
+        code: CAPTURE_COMPLETE_RAM,
+        parameter: 0,
+    }]);
+    std::thread::sleep(Duration::from_millis(400));
+    let health = a.health();
+    // The session stays connected and usable: no operator reconnect is required.
+    assert!(
+        health.connected && !health.isolated && health.cleanup_confirmed,
+        "{:?}",
+        health.last_error
+    );
+    assert!(health.last_error.is_none(), "{:?}", health.last_error);
+    assert_eq!(health.phase, "idle");
+    // The absorbed event is retained as evidence on the committed operation's
+    // diagnostic, with its raw parameter and event batch, instead of being dropped.
+    let diagnostic = health.last_capture_event_diagnostic.clone().unwrap();
+    assert_eq!(diagnostic.session_id, session);
+    assert_eq!(diagnostic.operation_id, "late-c102");
+    assert_eq!(diagnostic.late_completion_absorbed_count, 1);
+    assert_eq!(diagnostic.late_completion_parameter, Some(0));
+    let absorbed = diagnostic.event_batches.last().unwrap();
+    assert_eq!(absorbed.response.events[0].code, CAPTURE_COMPLETE_RAM);
+    assert_eq!(absorbed.response.events[0].parameter, 0);
+    assert_eq!(absorbed.response.response_code, Some(OK));
+    assert_eq!(absorbed.event_count, 1);
+    // No capture credit: the absorbed late completion is not exposure-end evidence
+    // and did not enter the batch count of the capture itself.
+    assert!(!diagnostic.exposure_ended_observed);
+    assert_eq!(diagnostic.capture_complete_count, 0);
+    // No operation was created, resurrected, re-triggered or re-downloaded.
+    {
+        let s = script.lock().unwrap();
+        assert_eq!(s.calls.iter().filter(|code| **code == CAPTURE_RAM).count(), 1);
+        assert_eq!(s.calls.iter().filter(|code| **code == GET_OBJECT_INFO).count(), 1);
+        assert_eq!(s.calls.iter().filter(|code| **code == GET_OBJECT).count(), 1);
+    }
+    // The committed file and its registration are unchanged.
+    assert_eq!(
+        health.last_capture.as_deref(),
+        Some(path.to_string_lossy().as_ref())
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
+    assert_eq!(
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter(|entry| entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "nef"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn late_ram_completion_outside_the_post_commit_window_still_retires_the_session() {
+    // The tolerance is bounded: a `0xC102` judged after its window has closed keeps
+    // today's fail-closed retirement. A zero-length injected window is already
+    // closed when the late event is judged, which is the same verdict as an event
+    // that simply arrived too late, with no real waiting and no timing dependence.
+    let mut s = Script::new();
+    s.capture_events = vec![vec![NikonEvent {
+        code: OBJECT_RAM,
+        parameter: 0xffff0001,
+    }]];
+    let script = Arc::new(Mutex::new(s));
+    let a = adapter(script.clone());
+    a.set_post_commit_drain_window(Duration::ZERO);
+    a.connect_selected("fake-camera-1").unwrap();
+    let path = output("post-commit-late-c102-outside-window");
+    let image = a
+        .capture_to_path(&path, "late-c102-outside-window", &AtomicBool::new(false), None)
+        .unwrap();
+    let committed = std::fs::read(&path).unwrap();
+    assert_eq!(
+        image.sha256,
+        format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&committed))
+    );
+    script.lock().unwrap().events.push_back(vec![NikonEvent {
+        code: CAPTURE_COMPLETE_RAM,
+        parameter: 0,
+    }]);
+    std::thread::sleep(Duration::from_millis(400));
+    let health = a.health();
+    assert!(!health.connected && health.isolated && health.cleanup_confirmed);
+    let error = health.last_error.unwrap();
+    assert!(
+        error.contains("unassociated capture or device event while idle"),
+        "{error}"
+    );
+    assert!(error.contains("0xC102"), "{error}");
+    assert!(error.contains("0x00000000"), "{error}");
+    assert!(error.contains("session retired"), "{error}");
+    // Nothing was absorbed, and the already-committed file/registration survives
+    // the retirement untouched: the fix never rolls back a committed capture.
+    let diagnostic = health.last_capture_event_diagnostic.unwrap();
+    assert_eq!(diagnostic.late_completion_absorbed_count, 0);
+    assert_eq!(diagnostic.late_completion_parameter, None);
+    assert_eq!(
+        health.last_capture.as_deref(),
+        Some(path.to_string_lossy().as_ref())
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
+}
+
+#[test]
+fn unassociated_ram_object_event_inside_the_post_commit_window_still_retires_the_session() {
+    // Only `0xC102` is tolerated. An unassociated `0xC101` RAM object event keeps
+    // today's fail-closed retirement even while a committed operation's post-commit
+    // window is open, and it grants no capture credit
+    // (docs/validation/card-sd-migration-hardware-2026-10-11.md section 7).
+    let (a, script) = object_only_capture_session();
+    let session = a.health().session_id.unwrap();
+    let path = output("post-commit-window-late-c101");
+    let image = a
+        .capture_to_path(&path, "late-window-object", &AtomicBool::new(false), None)
+        .unwrap();
+    let committed = std::fs::read(&path).unwrap();
+    assert_eq!(
+        image.sha256,
+        format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&committed))
+    );
+    // The production window is open here and the object event is judged inside it.
+    assert!(super::actor::POST_COMMIT_DRAIN_WINDOW > Duration::from_millis(400));
+    script.lock().unwrap().events.push_back(vec![NikonEvent {
+        code: OBJECT_RAM,
+        parameter: 0x0b00_0001,
+    }]);
+    std::thread::sleep(Duration::from_millis(400));
+    let health = a.health();
+    assert!(!health.connected && health.isolated && health.cleanup_confirmed);
+    let error = health.last_error.unwrap();
+    assert!(error.contains("0xC101"), "{error}");
+    assert!(error.contains("0x0B000001"), "{error}");
+    assert!(error.contains("unverified"), "{error}");
+    let event = health.last_event_diagnostic.unwrap();
+    assert_eq!(event.events[0].code, OBJECT_RAM);
+    assert_eq!(event.events[0].parameter, 0x0b00_0001);
+    assert_eq!(event.response_code, Some(OK));
+    let diagnostic = health.last_capture_event_diagnostic.unwrap();
+    assert_eq!(diagnostic.session_id, session);
+    assert_eq!(diagnostic.late_completion_absorbed_count, 0);
+    assert_eq!(diagnostic.late_completion_parameter, None);
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
+}
+
+#[test]
+fn late_ram_completion_without_a_committed_capture_still_retires_the_session() {
+    // No preceding successful commit means no window: an idle `0xC102` keeps the
+    // unchanged fail-closed retirement and creates nothing.
+    let script = Arc::new(Mutex::new(Script::new()));
+    let a = connected(script.clone());
+    script.lock().unwrap().events.push_back(vec![NikonEvent {
+        code: CAPTURE_COMPLETE_RAM,
+        parameter: 0,
+    }]);
+    std::thread::sleep(Duration::from_millis(400));
+    let health = a.health();
+    assert!(!health.connected && health.isolated && health.cleanup_confirmed);
+    assert!(health.last_capture.is_none());
+    let error = health.last_error.unwrap();
+    assert!(
+        error.contains("unassociated capture or device event while idle"),
+        "{error}"
+    );
+    assert!(error.contains("0xC102"), "{error}");
+    assert!(error.contains("0x00000000"), "{error}");
+    assert!(
+        health.last_capture_event_diagnostic.is_none(),
+        "no operation may be invented for an idle event"
+    );
+}
+
+#[test]
+fn duplicate_late_ram_completion_inside_the_window_still_retires_the_session() {
+    // One committed exposure has exactly one optional completion, exactly as the
+    // capture boundary refuses a duplicate. The first in-window event is absorbed;
+    // a second one in the same window still fails closed.
+    let (a, script) = object_only_capture_session();
+    let path = output("post-commit-duplicate-late-c102");
+    a.capture_to_path(&path, "duplicate-late-c102", &AtomicBool::new(false), None)
+        .unwrap();
+    let committed = std::fs::read(&path).unwrap();
+    script.lock().unwrap().events.push_back(vec![
+        NikonEvent {
+            code: CAPTURE_COMPLETE_RAM,
+            parameter: 0,
+        },
+        NikonEvent {
+            code: CAPTURE_COMPLETE_RAM,
+            parameter: 0,
+        },
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    let health = a.health();
+    assert!(!health.connected && health.isolated && health.cleanup_confirmed);
+    let error = health.last_error.unwrap();
+    assert!(error.contains("0xC102"), "{error}");
+    let diagnostic = health.last_capture_event_diagnostic.unwrap();
+    assert_eq!(diagnostic.late_completion_absorbed_count, 1);
+    assert_eq!(diagnostic.late_completion_parameter, Some(0));
+    assert_eq!(std::fs::read(&path).unwrap(), committed);
+}
+
+#[test]
 fn property_only_exposure_notification_never_completes_or_commits_a_capture() {
     // The real D7100 reported one exposure only as `0x4006 PropertyChanged
     // (0xD1B4)` for a host RAM capture that produced no object in the engine's

@@ -54,6 +54,33 @@ pub(crate) const OBJECT_ARRIVAL_WINDOW: Duration = Duration::from_secs(30);
 const _: () = assert!(
     OBJECT_ARRIVAL_WINDOW.as_secs() >= 1 && OBJECT_ARRIVAL_WINDOW.as_secs() < CAPTURE_TIMEOUT.as_secs()
 );
+/// Bounded "post-commit drain window" for the optional Nikon `0xC102` RAM
+/// capture-complete of the host-RAM operation that just committed and registered
+/// its file.
+///
+/// The real body delivered that completion **after** the file boundary while the
+/// camera was already idle, and the idle guard retired the session for it
+/// (`docs/validation/card-sd-migration-hardware-2026-10-11.md` section 9: a
+/// successful 27,308,012-byte capture left `lastError = "unassociated capture or
+/// device event while idle: code=0xC102, parameter=0x00000000; session retired"`).
+/// Inside this window — and only there, only for `0xC102`, and only after a
+/// successful commit of the immediately preceding operation — that event is
+/// recorded as the operation's optional late completion instead of an
+/// unassociated idle event. It grants no capture credit: it can never complete,
+/// commit or resurrect an operation, and it never opens a beam.
+///
+/// Reference: digiCamControl has **no** capture deadline; it polls `GetEvent`
+/// every 100 ms (`CameraControl.Devices/Nikon/NikonBase.cs:348`) and its callers
+/// wait in second-scale units (1500/2000/5000/30000 ms,
+/// `CameraControl.Core/Classes/CameraHelper.cs:165-174`). The value is therefore
+/// an engineering choice at the same magnitude as the reference's 5 s
+/// application wait (`CameraControl/App.xaml.cs:479`), **not** a library proof.
+pub(crate) const POST_COMMIT_DRAIN_WINDOW: Duration = Duration::from_secs(5);
+/// The late-completion window must stay a real second-scale wait and must stay
+/// well inside the unchanged camera-owner deadline, whatever the values become.
+const _: () = assert!(
+    POST_COMMIT_DRAIN_WINDOW.as_secs() >= 1 && POST_COMMIT_DRAIN_WINDOW.as_secs() < CAPTURE_TIMEOUT.as_secs()
+);
 /// Metadata-only enumeration budget for one authorized import. The work is
 /// bounded per object by the shared deadline and by the cancellation generation,
 /// so a wedged card cannot delay Stop; the budget only has to cover a large card
@@ -143,6 +170,12 @@ struct Control {
     /// host-RAM `0xc102` completion, and the card object itself is never deleted
     /// or re-shot because no local file exists for it.
     card_capture_pending: AtomicBool,
+    /// Bound used to arm the post-commit drain window of a host-RAM capture that
+    /// just committed its file. Production always uses
+    /// [`POST_COMMIT_DRAIN_WINDOW`]; the test-only setter below replaces it so the
+    /// in-window/out-of-window boundary is exercised deterministically without
+    /// real waiting. A shorter test bound only ever removes tolerance.
+    post_commit_drain_window: Mutex<Duration>,
 }
 #[derive(Clone)]
 pub struct CameraAdapter {
@@ -177,6 +210,7 @@ impl CameraAdapter {
             deadline: Mutex::new(None),
             shutter_target: Mutex::new(None),
             card_capture_pending: AtomicBool::new(false),
+            post_commit_drain_window: Mutex::new(POST_COMMIT_DRAIN_WINDOW),
         });
         let worker_control = control.clone();
         thread::Builder::new()
@@ -230,6 +264,14 @@ impl CameraAdapter {
     }
     pub fn pipe_descriptor(&self) -> Option<LiveViewPipeDescriptor> {
         self.control.frames.descriptor()
+    }
+    /// Test-only: replace the bound used to arm the post-commit drain window, so
+    /// the in-window and out-of-window boundaries are exercised deterministically
+    /// without real waiting. It only replaces the bound; no call adds tolerance to
+    /// a session that has no committed host-RAM file.
+    #[cfg(test)]
+    pub(crate) fn set_post_commit_drain_window(&self, window: Duration) {
+        *self.control.post_commit_drain_window.lock().unwrap() = window;
     }
     /// Acceptance is synchronous and independent of the normal queue/COM call.
     /// No claim of hardware cancellation or cleanup is made at this boundary.
@@ -730,6 +772,9 @@ fn publish(camera: &NativeCamera, control: &Control, epoch: u64) {
 }
 fn cleanup(camera: &mut NativeCamera, control: &Control, epoch: u64) {
     let trigger_error = camera.health.last_error.clone();
+    // Retiring or closing the session ends any post-commit tolerance with it: a
+    // late `0xC102` is only ever recognised for a live, committed session.
+    camera.post_commit_drain = None;
     control.frames.revoke();
     let session = camera.health.session_id.clone();
     if !camera.transport_open {
@@ -1247,6 +1292,60 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
     }
 }
 
+/// Recognises the optional late Nikon `0xC102` RAM capture-complete of the
+/// host-RAM operation that just committed and registered its file, and records it
+/// on that operation's existing capture diagnostic.
+///
+/// It returns `true` only when every one of these holds: the operation's bounded
+/// post-commit drain window is still open, the window names the unchanged session,
+/// this operation's diagnostic is still the current one, and no completion of this
+/// operation was absorbed yet. Anything else returns `false` so the caller keeps
+/// the unchanged fail-closed idle refusal. A recognised event is diagnostic only:
+/// it never completes, commits, resurrects or re-downloads an operation, is never
+/// capture credit and never reaches `ExposureEnded`.
+fn absorb_late_ram_completion(camera: &mut NativeCamera, parameter: u32) -> bool {
+    let session = camera.health.session_id.clone();
+    let eligible = camera.post_commit_drain.as_ref().is_some_and(|window| {
+        Instant::now() < window.deadline
+            && window.absorbed == 0
+            && Some(&window.session_id) == session.as_ref()
+            && camera
+                .health
+                .last_capture_event_diagnostic
+                .as_ref()
+                .is_some_and(|diagnostic| {
+                    diagnostic.session_id == window.session_id
+                        && diagnostic.operation_id == window.operation_id
+                })
+    });
+    if !eligible {
+        return false;
+    }
+    if let Some(window) = camera.post_commit_drain.as_mut() {
+        window.absorbed += 1;
+    }
+    // Retained as evidence instead of being silently dropped: the committed
+    // operation's diagnostic carries the count, the raw late parameter and the raw
+    // event batch that delivered it.
+    let response = camera.health.last_event_diagnostic.clone().unwrap_or_default();
+    if let Some(diagnostic) = camera.health.last_capture_event_diagnostic.as_mut() {
+        diagnostic.late_completion_absorbed_count += 1;
+        diagnostic.late_completion_parameter = Some(parameter);
+        let sequence = diagnostic
+            .event_batches
+            .last()
+            .map_or(0, |batch| batch.sequence)
+            + 1;
+        CameraEventBatchDiagnostic::record(
+            &mut diagnostic.event_batches,
+            sequence,
+            response.events.len().max(1),
+            response,
+        );
+    }
+    true
+}
+
 fn poll_idle_health(camera: &mut NativeCamera, context: &CallContext) -> Result<(), CameraError> {
     if camera.d7100
         && camera.info.as_ref().is_some_and(|info| {
@@ -1299,6 +1398,21 @@ fn poll_idle_health(camera: &mut NativeCamera, context: &CallContext) -> Result<
                 // `Nikon/NikonBase.cs:2333-2334`) and is never credit for an
                 // unassociated exposure.
                 OBJECT_RAM => return Err(CameraError::Safety(format!("unassociated Nikon RAM object event while idle (0xC101 ObjectAddedInSdram, parameter 0x{:08X} unverified object value); this is not a standard 0x400D capture-complete/ExposureEnded and grants no capture credit; session retired", event.parameter))),
+                // The single bounded exception to the fail-closed idle rule: the
+                // optional `0xC102` RAM completion of the host-RAM operation that
+                // just committed its file may arrive after that boundary while the
+                // camera is idle (measured on real hardware,
+                // `docs/validation/card-sd-migration-hardware-2026-10-11.md`
+                // section 9), and retiring the session for it only forces an
+                // operator reconnect after every successful capture. It is accepted
+                // only inside that operation's post-commit drain window, only for
+                // the unchanged session and only once, and only as the diagnostic
+                // that `absorb_late_ram_completion` records. Every other case — the
+                // guard is false — falls through to the unchanged refusal below,
+                // so `0xC101`, any other capture/device event, an expired window,
+                // and an idle `0xC102` with no committed operation all still fail
+                // closed and retire the session.
+                CAPTURE_COMPLETE_RAM if absorb_late_ram_completion(camera, event.parameter) => (),
                 _ => return Err(CameraError::Safety(format!("unassociated capture or device event while idle: code=0x{:04X}, parameter=0x{:08X}; session retired", event.code, event.parameter))),
             }
         }
@@ -1454,6 +1568,16 @@ fn execute(
                 *scan_policy,
             )?;
             camera.health.last_capture = Some(image.path.display().to_string());
+            // The file is committed and this operation's path is registered on the
+            // same owner thread, so only now may the optional late `0xC102` of this
+            // one operation be tolerated while idle. The window is bound to this
+            // session and operation and grants no capture credit.
+            camera.post_commit_drain = Some(PostCommitDrainWindow {
+                session_id: image.session_id.clone(),
+                operation_id: image.operation_id.clone(),
+                deadline: Instant::now() + *control.post_commit_drain_window.lock().unwrap(),
+                absorbed: 0,
+            });
             Ok(Reply::Captured(image))
         }
         Request::CardPlan { projection_count } => {

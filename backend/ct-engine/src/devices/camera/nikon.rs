@@ -198,6 +198,12 @@ pub(crate) struct NativeCamera {
     pub d7100: bool,
     pub capture_pending: bool,
     pub pending_capture: Option<PendingCapture>,
+    /// Bounded post-commit drain window of the host-RAM operation that committed
+    /// and registered its file last. It exists only to recognise that operation's
+    /// optional late `0xC102` RAM completion while the camera is idle instead of
+    /// retiring the session for an unassociated event. It is never capture credit:
+    /// an absorbed event can neither complete, commit nor resurrect an operation.
+    pub post_commit_drain: Option<PostCommitDrainWindow>,
     /// Once Close is attempted this interface is retired, including Close failures.
     pub transport_open: bool,
 }
@@ -207,6 +213,18 @@ pub(crate) struct PendingCapture {
     pub exposure_ms: f64,
     pub queue_drained: bool,
     pub accepted: bool,
+}
+/// Armed on the owner thread only after a host-RAM capture committed its file; it
+/// names that one operation and the bound inside which its optional late `0xC102`
+/// completion may still be recognised while idle.
+pub(crate) struct PostCommitDrainWindow {
+    pub session_id: String,
+    pub operation_id: String,
+    pub deadline: Instant,
+    /// Late completions already absorbed for this one operation. A committed
+    /// exposure has exactly one optional completion, so a second in-window
+    /// `0xC102` stays fail-closed just like the duplicate rule inside the capture.
+    pub absorbed: usize,
 }
 impl NativeCamera {
     pub fn new(transport: Box<dyn CameraTransport>) -> Self {
@@ -222,6 +240,7 @@ impl NativeCamera {
             d7100: false,
             capture_pending: false,
             pending_capture: None,
+            post_commit_drain: None,
             transport_open: false,
         }
     }

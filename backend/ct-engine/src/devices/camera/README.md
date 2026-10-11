@@ -260,7 +260,18 @@ downloaded immediately, exactly as the reference does
 (`Nikon/NikonBase.cs:2330-2367`). `0xC102` is optional — it may arrive before,
 after or never (`:2369-2375` only raises `OnCaptureCompleted`) — and produces
 `ExposureEnded` when it is observed; its absence never blocks commit and its late
-arrival is absorbed once for the same operation. Standard/card, duplicate,
+arrival is absorbed once for the same operation. A host-RAM operation that has
+committed and registered its file keeps a bounded second-scale post-commit drain
+window (5 s, compile-time asserted inside the unchanged 75 s owner deadline). The
+real body delivered `0xC102, 0x00000000` after the file boundary while the camera
+was already idle, and that used to retire the session after every success
+(`docs/validation/card-sd-migration-hardware-2026-10-11.md` section 9). Only that
+one operation's `0xC102`, only inside that window, only for the unchanged session
+and only once is then recorded as its optional late completion. It is diagnostic
+only: it never completes, commits or resurrects an operation, never becomes
+`ExposureEnded` or capture credit, and `0xC101`, any other capture/device event, an
+expired window and an idle `0xC102` with no committed operation all still retire
+the session. Standard/card, duplicate,
 unexpected and unresolved events are refused. Neither a completion nor a file is
 ever inferred from elapsed exposure, temporary files, process exit, object
 appearance, the end of transfer, or a `0x4006`/`0xD1B4` property notification.
@@ -333,6 +344,9 @@ connection clears this previous-session error evidence.
 batch with its session/operation, batch sequence/counts, bounded raw evidence,
 the optional exposure-ended flag and the independent `exposureObserved` flag
 (one `0x4006`/`0xD1B4` notification, diagnostic only, never commit evidence).
+`lateCompletionAbsorbedCount` and `lateCompletionParameter` keep the absorbed
+post-commit drain-window `0xC102` visible, with its raw event batch appended after
+the capture's own batches, instead of dropping it.
 Capture and cleanup diagnostics also keep `eventBatches`,
 the last 16 nonempty batches, with monotonic sequence and bounded response
 metadata. Empty polls cannot erase this history; no image bytes are recorded.

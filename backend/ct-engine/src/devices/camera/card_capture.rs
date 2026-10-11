@@ -480,6 +480,10 @@ fn record_event_batch(
         // standard `ObjectAdded`/`CaptureComplete` pair below and never by a
         // `0x4006` property notification.
         exposure_observed: false,
+        // The post-commit drain window belongs to the host-RAM path only: a card
+        // operation never arms it and never absorbs a late RAM completion.
+        late_completion_absorbed_count: 0,
+        late_completion_parameter: None,
         event_batches: event_batches.clone(),
         response: camera
             .health
