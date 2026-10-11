@@ -29,8 +29,41 @@ pub(crate) struct TestConnections {
 impl Engine {
     pub(crate) fn camera_scan_readiness(&self)->Value {
         let health=self.camera.as_ref().map(|c|c.health()).or_else(||self.cached_camera_health.clone()).unwrap_or_default();
-        let issues=crate::capture_profile::scan_camera_issues(&health);
+        // Preflight freezes the destination the camera itself confirmed in its
+        // `recordingMedia` readback, so the published readiness must describe that
+        // same destination. Reporting the host-RAM requirement for a card
+        // destination told the operator to switch the body back to RAM and hid the
+        // controller firmware gate until Preflight had already refused.
+        let card_destination=health.properties.get("recordingMedia")
+            .and_then(|property|property.actual.as_ref())
+            .and_then(crate::devices::camera::CameraValue::integer)==Some(0)
+            && health.capabilities.card_capture;
+        let mut issues=if card_destination {
+            crate::capture_profile::scan_camera_issues_for(&health,crate::capture_profile::CaptureDestination::CameraCard)
+        } else {
+            // The host-RAM path keeps the previously published decision unchanged.
+            crate::capture_profile::scan_camera_issues(&health)
+        };
+        if card_destination {
+            if let Some(issue)=self.card_settle_firmware_issue(health.capabilities.card_overflow){issues.push(issue);}
+        }
         json!({"ready":issues.is_empty(),"issues":issues})
+    }
+    /// The controller half of a card admission: the card-scan settle contract is
+    /// only proven by the pinned firmware identity. The same decision Preflight
+    /// makes is published here, so the operator sees the gate before Preflight
+    /// instead of only after it.
+    fn card_settle_firmware_issue(&self,overflow_advertised:bool)->Option<crate::capture_profile::ScanCameraIssue> {
+        let error=self.nano.as_ref()
+            .ok_or_else(||"The turntable controller is not connected, so the card-scan settle firmware cannot be verified".to_string())
+            .and_then(|nano|card_capture_policy_for(nano,overflow_advertised))
+            .err()?;
+        Some(crate::capture_profile::ScanCameraIssue {
+            key:"cardSettleFirmware".into(),
+            actual:None,
+            requirement:"Controller firmware advertising the unified 150 ms last-step settle contract".into(),
+            remedy:error,
+        })
     }
     pub(crate) fn set_capture_root(&mut self,payload:&Value)->Result<(),&'static str>{
         self.manual_control_allowed()?;
@@ -1165,6 +1198,14 @@ fn device_value_rejection_error(error:&str)->bool {
             .any(|marker|error.contains(marker))
 }
 
+/// The single controller-side card admission. Preflight's profile freeze and the
+/// published scan readiness both call it, so they can never disagree about
+/// whether the connected controller may carry a card acquisition.
+fn card_capture_policy_for(nano:&NanoAdapter,overflow_advertised:bool)->Result<crate::capture_profile::CardCapturePolicy,String>{
+    let identity=nano.health().identity.ok_or("Turntable identity is unknown; the card-capture settle firmware cannot be frozen")?;
+    crate::scan::card_capture_policy(&identity,overflow_advertised)
+}
+
 /// Freezes the current camera and controller evidence as the profile of the
 /// destination the camera itself confirmed. An unknown destination is refused
 /// instead of being defaulted to either side, and a card profile additionally
@@ -1181,8 +1222,7 @@ fn freeze_capture_profile(
             // The card readback is the card counterpart of `profile_readback`; the
             // RAM readback requires the SDRAM destination and would refuse here.
             let readback=camera.card_profile_readback().map_err(|error|error.to_string())?;
-            let identity=nano.health().identity.ok_or("Turntable identity is unknown; the card-capture settle firmware cannot be frozen")?;
-            let policy=crate::scan::card_capture_policy(&identity,health.capabilities.card_overflow)?;
+            let policy=card_capture_policy_for(nano,health.capabilities.card_overflow)?;
             crate::capture_profile::CaptureProfile::from_card_readback(&health,readback,preset,policy)
         }
         Some(0)=>Err("CAMERA_CARD_CAPTURE_UNSUPPORTED: the selected camera body does not advertise the standard card-capture operations".into()),
@@ -1936,6 +1976,42 @@ mod tests{
         let mut engine=Engine::new(false);engine.cached_camera_health=Some(previous);engine.preflight=true;engine.capture_profile=Some(crate::capture_profile::test_profile());
         engine.sync_camera_readback(actual);assert!(!engine.preflight);assert!(engine.capture_profile.is_none());
         let focus=&engine.cached_camera_health.as_ref().unwrap().properties["focusMode"];assert!(focus.target.is_none());assert_eq!(focus.actual,Some(CameraValue::Integer(0)));assert!(!engine.fault_latched);
+    }
+    #[test]
+    fn published_readiness_describes_the_destination_the_camera_confirmed(){
+        let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/camera").join(format!("{}-readiness-destination",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        // A card body: the scripted session confirms `recordingMedia = 0` and
+        // negotiates the standard card operations, exactly like the real D7100.
+        let mut engine=Engine::new_with_storage(false,root.join("engine-data"));
+        let(camera,_probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});
+        camera.disconnect_confirmed().unwrap();
+        engine.cached_camera_health=Some(camera.health());engine.camera=Some(camera.clone());
+        engine.device_command("camera_connect",json!({"deviceId":"fake-camera-1"})).unwrap().unwrap();pump(&mut engine);
+        let readiness=engine.camera_scan_readiness();
+        let issues=readiness["issues"].as_array().cloned().unwrap_or_default();
+        // The confirmed card destination satisfies the card requirement set, so no
+        // `recordingMedia` issue may remain. The previous host-RAM-only decision
+        // reported exactly that issue ("Host RAM (1)") for this same body and told
+        // the operator to switch it back to RAM.
+        assert!(!issues.iter().any(|issue|issue["requirement"]=="Host RAM (1)"),
+            "a confirmed card destination must not publish the host-RAM requirement: {issues:?}");
+        assert!(!issues.iter().any(|issue|issue["key"]=="recordingMedia"),"{issues:?}");
+        // The controller firmware gate Preflight applies must be visible before it
+        // runs, and it is the reason this session is not yet ready.
+        assert!(issues.iter().any(|issue|issue["key"]=="cardSettleFirmware"),"{issues:?}");
+        assert_eq!(readiness["ready"],json!(false));
+        // A body without the negotiated card capability keeps the host-RAM decision
+        // even when it reports the card destination it cannot use.
+        let mut ram=Engine::new_with_storage(false,root.join("ram-engine-data"));
+        let(ram_camera,ram_probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig::default());
+        ram_camera.disconnect_confirmed().unwrap();
+        ram.cached_camera_health=Some(ram_camera.health());ram.camera=Some(ram_camera.clone());
+        ram.device_command("camera_connect",json!({"deviceId":"fake-camera-1"})).unwrap().unwrap();pump(&mut ram);
+        ram_probe.set_actual("recordingMedia",crate::devices::camera::CameraValue::Integer(0));
+        ram.device_command("camera_read_properties",json!({})).unwrap().unwrap();pump(&mut ram);
+        let ram_issues=ram.camera_scan_readiness()["issues"].as_array().cloned().unwrap_or_default();
+        assert!(ram_issues.iter().any(|issue|issue["key"]=="recordingMedia"&&issue["requirement"]=="Host RAM (1)"),"{ram_issues:?}");
+        assert!(!ram_issues.iter().any(|issue|issue["key"]=="cardSettleFirmware"),"{ram_issues:?}");
     }
     #[test]
     fn card_safe_finishing_is_registered_as_acquired_pending_import_and_never_completed(){
