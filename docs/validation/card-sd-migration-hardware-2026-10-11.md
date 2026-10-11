@@ -107,7 +107,7 @@ valid reference`），每次拒绝后引擎按既定策略补发 `stop`。`plan_
 | --- | --- |
 | `camera_apply_properties {recordingMedia:1}` | 接受，属性读回确认 |
 | `camera_capture` 操作终态 | `cleanup_unconfirmed`，`error = camera timeout: camera owner deadline; COM session isolated; cleanup unconfirmed` |
-| 事件诊断 `lastCaptureEventDiagnostic` | `operationCode=37063 (0x90C7)`、`responseCode=8193 (0x2001 OK)`、`eventCount=1`、`captureCompleteCount=0`、`exposureEndedObserved=false` |
+| 事件诊断 `lastCaptureEventDiagnostic` | `operationCode=37063 (0x90C7 = **GetEvent 事件轮询**，不是拍摄操作码；拍摄操作码需另行取证)`、`responseCode=8193 (0x2001 OK)`、`eventCount=1`、`captureCompleteCount=0`、`exposureEndedObserved=false` |
 | 收到的事件 | `code=16390 (0x4006 PropertyChanged)`、`parameter=53684 (0xD1B4 连拍计数)` —— **机身确实完成了一次曝光** |
 | 输出文件 | `CameraCaptures/` 为空，**没有 NEF** |
 | 会话结果 | `isolated=true`、`cleanupConfirmed=false`，引擎按 fail-closed 隔离会话并以退出码 1 结束（`EOF safety cleanup unconfirmed`） |
