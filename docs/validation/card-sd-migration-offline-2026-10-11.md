@@ -95,4 +95,4 @@ npm.cmd run firmware:test
 2.2.0 烧录（记录见实机台架文档）；转台运动与拍摄、以及全部射线相关项仍未授权、仍为 **BLOCKED**。
 `hardwareCertified` 保持 false，本候选仍只能标记为**仅离线验证 + 部分实机台架检查**。
 
-**已知需在交付说明中同时声明的事项**：卡清理等待仍复用"曝光 + 2 s"（SD 实测界限属 P2）；容量上界为 64 MiB/张的保守估算而非实测 NEF 尺寸；策略中的固件源哈希是候选 provenance，不证明控制器当前刷入的镜像；卡策略还要求控制器公布 `MOVE_SETTLE_150MS`，否则以 `CARD_FIRMWARE_UNVERIFIED` 拒绝。
+**已知需在交付说明中同时声明的事项**：**存卡模式（`recordingMedia=0`）下拍摄期间不向电脑传输任何图像数据，图像只保留在相机 SD 卡；只有操作员显式发起 USB 导入（`start_card_import`）时才传输并校验封存**；卡清理等待仍复用"曝光 + 2 s"（SD 实测界限属 P2）；容量上界为 64 MiB/张的保守估算而非实测 NEF 尺寸；策略中的固件源哈希是候选 provenance，不证明控制器当前刷入的镜像；卡策略还要求控制器公布 `MOVE_SETTLE_150MS`，否则以 `CARD_FIRMWARE_UNVERIFIED` 拒绝。

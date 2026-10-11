@@ -185,3 +185,13 @@ parameter=0x00000000; session retired`，会话被退役（`isolated=true`，`cl
 事件、以及 `0xC101` 一类**对象**事件，继续保持今天的 fail-closed 处置。
 
 证据：`.cache/tests/hardware/20261011-capture-retest/`（计划、请求/响应、引擎哈希与 git rev）。
+
+**相机已恢复到存卡目的**：第 9 节的主机 RAM 复测把 `recordingMedia` 写为 1，复测后已用
+`camera_apply_properties {recordingMedia:0}` 写回并经读回确认（`actual=0`、`confirmed=true`，
+会话 `connected=true`、`isolated=false`、`lastError` 为空，引擎退出 0）。证据：
+`.cache/tests/hardware/20261011-restore-card-mode/`。
+
+**需求确认（操作员 2026-10-11 明确）**：存卡模式下拍摄完成后**不向电脑传输图像**，图像只保留在
+相机 SD 卡；本迁移的扫描路径因此不请求任何图像载荷（只发一次 `0x100E` 与一次 64 KiB 级
+`GetObjectInfo` 收据），任务以 `acquired_pending_import` 结束并保持重构关闭；只有操作员显式发起
+USB 导入时才传输、校验并封存。
