@@ -34,11 +34,11 @@
 
 ## 2 门禁与实测证据
 
-- `npm run verify`（= module-map:check + typecheck + build + test:frontend + test:desktop + cargo workspace + firmware:test）在 B1/B2、B3、B4a、B4b、卡路径修正各批均**退出码 0**；其中 module-map 为 **245 文件 / 16 模块 / 39 目录边界**（PASS 且图谱 current）。
-- `cargo test --manifest-path backend/Cargo.toml --workspace`：最新一次为 **402 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**。
+- `npm run verify`（= module-map:check + typecheck + build + test:frontend + test:desktop + cargo workspace + firmware:test）在 B1/B2、B3、B4a、B4b、卡路径修正、⑤ 导入与实机就绪度修正各批均**退出码 0**；其中 module-map 为 **248 文件 / 16 模块 / 39 目录边界**（PASS 且图谱 current）。
+- `cargo test --manifest-path backend/Cargo.toml --workspace`：最新一次为 **428 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**。
 - 前端：`test:frontend` **193 通过 / 0 失败**；`test:desktop` **27 通过 / 0 失败**；`typecheck` 无错误。
-- 固件：`firmware:build` PASS，`flash=14160 / 30720`、`RAM=1476 / 2048`；`firmware:test` PASS，host harness **8443 断言**。
-- 固件源身份（`firmware/rts9060_nano/build-config.json` 固定）：`rts9060_nano.ino` **34782 字节**，SHA-256 `811bae5c1d6e08b318c81ac8d077908df127e00d1e95bf185cf090b5ad1069ec`，版本 2.2.0 / 构建 20261010；上一候选（2.1.1 / 20261009）SHA-256 `ecadf6220e53954cb303e0e40fb85710f73735ebe5271a127c8a4ba93bd84423` 作为历史保留。**改动固件源必须同步该固定身份，否则 `firmware:build`/`firmware:test` 会以 "candidate source identity mismatch" 失败。**
+- 固件：`firmware:build` PASS，`flash=14196 / 30720`、`RAM=1476 / 2048`；`firmware:test` PASS，host harness **8443 断言**。
+- 固件源身份（`firmware/rts9060_nano/build-config.json` 固定）：`rts9060_nano.ino` **34818 字节**，SHA-256 `2843f57ecb3d304c47f061f5d342b1b809a807dc2a7980ccc0cf9d14f0ecaa1e`，版本 2.2.0 / 构建 20261010；上一候选（2.1.1 / 20261009）SHA-256 `ecadf6220e53954cb303e0e40fb85710f73735ebe5271a127c8a4ba93bd84423` 作为历史保留，2026-10-11 已从实机读回为回滚备份。**改动固件源必须同步该固定身份，否则 `firmware:build`/`firmware:test` 会以 "candidate source identity mismatch" 失败。**
 - 卡路径测试清单：`card_capture` 23 项（含单卡成功、Overflow、StoreRemoved、RAM 事件、重复/多余对象、未知事件、LV 活跃、`recordingMedia≠0`、会话变更、边界后多余事件、意图无收据）、`storage` 16 项、`task_registry` 14 项（含 3 项 `acquired_pending_import`）、`capture_profile` 16 项（含 5 项 schema-7）。
 - 零图像载荷证据（脚本传输 opcode 日志）：触发后所有 opcode ∉ {`0x1009` GetObject, `0x101b` GetPartialObject, `0x100a` GetThumb}，从未发送 `0x90C0`，恰好一次 `InitiateCapture(0x100E, 0xFFFFFFFF, DataPhase::None)`，恰好一次 `GetObjectInfo(0x1008)` 且读上限 64 KiB，无 `TransferStarted`/`FileComplete`。
 
@@ -48,7 +48,8 @@
 
 ## 4 尚未完成（离线）与 BLOCKED 边界
 
-- 尚未完成：扫描协调器存卡接线（参考与投影同目标、拍摄意图预写、schema-4 写入器、卡任务默认 1000 秒、安全收尾后登记 `acquired_pending_import`）、USB 批量导入与校验封存、前端状态/计数/UI 与重构准入、文档与模块图谱终检。
+- 尚未完成（离线）：180/360/720 投影取整、无重复端点、末张不多转与暂停/Stop 窗口的专门用例（B4e）；真实浏览器 1920×1080 目视核对。
+- 已由实机台架覆盖：转台连接与身份、D7100 发现/选择/能力协商/属性读回、固件 2.2.0 烧录与读回校验、卡策略固件门禁与目的感知就绪度；见[存卡迁移实机台架记录](card-sd-migration-hardware-2026-10-11.md)。
 - **BLOCKED（需另行授权的真实设备动作）**：
   1. P2 无射线台架：单卡/Overflow 触发、结束与续存证据；不同角度"末脉冲下降沿 → 150 ms → READY"的实测间隔与图像质量；Stop/心跳；不得对原卡做破坏性满卡试验。
   2. P5 射线与全链：1000 秒连续出束截止、温度全过程、OFF 证据、失联/联锁故障关束，以及采集至重构整链。
@@ -69,9 +70,9 @@ npm.cmd run firmware:test
 ```
 证据日志按批保存在 `.cache/tests/verify/20261010-batch*/`（缓存不提交）；固件构建与 harness 证据保存在 `.cache/tests/turntable/<run-id>/result.json`。
 
-## 6 交付状态（截至 HEAD `e8b1c48`）
+## 6 交付状态（截至代码尖端 `399aa55`；其后为文档提交）
 
-全量 `npm run verify` 在最终尖端**退出码 0**：module-map PASS（246 文件 / 16 模块 / 39 边界）、typecheck、build、`test:frontend` 193 通过、`test:desktop` 27 通过、`cargo test --workspace` **414 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**、`firmware:test` host harness **8443 断言**。
+全量 `npm run verify` 在最终尖端**退出码 0**：module-map PASS（248 文件 / 16 模块 / 39 边界）、typecheck、build、`test:frontend` 193 通过、`test:desktop` 27 通过、`cargo test --workspace` **428 engine + 2 entry + 56 desktop 通过 / 9 ignored / 0 failed**、`firmware:test` host harness **8443 断言**。
 
 | 目标项 | 状态 | 说明 |
 | --- | --- | --- |
@@ -79,14 +80,19 @@ npm.cmd run firmware:test
 | ② 扫描上限 1000 秒 | **PASS（离线）** | `scan::SCAN_MAX_XRAY_SEC` 统一十处判据；旧冻结值与手动 600 秒不变；前端 mm:ss 精确换算（1000 s = 16:40） |
 | ③ 单卡/Overflow 存卡采集 | **PASS（离线，协议语义待实机）** | 能力分离、严格存储/卡对象解析、标准 `InitiateCapture` + 唯一元数据读取、零图像载荷（opcode 级证据）、目的感知清理与取消 |
 | ④ schema 4 / profile 7 / 意图与 receipt / 状态与占用分离 / 崩溃窗口 | **PASS（离线）** | schema-4 清单与完成规则、`acquired_pending_import`、账本闸门（意图无收据即故障）、暂停/Stop/崩溃窗口测试 |
-| ⑤ USB 批量导入与校验封存 | **BLOCKED（未实施）** | 已完成可独立验证的**唯一绑定**（`bind_expected_objects`：缺/多候选/意外/重复期望全部拒绝，采集期 handle 不作身份）与**目标文件名安全**（拒绝分隔符、`..`、盘符/UNC、控制字符、Windows 保留名、结尾点空格、超长）；仍缺：经 owner 线程的对象下载、流式 SHA-256 与 NEF 校验、原子不覆盖封存、续导/取消、域服务与 schema-4 封存、前端已定的 `start_card_import`/`cancel_card_import` 命令与 8 个导入快照字段 |
-| ⑥ 前端类型/快照/计数/状态/文案 | **PASS（离线；引擎侧对齐待 ⑤）** | 类型与严格校验（兼容"基础 8 键"与"基础+8 导入键"两种形态，避免引擎只发基础块时被判 Fault）、状态词与三计数、SD 模式不取缩略图并提示 "Images are on the camera SD card"、导入对话框与进度/取消/续导入口、运行期禁用拍摄/LV/改参数/新扫描、重构三处准入拒绝；**未做**真实浏览器 1920×1080 目视核对 |
+| ⑤ USB 批量导入与校验封存 | **PASS（离线）** | `card_import.rs`：owner 线程内枚举/下载、长度与 NEF 结构校验、流式 SHA-256、原子不覆盖封存、续导与取消、拒绝码（缺失/歧义/意外/不可读/超限/变更/身份变更/存储变更/截断/NEF 无效/目标冲突/路径逃逸/封存不一致）；域命令 `start_card_import`（带 `taskId`）与 `cancel_card_import`（无参）及引擎别名 |
+| ⑥ 前端类型/快照/计数/状态/文案 | **PASS（离线）** | 类型与严格校验（兼容"基础 8 键"与"基础+8 导入键"两种形态）、状态词与三计数、SD 模式不取缩略图并提示 "Images are on the camera SD card"、导入对话框与进度/取消/续导入口、运行期禁用拍摄/LV/改参数/新扫描、重构三处准入拒绝；引擎已发布完整 16 键 `cardAcquisition` 并接受前端命令名。**未做**真实浏览器 1920×1080 目视核对 |
 | 故障注入与 180/360/720 全链 | **BLOCKED（未实施）** | 投影取整/无重复端点/末张不多转的专门用例尚未补 |
+| 实机台架（授权范围内） | **部分 PASS（实机）** | 转台 COM7 连接与身份、D7100 发现/选择/能力协商/属性读回、固件 2.2.0 烧录与读回校验、卡策略固件门禁 + 目的感知就绪度经生产引擎复核；**未运动、未拍摄、未出束**。详见[存卡迁移实机台架记录](card-sd-migration-hardware-2026-10-11.md) |
 
 **FAIL：无。**
 
-**引擎侧必须对齐前端的两点**：命令名 `start_card_import`（带 `taskId`）/`cancel_card_import`（无参）；一次性发布完整 16 键的 `cardAcquisition`（前端已同时兼容 8 键与 16 键，故不会再出现启动 Fault）。
+**引擎与前端对齐（已完成）**：命令名 `start_card_import`（带 `taskId`）/`cancel_card_import`（无参）
+已在引擎侧提供（并保留 `camera_card_import`/`camera_card_import_cancel` 别名）；引擎一次性发布完整
+16 键 `cardAcquisition`，前端同时兼容 8 键与 16 键。
 
-**待授权实机验收（P2/P5/P6）**：步骤见第 4 节，未授权前不得执行；`hardwareCertified` 保持 false，本候选只能标记为**仅离线验证**。
+**实机验收进度**：P2/P5/P6 的授权边界见第 4 节。2026-10-11 已获授权完成只读台架检查与固件
+2.2.0 烧录（记录见实机台架文档）；转台运动与拍摄、以及全部射线相关项仍未授权、仍为 **BLOCKED**。
+`hardwareCertified` 保持 false，本候选仍只能标记为**仅离线验证 + 部分实机台架检查**。
 
 **已知需在交付说明中同时声明的事项**：卡清理等待仍复用"曝光 + 2 s"（SD 实测界限属 P2）；容量上界为 64 MiB/张的保守估算而非实测 NEF 尺寸；策略中的固件源哈希是候选 provenance，不证明控制器当前刷入的镜像；卡策略还要求控制器公布 `MOVE_SETTLE_150MS`，否则以 `CARD_FIRMWARE_UNVERIFIED` 拒绝。

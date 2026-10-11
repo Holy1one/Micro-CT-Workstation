@@ -22,7 +22,7 @@ task4 不提供待测材料/厚度的完整材料库拟合、Al–Cu 分解后�
 
 当前 0.9.13 相机准入清理、高级设置满高布局与预检提示修复见 [0.9.13 验收](camera-preflight-layout-0.9.13.md)，仅离线验证，未安装。此前首次射线连接失败误报警与日志刷屏修复见 [0.9.12 验收](xray-discovery-alarm-0.9.12.md)。0.9.11 安装器 Repair 权限修复及原目录实际升级、两次 Repair 见 [0.9.11 验收](windows-installer-repair-0.9.11.md)。0.9.10 安装器显示、原生目录选择与预扫描提示修正及后续真实维护失败见 [0.9.10 验收](windows-installer-preflight-0.9.10.md)。此前任务栏图标修正见 [Windows 任务栏图标验收](windows-taskbar-icon-2026-10-08.md)，本次继续保留。各记录分别说明安装执行范围。
 
-D7100 SD 卡采集迁移的离线实施与验收证据见 [卡采集迁移离线证据](card-sd-migration-offline-2026-10-11.md)：固件 150 ms 末 STEP 下降沿握手、扫描上限 1000 秒、卡能力协商与严格卡对象解析、存卡事务的 opcode 级零图像载荷证据、schema-4 清单与 schema-7 卡 profile、`acquired_pending_import` 状态；真实设备项（P2/P5/P6）仍为 BLOCKED。
+D7100 SD 卡采集迁移的离线实施与验收证据见 [卡采集迁移离线证据](card-sd-migration-offline-2026-10-11.md)：固件 150 ms 末 STEP 下降沿握手、扫描上限 1000 秒、卡能力协商与严格卡对象解析、存卡事务的 opcode 级零图像载荷证据、schema-4 清单与 schema-7 卡 profile、`acquired_pending_import` 状态。2026-10-11 获授权的实机台架检查（只读连接、能力协商、固件 2.2.0 烧录与读回校验、卡策略固件门禁）见 [存卡迁移实机台架记录](card-sd-migration-hardware-2026-10-11.md)；转台运动与拍摄、以及全部射线相关项（P2 时序/拍摄部分、P5、P6）仍为 BLOCKED。
 
 此前 0.9.7 包、深色 Logo 和残留检查见 [深色 Logo 与清理记录](dark-logo-cleanup-2026-10-08.md)；三处 C 盘残留及缓存历史包删除被自动审批阻止。历史 0.9.6 安装维护证据见 [Windows 安装与更新验收](windows-installer-update-2026-10-08.md)，只证明原构建，不代表当前安装状态。历史身份文件和原始报告保存在本机 .cache/tests/release/retained-history/。
 
