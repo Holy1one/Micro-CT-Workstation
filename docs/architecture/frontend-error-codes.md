@@ -39,6 +39,8 @@
 
 `rejected` 是**操作状态**，不是错误码。判定在 `backend/ct-engine/src/device_controls.rs:177-195`，分类器在 `device_controls.rs:812-828`：
 
+当前引擎还用 `rejected` 表达尚未打开源会话的 Moxtek 发现失败和扫描输出目录准入拒绝。前端按 operation 的 `device`、`kind`、原始错误和明确错误码选择标题及排查分组，不能把全部 rejected 解释为相机参数拒绝。无错误码的 Moxtek connect 拒绝显示射线源连接失败与 USB/供电检查建议，保留原文且不补造错误码；UNKNOWN 和预检门禁保持。
+
 ```text
 value_rejected = !cleanup_unconfirmed && device_value_rejection_error(error)
 device_value_rejection_error(error) =
@@ -108,7 +110,10 @@ device_value_rejection_error(error) =
 | `CAMERA_AUTOFOCUS_UNQUALIFIED` | `camera_autofocus` 入队前，worker 同源的自动对焦资格不成立（`device_controls.rs:517`） | A | 是 | 无 | 需先修配置 | `device_controls.rs:517` |
 | `CAMERA_BACKEND_UNAVAILABLE` | WPD 相机后端无法建立（`device_controls.rs:425`；`lib.rs:1023,1501`；测试路径 `device_controls.rs:427`） | A | 是 | 无 | 可恢复重试 | `device_controls.rs:425、lib.rs:1023、lib.rs:1501` |
 | `CAMERA_CAPTURE_DIRECTORY_REQUIRES_ROOT` | `camera_capture` 传入的兼容 `directory` 不等于唯一根下的 `CameraCaptures`（`device_controls.rs:496`） | A | 是 | 无 | 需先修配置 | `device_controls.rs:496` |
-| `CAMERA_CAPTURE_ROOT_REQUIRED` | `CameraCaptures` 需要引擎保存根，但 `Parameters.savePath` 为空（`device_controls.rs:495,498`） | A | 是 | 无 | 需先修配置 | `device_controls.rs:495、device_controls.rs:498` |
+| `CAMERA_SCAN_SD_REQUIRED` | 新任务未确认 SD=0，也未在当前会话明确 Apply RAM=1；预检/开始在暗场前拒绝，不自动改值。默认 Apply SD；只有明确选择 RAM 才下载 | A | 是 | 无 | 需先修配置 | `device_controls.rs` |
+| `CAMERA_CARD_CAPTURE_UNSUPPORTED` | 未协商原生 D7100 标准卡捕获或身份不符，卡目标不能隐式回退 RAM | A | 是 | 无 | 需先修配置 | `device_controls.rs` |
+| `CAMERA_HOST_TRANSFER_OPT_IN_REQUIRED` | 继承的 RAM=1 未经当前相机会话明确 Apply 授权；入队前拒绝本地传输。Apply SD 或明确选择并 Apply Host RAM | A | 是 | 无 | 需先修配置 | `device_controls.rs` |
+| `CAMERA_CAPTURE_ROOT_REQUIRED` | RAM 单拍 `CameraCaptures` 需要引擎保存根，但 `Parameters.savePath` 为空；SD 单拍无此要求 | A | 是 | 无 | 需先修配置 | `device_controls.rs` |
 | `CAMERA_CAPTURE_UNQUALIFIED` | `camera_capture` 与 `camera_test_capture` 都走 `capture_readiness`，在入队前发现策略读回 / LV OFF / 已确认运行诊断不成立（`device_controls.rs:515`） | A | 是 | 无 | 需先修配置 | `device_controls.rs:515` |
 | `CAMERA_CONNECTION_FAILED` | `command_core` 预览路径下预检或 `retry_device{camera}` 自动连接 D7100 失败（`lib.rs:1024-1030,1500-1502`） | A | 是 | 无 | 可恢复重试 | `lib.rs:1030、lib.rs:1502` |
 | `CAMERA_FOCUS_MODE_LOCKED` | 目标属性的对焦模式被当前 D061/镜头资格锁住（`properties.rs:277,390`） | A | 是 | 无 | 需先修配置 | `devices/camera/properties.rs:277` |

@@ -1,75 +1,17 @@
-# Agent Note: No out-of-process camera bridge or algorithm plugin system
+# ADR 0002：相机原生传输与内置重构
 
-Status: implemented for the bridge/plugin decision. The camera transport choice is
-superseded by [ADR 0003](0003-native-wpd-camera-and-device-control.md), accepted and
-implemented as an offline candidate; hardware acceptance is pending.
+状态：有效。相机原生协议契约见 [ADR 0003](0003-native-wpd-camera-and-device-control.md)。
 
-## Problem
+## 决定
 
-Two extension seams existed only as design drafts while carrying tracked files
-and module-map ownership: a Windows-only .NET `digicam-bridge.exe` process for
-the Nikon D7100 (`bridges/digicam/README.md`, protocol `digicam.bridge.v1`) and a
-Python algorithm plugin system with four package contracts and an
-`AlgorithmSupervisor` running `python -m ct_worker` (`algorithm-plugins/README.md`).
-No build, test, or release path produced either one. The Rust camera adapter lives
-inside `ct-engine`, but the existing implementation launches the external
-DigiCamControl `CameraControlRemoteCmd.exe` executable. It is not a native
-in-process camera transport. Reconstruction methods are implemented inside
-`ct-engine`.
+- 相机传输由 Rust ct-engine 的 devices/camera 持有，使用 Windows WPD/PTP；生产链不调用 DigiCamControl RemoteCmd，不另设 .NET 相机桥。
+- 重构算法编译进 ct-engine；自动去坏点、暗空场校正、去噪及适用的锥束重构集成在现有操作入口，不要求操作员配置另一套处理系统。
+- 新算法通过源码实现、适用验证和版本化发布交付，不引入 Python 算法插件运行时。离线研究可读取导出的科学数据，不能成为未声明的生产依赖。
 
-## Decision
+## 原因与边界
 
-Neither seam is adopted. Both draft directories and their module-map ownership
-were removed, and the replacement facts are recorded here.
+额外桥进程和插件运行时会增加设备状态、取消、数据兼容、信任及部署契约。当前单 Windows 上位机已有原生相机所有者和内置重构入口，保持这一条生产路径即可完成现有目标。
 
-- Camera ownership remains in `backend/ct-engine/src/devices/camera/`. The pre-migration
-  adapter invoked DigiCamControl RemoteCmd externally; no additional managed
-  camera bridge, bridge handshake, or bridge-side scan state was adopted. ADR
-  0003 replaces this transport choice with native Rust Windows WPD/PTP while
-  preserving the prohibition on an additional camera bridge process.
-- Reconstruction algorithms are compiled into `ct-engine` and declared by
-  `ReconstructionMethod`. Adding a method means adding a Rust implementation,
-  offline tests, and a versioned release.
+原始扫描只读，新处理写独立版本缓存；保留质量诊断和失败原因。集成自动处理不意味着隐藏失败、假定硬件安全或保证定量成像。算法细节和验证见 [自动重构记录](../validation/automatic-cbct-2026-10-15.md)。
 
-## Alternatives considered
-
-### Keep the drafts as unimplemented contracts
-
-Keeping them cost nothing at build time, but a directory-policy entry plus
-module-map ownership made an unbuilt plan read as an owned subsystem; two
-reviews already treated `bridges/` as stale. The drafts stay recoverable from git
-history, and this note records why they were dropped.
-
-### Implement the .NET bridge
-
-It would have isolated .NET/SDK incompatibility from the Rust engine and kept a
-non-Windows host option open. The product is now a single Windows host (Tauri,
-WebView2, DigiCamControl), so that isolation buys no compatibility while adding a
-second owner of camera state that must be reconciled with `ct-engine`.
-
-### Implement the algorithm plugin system
-
-It would let algorithm authors add methods without rebuilding the application,
-and this project does add reconstruction algorithms over time. It also requires a
-second runtime (a Python environment), a package and source-trust model, dataset
-compatibility checks, resource limits, cancellation, and a new execution path
-that consumes scan data. `algorithm-plugins/README.md` itself listed unresolved
-blocking questions and shipped no executable schema. Adding the same method in
-Rust is cheaper and auditable: the `ReconstructionMethod` seam, offline tests,
-and a release tag keep one truth source.
-
-## Consequences
-
-- `bridges/` and `algorithm-plugins/` no longer exist. `docs/architecture/modules.json`
-  and `docs/architecture/directory-policy.json` no longer register them, and the
-  `extensions` module now owns only the Sites static preview worker.
-- Adding a reconstruction algorithm is a source change in `ct-engine` carried by
-  a release tag. Exporting scientific artifacts stays the supported way to
-  experiment with external algorithms outside the application.
-- Historical documents that still describe the two seams as options
-  (`docs/ARCHITECTURE.md` selection rationale, `CURRENT-PROGRESS.md`,
-  `WINDOWS-CODEX-PROMPT.md`,
-  `PHASE-1-3-IMPLEMENTATION-PLAN.md`) keep their text as history; they are not
-  authority for current paths or behavior.
-- Revisit only when several external authors must add algorithms without a
-  repository build, or when a non-Windows host must drive the D7100 again.
+早期未实现的桥、插件目录及设计稿已退出维护材料；它们不构成待实施任务。

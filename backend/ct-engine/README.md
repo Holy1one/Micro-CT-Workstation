@@ -4,7 +4,13 @@
 
 ## Source layout
 
-Versioned colour reconstruction is implemented in `reconstruction_channels.rs` (linear CFA registration and native saturation), `reconstruction_spectral.rs` (band selection, shared geometry, sealed artifacts) and `material_decomposition.rs` (measured two-basis inversion). `start_reconstruction.options` selects monochrome/multicolor; this path uses FDK and stores `reconstruction/spectral/v2-<input-hash>/`. Existing method caches keep their original numerical semantics. Scan geometry optionally freezes up to five incident-ordered scintillator layers. RGB observations are not independently resolved layers; quantitative material labels require matching measured calibration and held-out validation. See [strategy and calibration contract](../../docs/decisions/stacked-scintillator-material-imaging.md).
+Versioned colour reconstruction is implemented in `reconstruction_channels.rs` (linear CFA registration and native saturation), `reconstruction_spectral.rs` (band selection, shared geometry, sealed artifacts) and `material_decomposition.rs` (measured two-basis inversion). `start_reconstruction.options` selects monochrome/multicolor; this path uses FDK and stores `reconstruction/spectral/v3-<input-hash>/`. Existing method caches keep their original numerical semantics. Scan geometry optionally freezes up to five incident-ordered scintillator layers. RGB observations are not independently resolved layers; quantitative material labels require matching measured calibration and held-out validation. See [strategy and calibration contract](../../docs/decisions/stacked-scintillator-material-imaging.md).
+
+Version 3 automatically detects reference defects in `reconstruction_defects.rs`: local multiscale intensity/chromaticity, dark hot pixels and temporal variance, with large/elongated/boundary protection and a repair budget. Gain interpolation uses each channel's own valid boundary. Projections are never classified as defective from specimen colour or brightness. Original reference files, raw invalid-data gates and original missing/saturated flags are retained; `estimated-rays.bin` and flags 6/7 distinguish estimates from quantitative measurements. Masks and reports are sealed with the result. Detection currently runs at the registered 256 detector grid; compact fixtures and broad smooth defects remain ambiguous.
+
+Twelve distributed projection probes check only reference-selected sites: repeated multiplicative gain patterns retain the measured flat, since dark/flat normalization already corrects them. `persistent-gain.bin` records this per band. Component-sized collars include optical halos before interpolation. Broad regions missing both reference and specimen signal remain missing, rather than becoming artificial high attenuation.
+
+Uncalibrated monochrome additionally tries `reconstruction_refine.rs`: a bounded 64³ cone-beam PWLS-Huber correction using matched Siddon ray-length operators, noise/confidence weighting, eight iterations and disjoint validation angles. Only a correction passing fit/validation and size gates is prolonged onto FDK. Fine FDK detail and signed values are retained; accepted results retain `fdk-baseline.f32le`. This is a coarse correction, not a full-resolution iterative reconstruction. Multicolor/material paths retain the shared FDK model. The automatic display uses signed P1–P99.5 windowing without changing scientific values. See [algorithm choices and offline evidence](../../docs/validation/automatic-cbct-2026-10-15.md).
 
 - `src/main.rs`: bounded JSONL stdin/stdout process loop and deterministic shutdown on parent EOF.
 - `src/lib.rs`: public request/response DTOs, domain commands, safety checks, complete snapshots, and top-level engine state.
@@ -33,7 +39,7 @@ The production-coordinator regression group `cargo test --manifest-path backend/
 runs all three real device owners with scripted physical transports. It covers projection-time
 camera loss, interlock, Stop during transfer, unconfirmed OFF, manifest persistence failure,
 and pause/resume without duplicate files. Each case retains its own evidence under
-`.cache/tests/ct-engine/`. The [R0 coverage matrix](../../docs/validation/README.md)
+`.cache/tests/ct-engine/`. The [validation index](../../docs/validation/README.md)
 records the assertions, remaining scope and required hardware acceptance.
 
 The native WPD/PTP camera and message-owned device runtime are an offline candidate. Camera JPEG streams use a random user-ACL named pipe; stdio carries protocol-v2 control/snapshot envelopes. Timed tick, monitoring and EOF do not require UI polling. `MICRO_CT_ENGINE_DATA_DIR` isolates offline test state; normal state lives under `LOCALAPPDATA/MicroCTWorkstation`.

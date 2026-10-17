@@ -30,7 +30,7 @@ pub(super) struct Quality {
     pub nonpositive:usize, pub low_signal:usize, pub low_gain:usize,
 }
 
-pub(super) struct Correction { pub projection:Vec<f32>, pub flags:Vec<u8>, pub quality:Quality }
+pub(super) struct Correction { pub projection:Vec<f32>, pub flags:Vec<u8>, pub quality:Quality, pub estimated:Vec<u8> }
 
 pub(super) fn support_threshold(dark:&ReferenceStats,flat:&ReferenceStats)->f32 {
     let mut gains:Vec<_>=flat.mean.iter().zip(&dark.mean).enumerate().filter_map(|(i,(f,d))| {
@@ -46,6 +46,16 @@ pub(super) fn support_threshold(dark:&ReferenceStats,flat:&ReferenceStats)->f32 
 /// missing, 4 saturated, 5 low gain retained. Quality is not a spatial crop.
 pub(super) fn correct(raw:&[f32],white:f32,dark:&ReferenceStats,flat:&ReferenceStats,
     threshold:f32,index:u32)->Result<Correction,String> {
+    correct_impl(raw,white,dark,flat,threshold,index,None)
+}
+
+pub(super) fn correct_automatic(raw:&[f32],white:f32,dark:&ReferenceStats,flat:&ReferenceStats,
+    threshold:f32,index:u32,plan:&defects::Plan,band:usize)->Result<Correction,String> {
+    correct_impl(raw,white,dark,flat,threshold,index,Some((plan,band)))
+}
+
+fn correct_impl(raw:&[f32],white:f32,dark:&ReferenceStats,flat:&ReferenceStats,
+    threshold:f32,index:u32,automatic:Option<(&defects::Plan,usize)>)->Result<Correction,String> {
     let n=DETECTOR_N;
     let mut p=vec![0.;n*n];let mut flags=vec![0u8;n*n];let mut weights=vec![0.;n*n];
     let mut q=Quality {index,..Default::default()};
@@ -66,13 +76,40 @@ pub(super) fn correct(raw:&[f32],white:f32,dark:&ReferenceStats,flat:&ReferenceS
     if q.samples==0 || q.weak_gain+q.saturated+q.nonpositive>q.samples/5 {
         return Err(format!("too many invalid detector samples in cropped view {}: {} / {}",index,q.weak_gain+q.saturated+q.nonpositive,q.samples));
     }
+    let mut estimated=vec![0u8;n*n];
+    if let Some((plan,band))=automatic {
+        for i in 0..p.len() {
+            if plan.mask[i]&defects::FLAT==0 || plan.mask[i]&defects::SENSOR!=0 || plan.persistent_gain[band][i]
+                || !matches!(flags[i],1|2|3|5) || !raw[i].is_finite() || raw[i]>=white {continue;}
+            let gain=plan.flat[band].mean[i]-dark.mean[i];
+            if !gain.is_finite() || gain<=1. {continue;}
+            let floor=(dark.variance[i].max(0.)*(1.+1./REFERENCE_COUNT as f32)).sqrt().max(1.);
+            // Missing flat plus absent specimen signal does not establish a
+            // transmission value. Leave broad dead regions missing; only the
+            // separately bounded tiny-island interpolation may estimate them.
+            if flags[i]==3 && raw[i]-dark.mean[i]<3.*floor {continue;}
+            p[i]=-((raw[i]-dark.mean[i]).max(floor)/gain).ln();
+            weights[i]=1.; estimated[i]=1;
+            // 6 = reference-repaired; 7 = interpolated sensor value. Neither
+            // is a measured quantitative ray. Preserve original 2/3/4 flags.
+            if matches!(flags[i],1|5) {flags[i]=6;}
+        }
+        let mask=defects::projection_mask(&flags,plan,n);
+        let valid:Vec<_>=flags.iter().enumerate().map(|(i,f)|
+            matches!(*f,1|5|6) && !mask[i] && p[i].is_finite() && plan.mask[i]&defects::PROTECTED==0).collect();
+        let repaired=defects::interpolate_marked(&mut p,&mask,&valid,n);
+        for i in 0..p.len() {if repaired[i] {
+                weights[i]=1.;estimated[i]=2;
+                if matches!(flags[i],1|5|6) {flags[i]=7;}
+        }}
+    }
     p=normalized_smooth(&p,&weights,n);
     for i in 0..p.len() {
         let u=((i%n) as f64+0.5)/n as f64*2.-1.;let v=((i/n) as f64+0.5)/n as f64*2.-1.;
         let taper=((1.0-u.hypot(v)*SCREEN_CROP_SCALE)/0.02).clamp(0.,1.) as f32;
         p[i]*=weights[i]*taper;
     }
-    Ok(Correction {projection:p,flags,quality:q})
+    Ok(Correction {projection:p,flags,quality:q,estimated})
 }
 
 fn normalized_smooth(input:&[f32],weights:&[f32],n:usize)->Vec<f32> {
@@ -242,6 +279,37 @@ mod tests {
         assert_eq!(c.flags[len/2+DETECTOR_N/2],2);
         assert!(c.projection.iter().all(|v|v.is_finite() && *v<4.));
         assert!(correct(&vec![99.;len],16000.,&dark,&flat,60.,1).is_err());
+    }
+    #[test]
+    fn automatic_repair_preserves_saturation_evidence_and_raw_failure_gate() {
+        let n=DETECTOR_N;let len=n*n;
+        let d: [ReferenceStats;3]=std::array::from_fn(|_|ReferenceStats{mean:vec![10.;len],variance:vec![1.;len]});
+        let mut f: [ReferenceStats;3]=std::array::from_fn(|_|ReferenceStats{mean:vec![1010.;len],variance:vec![4.;len]});
+        let bad=128*n+128;f[0].mean[bad]=4010.;
+        let plan=defects::detect(&d,&f,n);
+        let raw=vec![510.;len];
+        let c=correct_automatic(&raw,16000.,&d[0],&f[0],200.,1,&plan,0).unwrap();
+        assert_eq!(c.flags[bad],6);assert_eq!(c.estimated[bad],1);
+        assert!((c.projection[bad]-2f32.ln()).abs()<1e-4);
+        let mut raw=raw;raw[bad]=16000.;
+        let c=correct_automatic(&raw,16000.,&d[0],&f[0],200.,1,&plan,0).unwrap();
+        assert_eq!(c.flags[bad],4);assert_eq!(c.estimated[bad],2);
+        assert_eq!(c.quality.saturated,1);
+        assert!((c.projection[bad]-2f32.ln()).abs()<1e-4);
+        assert!(correct_automatic(&vec![16000.;len],16000.,&d[0],&f[0],200.,1,&plan,0).is_err());
+    }
+    #[test]
+    fn broad_dead_reference_and_absent_signal_do_not_become_large_attenuation() {
+        let n=DETECTOR_N;let len=n*n;
+        let d:[ReferenceStats;3]=std::array::from_fn(|_|ReferenceStats{mean:vec![10.;len],variance:vec![1.;len]});
+        let mut f:[ReferenceStats;3]=std::array::from_fn(|_|ReferenceStats{mean:vec![1010.;len],variance:vec![4.;len]});
+        let mut raw=vec![510.;len];
+        for y in 118..138 {for x in 118..138 {raw[y*n+x]=10.;for band in &mut f {band.mean[y*n+x]=10.;}}}
+        let plan=defects::detect(&d,&f,n);
+        let c=correct_automatic(&raw,16000.,&d[0],&f[0],200.,1,&plan,0).unwrap();
+        let center=128*n+128;
+        assert_eq!(c.flags[center],3);assert_eq!(c.estimated[center],0);
+        assert_eq!(c.projection[center],0.);assert_eq!(c.quality.weak_gain,400);
     }
     #[test]
     fn empty_axis_data_cannot_change_geometry() {

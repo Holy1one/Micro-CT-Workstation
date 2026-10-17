@@ -218,6 +218,55 @@ mod tests {
         }
     }
     #[test]
+    fn capture_hold_evidence_rejects_a_wrong_ticket_and_stale_or_reused_status() {
+        let source = status(0);
+        let plan = plan_to_phase(&source, 90_000).unwrap();
+        let ticket = MoveTicket {
+            command_id: 7,
+            angle_mdeg: plan.protocol_delta_mdeg,
+            position_pulses: plan.target_pulses,
+        };
+        let ready = NanoStatus {
+            state: "CAPTURE_HOLD".into(),
+            position_pulses: plan.target_pulses,
+            target_pulses: plan.target_pulses,
+            capture_id: 7,
+            ..source.clone()
+        };
+        verify_plan_capture_hold(&plan, &ticket, &ready).unwrap();
+        // A different ticket, a drifted/stale position or a released (IDLE)
+        // status all fail closed instead of passing off old evidence.
+        assert!(verify_plan_capture_hold(
+            &plan,
+            &MoveTicket {
+                command_id: 8,
+                ..ticket.clone()
+            },
+            &ready,
+        )
+        .is_err());
+        assert!(verify_plan_capture_hold(
+            &plan,
+            &ticket,
+            &NanoStatus {
+                position_pulses: ready.position_pulses + 1,
+                ..ready.clone()
+            },
+        )
+        .is_err());
+        assert!(verify_plan_capture_hold(
+            &plan,
+            &ticket,
+            &NanoStatus {
+                state: "IDLE".into(),
+                capture_id: 0,
+                ..ready.clone()
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
     fn relative_full_circle_retains_unwrapped_displacement() {
         let plan = plan_relative(&status(-800), 360000).unwrap();
         assert_eq!(plan.protocol_delta_mdeg, -360000);

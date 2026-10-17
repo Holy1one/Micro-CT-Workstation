@@ -7,7 +7,8 @@
 - [guides/windows-integration.md](guides/windows-integration.md)：Windows 集成。
 - [guides/3d-scene-maintenance.md](guides/3d-scene-maintenance.md)：三维几何与视角维护。
 - [guides/desktop-update-distribution.md](guides/desktop-update-distribution.md)：发行与签名。
-- [validation/README.md](validation/README.md)：验收摘要。
-- [decisions/0004-camera-sd-card-acquisition-plan.md](decisions/0004-camera-sd-card-acquisition-plan.md)：D7100 存卡/USB 导入、150 ms 转台握手、1000 秒出束策略及精简实施提示词。
+- [validation/README.md](validation/README.md)：当前交付、设备分项及重构质量边界。
+- [validation/history.md](validation/history.md)：仍影响当前判断的历史结论与保护快照。
+- [decisions/0004-camera-sd-card-acquisition.md](decisions/0004-camera-sd-card-acquisition.md)：现行 D7100 存卡、早释放、USB 导入与只删除本次图像的完整契约。
 
 历史进度、旧交接提示词、过时计划和重复架构页已从当前工作树移除。Git 保存提交历史；仍有价值的原始验收记录和过程资料在本机 .cache/tests/ 保留。文档配图统一从根 assets/ 引用。

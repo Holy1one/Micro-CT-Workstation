@@ -65,7 +65,7 @@ impl Options {
     }
 }
 
-const ALGORITHM_VERSION: u32 = 2;
+const ALGORITHM_VERSION: u32 = 3;
 
 fn effective_options(scan: &Path, options: &Options) -> Result<Options, String> {
     let (manifest, _) = read_manifest(scan)?;
@@ -154,13 +154,17 @@ pub fn cached_result(
 ) -> Result<Option<ReconstructionResult>, String> {
     let options = effective_options(scan, options)?;
     let (root, identity, _) = input_identity(scan, method, &options)?;
+    cached_result_root(scan,method,&root,&identity)
+}
+
+fn cached_result_root(scan:&Path,method:ReconstructionMethod,root:&Path,identity:&str)->Result<Option<ReconstructionResult>,String> {
     let Some(result) = cached_result_at(scan, method, &root)? else {
         return Ok(None);
     };
     let report: serde_json::Value =
         serde_json::from_reader(File::open(root.join("spectral.json")).map_err(io_error)?)
             .map_err(|e| e.to_string())?;
-    if report["identity"].as_str() != Some(identity.as_str()) {
+    if report["identity"].as_str() != Some(identity) {
         return Ok(None);
     }
     for entry in report["artifacts"]
@@ -356,12 +360,14 @@ fn prepare(
     dark: &[preprocessing::ReferenceStats; 3],
     flat: &[preprocessing::ReferenceStats; 3],
     active: &[Band],
+    automatic: &defects::Plan,
     calibration: Option<&material::Calibration>,
     progress: &Mutex<ReconstructionProgress>,
 ) -> Result<(), String> {
     let roots: [PathBuf; 3] = std::array::from_fn(|b| root.join(Band::ALL[b].id()));
     let mut writers = Vec::new();
     let mut masks = Vec::new();
+    let mut estimates = Vec::new();
     let mut quality: [Vec<preprocessing::Quality>; 3] = std::array::from_fn(|_| Vec::new());
     for b in 0..3 {
         fs::create_dir_all(&roots[b]).map_err(io_error)?;
@@ -371,6 +377,7 @@ fn prepare(
         masks.push(BufWriter::new(
             File::create(roots[b].join("detector-quality.bin")).map_err(io_error)?,
         ));
+        estimates.push(BufWriter::new(File::create(roots[b].join("estimated-rays.bin")).map_err(io_error)?));
         for (name, values) in [
             ("dark-crop.f32le", &dark[b].mean),
             ("dark-variance.f32le", &dark[b].variance),
@@ -379,6 +386,7 @@ fn prepare(
         ] {
             write_float_file(&roots[b].join(name), values)?;
         }
+        write_float_file(&roots[b].join("repaired-flat.f32le"), &automatic.flat[b].mean)?;
     }
     for frame in &manifest.frames {
         let image = channels::decode(&verified_path(
@@ -398,16 +406,19 @@ fn prepare(
                     sampled.values[b][i] = sampled.white[b];
                 }
             }
-            let correction = preprocessing::correct(
+            let correction = preprocessing::correct_automatic(
                 &sampled.values[b],
                 sampled.white[b],
                 &dark[b],
                 &flat[b],
                 preprocessing::support_threshold(&dark[b], &flat[b]),
                 frame.index,
+                automatic,
+                b,
             )?;
             write_floats(&mut writers[b], &correction.projection)?;
             masks[b].write_all(&correction.flags).map_err(io_error)?;
+            estimates[b].write_all(&correction.estimated).map_err(io_error)?;
             quality[b].push(correction.quality);
         }
         set_progress(
@@ -421,7 +432,7 @@ fn prepare(
             ),
         );
     }
-    for writer in writers.iter_mut().chain(masks.iter_mut()) {
+    for writer in writers.iter_mut().chain(masks.iter_mut()).chain(estimates.iter_mut()) {
         writer.flush().map_err(io_error)?;
         writer.get_ref().sync_all().map_err(io_error)?;
     }
@@ -434,6 +445,9 @@ fn prepare(
                 "cfaRegistration":"R,G1,G2,B offsets applied before averaging greens; native saturation propagated before detector downsampling",
                 "logTransform":"measured dark and band-specific flat; no white balance or gamma",
                 "noiseFloor":"dark measured variance; censored samples retained for display, excluded from quantitative colour confidence",
+                "automaticDefects":"../detector-defects.json; reference-only colour-independent detection, local same-channel gain interpolation; raw invalid-data gate unchanged",
+                "qualityFlags":{"0":"outside","1":"measured","2":"noise censored","3":"original reference missing","4":"original saturated","5":"measured low gain","6":"reference repaired","7":"sensor interpolated"},
+                "estimatedRays":{"path":"estimated-rays.bin","0":"unmodified","1":"reference repaired","2":"projection interpolated","sha256":hash_file(&roots[b].join("estimated-rays.bin"))?.1},
                 "projectionSha256":hash_file(&roots[b].join("projections.f32le"))?.1,
                 "qualitySha256":hash_file(&roots[b].join("detector-quality.bin"))?.1
             }),
@@ -456,6 +470,58 @@ fn copy_primary(child: &Path, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Version-3 presentation only: robust signed window, without altering the
+/// scientific volume or the numerical/window contract of any older cache.
+fn automatic_window(volume:&[f32])->(f32,f32) {
+    let mut values:Vec<_>=volume.iter().copied().filter(|x|x.is_finite()).collect();
+    let low=values.len()/100;
+    let high=values.len()*995/1000;
+    let lo=*values.select_nth_unstable_by(low,f32::total_cmp).1;
+    let hi=*values.select_nth_unstable_by(high,f32::total_cmp).1;
+    (lo,hi.max(lo+1e-6))
+}
+
+fn finish_automatic(request:&ReconstructionRequest,manifest:&Manifest,manifest_hash:&str,
+    child:&Path,axis:&preprocessing::AxisEstimate,iterative:bool,
+    progress:&Mutex<ReconstructionProgress>)->Result<(),String> {
+    let mut volume=floats(&child.join("volume.f32le"))?;
+    if iterative {
+        set_progress(progress,"running",95,"Validating cone-beam PWLS-Huber correction");
+        let stack=floats(&child.join("projections.f32le"))?;
+        let flags=fs::read(child.join("detector-quality.bin")).map_err(io_error)?;
+        let dark=floats(&child.join("dark-crop.f32le"))?;
+        let flat=floats(&child.join("repaired-flat.f32le"))?;
+        let gain:Vec<_>=flat.iter().zip(dark).map(|(f,d)|f-d).collect();
+        let angles:Vec<_>=manifest.frames.iter().map(|f|f.angle_deg.to_radians()*
+            if manifest.geometry.rotation_direction=="counterclockwise" {1.}else{-1.}).collect();
+        let g=&manifest.geometry;
+        let report=refinement::refine(&mut volume,VOLUME_N,&stack,&flags,&angles,
+            refinement::Geometry{sod:g.sod_mm,sdd:g.sod_mm+g.object_to_detector_mm,
+                width:g.detector_width_mm,offset_u:axis.applied_offset_mm,offset_v:g.center_offset_y_mm},
+            &gain,&floats(&child.join("dark-variance.f32le"))?,&floats(&child.join("flat-variance.f32le"))?);
+        write_json(&child.join("refinement.json"),&report)?;
+        if report.accepted {
+            fs::copy(child.join("volume.f32le"),child.join("fdk-baseline.f32le")).map_err(io_error)?;
+            let meta:CacheMetadata=serde_json::from_reader(File::open(child.join("result.json")).map_err(io_error)?).map_err(|e|e.to_string())?;
+            let selection=BackendSelection{name:meta.backend,cpu_estimated_ms:meta.cpu_estimated_ms,
+                gpu_estimated_ms:meta.gpu_estimated_ms,reason:meta.backend_selection};
+            persist_result(&request.scan_dir,child,manifest,manifest_hash.into(),&volume,
+                &fs::read(child.join("coverage.bin")).map_err(io_error)?,meta.spacing_mm[0],request.method,&selection)?;
+        }
+    } else {
+        write_json(&child.join("refinement.json"),&serde_json::json!({"accepted":false,
+            "reason":"automatic iterative correction is limited to uncalibrated monochrome; shared multi-band quantitative model retained"}))?;
+    }
+    let (window_min,window_max)=automatic_window(&volume);
+    write_bytes_durable(&child.join("preview.bin"),&full_volume_preview(&volume,VOLUME_N,PREVIEW_N,window_min,window_max)?)?;
+    let mut meta:CacheMetadata=serde_json::from_reader(File::open(child.join("result.json")).map_err(io_error)?).map_err(|e|e.to_string())?;
+    meta.preview_sha256=hash_file(&child.join("preview.bin"))?.1;
+    write_json(&child.join("preview.json"),&PreviewMetadata{shape:meta.preview_shape,spacing_mm:meta.preview_spacing_mm,
+        window_min,window_max,sha256:meta.preview_sha256.clone()})?;
+    meta.note.push_str("; v3 automatic reference defect estimates excluded from quantitative coverage; display window signed P1-P99.5; optional accepted coarse PWLS-Huber correction recorded in refinement.json");
+    write_json(&child.join("result.json"),&meta)
+}
+
 pub(super) fn reconstruct(
     request: &ReconstructionRequest,
     options: &Options,
@@ -470,6 +536,11 @@ pub(super) fn reconstruct(
     }
     let (root, identity, calibration) =
         input_identity(&request.scan_dir, request.method, &options)?;
+    reconstruct_fresh(request,options,progress,root,identity,calibration)
+}
+
+fn reconstruct_fresh(request:&ReconstructionRequest,options:Options,progress:&Mutex<ReconstructionProgress>,
+    root:PathBuf,identity:String,calibration:Option<material::Calibration>)->Result<ReconstructionResult,String> {
     fs::create_dir_all(&root).map_err(io_error)?;
     if root.join("result.json").exists() {
         fs::remove_file(root.join("result.json")).map_err(io_error)?;
@@ -505,6 +576,29 @@ pub(super) fn reconstruct(
         progress,
         "Flat reference",
     )?;
+    set_progress(progress,"running",15,"Detecting reference defects and preserving support boundaries");
+    let mut automatic = defects::detect(&dark,&flat,DETECTOR_N);
+    let mut probes=Vec::new();
+    let probe_count=manifest.frames.len().min(12);
+    for k in 0..probe_count {
+        let frame=&manifest.frames[k*manifest.frames.len()/probe_count];
+        let image=channels::decode(&verified_path(&request.scan_dir,&frame.path,frame.bytes,&frame.sha256)?)?;
+        let mut sample=channels::sample(&image,&screen,manifest.geometry.mirror_x)?;
+        register_blue(&mut sample,calibration.as_ref());
+        for b in 0..3 {for i in 0..DETECTOR_N*DETECTOR_N {if sample.saturated[b][i] {sample.values[b][i]=f32::NAN;}}}
+        probes.push(sample.values);
+    }
+    defects::confirm_persistent_gain(&mut automatic,&dark,&flat,&probes,DETECTOR_N);
+    drop(probes);
+    write_bytes_durable(&root.join("detector-defects.bin"),&automatic.mask)?;
+    let gain_mask:Vec<_>=automatic.persistent_gain.iter().flat_map(|v|v.iter().map(|&b|u8::from(b))).collect();
+    write_bytes_durable(&root.join("persistent-gain.bin"),&gain_mask)?;
+    write_json(&root.join("detector-defects.json"),&serde_json::json!({
+        "report":automatic.report,"shape":[DETECTOR_N,DETECTOR_N],
+        "maskBits":{"1":"reference anomaly candidate; applied estimates recorded per ray","2":"sensor defect","4":"protected support or boundary"},
+        "maskSha256":hash_file(&root.join("detector-defects.bin"))?.1
+        ,"persistentGain":{"path":"persistent-gain.bin","layout":"R,G,B planar 256x256 uint8; 1 retains original measured flat gain after >=8 valid probes and >=80% agreement","sha256":hash_file(&root.join("persistent-gain.bin"))?.1}
+    }))?;
     let scores: Vec<_> = Band::ALL
         .iter()
         .map(|b| band_score(*b, &dark[b.index()], &flat[b.index()]))
@@ -542,6 +636,7 @@ pub(super) fn reconstruct(
         &dark,
         &flat,
         &bands,
+        &automatic,
         calibration.as_ref(),
         progress,
     )?;
@@ -583,6 +678,8 @@ pub(super) fn reconstruct(
             &child.join("projections.f32le"),
             Some(shared_axis),
         )?;
+        finish_automatic(request,&manifest,&manifest_hash,&child,&axis,
+            options.mode==Mode::Monochrome && calibration.is_none(),progress)?;
     }
     // Do not expose a primary-only seal while additional artifacts are pending.
     copy_primary(&primary, &root)?;
@@ -602,6 +699,9 @@ pub(super) fn reconstruct(
         colour_preview(&root, &observations, calibration.as_ref())?;
     }
     let mut artifacts = Vec::new();
+    for name in ["detector-defects.bin","detector-defects.json","persistent-gain.bin"] {
+        artifacts.push(serde_json::json!({"path":name,"sha256":hash_file(&root.join(name))?.1}));
+    }
     for band in &bands {
         for name in [
             "result.json",
@@ -609,11 +709,23 @@ pub(super) fn reconstruct(
             "coverage.bin",
             "projections.f32le",
             "detector-quality.bin",
+            "estimated-rays.bin",
+            "preprocessing.json",
+            "repaired-flat.f32le",
+            "refinement.json",
+            "dark-crop.f32le",
+            "dark-variance.f32le",
+            "flat-crop.f32le",
+            "flat-variance.f32le",
         ] {
             let relative = format!("{}/{}", band.id(), name);
             artifacts.push(
                 serde_json::json!({"path":relative,"sha256":hash_file(&root.join(&relative))?.1}),
             );
+        }
+        let baseline=format!("{}/fdk-baseline.f32le",band.id());
+        if root.join(&baseline).is_file() {
+            artifacts.push(serde_json::json!({"path":baseline,"sha256":hash_file(&root.join(&baseline))?.1}));
         }
     }
     if options.mode == Mode::Multicolor {
@@ -669,7 +781,7 @@ pub(super) fn reconstruct(
         return Err("manifest changed before colour result publication".into());
     }
     fs::rename(root.join("result.json.pending"), root.join("result.json")).map_err(io_error)?;
-    cached_result(&request.scan_dir, request.method, &options)?
+    cached_result_root(&request.scan_dir, request.method, &root,&identity)?
         .ok_or("colour result failed final integrity verification".into())
 }
 
@@ -880,6 +992,36 @@ fn colour_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_signed_window_ignores_isolated_extremes_without_clipping_negative_values() {
+        let mut v:Vec<f32>=(0..10000).map(|i|i as f32/10000.-0.3).collect();
+        v[0]=-1000.;v[9999]=1000.;
+        let (lo,hi)=automatic_window(&v);
+        assert!((-0.30..-0.28).contains(&lo));assert!((0.69..0.70).contains(&hi));
+        assert_eq!(v[0],-1000.);
+    }
+    #[test]
+    #[ignore = "explicit read-only sealed scan; all new results under repository .cache"]
+    fn inspect_automatic_scan_offline() {
+        let scan=PathBuf::from(std::env::var("CT_SCAN_DIR").expect("CT_SCAN_DIR"));
+        let root=PathBuf::from(std::env::var("CT_DIAGNOSTIC_DIR").expect("CT_DIAGNOSTIC_DIR"));
+        fs::create_dir_all(&root).unwrap();
+        let root=root.canonicalize().unwrap();
+        let allowed=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").canonicalize().unwrap();
+        assert!(root.starts_with(allowed));
+        assert!(!root.join("result.json").exists(),"keep existing evidence");
+        let options=effective_options(&scan,&Options::default()).unwrap();
+        let (_,identity,cal)=input_identity(&scan,ReconstructionMethod::Fdk,&options).unwrap();
+        let progress=Arc::new(Mutex::new(ReconstructionProgress{status:"running",percent:0,message:String::new(),events:Vec::new()}));
+        let monitor=Arc::clone(&progress);let done=Arc::new(AtomicBool::new(false));let stop=Arc::clone(&done);
+        let reporter=thread::spawn(move || {while !stop.load(Ordering::Relaxed) {
+            {let p=monitor.lock().unwrap();println!("{}% {}",p.percent,p.message);}
+            thread::sleep(Duration::from_secs(5));
+        }});
+        let result=reconstruct_fresh(&ReconstructionRequest{scan_dir:scan,method:ReconstructionMethod::Fdk},options,&progress,root,identity,cal);
+        done.store(true,Ordering::Relaxed);reporter.join().unwrap();
+        println!("PASS automatic offline reconstruction {}",result.unwrap().cache_path.display());
+    }
     #[test]
     fn emission_bands_follow_the_configured_stack_and_measured_calibration() {
         let layers: Vec<_> = ["blue", "red", "green", "blue", "other"]

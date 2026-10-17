@@ -94,7 +94,7 @@ export const NATIVE_ENUM_LABELS: Record<string, Record<string, string>> = {
     "3": "TIFF RGB (only when advertised)", "4": "NEF (RAW)",
     "5": "NEF + JPEG Basic", "6": "NEF + JPEG Normal", "7": "NEF + JPEG Fine",
   },
-  recordingMedia: { "0": "Camera card (host capture unavailable)", "1": "SDRAM · host capture" },
+  recordingMedia: { "0": "Camera SD card · keep images on camera", "1": "Host RAM · download each image" },
   shutter: {
     "4294967293": "Unsupported special shutter value",
     "4294967294": "Time (not supported)",

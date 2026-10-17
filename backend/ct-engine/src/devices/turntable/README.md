@@ -27,7 +27,11 @@ Every HOME confirms a newly sequenced HEARTBEAT/HBACK on the serial owner before
 sending motion. This restores the firmware heartbeat latch cleared by CLEAR_FAULT
 without relying on the idle timer. Missing or stale HBACK, operation cancellation
 and priority STOP prevent HOME admission. The existing heartbeat timeout is
-unchanged; the separate late-HBACK risk remains pending.
+unchanged. In-flight commands bound each read by both the command and pending
+heartbeat deadlines, then recheck both deadlines and cancellation after I/O;
+late HBACK or terminal replies cannot become successful completion evidence.
+Serial reception bounds each individual line to 512 bytes before its newline,
+including when that newline arrives in the same read as the oversized payload.
 
 `restore_reference_cancelled` is a crate-only recovery entry. It requires current
 `RESTORE_REFERENCE` advertisement, fixed scaling, unchanged idle counters and a

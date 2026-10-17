@@ -54,11 +54,11 @@
 :root,
 [data-theme="light"] {
   /* ---- 底色 / 机箱层级 ---- */
-  --appBg:        #E8EDF2;
-  --chassis:      #EFF3F7;
-  --panel:        #FBFCFD;
-  --panelHeader:  #F0F4F8;
-  --well:         #E7EDF2;
+  --appBg:        #F0F4F7;
+  --chassis:      #F0F4F7;
+  --panel:        #FCFDFE;
+  --panelHeader:  #FCFDFE;
+  --well:         #EEF3F7;
   /* 发丝线：看得见但不刻意——只承担分区职责，不抢内容 */
   --line:         rgba(15, 23, 42, 0.09);
   --lineStrong:   rgba(15, 23, 42, 0.13);
@@ -67,14 +67,14 @@
   /* ---- Apple 质感画布：极浅的多层渐变，衬托实心面板的边缘 ---- */
   --appGradient:
     radial-gradient(1200px 640px at 12% -12%, rgba(255, 255, 255, 0.85) 0%, rgba(255, 255, 255, 0) 55%),
-    radial-gradient(1100px 720px at 108% 112%, rgba(171, 198, 227, 0.40) 0%, rgba(171, 198, 227, 0) 60%),
-    linear-gradient(160deg, #ECF0F5 0%, #E2E8F0 100%);
+    radial-gradient(1100px 720px at 108% 112%, rgba(171, 198, 227, 0.12) 0%, rgba(171, 198, 227, 0) 60%),
+    linear-gradient(160deg, #F3F6F9 0%, #EDF2F6 100%);
 
   /* ---- 面板：实心卡片（清晰骨架）；玻璃只留给浮层（菜单/下拉/控制坞/对话框） ---- */
   --panelGlass:        rgba(255, 255, 255, 0.88);
   --panelHeaderGlass:  rgba(250, 251, 253, 0.55);
   --panelBlur:         blur(24px) saturate(150%);
-  --shadowCard:        0 1px 2px rgba(16, 24, 40, 0.05), 0 6px 16px rgba(16, 24, 40, 0.06);
+  --shadowCard:        0 1px 2px rgba(16, 24, 40, 0.025);
   --consoleGlass:      rgba(255, 255, 255, 0.88);
 
   /* ---- 最大化窗口的机箱留白（8:5 画布之外的区域 = 机箱框，不是空白） ---- */
@@ -102,9 +102,9 @@
   /* 顶栏：半透薄纱，直接让画布渐变透上来（不做毛玻璃）；磨砂玻璃只留给灵动岛与浮层 */
   --menuBarBg:             rgba(241, 245, 249, 0.50);
   --shadowFloat:           0 10px 26px rgba(25, 36, 48, 0.14);
-  --shadowIsland:          0 18px 40px rgba(25, 36, 48, 0.18);
-  --islandBg:              rgba(247, 250, 252, 0.62);
-  --islandBorder:          rgba(165, 186, 203, 0.46);
+  --shadowIsland:          0 8px 24px rgba(25, 36, 48, 0.12);
+  --islandBg:              rgba(250, 252, 254, 0.84);
+  --islandBorder:          rgba(255, 255, 255, 0.72);
   --islandHighlight:       rgba(255, 255, 255, 0.88);
   --islandKeyBg:           color-mix(in srgb, var(--neutralSoft) 84%, transparent);
   --islandKeyHover:        color-mix(in srgb, var(--accentSoft) 88%, var(--neutralSoft));
@@ -133,7 +133,7 @@
   --warnSoft:   #FEF2E4;
   --dangerSoft: #FCE6E5;
   --accentSoft: rgba(14, 116, 144, 0.10);
-  --neutralSoft:#E6EBF0;
+  --neutralSoft:#EDF2F6;
 
   /* ---- 中央 Live Scene 视口（跟随主题） ---- */
   --sceneBg:     #EEF2F5;
@@ -157,8 +157,8 @@
 
   /* ---- 底部控制台（日志） ---- */
   --consoleBg:     #FFFFFF;
-  --consoleTabBg:  #FAFAFC;
-  --consoleTabActive: #E8E8ED;
+  --consoleTabBg:  transparent;
+  --consoleTabActive: #E4F3F9;
   --consoleRail:   #FAFAFC;
   --consoleThumb:  #C7C7CC;
 
@@ -232,7 +232,7 @@
   --panelGlass:        rgba(29, 39, 51, 0.92);
   --panelHeaderGlass:  rgba(38, 48, 62, 0.45);
   --panelBlur:         blur(24px) saturate(140%);
-  --shadowCard:        0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 22px rgba(0, 0, 0, 0.30);
+  --shadowCard:        0 1px 2px rgba(0, 0, 0, 0.18);
   --consoleGlass:      rgba(22, 29, 39, 0.92);
 
   /* ---- 最大化窗口的机箱留白（暗色：比画布更深的机身） ---- */
@@ -258,7 +258,7 @@
   /* 顶栏：半透薄纱，直接让画布渐变透上来（不做毛玻璃）；磨砂玻璃只留给灵动岛与浮层 */
   --menuBarBg:             rgba(18, 25, 34, 0.48);
   --shadowFloat:           0 12px 28px rgba(0, 0, 0, 0.34);
-  --shadowIsland:          0 20px 44px rgba(0, 0, 0, 0.40);
+  --shadowIsland:          0 8px 24px rgba(0, 0, 0, 0.30);
   --islandBg:              rgba(30, 42, 54, 0.64);
   --islandBorder:          rgba(159, 182, 200, 0.26);
   --islandHighlight:       rgba(255, 255, 255, 0.14);
@@ -309,8 +309,8 @@
   --dockHighlight: rgba(255, 255, 255, 0.25);
 
   --consoleBg:        #141922;
-  --consoleTabBg:     #1A2029;
-  --consoleTabActive: #2A323E;
+  --consoleTabBg:     transparent;
+  --consoleTabActive: var(--accentSoft);
   --consoleRail:      #212834;
   --consoleThumb:     #3D4654;
 

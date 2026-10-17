@@ -117,10 +117,10 @@ and motor. The UI consumes the engine's capability/disabled reasons.
 Preset comparison labels unconfirmed, unreadable, unsupported or failed values
 UNKNOWN even if a retained value equals the preset. `WorkstationDialog` focuses on
 mount and uses current callback refs; ordinary snapshot updates do not steal typing
-focus. [Focused browser evidence](../.cache/tests/frontend/20261005-163257-dialog-focus-fix/result.json)
+focus. [Focused browser evidence](../../.cache/tests/frontend/20261005-163257-dialog-focus-fix/result.json)
 is UI_ONLY_NO_HARDWARE. These new source changes prepare a later rc3 candidate and
 are only offline verified; the signed rc2 package and its acceptance remain separate.
-Current fixed scans consume profile 6 readiness and fresh parameter readback. AF-region9205, Bulb/video/JPEG transactions and full Picture Control editing
+Current fixed scans consume RAM profile 6 or SD profile 7 readiness and fresh parameter readback. AF-region9205, Bulb/video/JPEG transactions and full Picture Control editing
 remain outside the implemented subset.
 
 Turntable UI angles are positive along the prescribed direction and the preview

@@ -20,6 +20,8 @@
         "backend/ct-engine/src/reconstruction_preprocess.rs",
         "backend/ct-engine/src/reconstruction_channels.rs",
         "backend/ct-engine/src/reconstruction_spectral.rs",
+        "backend/ct-engine/src/reconstruction_defects.rs",
+        "backend/ct-engine/src/reconstruction_refine.rs",
         "backend/ct-engine/src/material_decomposition.rs",
         "backend/ct-engine/src/fdk.wgsl",
         "backend/ct-engine/src/devices/README.md",
@@ -48,7 +50,7 @@
       ],
       "risk": "critical",
       "description": "Owns Moxtek discovery, binary serial transport, measured readback, and fail-closed beam shutdown.",
-      "execution": "One serial owner verifies source responses. A complete monitoring pair shares a five-second budget and fresh current-generation readbacks for 250 ms; 50 ms read slices allow priority OFF and hard deadlines to preempt. No command replay. Serial diagnostics flow to domain logs and scan.log.",
+      "execution": "One serial owner verifies source responses. A complete monitoring pair shares a ten-second budget and fresh current-generation readbacks for 250 ms; 50 ms read slices allow priority OFF and hard deadlines to preempt. No command replay. A typed monitor read timeout with confirmed OFF can enter coordinator-owned recovery; protocol, safety and unknown-OFF failures remain hard faults. Serial diagnostics flow to domain logs and scan.log.",
       "gates": [
         "cargo test --manifest-path backend/Cargo.toml -p ct-engine devices::xray"
       ]

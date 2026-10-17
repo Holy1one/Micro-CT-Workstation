@@ -25,12 +25,26 @@ export function cameraControlReason(camera: CameraHealth | null): string | null 
 }
 export function cameraCapturePreparationReason(camera: CameraHealth | null): string | null {
   if (!camera) return "Read camera parameters before capture";
-  if (camera.capabilities.disabledReasons.captureReady) return englishReason(camera.capabilities.disabledReasons.captureReady);
   const media = camera.properties.recordingMedia;
-  if (!media?.confirmed || media.error || media.actual !== 1) return "Apply and verify RAM recording media before capture";
+  const card = media?.confirmed && !media.error && media.actual === 0;
+  const readiness = camera.capabilities.disabledReasons[card ? "cardCaptureReady" : "captureReady"];
+  if (readiness) return englishReason(readiness);
+  if (!media?.confirmed || media.error || ![0, 1].includes(Number(media.actual))) return "Apply and verify the photo destination before capture";
+  if (!card && camera.capabilities.disabledReasons.hostTransferOptIn) return englishReason(camera.capabilities.disabledReasons.hostTransferOptIn);
+  if (card && !camera.capabilities.cardCapture) return "Camera SD card capture unavailable";
   const burst = camera.properties.burstNumber;
   if (!burst?.confirmed || burst.error || burst.actual !== 1) return "Apply and verify a single photo before capture";
   return null;
+}
+
+/** Prefer SD in the new session's draft; only an explicit Apply writes it. */
+export function newScanCameraDraft(camera: CameraHealth): CameraProperties {
+  const draft = confirmedCameraDraft(camera.properties);
+  const media = camera.properties.recordingMedia;
+  const advertisesCard = media?.options?.some(option => option.value === 0 && option.supported && option.enabled)
+    || media?.supportedValues?.includes(0) || media?.range?.[0] === 0;
+  if (camera.capabilities.cardCapture && media?.supported && media.readable && media.confirmed && media.writable && !media.error && advertisesCard) draft.recordingMedia = 0;
+  return draft;
 }
 export function shutterExposureMs(native: CameraValue, propertyCode: number | undefined): number | null {
   if (typeof native !== "number" || !Number.isSafeInteger(native) || native <= 0 || native > 0xffffffff) return null;
@@ -170,6 +184,13 @@ export function cameraDraftChanges(camera: CameraHealth, draft: CameraProperties
     return !property?.confirmed || Boolean(property.error) || property.actual !== value;
   }));
 }
+
+/** A deliberate destination selection must reach Apply even when actual is already RAM. */
+export function cameraDraftApplyTargets(camera: CameraHealth, draft: CameraProperties, explicitDestination: boolean): CameraProperties {
+  const changes = cameraDraftChanges(camera, draft);
+  if (explicitDestination && Object.hasOwn(draft, "recordingMedia")) changes.recordingMedia = draft.recordingMedia;
+  return changes;
+}
 export function cameraPropertyValueLabel(property: CameraProperty, value: CameraValue | null): string {
   if (value === null) return "UNKNOWN";
   const option = property.options?.find(option => option.value === value);
@@ -182,6 +203,11 @@ export function cameraPropertyValueLabel(property: CameraProperty, value: Camera
 /** Use a labelled select for a fully described finite range as well as enums.
  * A partially labelled or open range keeps its numeric input and full range. */
 export function cameraPropertyUsesSelect(property: CameraProperty): boolean {
+  // D7100 describes destination as range 0..2. Only 0 (SD) and 1 (RAM)
+  // have established semantics; show their descriptor-backed named choices.
+  if (property.key === "recordingMedia" && property.range?.[0] === 0
+    && [1, 2].includes(property.range[1]) && property.range[2] === 1
+    && [0, 1].every(value => property.options.some(option => option.supported && option.value === value))) return true;
   if (property.supportedValues.length || !property.range) return property.options.length > 0;
   const [min, max, step] = property.range;
   if (step <= 0) return false;
@@ -285,6 +311,9 @@ export const FAILURE_ADVICE: Record<string, FailureAdvice> = {
   LIVE_VIEW_APPLY_FORBIDDEN: { action: "Photographic parameter Apply is refused while Live View is active. Stop Live View explicitly, apply the parameters, then restart Live View if needed.", group: "camera" },
   LIVE_VIEW_CAPTURE_FORBIDDEN: { action: "Capture is refused while Live View is active, and the engine will not stop the preview for you. Stop Live View, then capture.", group: "camera" },
   CAMERA_CAPTURE_UNQUALIFIED: { action: "The published capture readiness is not satisfied (recording media, single release, Live View off, read-only run diagnostics). Resolve each item in Camera → Advanced, then Apply and verify.", group: "camera" },
+  CAMERA_SCAN_SD_REQUIRED: { action: "Select Camera SD card under Photo destination, Apply and verify before Preflight. To download instead, explicitly select Host RAM and Apply in this camera session. A retained task keeps its original destination and data.", group: "camera" },
+  CAMERA_CARD_CAPTURE_UNSUPPORTED: { action: "The connected camera does not advertise verified SD card capture. Read its capabilities and check the selected destination before Preflight.", group: "camera" },
+  CAMERA_HOST_TRANSFER_OPT_IN_REQUIRED: { action: "Local transfer is disabled by default. Apply Camera SD card to keep photos on the camera, or explicitly select Host RAM and Apply to enable local downloads for this camera session.", group: "camera" },
   CAMERA_FOCUS_UNQUALIFIED: { action: "Lens step drive eligibility is not established. Start Live View, read the Live View controls, and confirm the lens/focus evidence before stepping.", group: "camera" },
   CAMERA_AUTOFOCUS_UNQUALIFIED: { action: "Autofocus eligibility is not established. Live View must be active with a focus mode that permits AF, and the lens evidence must be fresh.", group: "camera" },
   CAMERA_SHUTTER_UNCONFIRMED: { action: "A confirmed native shutter readback is required before preparing a scan. Read the camera properties, Apply and verify the shutter, then repeat Preflight.", group: "camera" },
@@ -386,7 +415,7 @@ export function failureNextAction(code: string | null, kind: FailureKind): strin
   const advice = failureAdvice(code);
   if (advice) return advice.action;
   if (kind === "cleanup_unconfirmed") return "Cleanup is not confirmed and the session stays isolated. This condition is not documented for this build: record the exact code and text, and do not treat the machine as cleaned up.";
-  if (kind === "rejected") return "The camera refused the requested value while the session stayed healthy. Restore or change the value and Apply again in the same session.";
+  if (kind === "rejected") return "The operation was refused. Review the reported device requirements and status, correct the cause, then retry.";
   if (code) return "This code is not documented in this build. Record the code and the exact engine text, keep the machine state as reported, and do not assume a restart resolves it.";
   if (kind !== "transport") return "Review the reported device requirements and status, correct the cause, then retry. Stop and status reads remain available.";
   return "The control service did not answer. Stop and status reads remain available; verify the engine process before retrying.";
@@ -427,16 +456,20 @@ export function deriveFailureReport(
       const code = parseEngineCode(current.error);
       const camera = kind === "cleanup_unconfirmed" ? null : cameraPreflightFailure(current.error);
       const folder = kind !== "cleanup_unconfirmed" && code?.startsWith("SCAN_OUTPUT_");
+      const cameraValueRejected = kind === "rejected" && current.device === "camera"
+        && (code === "CAMERA_PROPERTY_UNSUPPORTED_VALUE" || /^(Camera parameter application partial: |Live View control application incomplete: )/.test(current.error || ""));
+      const xrayConnectRejected = kind === "rejected" && current.device === "xray" && current.kind === "connect";
+      const deviceGroup = ["camera", "turntable", "xray"].includes(current.device) ? current.device : null;
       return {
         key: `${kind}|${current.operationId}|${code ?? ""}`,
         kind,
-        title: folder ? "Scan folder needs attention" : camera ? "Preflight needs attention" : kind === "cleanup_unconfirmed" ? "Cleanup is not confirmed" : kind === "rejected" ? "The camera rejected the requested value" : "The device operation failed",
-        stage: englishDisplayText(`${current.kind} · ${status} · ${current.stage}`),
+        title: folder ? "Scan folder needs attention" : camera ? "Preflight needs attention" : kind === "cleanup_unconfirmed" ? "Cleanup is not confirmed" : cameraValueRejected ? "The camera rejected the requested value" : xrayConnectRejected ? "The X-ray source could not be connected" : kind === "rejected" ? "The device operation was refused" : "The device operation failed",
+        stage: englishDisplayText(`${current.device} · ${current.kind} · ${status} · ${current.stage}`),
         reason: englishDisplayText(current.error) || `${current.kind} ended as ${status} without an error detail`,
         ...(camera ? { displayReason: camera.summary } : {}),
         code,
-        nextAction: camera?.action || failureNextAction(code, kind),
-        group: camera ? "camera" : failureGroup(code, current.kind),
+        nextAction: camera?.action || (xrayConnectRejected ? FAILURE_ADVICE.XRAY_CONNECTION_FAILED.action : cameraValueRejected && !code ? "The camera refused the requested value while the session stayed healthy. Restore or change the value and Apply again in the same session." : failureNextAction(code, kind)),
+        group: camera ? "camera" : failureAdvice(code)?.group || deviceGroup || failureGroup(code, current.kind),
       };
     }
   }

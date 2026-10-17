@@ -1,15 +1,20 @@
 /** Shared presentation drafts and correlated operation waiting. Device truth stays in snapshots. */
 import { useEffect, useRef, useState } from "react";
 import type { CameraProperties, CameraPreset, CameraValue, EngineCommand, EngineSnapshot } from "./engine/types";
-import { cameraDraftChanges, confirmedCameraDraft, validateCameraDraft } from "./engine/deviceControls";
+import { cameraDraftApplyTargets, confirmedCameraDraft, newScanCameraDraft, validateCameraDraft } from "./engine/deviceControls";
 
 export type DeviceDispatch = (command: EngineCommand) => Promise<EngineSnapshot | undefined>;
 const TERMINAL = new Set(["completed", "cancelled", "failed", "cleanup_unconfirmed", "rejected"]);
 const SYNCHRONOUS = new Set(["prepare_scan", "set_capture_root", "camera_status", "camera_identity", "xray_status", "xray_identity", "turntable_identity", "preset_list", "preset_load", "preset_compare", "preset_save", "preset_delete", "preset_import", "preset_export"]);
 const ASYNC_REQUIRED = new Set(["open_scan_project", "camera_connect", "camera_disconnect", "camera_read_properties", "camera_apply_properties", "camera_capture", "camera_test_capture", "camera_live_view_start", "camera_live_view_read", "camera_live_view_configure", "camera_autofocus", "camera_focus", "turntable_connect", "turntable_disconnect", "turntable_home", "turntable_relative", "turntable_to_angle", "preflight", "restore_previous"]);
 
-export async function awaitOperation(ack: EngineSnapshot, operationId: string, current: () => EngineSnapshot | null, timeoutMs = 110_000): Promise<EngineSnapshot> {
-  const deadline = performance.now() + timeoutMs;
+export async function awaitOperation(ack: EngineSnapshot, operationId: string, current: () => EngineSnapshot | null, timeoutMs?: number): Promise<EngineSnapshot> {
+  const kind = ack.operations.find(item => item.operationId === operationId)?.kind;
+  // Nano HOME/MOVE allow 300 s, plus preparation, readback and cleanup.
+  // The UI must keep awaiting the correlated receipt beyond the generic 110 s
+  // window; this changes no device deadline and never infers completion.
+  const motion = kind === "home" || kind === "turntable_relative" || kind === "turntable_to_angle";
+  const deadline = performance.now() + (timeoutMs ?? (motion ? 360_000 : 110_000));
   let snapshot = ack;
   while (true) {
     if (snapshot.engineSessionId !== ack.engineSessionId) throw new Error("Control session changed; old operation discarded");
@@ -47,7 +52,7 @@ export function useDeviceActions(snapshot: EngineSnapshot | null, dispatch: Devi
       if (ack.engineSessionId !== before.engineSessionId) throw new Error("Control session changed during the command");
       if (SYNCHRONOUS.has(command.type)) return ack;
       const operation = ack.operationId && !known.has(ack.operationId) ? ack.operations.find(item => item.operationId === ack.operationId) : null;
-      if (operation) return await awaitOperation(ack, operation.operationId, () => current.current, command.type === "open_scan_project" ? 300_000 : 110_000);
+      if (operation) return await awaitOperation(ack, operation.operationId, () => current.current, command.type === "open_scan_project" ? 300_000 : undefined);
       if (ASYNC_REQUIRED.has(command.type)) throw new Error("No new correlated operation receipt; completion is unconfirmed");
       return ack;
     } catch (reason) {
@@ -64,18 +69,19 @@ export function useCameraDraft(snapshot: EngineSnapshot | null) {
   const scope = `${snapshot?.engineSessionId || "none"}/${camera?.sessionId || "none"}`;
   const [draft, setDraft] = useState<CameraProperties>({});
   const [presetId, setPresetId] = useState("");
+  const [explicitDestination, setExplicitDestination] = useState(false);
   const initialized = useRef("");
   const mountedScope = useRef(scope); mountedScope.current = scope;
   useEffect(() => {
     if (initialized.current === scope) return;
     initialized.current = scope;
-    setDraft(camera ? confirmedCameraDraft(camera.properties) : {}); setPresetId("");
+    setDraft(camera ? newScanCameraDraft(camera) : {}); setPresetId(""); setExplicitDestination(false);
   }, [scope]);
-  const set = (key: string, value: CameraValue) => { setPresetId(""); setDraft(previous => ({ ...previous, [key]: value })); };
+  const set = (key: string, value: CameraValue) => { setPresetId(""); if (key === "recordingMedia") setExplicitDestination(true); setDraft(previous => ({ ...previous, [key]: value })); };
   const loadConfirmed = (result: EngineSnapshot) => {
     const selected = result.deviceControls.camera;
     if (`${result.engineSessionId}/${selected?.sessionId || "none"}` !== mountedScope.current) return;
-    setDraft(selected ? confirmedCameraDraft(selected.properties) : {}); setPresetId("");
+    setDraft(selected ? confirmedCameraDraft(selected.properties) : {}); setPresetId(""); setExplicitDestination(false);
   };
   const loadPreset = (preset: CameraPreset) => {
     if (!camera?.identity || !preset.models.some(model => model.toLowerCase() === camera.identity!.model.toLowerCase())) throw new Error("Preset does not match this camera model");
@@ -83,7 +89,7 @@ export function useCameraDraft(snapshot: EngineSnapshot | null) {
     if (invalid) throw new Error(invalid);
     setDraft({ ...preset.parameters }); setPresetId(preset.id);
   };
-  const changes = camera ? cameraDraftChanges(camera, draft) : {};
+  const changes = camera ? cameraDraftApplyTargets(camera, draft, explicitDestination) : {};
   const targets = presetId ? draft : changes;
   const issue = camera && Object.keys(draft).length ? validateCameraDraft(camera, draft, !presetId) : "Read confirmed camera parameters";
   return { draft, presetId, changes: targets, dirty: Object.keys(targets).length > 0, issue, set, loadConfirmed, loadPreset };

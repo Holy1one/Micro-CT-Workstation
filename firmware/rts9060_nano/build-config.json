@@ -2,14 +2,15 @@
   "schemaVersion": 1,
   "candidate": {
     "source": "rts9060_nano.ino",
-    "bytes": 34818,
-    "sha256": "2843f57ecb3d304c47f061f5d342b1b809a807dc2a7980ccc0cf9d14f0ecaa1e",
-    "version": "2.2.0",
+    "bytes": 35319,
+    "sha256": "fc2d01af3d16ea83f3887ec196efdf4712d8ffe782d5c89d62bb7fb8f53fac06",
+    "version": "2.3.0",
     "advertisedCapabilities": [
       "HEARTBEAT_ACK",
       "XRAY_WARNING",
       "RESTORE_REFERENCE",
-      "MOVE_SETTLE_150MS"
+      "MOVE_SETTLE_150MS",
+      "MOVE_RAMP_4MS"
     ],
     "settlePolicy": {
       "ordinaryMoveSettleMs": 150,
@@ -21,7 +22,16 @@
     "recoveredFrom": ".cache/tests/turntable/20260929-firmware-recovery/rts9060_nano/rts9060_nano.ino",
     "hardwareCertified": false,
     "originalSourceSha256": "470133efbb0f2192c725a0aef223cf6256030ce1f9c0dc541bd3cea4efa8e562",
-    "previousCandidateSha256": "ecadf6220e53954cb303e0e40fb85710f73735ebe5271a127c8a4ba93bd84423"
+    "previousCandidateSha256": "2843f57ecb3d304c47f061f5d342b1b809a807dc2a7980ccc0cf9d14f0ecaa1e",
+    "motionPolicy": {
+      "ordinaryStartPeriodUs": 4000,
+      "ordinaryCruisePeriodUs": 2000,
+      "rampPeriodStepUs": 100,
+      "ordinaryRampMaxPulses": 20,
+      "homeStartPeriodUs": 12000,
+      "homeCurveUnchanged": true,
+      "hardwareCertified": false
+    }
   },
   "avr": {
     "core": "arduino:avr",

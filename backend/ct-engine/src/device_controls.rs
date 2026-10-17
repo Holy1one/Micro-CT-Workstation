@@ -27,24 +27,25 @@ pub(crate) struct TestConnections {
 }
 
 impl Engine {
+    fn camera_host_transfer_authorized(&self,health:&crate::devices::camera::CameraHealth)->bool {
+        health.session_id.as_ref().is_some_and(|session|self.camera_host_transfer_session.as_ref()==Some(session))
+    }
     pub(crate) fn camera_scan_readiness(&self)->Value {
         let health=self.camera.as_ref().map(|c|c.health()).or_else(||self.cached_camera_health.clone()).unwrap_or_default();
-        // Preflight freezes the destination the camera itself confirmed in its
-        // `recordingMedia` readback, so the published readiness must describe that
-        // same destination. Reporting the host-RAM requirement for a card
-        // destination told the operator to switch the body back to RAM and hid the
-        // controller firmware gate until Preflight had already refused.
+        // SD is the default. RAM for a new task requires explicit Apply in this
+        // session; retained tasks keep their frozen recovery destination.
         let card_destination=health.properties.get("recordingMedia")
             .and_then(|property|property.actual.as_ref())
             .and_then(crate::devices::camera::CameraValue::integer)==Some(0)
             && health.capabilities.card_capture;
-        let mut issues=if card_destination {
-            crate::capture_profile::scan_camera_issues_for(&health,crate::capture_profile::CaptureDestination::CameraCard)
-        } else {
-            // The host-RAM path keeps the previously published decision unchanged.
+        let legacy_ram_recovery=self.task_registry.matches(&self.parameters)&&!card_destination;
+        let explicit_ram=!card_destination&&self.camera_host_transfer_authorized(&health);
+        let mut issues=if legacy_ram_recovery||explicit_ram {
             crate::capture_profile::scan_camera_issues(&health)
+        } else {
+            crate::capture_profile::scan_camera_issues_for(&health,crate::capture_profile::CaptureDestination::CameraCard)
         };
-        if card_destination {
+        if !legacy_ram_recovery && !explicit_ram && health.capabilities.card_capture {
             if let Some(issue)=self.card_settle_firmware_issue(health.capabilities.card_overflow){issues.push(issue);}
         }
         json!({"ready":issues.is_empty(),"issues":issues})
@@ -70,6 +71,7 @@ impl Engine {
         let path=payload.get("savePath").and_then(Value::as_str).ok_or("INVALID_PARAMETERS")?.trim();
         if path.is_empty()||!PathBuf::from(path).is_absolute()||path.contains('\0'){return Err("INVALID_CAPTURE_DIRECTORY");}
         reject_capture_metadata_ancestors(&PathBuf::from(path)).map_err(|_|"CAPTURE_DIRECTORY_IS_SCAN_TASK")?;
+        self.card_import=None;
         self.parameters.save_path=path.into();self.preflight=false;self.capture_profile=None;self.scan_geometry=None;self.scan_prompt=None;
         self.schedule_metadata_probe();Ok(())
     }
@@ -78,7 +80,7 @@ impl Engine {
         #[derive(serde::Deserialize)]
         #[serde(rename_all="camelCase",deny_unknown_fields)]
         struct Preparation { #[serde(rename="type")] _command:Option<String>,task_id:String,projection_count:u32,
-            #[serde(default)] max_xray_sec:Option<u32>,geometry:scan::ScanGeometry }
+            #[serde(default)] max_xray_sec:Option<u32>,#[serde(default)] early_release:Option<bool>,geometry:scan::ScanGeometry }
         let input:Preparation=serde_json::from_value(payload.clone()).map_err(|_|"INVALID_SCAN_PREPARATION")?;
         input.geometry.validate()?;
         if input.geometry.rotation_direction!="counterclockwise"||input.geometry.measurement!="measured"{return Err("INVALID_SCAN_GEOMETRY");}
@@ -103,7 +105,9 @@ impl Engine {
         let actual_root=verified_candidate_path(&root).map_err(|_|"SCAN_OUTPUT_UNVERIFIED")?;
         let actual_independent=verified_candidate_path(&independent).map_err(|_|"CAPTURE_DIRECTORY_UNVERIFIED")?;
         if actual_root.components().any(|part|part.as_os_str().to_string_lossy().eq_ignore_ascii_case("CameraCaptures"))||crate::task_registry::lexical_path(&actual_root).starts_with(&crate::task_registry::lexical_path(&actual_independent)){return Err("RESERVED_TASK_DIRECTORY");}
+        self.card_import=None;
         self.parameters=parameters;self.max_xray_sec=max_xray_sec;self.max_xray_sec_explicit=input.max_xray_sec.is_some();self.current=0;self.preflight=false;self.capture_profile=None;self.homed=false;self.phase=Phase::Idle;
+        self.early_release=input.early_release.unwrap_or(true);
         self.scan_geometry=Some(input.geometry);self.scan_references=scan::ReferenceFrames::default();self.scan_prompt=None;self.scan_stage="idle";self.restored_scan=None;self.restored_frames.clear();self.real_frames.clear();
         self.schedule_metadata_probe();Ok(())
     }
@@ -138,6 +142,19 @@ impl Engine {
                 reporter.publish(|value|value.acquired_projections=projections);
                 engine.card_import=Some(reporter);
                 engine.log("PASS","system","Card acquisition safely finished; the task is retained as acquired with import required. The NEFs stay on the camera card until the authorized USB import is verified, and reconstruction stays locked.");
+                // Stop may supersede the terminal registry write. It must never
+                // start a new transfer or turn a late acquisition into completion.
+                if !engine.scan_stop_requested && !engine.task_exit_pending
+                    && !engine.shutting_down && !engine.fault_latched {
+                    let payload=serde_json::json!({"taskId":parameters.task_id,"savePath":parameters.save_path});
+                    if let Err(error)=engine.enqueue_card_import_after_scan(&payload) {
+                        if let Some(reporter)=engine.card_import.as_ref() {
+                            reporter.publish(|value|{value.status=crate::devices::camera::card_import::IMPORT_STATUS_FAILED;value.stage="failed";value.error=Some(error.into());});
+                        }
+                        engine.last_error=Some(error.into());
+                        engine.log("ERR","camera",&format!("Automatic card import could not start: {error}; card images and the pending-import task are retained"));
+                    }
+                }
                 Ok(())
             }))
         })
@@ -169,6 +186,15 @@ impl Engine {
     /// single COM owner while it runs. Nothing is started for a task the registry
     /// does not already retain as `acquired_pending_import`.
     pub(crate) fn enqueue_card_import(&mut self,payload:&Value)->Result<(),&'static str>{
+        self.enqueue_card_import_with_shutdown(payload,false)
+    }
+    fn enqueue_card_import_after_scan(&mut self,payload:&Value)->Result<(),&'static str>{
+        self.enqueue_card_import_with_shutdown(payload,true)?;
+        self.phase=Phase::Finishing;
+        self.scan_stage="importing";
+        Ok(())
+    }
+    fn enqueue_card_import_with_shutdown(&mut self,payload:&Value,after_scan:bool)->Result<(),&'static str>{
         if self.preview{return Err("PRODUCTION_LOCKED");}
         if self.maintenance_lock{return Err("SOFTWARE_UPDATE_MAINTENANCE_LOCKED");}
         if self.real_scan.is_some()||self.busy(){return Err("DEVICE_CONTROL_LOCKED");}
@@ -179,6 +205,7 @@ impl Engine {
         let health=camera.health();
         if !health.connected||health.isolated||!health.cleanup_confirmed{return Err("CAMERA_NOT_CONNECTED");}
         if health.live_view.active{return Err("CAMERA_LIVE_VIEW_ACTIVE");}
+        let shutdown_source=if after_scan {Some(self.xray.as_ref().cloned().ok_or("XRAY_NOT_CONNECTED")?)} else {None};
         let reporter=crate::devices::camera::card_import::CardImportReporter::new();
         reporter.publish(|value|{value.status=crate::devices::camera::card_import::IMPORT_STATUS_RUNNING;value.stage="admission";});
         let camera_for_job=camera.clone();
@@ -186,7 +213,19 @@ impl Engine {
         let reporter_for_job=reporter.clone();
         let operation_progress=reporter.operation.clone();
         self.enqueue_device("camera","card_import",move|cancel|{
-            match crate::devices::camera::card_import::run_card_import(&camera_for_job,&parameters_for_job,&cancel,&reporter_for_job){
+            let result=(||{
+              if let Some(mut xray)=shutdown_source {
+                // No camera enumeration or payload precedes a fresh confirmed
+                // OFF. This does not depend on the UI's displayed beam state.
+                let off=xray.force_off().map_err(|error|crate::devices::camera::card_import::CardImportFailure::Failed(format!("Automatic card import beam OFF failed: {error}")))?;
+                if !off.beam_off_confirmed || off.beam_on {
+                    return Err(crate::devices::camera::card_import::CardImportFailure::Failed("Automatic card import requires confirmed X-ray OFF".into()));
+                }
+                if cancel.load(Ordering::SeqCst) {return Err(crate::devices::camera::card_import::CardImportFailure::Cancelled);}
+              }
+              crate::devices::camera::card_import::run_card_import(&camera_for_job,&parameters_for_job,&cancel,&reporter_for_job)
+            })();
+            match result {
                 Ok(summary)=>{
                     let parameters=parameters_for_job.clone();
                     Ok(Box::new(move|engine|engine.complete_card_import(&parameters,summary)))
@@ -255,8 +294,11 @@ impl Engine {
             self.scan_stage=if self.task_exit_pending{"stopping"}else{"completed"};
             self.scan_prompt=None;
             self.last_error=None;
+            self.current=summary.projections;
+            self.real_frames=summary.frames.iter().map(|frame|serde_json::to_value(frame).unwrap_or(Value::Null)).collect();
+            self.scan_references=summary.references.clone();
         }
-        self.log("PASS","camera",&format!("Card import verified and sealed: {}/{} records with local file identities and {} projection(s); the retained task is registered as completed and reconstruction is unlocked",summary.verified,summary.records,summary.projections));
+        self.log("PASS","camera",&format!("Card import verified, sealed and SD cleanup confirmed: {}/{} records with local file identities and {} projection(s); only this task's SD images were removed, the retained task is completed and reconstruction is unlocked",summary.verified,summary.records,summary.projections));
         Ok(())
     }
     pub(crate) fn enqueue_stop_for_shutdown(&mut self)->Result<(),&'static str>{self.enqueue_stop(true,false)}
@@ -415,7 +457,12 @@ impl Engine {
     pub(crate) fn device_controls_snapshot(&self)->Value {
         let health=self.nano.as_ref().map(|n|n.health());
         let status=health.as_ref().and_then(|h|h.status.as_ref());
-        let mut camera=serde_json::to_value(self.camera.as_ref().map(|c|c.control_snapshot()).or_else(||self.cached_camera_health.clone()).unwrap_or_default()).unwrap_or_else(|_|json!({}));
+        let mut camera_health=self.camera.as_ref().map(|c|c.control_snapshot()).or_else(||self.cached_camera_health.clone()).unwrap_or_default();
+        if camera_health.connected&&!self.camera_host_transfer_authorized(&camera_health)
+            &&camera_health.properties.get("recordingMedia").and_then(|property|property.actual.as_ref()).and_then(crate::devices::camera::CameraValue::integer)==Some(1) {
+            camera_health.capabilities.disabled_reasons.insert("hostTransferOptIn".into(),"Local image transfer is disabled; explicitly select Host RAM and Apply to enable it for this camera session, or Apply Camera SD card".into());
+        }
+        let mut camera=serde_json::to_value(camera_health).unwrap_or_else(|_|json!({}));
         camera["lastCapturedImage"]=self.captures.back().map(|capture|serde_json::to_value(capture).unwrap_or(Value::Null)).unwrap_or(Value::Null);
         json!({
             "camera":camera,
@@ -748,7 +795,9 @@ impl Engine {
         if matches!(command,"camera_capture"|"camera_test_capture") && health.live_view.active {return Err("LIVE_VIEW_CAPTURE_FORBIDDEN");}
         let properties:Option<CameraProperties>=if command=="camera_apply_properties"{Some(serde_json::from_value(payload.get("properties").cloned().ok_or("INVALID_PARAMETERS")?).map_err(|_|"INVALID_PARAMETERS")?)}else{None};
         if let Some(properties)=properties.as_ref(){camera.property_rejection(properties).map_err(|rejection|rejection.code())?;self.preflight=false;}
-        let capture_dir=if matches!(command,"camera_capture"|"camera_test_capture") {
+        let card_capture=matches!(command,"camera_capture"|"camera_test_capture")
+            &&health.properties.get("recordingMedia").and_then(|property|property.actual.as_ref()).and_then(crate::devices::camera::CameraValue::integer)==Some(0);
+        let capture_dir=if matches!(command,"camera_capture"|"camera_test_capture")&&!card_capture {
             let expected=PathBuf::from(self.parameters.save_path.trim()).join("CameraCaptures");
             if command=="camera_capture" {
                 if self.parameters.save_path.trim().is_empty(){return Err("CAMERA_CAPTURE_ROOT_REQUIRED");}
@@ -758,7 +807,7 @@ impl Engine {
         }else{PathBuf::new()};
         let mut capture_roots=self.task_registry.capture_roots();
         if !self.parameters.save_path.trim().is_empty()&&!self.parameters.task_id.trim().is_empty(){capture_roots.push(PathBuf::from(self.parameters.save_path.trim()).join(self.parameters.task_id.trim()));}
-        if matches!(command,"camera_capture"|"camera_test_capture"){
+        if matches!(command,"camera_capture"|"camera_test_capture")&&!card_capture{
             if !capture_dir.is_absolute(){return Err("INVALID_CAPTURE_DIRECTORY");}
             let known_root=PathBuf::from(self.parameters.save_path.trim()).join(self.parameters.task_id.trim());
             if (!self.parameters.save_path.trim().is_empty()&&!self.parameters.task_id.trim().is_empty()&&crate::task_registry::lexical_path(&capture_dir).starts_with(&crate::task_registry::lexical_path(&known_root)))||self.task_registry.capture_directory_conflicts(&capture_dir){return Err("CAPTURE_DIRECTORY_IS_SCAN_TASK");}
@@ -771,12 +820,17 @@ impl Engine {
         // rejection instead of a worker-level failure that latches a fault and
         // tears down the whole camera session. Only the exact precondition the
         // worker would apply is hoisted, so no new capability is granted.
-        if matches!(command,"camera_capture"|"camera_test_capture")&&crate::devices::camera::capture_readiness(&health).is_err(){return Err("CAMERA_CAPTURE_UNQUALIFIED");}
+        if matches!(command,"camera_capture"|"camera_test_capture"){
+            let ready=if card_capture{crate::devices::camera::card_capture_readiness(&health)}else{crate::devices::camera::capture_readiness(&health)};
+            if ready.is_err(){return Err("CAMERA_CAPTURE_UNQUALIFIED");}
+            if !card_capture&&!self.camera_host_transfer_authorized(&health){return Err("CAMERA_HOST_TRANSFER_OPT_IN_REQUIRED");}
+        }
         if command=="camera_focus"&&(!health.capabilities.focus_step||!health.live_view.active){return Err("CAMERA_FOCUS_UNQUALIFIED");}
         if command=="camera_autofocus"&&!health.capabilities.autofocus{return Err("CAMERA_AUTOFOCUS_UNQUALIFIED");}
         let kind=command.to_owned();let operation=self.operations.next_id(health.session_id.as_deref().unwrap_or(&self.engine_session_id));
         self.enqueue_device("camera",command,move |cancel|{
             let mut captured=None;
+            let mut card_captured=None;
             match kind.as_str(){
                 "camera_read_properties"=>{camera.read_properties().map_err(|e|e.to_string())?;}
                 "camera_live_view_read"=>{camera.read_live_view_controls(live_session.as_deref().expect("validated LV session")).map_err(|e|e.to_string())?;}
@@ -786,10 +840,20 @@ impl Engine {
                     if !result.complete{return Err(format!("Camera parameter application partial: {:?}",result.failed));}
                 }
                 "camera_capture"|"camera_test_capture"=>{
-                    reject_capture_metadata_ancestors(&capture_dir)?;
-                    for root in &capture_roots{if let(Ok(directory),Ok(root))=(std::fs::canonicalize(&capture_dir),std::fs::canonicalize(root)){if directory.starts_with(root){return Err("Independent capture aliases a retained scan directory".into());}}}
-                    std::fs::create_dir_all(&capture_dir).map_err(|e|e.to_string())?;
-                    captured=Some(camera.capture_independent_to_path(&capture_dir.join(format!("{operation}.nef")),&operation,&cancel).map_err(|e|e.to_string())?);
+                    if card_capture {
+                        let storages=camera.read_card_storages().map_err(|error|error.to_string())?;
+                        let planned=crate::devices::camera::plan_camera_cards(&camera.health(),&storages,1,crate::devices::camera::CONSERVATIVE_NEF_BYTES)?;
+                        let plan=crate::devices::camera::CardCapturePlan{
+                            allow_overflow:camera.health().capabilities.card_overflow&&planned.storages.len()>=2,
+                            storages:planned.storages.iter().map(|storage|storage.id).collect(),expected_objects:1,early_release:false,
+                        };
+                        card_captured=Some(camera.capture_to_card(plan,&operation,&cancel,None).map_err(|error|error.to_string())?);
+                    } else {
+                        reject_capture_metadata_ancestors(&capture_dir)?;
+                        for root in &capture_roots{if let(Ok(directory),Ok(root))=(std::fs::canonicalize(&capture_dir),std::fs::canonicalize(root)){if directory.starts_with(root){return Err("Independent capture aliases a retained scan directory".into());}}}
+                        std::fs::create_dir_all(&capture_dir).map_err(|e|e.to_string())?;
+                        captured=Some(camera.capture_independent_to_path(&capture_dir.join(format!("{operation}.nef")),&operation,&cancel).map_err(|e|e.to_string())?);
+                    }
                 }
                 "camera_live_view_start"=>{camera.start_live_view().map_err(|e|e.to_string())?;}
                 "camera_live_view_stop"=>{camera.stop_live_view().map_err(|e|e.to_string())?;}
@@ -800,6 +864,11 @@ impl Engine {
             if cancel.load(Ordering::SeqCst){return Err("Camera operation cancelled".into());}
             Ok(Box::new(move |engine|{
                 let health=camera.health();
+                if let Some(outcome)=card_captured {
+                    let receipt=outcome.receipt;
+                    if !outcome.exposure_ended||receipt.size==0||receipt.operation_id!=operation||Some(receipt.session_id.as_str())!=health.session_id.as_deref(){return Err("Independent card capture completion evidence mismatch".into());}
+                    engine.log("PASS","camera",&format!("Single NEF saved to camera SD card · {} · object={} · no local image transfer",receipt.filename,receipt.handle));
+                }
                 if let Some(image)=captured {
                     if !image.exposure_ended || image.size==0 || image.sha256.len()!=64 || image.operation_id!=operation || Some(image.session_id.as_str())!=health.session_id.as_deref(){return Err("Independent capture completion evidence mismatch".into());}
                     engine.captures.push_back(RegisteredCapture{capture_id:operation.clone(),session_id:image.session_id,operation_id:image.operation_id,path:image.path,bytes:image.size,sha256:image.sha256,format:image.format,exposure_ended:image.exposure_ended});
@@ -807,6 +876,10 @@ impl Engine {
                     engine.log("PASS","camera","Single host NEF output saved and registered with complete file/hash evidence; physical exposure count is not established");
                 }
                 if kind=="camera_apply_properties" {
+                    if properties.as_ref().is_some_and(|values|values.contains_key("recordingMedia")) {
+                        engine.camera_host_transfer_session=if properties.as_ref().and_then(|values|values.get("recordingMedia")).and_then(crate::devices::camera::CameraValue::integer)==Some(1)
+                            &&health.properties.get("recordingMedia").is_some_and(|property|property.confirmed&&property.error.is_none()&&property.actual.as_ref().and_then(crate::devices::camera::CameraValue::integer)==Some(1)) {health.session_id.clone()}else{None};
+                    }
                     if properties.as_ref().is_some_and(|properties|properties.contains_key("shutter")) {
                         let shutter=health.properties.get("shutter").ok_or("Applied shutter lacks a described readback")?;
                         engine.parameters.exposure_ms=crate::devices::camera::shutter_property_ms(shutter).map_err(|error|error.to_string())?;
@@ -851,11 +924,12 @@ impl Engine {
             let plan=if relative{crate::devices::turntable::plan_relative(&status,mdeg)}else{crate::devices::turntable::plan_to_phase(&status,mdeg)}.map_err(|e|e.to_string())?;
             if cancel.load(Ordering::SeqCst){return Err("Motion cancelled before command".into());}
             if !plan.is_noop(){
-                let ticket=nano.execute_plan_cancelled(&plan,cancel.clone()).map_err(|e|e.to_string())?;
-                let held=nano.status().map_err(|e|e.to_string())?;
-                crate::devices::turntable::verify_plan_capture_hold(&plan,&ticket,&held).map_err(|e|e.to_string())?;
+                let outcome=nano.execute_plan_cancelled(&plan,cancel.clone()).map_err(|e|e.to_string())?;
+                // The move reply already carries the qualified CAPTURE_HOLD STATUS;
+                // reusing it avoids a redundant STATUS round trip before release.
+                crate::devices::turntable::verify_plan_capture_hold(&plan,&outcome.ticket,&outcome.ready_status).map_err(|e|e.to_string())?;
                 if cancel.load(Ordering::SeqCst){let _=nano.stop();return Err("Motion cancelled in capture hold".into());}
-                nano.capture_done_cancelled(ticket.command_id,cancel.clone()).map_err(|e|e.to_string())?;
+                nano.capture_done_cancelled(outcome.ticket.command_id,cancel.clone()).map_err(|e|e.to_string())?;
                 let idle=nano.status().map_err(|e|e.to_string())?;
                 crate::devices::turntable::verify_plan_released(&plan,&idle).map_err(|e|e.to_string())?;
             }
@@ -878,19 +952,26 @@ impl Engine {
         if !recovery {
             if !self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down{return Err("USB_AUTO_SHUTDOWN_RELEASE_REQUIRED");}
             if !self.set_kv_confirmed || !self.set_ua_confirmed{return Err("XRAY_SETPOINT_CONFIRMATION_REQUIRED");}
+            require_new_scan_destination(&camera.health(),self.camera_host_transfer_session.as_deref())?;
         }
         let unchanged=recovery&&payload.get("confirmTurntableUnchanged").and_then(Value::as_bool)==Some(true);
         let confirmed_home_zero=unchanged&&payload.get("confirmReferenceAtHome").and_then(Value::as_bool)==Some(true);
-        let params=self.parameters.clone();let kv=self.set_kv;let ua=self.set_ua;let reused=self.reference_verified_this_process;let preset=self.preset_tag.clone();
+        let params=self.parameters.clone();let kv=self.set_kv;let ua=self.set_ua;let reused=self.reference_verified_this_process;let preset=self.preset_tag.clone();let host_transfer_session=self.camera_host_transfer_session.clone();
         self.preflight=false;
         self.enqueue_device("system","preflight",move |cancel|{
             let (kv,ua,frozen_max,frozen_profile)=if recovery {let(kv,ua,max,profile)=read_frozen_recovery(&params)?;(kv,ua,Some(max),Some(profile))}else{(kv,ua,None,None)};
             if scan::manifest_file_exists(&params) && !scan::resume_manifest_exists(&params){return Err("Scan output exists; use a new task".into());}
             if camera.health().live_view.active{return Err("LIVE_VIEW_CAPTURE_FORBIDDEN: explicitly stop Live View".into());}
             camera.read_properties().map_err(|e|e.to_string())?;
+            if !recovery {require_new_scan_destination(&camera.health(),host_transfer_session.as_deref()).map_err(str::to_owned)?;}
             let mut profile=freeze_capture_profile(&camera,&nano,preset)?;
             if let Some(frozen)=frozen_profile.as_ref(){frozen.matches(&profile)?;profile.preset=frozen.preset.clone();}
             if profile.exposure_ms()!=Some(params.exposure_ms){return Err("Camera shutter differs from the shared Exposure target".into());}
+            let checkpoint = if recovery && scan::manifest_file_exists(&params) {
+                let checkpoint = scan::load_resume(&params,kv,ua,&profile)?;
+                scan::verify_card_resume_objects(&camera,&checkpoint,&cancel)?;
+                Some(checkpoint)
+            } else { None };
             xray.force_off().map_err(|e|format!("OFF unconfirmed during preflight: {e}"))?;
             if cancel.load(Ordering::SeqCst){return Err("Preflight cancelled before setpoint/USB writes".into());}
             if recovery {let usb=xray.set_usb_auto_shutdown(false).map_err(|e|e.to_string())?;if usb.usb_auto_shutdown!=Some(false){return Err("USB auto-shutdown release lacks current-session confirmation".into());}}
@@ -900,7 +981,7 @@ impl Engine {
             let mut reusable=may_reuse_home(reused,unchanged,&status);
             if unchanged && !reusable {
                 // Verify retained acquisition before trusting a stopped controller counter.
-                let checkpoint=scan::load_resume(&params,kv,ua,&profile)?;
+                let checkpoint=checkpoint.as_ref().ok_or("REFERENCE_RECOVERY_POSITION_UNVERIFIED: no acquisition checkpoint")?;
                 let at_confirmed_origin=confirmed_home_zero&&status.hall_active&&status.position_pulses==0;
                 if status.state=="FAULT" || (!at_confirmed_origin&&!scan::recovery_position_matches(&checkpoint,&params,status.position_pulses,status.pulses_per_rev)) {
                     return Err("REFERENCE_RECOVERY_POSITION_UNVERIFIED: current position does not match the checkpoint; do not continue without re-establishing the reference".into());
@@ -938,8 +1019,9 @@ impl Engine {
             camera.read_properties().map_err(|e|e.to_string())?;
             let actual=freeze_capture_profile(&camera,&nano,preset)?;
             let restored=scan::load_resume(&params,kv,ua,&actual)?;
+            scan::verify_card_resume_objects(&camera,&restored,&cancel)?;
             if cancel.load(Ordering::SeqCst){return Err("Restore cancelled".into());}
-            Ok(Box::new(move |engine|{engine.max_xray_sec=restored.max_xray_sec;engine.capture_profile=Some(actual);engine.current=restored.frames.len()as u32;engine.real_frames=restored.frames.iter().map(|f|serde_json::to_value(f).unwrap_or(Value::Null)).collect();engine.scan_geometry=Some(restored.geometry.clone());engine.scan_references=restored.references.clone();engine.restored_frames=restored.frames.clone();engine.restored_scan=Some(restored);engine.scan_prompt=None;engine.scan_stage="idle";engine.phase=Phase::Ready;Ok(())}))
+            Ok(Box::new(move |engine|{engine.max_xray_sec=restored.max_xray_sec;engine.capture_profile=Some(actual);engine.current=restored.projection_count()as u32;engine.real_frames=restored.frames.iter().map(|f|serde_json::to_value(f).unwrap_or(Value::Null)).collect();engine.scan_geometry=Some(restored.geometry.clone());engine.scan_references=restored.references.clone();engine.restored_frames=restored.frames.clone();engine.restored_scan=Some(restored);engine.scan_prompt=None;engine.scan_stage="idle";engine.phase=Phase::Ready;Ok(())}))
         })
     }
     fn enqueue_reconstruction(&mut self,payload:Value)->Result<(),&'static str> {
@@ -974,6 +1056,8 @@ impl Engine {
         let nano=self.nano.as_ref().cloned().ok_or("NANO_NOT_CONNECTED")?;
         let camera=self.camera.as_ref().cloned().ok_or("CAMERA_NOT_CONNECTED")?;
         let expected=self.capture_profile.clone().ok_or("CAPTURE_PROFILE_REQUIRED")?;
+        let recovery=self.task_registry.matches(&self.parameters);let host_transfer_session=self.camera_host_transfer_session.clone();
+        if !recovery {require_new_scan_destination(&camera.health(),host_transfer_session.as_deref())?;}
         let preset=self.preset_tag.clone();
         let parameters=self.parameters.clone();
         let operation_id=self.operations.next_id(&self.engine_session_id);
@@ -982,6 +1066,7 @@ impl Engine {
             if !nano_reference_ready(&status){return Err("HOME_REQUIRED".into());}
             if camera.health().live_view.active{return Err("LIVE_VIEW_CAPTURE_FORBIDDEN: explicitly stop Live View".into());}
             camera.read_properties().map_err(|e|e.to_string())?;
+            if !recovery {require_new_scan_destination(&camera.health(),host_transfer_session.as_deref()).map_err(str::to_owned)?;}
             let actual=freeze_capture_profile(&camera,&nano,preset)?;
             expected.matches(&actual)?;
             if cancel.load(Ordering::SeqCst){return Err("Scan start cancelled".into());}
@@ -1066,7 +1151,10 @@ impl Engine {
                 let _=camera.stop_live_view_with_timeout(Duration::from_secs(5));
             }
         }
-        if let Some(camera)=camera.as_ref(){camera.request_cancel();}
+        if let Some(camera)=camera.as_ref(){
+            if disconnect || self.shutting_down || self.maintenance_lock {camera.request_cancel();}
+            else {camera.request_stop();}
+        }
         if let Some(scan)=self.real_scan.as_ref(){scan.cancel_only();}
         let mut xray=self.xray.as_ref().cloned();
         self.enqueue_device("safety","stop",move |_|{
@@ -1129,6 +1217,7 @@ impl Engine {
         self.log("PASS","system","Scan ended and task closed; all acquired files retained. Prepare a new task and repeat Preflight and HOME.");
     }
     fn clear_task_selection(&mut self) {
+        self.card_import=None;
         self.parameters.task_id.clear();self.current=0;self.real_frames.clear();
         self.scan_references=scan::ReferenceFrames::default();self.scan_geometry=None;self.capture_profile=None;
         self.scan_stage="stopped";self.metadata_generation+=1;
@@ -1206,6 +1295,19 @@ fn card_capture_policy_for(nano:&NanoAdapter,overflow_advertised:bool)->Result<c
     crate::scan::card_capture_policy(&identity,overflow_advertised)
 }
 
+/// Admission is read-only; inherited RAM values never authorize local transfer.
+fn require_new_scan_destination(health:&crate::devices::camera::CameraHealth,host_transfer_session:Option<&str>)->Result<(),&'static str>{
+    if host_transfer_session.is_some()&&health.session_id.as_deref()==host_transfer_session
+        &&health.properties.get("recordingMedia").is_some_and(|property|property.supported&&property.readable&&property.confirmed&&property.error.is_none()
+            &&property.actual.as_ref().and_then(crate::devices::camera::CameraValue::integer)==Some(1)){return Ok(());}
+    let confirmed_card=health.properties.get("recordingMedia").is_some_and(|property|
+        property.supported&&property.readable&&property.confirmed&&property.error.is_none()
+        &&property.actual.as_ref().and_then(crate::devices::camera::CameraValue::integer)==Some(0));
+    if !confirmed_card{return Err("CAMERA_SCAN_SD_REQUIRED");}
+    if !health.capabilities.card_capture{return Err("CAMERA_CARD_CAPTURE_UNSUPPORTED");}
+    Ok(())
+}
+
 /// Freezes the current camera and controller evidence as the profile of the
 /// destination the camera itself confirmed. An unknown destination is refused
 /// instead of being defaulted to either side, and a card profile additionally
@@ -1253,7 +1355,7 @@ fn read_frozen_recovery(parameters:&crate::Parameters)->Result<(f64,f64,u32,crat
     let path=if root.join("manifest.json").is_file(){root.join("manifest.json")}else{root.join("preparation-checkpoint.json")};
     if std::fs::metadata(&path).map_err(|e|e.to_string())?.len()>8*1024*1024{return Err("Retained acquisition metadata exceeds limit".into());}
     let data:Value=serde_json::from_reader(std::fs::File::open(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
-    if data["schemaVersion"]!=3 || data["scanId"].as_str()!=Some(parameters.task_id.as_str()) || data["projectionCount"].as_u64()!=Some(u64::from(parameters.projection_count)) || data["exposureMs"].as_f64()!=Some(parameters.exposure_ms){return Err("Retained task lacks matching schema 3 configuration; legacy tasks cannot resume with this backend".into());}
+    if !matches!(data["schemaVersion"].as_u64(),Some(3|4)) || data["scanId"].as_str()!=Some(parameters.task_id.as_str()) || data["projectionCount"].as_u64()!=Some(u64::from(parameters.projection_count)) || data["exposureMs"].as_f64()!=Some(parameters.exposure_ms){return Err("Retained task lacks matching schema 3/4 configuration; legacy tasks cannot resume with this backend".into());}
     let profile:crate::capture_profile::CaptureProfile=serde_json::from_value(data["captureProfile"].clone()).map_err(|e|e.to_string())?;profile.require_current_policy()?;
     let kv=data["voltageKv"].as_f64().ok_or("Frozen voltage missing")?;let ua=data["currentUa"].as_f64().ok_or("Frozen current missing")?;
     let max=u32::try_from(data["maxXraySec"].as_u64().ok_or("Frozen continuous X-ray limit missing")?).map_err(|_|"Invalid frozen continuous X-ray limit")?;
@@ -1281,6 +1383,26 @@ mod tests{
     // terminal evidence under parallel test load without changing that budget.
     fn pump(engine:&mut Engine){let deadline=Instant::now()+Duration::from_secs(8);while engine.operations.is_active()&&Instant::now()<deadline{engine.tick();std::thread::sleep(Duration::from_millis(5));}assert!(!engine.operations.is_active());}
     fn geometry()->Value{json!({"sodMm":100.0,"objectToDetectorMm":100.0,"detectorWidthMm":40.0,"centerOffsetXMm":1.0,"centerOffsetYMm":-1.0,"rotationDirection":"counterclockwise","mirrorX":true,"measurement":"measured"})}
+    #[test]
+    fn scan_preparation_defaults_to_early_release_and_accepts_an_explicit_off_choice() {
+        let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine")
+            .join(format!("{}-early-release-preparation",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        let mut engine=Engine::new_with_storage(false,root.join("engine-data"));
+        let (camera,probe)=crate::devices::camera::scripted_card_adapter(ScriptedCameraConfig::default());
+        engine.camera=Some(camera);engine.parameters.save_path=root.to_string_lossy().into();
+        assert!(engine.early_release);
+        let mut draft=json!({"taskId":"serial","projectionCount":3,"maxXraySec":120,"earlyRelease":false,"geometry":geometry()});
+        engine.prepare_scan(&draft).unwrap();pump(&mut engine);
+        assert!(!engine.early_release);
+        assert_eq!(engine.snapshot()["workstation"]["scanSetup"]["earlyRelease"],false);
+        draft["earlyRelease"]=json!("true");
+        assert_eq!(engine.prepare_scan(&draft),Err("INVALID_SCAN_PREPARATION"));
+        assert!(!engine.early_release,"invalid drafts cannot change the accepted choice");
+        draft.as_object_mut().unwrap().remove("earlyRelease");draft["taskId"]=json!("accelerated");
+        engine.prepare_scan(&draft).unwrap();pump(&mut engine);
+        assert!(engine.early_release,"a new preparation defaults to acceleration");
+        assert_eq!(probe.write_count(),0);
+    }
     fn registered_stop_fixture(topic:&str)->(Engine,PathBuf) {
         let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine")
             .join(format!("{}-stop-{topic}",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
@@ -1312,7 +1434,7 @@ mod tests{
     #[test]
     fn actual_start_can_reuse_a_deleted_retained_directory_without_waiting_for_poll(){
         let(mut engine,root)=registered_stop_fixture("reused-start");engine.task_registry.abandon().unwrap();let target=root.join("old-task");assert!(target.canonicalize().unwrap().starts_with(root.canonicalize().unwrap()));std::fs::remove_dir_all(target).unwrap();
-        let(camera,_)=crate::devices::camera::scripted_camera_with_probe(Default::default());engine.capture_profile=Some(crate::capture_profile::CaptureProfile::from_camera_readback(&camera.health(),camera.profile_readback().unwrap(),None).unwrap());engine.camera=Some(camera);engine.nano=Some(crate::devices::turntable::test_homed_nano());let(mut xray,_)=crate::devices::xray::test_worker(20.0,100.0);xray.set_usb_auto_shutdown(false).unwrap();engine.xray=Some(xray);engine.set_kv=20.0;engine.set_ua=100.0;engine.usb_auto_shut_down=false;engine.usb_auto_shut_down_confirmed=true;
+        let(camera,_)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});engine.nano=Some(crate::devices::turntable::test_card_homed_nano());engine.capture_profile=Some(freeze_capture_profile(&camera,engine.nano.as_ref().unwrap(),None).unwrap());engine.camera=Some(camera);let(mut xray,_)=crate::devices::xray::test_worker(20.0,100.0);xray.set_usb_auto_shutdown(false).unwrap();engine.xray=Some(xray);engine.set_kv=20.0;engine.set_ua=100.0;engine.usb_auto_shut_down=false;engine.usb_auto_shut_down_confirmed=true;
         engine.connected=true;engine.preflight=true;engine.homed=true;engine.scan_geometry=Some(serde_json::from_value(geometry()).unwrap());
         engine.device_command("start_scan",json!({})).unwrap().unwrap();pump(&mut engine);assert!(engine.real_scan.is_some());assert!(engine.task_registry.locked());assert_eq!(engine.task_registry.snapshot()["retained"],json!([]));
         engine.device_command("stop",json!({})).unwrap().unwrap();engine.shutdown_with_timeout(Duration::from_secs(5)).unwrap();
@@ -1537,8 +1659,10 @@ mod tests{
         assert!(camera.health().cleanup_confirmed,"the stop must confirm camera cleanup");
         assert!(!engine.fault_latched,"a clean stop must not latch a fault");
         assert!(engine.manual_lock.is_none(),"a clean stop must not leave a cleanup lock");
-        // No acknowledgement/recovery step is needed to use the camera again.
-        assert!(engine.device_command("camera_connect",json!({"deviceId":"fake-camera-1"})).unwrap().is_ok());
+        // The healthy idle session remains usable without reconnecting.
+        assert!(camera.health().connected);
+        assert_eq!(engine.device_command("camera_connect",json!({"deviceId":"fake-camera-1"})).unwrap(),Err("CAMERA_ALREADY_CONNECTED"));
+        engine.device_command("camera_read_properties",json!({})).unwrap().unwrap();
         pump(&mut engine);
         assert!(camera.health().connected);
     }
@@ -1638,8 +1762,9 @@ mod tests{
         let mut engine=Engine::new_with_storage(false,root.join("engine-data"));
         let(camera,_probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{close_failure:true,..Default::default()});
         engine.cached_camera_health=Some(camera.health());engine.camera=Some(camera.clone());
-        // A real stop whose cleanup can never be confirmed produces the same
-        // isolated/unconfirmed state observed on hardware.
+        // This session requires retirement; its Close failure must remain
+        // unconfirmed. A healthy idle Stop no longer calls Close at all.
+        camera.request_cancel();
         engine.device_command("stop",json!({})).unwrap().unwrap();pump(&mut engine);
         assert!(engine.manual_lock.as_deref().is_some_and(|reason|reason.starts_with("Camera cleanup unconfirmed")),"stop must latch the camera cleanup lock: {:?}",engine.manual_lock);
         assert!(engine.fault_latched);
@@ -1760,7 +1885,7 @@ mod tests{
     }
     #[test]
     fn preflight_and_start_fresh_read_without_camera_writes_or_implicit_live_view_stop(){
-        let mut engine=Engine::new(false);let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(Default::default());engine.camera=Some(camera.clone());engine.cached_camera_health=Some(camera.health());engine.nano=Some(crate::devices::turntable::test_homed_nano());engine.connected=true;engine.reference_verified_this_process=true;
+        let mut engine=Engine::new(false);let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});engine.camera=Some(camera.clone());engine.cached_camera_health=Some(camera.health());engine.nano=Some(crate::devices::turntable::test_card_homed_nano());engine.connected=true;engine.reference_verified_this_process=true;
         let(mut xray,_)=crate::devices::xray::test_worker(20.0,100.0);xray.set_usb_auto_shutdown(false).unwrap();engine.xray=Some(xray);engine.set_kv=20.0;engine.set_ua=100.0;engine.set_kv_confirmed=true;engine.set_ua_confirmed=true;engine.usb_auto_shut_down=false;engine.usb_auto_shut_down_confirmed=true;
         let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-read-only-preflight",chrono::Utc::now().timestamp_nanos_opt().unwrap()));engine.parameters.save_path=root.to_string_lossy().into();engine.prepare_scan(&json!({"taskId":"fixed","projectionCount":3,"maxXraySec":120,"geometry":geometry()})).unwrap();
         assert_eq!(engine.command("update_scan_setup",json!({"setup":{"exposureMs":125.0}})),Err("EXPOSURE_EDIT_REQUIRES_CAMERA_APPLY"));assert_eq!(probe.write_count(),0);
@@ -1774,7 +1899,7 @@ mod tests{
         use crate::devices::camera::CameraValue;
         for condition in ["iso","whiteBalance","liveView"]{
             let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-start-admission-{condition}",chrono::Utc::now().timestamp_nanos_opt().unwrap()));let storage=root.join("engine-data");
-            let mut engine=Engine::new_with_storage(false,&storage);let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(Default::default());engine.camera=Some(camera.clone());engine.cached_camera_health=Some(camera.health());engine.nano=Some(crate::devices::turntable::test_homed_nano());engine.connected=true;engine.reference_verified_this_process=true;
+            let mut engine=Engine::new_with_storage(false,&storage);let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});engine.camera=Some(camera.clone());engine.cached_camera_health=Some(camera.health());engine.nano=Some(crate::devices::turntable::test_card_homed_nano());engine.connected=true;engine.reference_verified_this_process=true;
             let(mut xray,_)=crate::devices::xray::test_worker(20.0,100.0);xray.set_usb_auto_shutdown(false).unwrap();engine.xray=Some(xray);engine.set_kv=20.0;engine.set_ua=100.0;engine.set_kv_confirmed=true;engine.set_ua_confirmed=true;engine.usb_auto_shut_down=false;engine.usb_auto_shut_down_confirmed=true;engine.parameters.save_path=root.to_string_lossy().into();
             engine.prepare_scan(&json!({"taskId":"not-started","projectionCount":3,"maxXraySec":120,"geometry":geometry()})).unwrap();engine.device_command("preflight",json!({})).unwrap().unwrap();pump(&mut engine);assert!(engine.preflight&&engine.homed);assert!(!engine.task_registry.locked());
             let original=camera.health().properties.get(condition).and_then(|p|p.actual.clone());
@@ -1808,6 +1933,7 @@ mod tests{
     #[test]
     fn independent_capture_registers_only_complete_image_in_shared_root_without_scan_progress(){
         let mut engine=Engine::new(false);engine.camera=Some(scripted_camera(Default::default()));
+        engine.device_command("camera_apply_properties",json!({"properties":{"recordingMedia":1}})).unwrap().unwrap();pump(&mut engine);
         let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-capture-register",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
         engine.set_capture_root(&json!({"savePath":root.to_string_lossy()})).unwrap();
         engine.device_command("camera_capture",json!({})).unwrap().unwrap();pump(&mut engine);
@@ -1830,6 +1956,7 @@ mod tests{
         probe.set_capture_event_codes(vec![vec![(0xc101,0xffff0001)]]);
         engine.camera=Some(camera);
         let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-object-only-register",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        engine.device_command("camera_apply_properties",json!({"properties":{"recordingMedia":1}})).unwrap().unwrap();pump(&mut engine);
         engine.set_capture_root(&json!({"savePath":root.to_string_lossy()})).unwrap();
         engine.device_command("camera_capture",json!({})).unwrap().unwrap();pump(&mut engine);
         let capture=engine.captures.back().expect("object-only capture must register");
@@ -1842,6 +1969,7 @@ mod tests{
     #[test]
     fn cancelled_transfer_does_not_register_or_commit_an_independent_image(){
         let mut engine=Engine::new(false);let(tx,rx)=mpsc::channel();engine.camera=Some(scripted_camera(ScriptedCameraConfig{capture_started_signal:Some(tx),transfer_delay:Duration::from_millis(200),..Default::default()}));
+        engine.device_command("camera_apply_properties",json!({"properties":{"recordingMedia":1}})).unwrap().unwrap();pump(&mut engine);
         let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-capture-cancel-register",chrono::Utc::now().timestamp_nanos_opt().unwrap()));engine.parameters.save_path=root.to_string_lossy().into();
         engine.device_command("camera_capture",json!({})).unwrap().unwrap();rx.recv_timeout(Duration::from_secs(2)).unwrap();engine.device_command("stop",json!({})).unwrap().unwrap();pump(&mut engine);assert!(engine.captures.is_empty());assert_eq!(engine.current,0);assert!(!engine.task_registry.locked());assert!(!std::fs::read_dir(root.join("CameraCaptures")).unwrap().any(|file|file.unwrap().path().extension().is_some_and(|ext|ext=="nef")));
     }
@@ -1865,6 +1993,54 @@ mod tests{
         let warning=events.iter().position(|line|line.starts_with("TX XRAY_WARNING ")&&line.ends_with(" ON")).unwrap();
         assert!(stopped<warning,"warning ON must not race an admitted STOP: {events:?}");
         assert!(!events.iter().any(|line|line.starts_with("TX HOME ")||line.starts_with("TX MOVE_")));
+    }
+    #[test]
+    fn stop_and_fault_cleanup_keep_healthy_idle_device_owners() {
+        for fault in [false, true] {
+            let mut engine=Engine::new(false);
+            let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig::default());
+            let session=camera.health().session_id;let lifecycle=probe.transport_lifecycle();
+            engine.cached_camera_health=Some(camera.health());engine.camera=Some(camera.clone());
+            let(nano,_)=crate::devices::turntable::test_delayed_stop_nano();engine.nano=Some(nano);engine.connected=true;
+            let(xray,_)=crate::devices::xray::test_worker(20.0,100.0);engine.xray=Some(xray);engine.ever_xray=true;
+            engine.fault_latched=fault;
+            if fault {engine.enqueue_stop_for_shutdown().unwrap();}else{engine.device_command("stop",json!({})).unwrap().unwrap();}
+            pump(&mut engine);
+            let snapshot=engine.snapshot();
+            assert_eq!(snapshot["deviceControls"]["camera"]["connected"],true,"{snapshot}");
+            assert_eq!(snapshot["deviceControls"]["turntable"]["connected"],true);
+            assert_eq!(snapshot["workstation"]["xray"]["connected"],true);
+            assert!(camera.health().cleanup_confirmed && !camera.health().isolated);
+            assert_eq!(camera.health().session_id,session);assert_eq!(probe.transport_lifecycle(),lifecycle);
+            assert!(!engine.preflight && !engine.homed && !engine.beam_on);
+            assert_eq!(engine.fault_latched,fault);
+            assert!(engine.xray.as_ref().unwrap().health().beam_off_confirmed);
+            engine.shutdown().unwrap();
+            assert!(!camera.health().connected);
+        }
+    }
+    #[test]
+    fn xray_transport_fault_keeps_other_idle_connections_and_retained_task_locked() {
+        let(mut engine,root)=registered_stop_fixture("xray-fault-keeps-connections");
+        let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(Default::default());
+        let session=camera.health().session_id;let lifecycle=probe.transport_lifecycle();
+        engine.cached_camera_health=Some(camera.health());engine.camera=Some(camera.clone());
+        let(nano,_)=crate::devices::turntable::test_delayed_stop_nano();engine.nano=Some(nano);engine.connected=true;
+        let(mut xray,xray_probe)=crate::devices::xray::test_worker(20.0,100.0);
+        xray_probe.fail_next_read();assert!(xray.refresh_status().is_err());
+        xray.force_off().unwrap();engine.xray=Some(xray);engine.ever_xray=true;
+        engine.tick();pump(&mut engine);
+        assert!(engine.fault_latched && engine.task_registry.locked());
+        assert!(!engine.task_exit_pending && !engine.preflight && !engine.beam_on);
+        assert!(camera.health().connected && camera.health().cleanup_confirmed);
+        assert_eq!(camera.health().session_id,session);assert_eq!(probe.transport_lifecycle(),lifecycle);
+        assert_eq!(engine.snapshot()["deviceControls"]["turntable"]["connected"],true);
+        assert!(engine.xray.as_ref().unwrap().health().beam_off_confirmed);
+        assert!(engine.xray.as_ref().unwrap().health().last_error.is_some());
+        assert!(!xray_probe.output_enabled());
+        assert!(xray_probe.beam_transitions().iter().all(|(enabled,_)|!*enabled));
+        assert_eq!(std::fs::read(root.join("old-task/original.nef")).unwrap(),b"SCRIPTED TEST ORIGINAL");
+        engine.shutdown().unwrap();
     }
     #[test]
     fn unopened_moxtek_discovery_failure_does_not_stop_or_alarm(){
@@ -2023,8 +2199,7 @@ mod tests{
         // runs, and it is the reason this session is not yet ready.
         assert!(issues.iter().any(|issue|issue["key"]=="cardSettleFirmware"),"{issues:?}");
         assert_eq!(readiness["ready"],json!(false));
-        // A body without the negotiated card capability keeps the host-RAM decision
-        // even when it reports the card destination it cannot use.
+        // A new task cannot fall back to host RAM when SD is unsupported.
         let mut ram=Engine::new_with_storage(false,root.join("ram-engine-data"));
         let(ram_camera,ram_probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig::default());
         ram_camera.disconnect_confirmed().unwrap();
@@ -2033,9 +2208,138 @@ mod tests{
         ram_probe.set_actual("recordingMedia",crate::devices::camera::CameraValue::Integer(0));
         ram.device_command("camera_read_properties",json!({})).unwrap().unwrap();pump(&mut ram);
         let ram_issues=ram.camera_scan_readiness()["issues"].as_array().cloned().unwrap_or_default();
-        assert!(ram_issues.iter().any(|issue|issue["key"]=="recordingMedia"&&issue["requirement"]=="Host RAM (1)"),"{ram_issues:?}");
+        assert!(ram_issues.iter().any(|issue|issue["key"]=="session"&&issue["requirement"]=="Confirmed native D7100 card-capture session"),"{ram_issues:?}");
         assert!(!ram_issues.iter().any(|issue|issue["key"]=="cardSettleFirmware"),"{ram_issues:?}");
     }
+    #[test]
+    fn sd_scan_routing_rejects_new_ram_preflight_and_start_before_any_capture(){
+        let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-sd-routing-ram",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        let mut engine=Engine::new_with_storage(false,root.join("engine-data"));
+        let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});
+        probe.set_actual("recordingMedia",crate::devices::camera::CameraValue::Integer(1));camera.read_properties().unwrap();
+        engine.camera=Some(camera);engine.nano=Some(crate::devices::turntable::test_card_homed_nano());engine.connected=true;
+        let(mut xray,_)=crate::devices::xray::test_worker(20.0,100.0);xray.set_usb_auto_shutdown(false).unwrap();engine.xray=Some(xray);
+        engine.set_kv_confirmed=true;engine.set_ua_confirmed=true;engine.usb_auto_shut_down=false;engine.usb_auto_shut_down_confirmed=true;
+        engine.parameters=crate::Parameters{task_id:"new-sd-only".into(),save_path:root.to_string_lossy().into(),projection_count:3,angle_step_deg:120.0,exposure_ms:200.0};
+        engine.scan_geometry=Some(serde_json::from_value(geometry()).unwrap());
+        let requests=probe.requests();let operation_count=engine.operations.history.len();
+        assert_eq!(engine.device_command("preflight",json!({})).unwrap(),Err("CAMERA_SCAN_SD_REQUIRED"));
+        assert!(!engine.preflight);assert!(!engine.fault_latched);assert!(!engine.task_registry.locked());
+        let readiness=engine.camera_scan_readiness();let issues=readiness["issues"].as_array().unwrap();
+        assert!(issues.iter().any(|issue|issue["key"]=="recordingMedia"&&issue["requirement"]=="Camera card (0)"));
+        assert!(!issues.iter().any(|issue|issue["requirement"]=="Host RAM (1)"));
+        engine.capture_profile=Some(crate::capture_profile::test_profile());engine.preflight=true;engine.homed=true;
+        assert_eq!(engine.device_command("start_scan",json!({})).unwrap(),Err("CAMERA_SCAN_SD_REQUIRED"));
+        assert_eq!(engine.operations.history.len(),operation_count);assert_eq!(probe.requests(),requests);assert_eq!(probe.write_count(),0);
+        assert!(!engine.task_registry.locked());assert!(engine.real_scan.is_none());assert!(!root.join("new-sd-only").exists());
+        assert_eq!(probe.operation_count(0x100e),0);assert_eq!(probe.operation_count(0x90c0),0);assert_eq!(probe.operation_count(0x1009),0);
+    }
+
+    #[test]
+    fn sd_scan_routing_card_single_photo_needs_no_local_root_or_other_devices(){
+        let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-sd-routing-single",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        let mut engine=Engine::new_with_storage(false,root.join("engine-data"));
+        let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});
+        let mut object=1u32.to_le_bytes().to_vec();
+        probe.set_storages(&[(1,2,64*1024*1024*1024,32*1024*1024*1024,5000)]);
+        object.extend(0x3800u16.to_le_bytes());object.extend(0u16.to_le_bytes());object.extend(26_673_241u32.to_le_bytes());
+        object.extend([0;26]);object.extend(0x0002_0005u32.to_le_bytes());object.extend([0;10]);
+        for value in ["DSC_0001.NEF","20261012T120000","20261012T120000",""] {
+            let units:Vec<u16>=value.encode_utf16().chain([0]).collect();object.push(units.len() as u8);object.extend(units.into_iter().flat_map(u16::to_le_bytes));
+        }
+        probe.set_card_object(0x0010_0001,object);probe.set_card_events(vec![vec![(0x4002,0x0010_0001)],vec![(0x400d,0)]]);
+        engine.camera=Some(camera);assert!(engine.parameters.save_path.is_empty());assert!(engine.nano.is_none()&&engine.xray.is_none());
+        engine.device_command("camera_capture",json!({})).unwrap().unwrap();let id=engine.operations.last_id.clone().unwrap();pump(&mut engine);
+        let operation=engine.operations.history.iter().find(|op|op.operation_id==id).unwrap();assert_eq!(operation.status,"completed","{:?}",operation.error);
+        let health=engine.camera.as_ref().unwrap().health();assert_eq!(health.properties["recordingMedia"].actual,Some(crate::devices::camera::CameraValue::Integer(0)));
+        assert!(health.last_card_capture_timing.as_ref().unwrap().completed);assert!(health.last_capture.is_none());assert!(engine.captures.is_empty());
+        assert_eq!(probe.operation_count(0x100e),1);assert_eq!(probe.operation_count(0x90c0),0);assert_eq!(probe.operation_count(0x1009),0);assert_eq!(probe.write_count(),0);
+        assert!(!root.join("CameraCaptures").exists());assert!(!engine.task_registry.locked());assert!(!engine.fault_latched);
+        assert!(engine.logs.iter().any(|log|log["message"].as_str().is_some_and(|message|message.contains("Single NEF saved to camera SD card"))));
+    }
+
+    #[test]
+    fn sd_scan_routing_legacy_ram_readiness_is_kept_only_for_a_retained_task(){
+        let(mut engine,root)=registered_stop_fixture("sd-routing-legacy");
+        let camera=scripted_camera(ScriptedCameraConfig::default());engine.camera=Some(camera);
+        engine.nano=Some(crate::devices::turntable::test_homed_nano());
+        assert!(engine.task_registry.matches(&engine.parameters));
+        assert_eq!(engine.camera_scan_readiness()["ready"],true);
+        let actual=freeze_capture_profile(engine.camera.as_ref().unwrap(),engine.nano.as_ref().unwrap(),None).unwrap();assert!(!actual.is_card_destination());
+        assert_eq!(std::fs::read(root.join("old-task/original.nef")).unwrap(),b"SCRIPTED TEST ORIGINAL");
+    }
+
+    #[test]
+    fn sd_scan_routing_card_single_photo_rejects_exhausted_read_only_before_trigger(){
+        let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-sd-routing-readonly",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        let mut engine=Engine::new_with_storage(false,root.join("engine-data"));
+        let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});
+        probe.set_storages(&[(1,2,64*1024*1024*1024,0,5000)]);engine.camera=Some(camera);
+        engine.device_command("camera_capture",json!({})).unwrap().unwrap();let id=engine.operations.last_id.clone().unwrap();pump(&mut engine);
+        let operation=engine.operations.history.iter().find(|op|op.operation_id==id).unwrap();assert_eq!(operation.status,"failed");assert!(operation.error.as_deref().unwrap().contains("CARD_CAPACITY_INSUFFICIENT"));
+        assert_eq!(probe.operation_count(0x100e),0);assert_eq!(probe.operation_count(0x90c0),0);assert_eq!(probe.operation_count(0x1009),0);assert_eq!(probe.write_count(),0);
+        assert!(engine.captures.is_empty());assert!(!root.join("CameraCaptures").exists());
+    }
+
+    #[test]
+    fn sd_scan_routing_local_transfer_requires_explicit_apply_in_the_current_session(){
+        let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-sd-routing-opt-in",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        let mut engine=Engine::new_with_storage(false,root.join("engine-data"));
+        let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig::default());
+        engine.camera=Some(camera.clone());
+        engine.parameters.save_path=root.to_string_lossy().into();
+        let requests=probe.requests();
+        for command in ["camera_capture","camera_test_capture"] {
+            assert_eq!(engine.device_command(command,json!({})).unwrap(),Err("CAMERA_HOST_TRANSFER_OPT_IN_REQUIRED"));
+        }
+        assert_eq!(requests,probe.requests());assert!(!root.join("CameraCaptures").exists());
+        assert!(engine.snapshot()["deviceControls"]["camera"]["capabilities"]["disabledReasons"]["hostTransferOptIn"].is_string());
+        engine.device_command("camera_read_properties",json!({})).unwrap().unwrap();pump(&mut engine);
+        assert!(!engine.camera_host_transfer_authorized(&camera.health()));
+        engine.device_command("camera_apply_properties",json!({"properties":{"iso":400}})).unwrap().unwrap();pump(&mut engine);
+        assert!(!engine.camera_host_transfer_authorized(&camera.health()));
+        engine.device_command("camera_apply_properties",json!({"properties":{"recordingMedia":1}})).unwrap().unwrap();pump(&mut engine);
+        assert!(engine.camera_host_transfer_authorized(&camera.health()));
+        assert!(require_new_scan_destination(&camera.health(),engine.camera_host_transfer_session.as_deref()).is_ok());
+        assert!(engine.snapshot()["deviceControls"]["camera"]["capabilities"]["disabledReasons"]["hostTransferOptIn"].is_null());
+        camera.disconnect_confirmed().unwrap();camera.connect_selected("fake-camera-1").unwrap();camera.read_properties().unwrap();
+        assert!(!engine.camera_host_transfer_authorized(&camera.health()));
+        assert_eq!(engine.device_command("camera_capture",json!({})).unwrap(),Err("CAMERA_HOST_TRANSFER_OPT_IN_REQUIRED"));
+        engine.device_command("camera_apply_properties",json!({"properties":{"recordingMedia":1}})).unwrap().unwrap();pump(&mut engine);
+        engine.device_command("camera_apply_properties",json!({"properties":{"recordingMedia":0}})).unwrap().unwrap();pump(&mut engine);
+        assert!(engine.camera_host_transfer_session.is_none());assert_eq!(probe.operation_count(0x100e),0);assert_eq!(probe.operation_count(0x90c0),0);assert_eq!(probe.operation_count(0x1009),0);
+        let restarted=Engine::new_with_storage(false,root.join("engine-data"));assert!(restarted.camera_host_transfer_session.is_none());
+    }
+
+    #[test]
+    fn sd_scan_routing_storage_error_never_triggers_or_falls_back_to_local(){
+        let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-sd-routing-storage-error",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        let mut engine=Engine::new_with_storage(false,root.join("engine-data"));
+        let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});
+        probe.fail_transport_operation(0x1005);engine.camera=Some(camera);
+        engine.device_command("camera_capture",json!({})).unwrap().unwrap();let id=engine.operations.last_id.clone().unwrap();pump(&mut engine);
+        assert_eq!(engine.operations.history.iter().find(|operation|operation.operation_id==id).unwrap().status,"cancelled");
+        assert!(engine.fault_latched,"transport loss must still fail closed");
+        assert_eq!(probe.operation_count(0x100e),0);assert_eq!(probe.operation_count(0x90c0),0);assert_eq!(probe.operation_count(0x1009),0);
+        assert!(engine.captures.is_empty());assert!(!root.join("CameraCaptures").exists());
+    }
+
+    #[test]
+    fn sd_scan_routing_real_capture_storage_errors_do_not_retry_or_download(){
+        for response in [0x200c,0x200e,0x2013] {
+            let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/tests/ct-engine").join(format!("{}-sd-routing-trigger-error-{response:04x}",chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+            let mut engine=Engine::new_with_storage(false,root.join("engine-data"));
+            let(camera,probe)=crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig{card_capture:true,..Default::default()});
+            probe.set_storages(&[(1,2,64*1024*1024*1024,32*1024*1024*1024,5000)]);probe.set_initiate_capture_response(response);engine.camera=Some(camera);
+            engine.device_command("camera_capture",json!({})).unwrap().unwrap();let id=engine.operations.last_id.clone().unwrap();pump(&mut engine);
+            let operation=engine.operations.history.iter().find(|operation|operation.operation_id==id).unwrap();
+            assert!(matches!(operation.status.as_str(),"failed"|"cancelled"));
+            let diagnostic=format!("{:?} {:?} {:?}",operation.error,engine.logs,engine.camera.as_ref().map(|camera|camera.health().last_error)).to_ascii_lowercase();assert!(diagnostic.contains(&format!("{response:04x}")),"{diagnostic}");
+            assert_eq!(probe.operation_count(0x100e),1);assert_eq!(probe.operation_count(0x90c0),0);assert_eq!(probe.operation_count(0x1009),0);
+            assert!(engine.captures.is_empty());assert!(!root.join("CameraCaptures").exists());
+        }
+    }
+
     #[test]
     fn card_safe_finishing_is_registered_as_acquired_pending_import_and_never_completed(){
         let(mut engine,_root)=registered_stop_fixture("card-pending-import");
@@ -2047,7 +2351,7 @@ mod tests{
             device:crate::devices::turntable::EXPECTED_DEVICE.into(),
             version:crate::scan::CARD_FIRMWARE_VERSION.into(),protocol:2,
             build:crate::scan::CARD_FIRMWARE_BUILD.into(),buzzer_installed:true,
-            capabilities:vec!["HEARTBEAT_ACK".into(),crate::scan::CARD_SETTLE_CAPABILITY.into()]};
+            capabilities:vec!["HEARTBEAT_ACK".into(),crate::scan::CARD_SETTLE_CAPABILITY.into(),crate::scan::CARD_MOVE_RAMP_CAPABILITY.into()]};
         let policy=crate::scan::card_capture_policy(&identity,false).unwrap();
         let profile=crate::capture_profile::CaptureProfile::from_card_readback(&camera.health(),camera.card_profile_readback().unwrap(),None,policy).unwrap();
         // The default limit of a new card acquisition is the unified 1000 s; an

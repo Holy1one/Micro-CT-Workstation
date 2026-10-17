@@ -330,7 +330,7 @@ pub(crate) fn capture_with_policy(
             emit(
                 sender,
                 CameraCaptureEvent::ExposureEnded {
-                    session_id: session.clone(),
+                    observed_at: Some(std::time::Instant::now()), session_id: session.clone(),
                     operation_id: operation_id.into(),
                 },
                 context,
@@ -501,7 +501,7 @@ pub(crate) fn capture_with_policy(
                 emit(
                     sender,
                     CameraCaptureEvent::ExposureEnded {
-                        session_id: session.clone(),
+                        observed_at: Some(std::time::Instant::now()), session_id: session.clone(),
                         operation_id: operation_id.into(),
                     },
                     context,

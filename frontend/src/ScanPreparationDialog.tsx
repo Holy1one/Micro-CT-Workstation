@@ -108,6 +108,7 @@ export function ScanPreparationDialog({ snapshot, dirtyCamera, submissionError =
   const setup = snapshot.workstation!.scanSetup;
   const [values, setValues] = useState<Record<string, string>>(() => ({ taskId: resetRevision ? "" : setup.taskId, count: resetRevision ? "120" : String(setup.projectionCount || ""), maxXray: resetRevision ? "10:00" : xrayLimitText(setup.maxXraySec || 600), sodMm: existing?.sodMm.toString() || "", objectToDetectorMm: existing?.objectToDetectorMm.toString() || "", detectorWidthMm: existing?.detectorWidthMm.toString() || "", centerOffsetXMm: existing?.centerOffsetXMm.toString() || "", centerOffsetYMm: existing?.centerOffsetYMm.toString() || "", mirrorX: existing ? String(existing.mirrorX) : "", measurement: existing?.measurement || "" }));
   const [pending, setPending] = useState(false);
+  const [earlyRelease, setEarlyRelease] = useState(resetRevision ? true : setup.earlyRelease ?? true);
   const [stacked, setStacked] = useState(Boolean(existing?.scintillatorLayers?.length));
   const [layers, setLayers] = useState<LayerDraft[]>(() => Array.from({ length: 5 }, (_, index) => {
     const layer = existing?.scintillatorLayers?.[index];
@@ -130,8 +131,8 @@ export function ScanPreparationDialog({ snapshot, dirtyCamera, submissionError =
     const scintillatorLayers = parseLayerDrafts(stacked, layers);
     if (!scintillatorLayers) return null;
     if (scintillatorLayers.length) geometry.scintillatorLayers = scintillatorLayers;
-    return { taskId: values.taskId.trim(), projectionCount: Number(values.count), maxXraySec, geometry };
-  }, [values, existing?.rotationDirection, stacked, layers]);
+    return { taskId: values.taskId.trim(), projectionCount: Number(values.count), maxXraySec, earlyRelease, geometry };
+  }, [values, existing?.rotationDirection, stacked, layers, earlyRelease]);
   const shutter = snapshot.deviceControls.camera?.properties.shutter;
   const exposure = shutter?.confirmed && shutter.actual !== null ? shutterExposureMs(shutter.actual, shutter.code) : null;
   const field = (key: string, label: string, numeric = true) => <label className="scan-geometry-field"><span>{label}</span><input value={values[key]} inputMode={numeric ? "decimal" : "text"} disabled={pending} onChange={event => setValues(current => ({ ...current, [key]: event.target.value }))} /></label>;
@@ -149,6 +150,8 @@ export function ScanPreparationDialog({ snapshot, dirtyCamera, submissionError =
     : "Cancel discards this draft before submission. Stop stays available; submitted settings remain.";
   return <WorkstationDialog title="Scan Preparation" onClose={close} closeDisabled={pending} onStop={onStop} className="scan-preparation-dialog" footerNote={stageText} footer={<div className="scan-stage-actions"><button disabled={pending} onClick={close}>Cancel</button><button disabled={pending || !prepared || dirtyCamera} onClick={() => { if (!prepared || submitting.current) return; submitting.current = true; const revision = lifetime.current; setPending(true); setError(null); setAttemptLogs(new Set(snapshot.logs.map(entry => entry.id))); void onSubmit(prepared).then(success => { if (lifetime.current === revision) { if (success) onClose(); else setError("Preflight is not complete. Review the requirements and the reported reason before retrying."); } }).catch(reason => { if (lifetime.current === revision) setError(String(reason)); }).finally(() => { if (lifetime.current === revision) { submitting.current = false; setPending(false); } }); }}>{pending ? "Checking…" : "Prepare and run preflight"}</button></div>}>
     <p className="scan-prep__lead">Prepare the complete task once. Exposure and storage come from the confirmed camera configuration.</p>
+    <label className="device-note"><input type="checkbox" checked={earlyRelease} disabled={pending} onChange={event => setEarlyRelease(event.target.checked)} /> Move as soon as exposure ends</label>
+    <p className="device-note">Enabled by default for SD scans. Each frame falls back to confirmed card completion if the early signal is absent. After the scan, X-ray OFF is confirmed before images are imported into the task folder. Once every local file is verified, only this scan’s SD images are removed; existing card files are kept.</p>
     {(pending || displayedError) && <section className="scan-prep__result" aria-live="polite"><h3>{pending ? "Preflight in progress" : "Preflight needs attention"}</h3><p className={displayedError ? "scan-stage-error" : "scan-prep__stage"}>{displayedError ? displayFailureText(displayedError) : stageText}</p>{recentLogs.length > 0 && <ul className="scan-prep__log">{recentLogs.map(entry => <li key={entry.id}>{displayFailureText(entry.message)}</li>)}</ul>}{pending && <p className="scan-prep__stage">Waiting for engine confirmation. Stop remains available.</p>}</section>}
     <div className="scan-prep">
       <div className="scan-prep__main">

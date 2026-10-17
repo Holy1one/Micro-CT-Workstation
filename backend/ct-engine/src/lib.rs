@@ -171,6 +171,8 @@ struct ScanSetupInput {
     exposure_ms: Option<f64>,
     #[serde(default)]
     max_xray_sec: Option<u32>,
+    #[serde(default)]
+    early_release: Option<bool>,
 }
 
 impl ScanSetupInput {
@@ -184,6 +186,7 @@ impl ScanSetupInput {
             && self.projection_count.is_none()
             && self.exposure_ms.is_none()
             && self.max_xray_sec.is_none()
+            && self.early_release.is_none()
         {
             return Err("INVALID_PARAMETERS");
         }
@@ -281,6 +284,8 @@ pub struct Engine {
     preset_tag: Option<capture_profile::PresetTag>,
     capture_profile: Option<capture_profile::CaptureProfile>,
     camera_draft: devices::camera::CameraProperties,
+    /// Local image transfer requires an explicit recordingMedia=1 Apply in this session.
+    camera_host_transfer_session: Option<String>,
     preset_export_json: Option<String>,
     preset_comparison: Value,
     scan_stop_requested: bool,
@@ -297,6 +302,7 @@ pub struct Engine {
     phase: Phase,
     parameters: Parameters,
     max_xray_sec: u32,
+    early_release: bool,
     /// True once this task's continuous X-ray limit was chosen explicitly. A
     /// destination-specific default (1000 s for a camera-card acquisition) must
     /// never override an operator value, and a host-RAM task keeps its 600 s
@@ -376,6 +382,7 @@ impl Engine {
             preset_tag: None,
             capture_profile: None,
             camera_draft: Default::default(),
+            camera_host_transfer_session: None,
             preset_export_json: None,
             preset_comparison: Value::Null,
             scan_stop_requested: false,
@@ -392,6 +399,7 @@ impl Engine {
             phase: Phase::Idle,
             parameters: Parameters::default(),
             max_xray_sec: 600,
+            early_release: true,
             max_xray_sec_explicit: false,
             current: 0,
             sequence: 0,
@@ -564,7 +572,9 @@ impl Engine {
             let messages = progress.messages.iter().skip(self.real_scan_message_count).cloned().collect::<Vec<_>>();
             self.real_scan_message_count = progress.messages.len();
             for message in messages { self.log(message.level, message.source, &message.message); }
-            if let Some(error) = progress.error { self.last_error = Some(error); }
+            if !self.fault_latched && matches!(progress.phase, "paused" | "running") {
+                self.last_error = progress.error;
+            } else if let Some(error) = progress.error { self.last_error = Some(error); }
         }
         let Some(outcome) = outcome else { return; };
         drop(self.real_scan.take());
@@ -754,12 +764,27 @@ impl Engine {
         let changed_error=self.cached_xray_health.as_ref().is_none_or(|previous|
             previous.last_error!=health.last_error || previous.connected!=health.connected
                 || previous.beam_off_confirmed!=health.beam_off_confirmed || previous.beam_on!=health.beam_on);
-        let changed_warning=self.cached_xray_health.as_ref().is_none_or(|previous|previous.telemetry_warning!=health.telemetry_warning);
+        if self.real_scan.is_some() && health.monitor_interruption.is_some()
+            && health.connected && !health.beam_on && !self.fault_latched {
+            // The serial owner already confirmed OFF. Do not cancel the camera
+            // receipt or invalidate the Nano reference for a recoverable timeout.
+            // The scan thread parks/requalifies before any subsequent exposure.
+            // A repeated bounded OFF verification may transiently publish
+            // UNKNOWN. Keep that readback unchanged; the owner clears this
+            // typed recovery marker on any failed OFF/protocol/safety result.
+            if self.cached_xray_health.as_ref().is_none_or(|previous| previous.monitor_interruption.is_none()) {
+                self.log("WARN", "xray", "Monitoring reply deadline exhausted; OFF confirmed. Scan recovery owns the pause; healthy device sessions retained.");
+            }
+            self.beam_on=false;
+            self.cached_xray_health=Some(health);
+            return;
+        }
+        let warning = health.new_telemetry_warning(self.cached_xray_health.as_ref()).map(str::to_owned);
         let result = match health.last_error.as_ref() { Some(error) => Err(error.clone()), None=>Ok(health.clone()) };
         match result {
             Ok(health) => {
-                if let Some(warning) = health.telemetry_warning.as_deref().filter(|_|changed_warning) {
-                    self.log("WARN", "xray", warning);
+                if let Some(warning) = warning {
+                    self.log("WARN", "xray", &warning);
                 }
                 if health.beam_on != self.beam_on {
                     self.log(
@@ -1045,6 +1070,7 @@ impl Engine {
                 )
                 .map_err(|_| "INVALID_PARAMETERS")?;
                 parameters.validate()?;
+                self.card_import = None;
                 self.parameters = parameters;
                 self.current = 0;
                 self.scan_geometry = None;
@@ -1086,8 +1112,10 @@ impl Engine {
                         camera.set_exposure_target(parameters.exposure_ms).map_err(|_|"EXPOSURE_NOT_NATIVE_CAMERA_VALUE")?;
                     }
                 }
+                self.card_import = None;
                 self.parameters = parameters;
                 self.max_xray_sec = max_xray_sec;
+                if let Some(enabled) = setup.early_release { self.early_release = enabled; }
                 if setup.max_xray_sec.is_some() {
                     // An explicit limit is never silently replaced by a
                     // destination default; omitting it keeps the last choice.
@@ -1451,7 +1479,7 @@ impl Engine {
                     };
                     self.cached_camera_health = Some(camera.health());
                     self.cached_xray_health = Some(xray.health());
-                    self.current = self.restored_frames.len() as u32;
+                    self.current = self.restored_scan.as_ref().map_or(self.restored_frames.len(),ScanResume::projection_count) as u32;
                     self.restored_frames.clear();
                     self.scan_angle_deg = Some(0.0);
                     if starting_new_scan { self.real_frames.clear(); }
@@ -1467,6 +1495,7 @@ impl Engine {
                         xray,
                         RealScanConfig {
                             capture_profile: self.capture_profile.clone().ok_or("CAPTURE_PROFILE_REQUIRED")?,
+                            early_release: self.early_release,
                             parameters: self.parameters.clone(),
                             max_xray_sec: self.max_xray_sec,
                             voltage_kv: self.set_kv,
@@ -1520,15 +1549,15 @@ impl Engine {
                 if self.fault_latched || self.phase == Phase::Fault {
                     return Err("FAULT_RECOVERY_REQUIRED");
                 }
-                if self.phase != Phase::Paused || !self.preflight || !self.homed {
+                if self.phase != Phase::Paused {
                     return Err("NOT_RESUMABLE");
                 }
                 if let Some(scan) = self.real_scan.as_ref() {
-                    scan.resume();
-                    self.phase = Phase::Running;
-                    self.log("ACTION", "operator", "Real scan resumed");
+                    scan.resume()?;
+                    self.log("ACTION", "operator", "Resume requested · task stays paused until device revalidation completes");
                     return Ok(());
                 }
+                if !self.preflight || !self.homed { return Err("NOT_RESUMABLE"); }
                 self.phase = Phase::Running;
                 self.beam_on = true;
                 self.last_tick = Instant::now();
@@ -1561,7 +1590,7 @@ impl Engine {
                             return Err("RESTORE_VALIDATION_FAILED");
                         }
                     };
-                    self.current = restored.frames.len() as u32;
+                    self.current = restored.projection_count() as u32;
                     self.real_frames = restored.frames.iter()
                         .map(|frame| serde_json::to_value(frame).unwrap_or_else(|_| json!({})))
                         .collect();
@@ -2196,7 +2225,7 @@ impl Engine {
             && crate::scan::scan_xray_seconds_valid(self.max_xray_sec);
         let checkpoint_available = if self.preview { self.current > 0 || self.logs.iter().any(|entry| entry["message"].as_str().is_some_and(|message| message.contains("Preview scan ended"))) }
             else { configured && self.phase != Phase::Completed && self.metadata_resume };
-        let pending_restore = !self.preview && checkpoint_available && self.restored_frames.is_empty();
+        let pending_restore = !self.preview && checkpoint_available && self.restored_scan.is_none();
         let is_preview = self.preview;
         let nano_health = self.nano.as_ref().map(|nano| nano.health());
         let angle_known = self.phase != Phase::Stopping && (self.preview || nano_health.as_ref().and_then(confirmed_nano_angle).is_some());
@@ -2391,12 +2420,13 @@ impl Engine {
                 "stop":matches!(self.phase, Phase::Running | Phase::Paused | Phase::Finishing),
                 "playMode":if self.phase == Phase::Running {"pause"} else if self.phase == Phase::Paused {"resume"} else if matches!(self.phase, Phase::Fault | Phase::Finishing | Phase::Stopping) {"disabled"} else {"start"},
                 "homeReason":if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to revalidate device safety"} else if !self.preflight {"Complete scan setup and run Preflight first"} else if self.busy() {"HOME is unavailable while a scan is active"} else {""},
-                "restoreReason":if !configured {"Complete valid scan parameters first"} else if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to recover from the device fault"} else if self.busy() {"Restore is unavailable while a scan is active"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if !checkpoint_available {"No unfinished scan checkpoint was found"} else if !self.restored_frames.is_empty() {"Checkpoint already verified; Start continues at the next view"} else {""},
+                "restoreReason":if !configured {"Complete valid scan parameters first"} else if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to recover from the device fault"} else if self.busy() {"Restore is unavailable while a scan is active"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if !checkpoint_available {"No unfinished scan checkpoint was found"} else if self.restored_scan.is_some() {"Checkpoint already verified; Start continues at the next view"} else {""},
                 "playReason":if self.phase == Phase::Running {"Pause after the active transaction closes"} else if self.phase == Phase::Paused {"Resume the paused scan"} else if matches!(self.phase, Phase::Finishing | Phase::Stopping) {"Wait for scan cleanup"} else if !self.connected {"Connect the Nano first"} else if self.fault_latched || self.phase == Phase::Fault {"Run Preflight to recover"} else if !self.preflight {"Run Preflight first"} else if !self.homed {"Run HOME first"} else if pending_restore {"Run Restore to verify the saved frames before Start"} else if !self.preview && (!self.usb_auto_shut_down_confirmed || self.usb_auto_shut_down) {"Disable USB Auto Shut Down manually in the X-ray panel"} else {""}
             },
             "scanSetup":{
                 "savePath":self.parameters.save_path,"taskId":self.parameters.task_id,"projectionCount":total,
-                "angleStepDeg":self.parameters.angle_step_deg,"exposureMs":self.parameters.exposure_ms,"maxXraySec":self.max_xray_sec
+                "angleStepDeg":self.parameters.angle_step_deg,"exposureMs":self.parameters.exposure_ms,"maxXraySec":self.max_xray_sec,
+                "earlyRelease":self.early_release
             },
             "scanFlow":{
                 "stage":self.scan_stage,
@@ -2438,11 +2468,11 @@ impl Engine {
         let progress = self.real_scan.as_ref().map(|scan| scan.progress());
         let acquisition = progress.as_ref().and_then(|value| value.card_acquisition_status);
         let data = progress.as_ref().and_then(|value| value.card_data_status);
+        let import = self.card_import_progress();
         let records = progress
             .as_ref()
-            .map_or(0, |value| value.card_records.len());
+            .map_or_else(||self.restored_scan.as_ref().map_or(import.records,|resume|resume.card_records.len()), |value| value.card_records.len());
         let pending = self.task_registry.pending_import_tasks();
-        let import = self.card_import_progress();
         json!({
             "destination": if card_profile { "cameraCard" } else if self.capture_profile.is_some() { "hostRam" } else { "unknown" },
             "active": card_profile,
@@ -2462,7 +2492,7 @@ impl Engine {
             "importError": import.error,
             "importedRecords": import.imported,
             "verifiedRecords": import.verified,
-            "acquiredProjectionCount": import.acquired_projections,
+            "acquiredProjectionCount": progress.as_ref().map_or_else(||self.restored_scan.as_ref().map_or(import.acquired_projections,|resume|resume.projection_count() as u32), |value| value.captured),
             "importedProjectionCount": import.imported_projections,
             "verifiedProjectionCount": import.verified_projections,
         })
@@ -2930,10 +2960,17 @@ mod tests {
 
         assert!(engine.parameters.task_id.is_empty());
         assert!(engine.scan_geometry.is_none());
+        let old_import = devices::camera::card_import::CardImportReporter::new();
+        old_import.publish(|value| { value.status = "verified"; value.records = 24; value.acquired_projections = 4; value.imported_projections = 4; value.verified_projections = 4; });
+        engine.card_import = Some(old_import);
         assert!(send(&mut engine, "prepare_scan", json!({
             "taskId":"new-after-stop", "projectionCount":5, "maxXraySec":30,
             "geometry":geometry
         })).error_code.is_none());
+        assert_eq!(engine.card_acquisition_snapshot()["acquiredProjectionCount"], 0);
+        assert_eq!(engine.card_acquisition_snapshot()["verifiedProjectionCount"], 0);
+        assert_eq!(engine.card_acquisition_snapshot()["importStatus"], "idle");
+        assert_eq!(engine.card_acquisition_snapshot()["recordCount"], 0);
         assert!(send(&mut engine, "preflight", json!({}))
             .error_code
             .is_none());
@@ -3237,6 +3274,10 @@ mod tests {
         use devices::camera::{scripted_camera,ScriptedCameraConfig};
         let mut engine=Engine::new(false);
         engine.camera=Some(scripted_camera(ScriptedCameraConfig{transfer_delay:Duration::from_secs(2),..Default::default()}));
+        assert!(send(&mut engine,"camera_apply_properties",json!({"properties":{"recordingMedia":1}})).error_code.is_none());
+        let apply_deadline=Instant::now()+Duration::from_secs(3);
+        while engine.operations.is_active()&&Instant::now()<apply_deadline{engine.tick();thread::sleep(Duration::from_millis(5));}
+        assert!(engine.operations.history.iter().any(|operation|operation.kind=="camera_apply_properties"&&operation.status=="completed"));
         engine.cached_camera_health=engine.camera.as_ref().map(|camera|camera.health());
         let (mut xray,probe)=devices::xray::test_worker(60.0,200.0);
         xray.beam_on_shared(Arc::new(std::sync::atomic::AtomicBool::new(false)),Instant::now()+Duration::from_secs(10)).unwrap();
@@ -3398,7 +3439,7 @@ mod tests {
             engine.connected=true;engine.preflight=true;engine.homed=true;engine.phase=Phase::Running;
             engine.nano=Some(nano.clone());engine.camera=Some(camera.clone());engine.xray=Some(xray.clone());
             engine.task_registry.register(&parameters).unwrap();
-            engine.real_scan=Some(RealScanHandle::start(nano,camera,xray,RealScanConfig{parameters:parameters.clone(),capture_profile:profile,max_xray_sec:120,voltage_kv:20.0,current_ua:100.0,geometry,resume:None}));
+            engine.real_scan=Some(RealScanHandle::start(nano,camera,xray,RealScanConfig{parameters:parameters.clone(),capture_profile:profile,early_release:false,max_xray_sec:120,voltage_kv:20.0,current_ua:100.0,geometry,resume:None}));
             let deadline=Instant::now()+Duration::from_secs(20);
             while engine.current<1&&Instant::now()<deadline {
                 engine.tick();if let Some(stage)=engine.scan_prompt{send(&mut engine,"confirm_scan_stage",json!({"stage":stage}));}
@@ -3451,7 +3492,7 @@ mod tests {
         let mut original=Engine::new_with_storage(false,&storage);original.parameters=parameters.clone();original.max_xray_sec=120;original.connected=true;original.preflight=true;original.homed=true;original.phase=Phase::Running;
         original.nano=Some(nano.clone());original.camera=Some(camera.clone());original.xray=Some(xray.clone());
         original.task_registry.register(&parameters).unwrap();
-        original.real_scan=Some(RealScanHandle::start(nano,camera,xray,RealScanConfig{parameters:parameters.clone(),capture_profile:profile,max_xray_sec:120,voltage_kv:20.0,current_ua:100.0,geometry,resume:None}));
+        original.real_scan=Some(RealScanHandle::start(nano,camera,xray,RealScanConfig{parameters:parameters.clone(),capture_profile:profile,early_release:false,max_xray_sec:120,voltage_kv:20.0,current_ua:100.0,geometry,resume:None}));
         let deadline=Instant::now()+Duration::from_secs(20);
         while original.current<1&&Instant::now()<deadline {
             original.tick();

@@ -4,7 +4,8 @@
 
 ## 构建与校验
 
-1. npm.cmd run installer:build 构建前端、桌面壳和同一来源的引擎，release/ 只生成最新 MSI；来源哈希、签名和许可证归 .cache/tests/release/<version>/。MSI 内含许可证和 WebView2 引导安装器（缺少运行时时自动联网安装）。构建不安装应用。
+1. npm.cmd run installer:build 构建前端、桌面壳和同一来源的引擎，release/ 只生成最新 MSI；来源哈希、签名和许可证归 .cache/tests/release/<version>/。MSI 内含许可证和 WebView2 引导安装器（缺少运行时时自动联网安装）。构建不安装应用。用户明确要求安装或更新后，可在原授权范围执行维护停机、安装与身份核验，无需再次索要同一授权。
+   构建入口先准备 release 引擎，再启动 Tauri；构建脚本跟踪共享 sidecar 及独立引擎输出的变化。进入 release/ 前自动提取本次 MSI，核对应用内引擎哈希、相邻引擎与构建来源并生成 bundle-identities.json。Rust 测试与安装包构建按先后顺序运行，避免同时覆盖共享 sidecar；卡采集离线验收使用线程内测试配置，早释放选择经冻结 plan 传入相机 owner，不修改进程环境。
 2. tools/release/windows-installer.wxs 提供当前用户安装、位置选择、开始菜单/桌面快捷方式复选框，以及 Windows 原生修改、修复、卸载。应用、引擎和许可证安装在同一目录；卸载保留任务、照片和用户数据。
 3. inspect-msi.ps1 读取实际 MSI 的 ProductCode、UpgradeCode、版本及架构；使用 WiX dark.exe 在 .cache/ 中提取 MSI 文件，record-bundle-identities.mjs 接受提取的应用路径，核对 MSI marker、桌面二进制和相邻引擎，无须安装。历史安装维护验收只认证原构建。
 4. sign-update-release.mjs 仅签最终 MSI 和发行清单，生成内部 MSI 更新容器并执行真实签名验证；不自动上传。签名材料继续使用 LocalAppData/MicroCTReleaseKeys 的 ACL/DPAPI，秘密不进入参数、日志或版本控制。

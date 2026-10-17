@@ -6,6 +6,6 @@
 - 退出与通信中断保留原有安全清理；更新必须取得本会话/操作关联的领域清理报告。
 - build.rs 记录引擎 SHA-256；binaries/ 的打包副本、测试副本和安装目录中的 ct-engine 必须来自同一次当前源码构建。生产启动只校验并运行安装目录中的引擎，不向用户缓存释放可执行文件。
 - gen/、binaries/ 为明确生成例外，其他日志、截图与测试输出进入 .cache/。
-- 新权限、插件、后台进程或领域职责需要明确批准。
+- 新增外部权限、插件、独立后台服务或领域职责时核对当前目标与授权；超出范围再确认。现有职责内的必要实现不重复索要授权。
 
-验证：cargo test --manifest-path backend/Cargo.toml --workspace；本机桌面契约测试使用 npm.cmd run test:desktop。桌面交付必须验证本机构建 EXE 的启动和正常退出。
+验证：桌面行为修改运行适用的 cargo test --manifest-path backend/Cargo.toml --workspace 和本机 test:desktop；纯文档按根规则检查。桌面交付验证本机构建 EXE 的启动和正常退出。

@@ -50,9 +50,10 @@
 //!   seal, `scan::completed_manifest_exists` keeps reconstruction and preview
 //!   unavailable.
 //!
-//! The card itself is read-only here: nothing is deleted, renamed or modified on
-//! the card, and the original card object metadata (handle, storage id, parent,
-//! source file name) stays untouched in the manifest as provenance.
+//! After the complete local seal, a separate durable `card-cleanup.json` journal
+//! authorizes exact receipt-bound deletes. Original receipt metadata stays intact
+//! as provenance. A failed/cancelled cleanup retains the sealed local data and can
+//! resume without downloading or shooting again; unrelated card files are kept.
 //!
 //! Every conclusion in this module is offline: real D7100 USB download semantics,
 //! `GetObjectHandles` parameter behaviour and card-side throughput remain hardware
@@ -74,6 +75,7 @@ use crate::scan::{
     DATA_PENDING_IMPORT, DATA_VERIFIED,
 };
 use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
@@ -109,6 +111,8 @@ pub(crate) const IMPORT_TARGET_CONFLICT: &str = "IMPORT_TARGET_CONFLICT";
 pub(crate) const IMPORT_PATH_ESCAPE: &str = "IMPORT_PATH_ESCAPE";
 pub(crate) const IMPORT_COMMIT_FAILED: &str = "IMPORT_COMMIT_FAILED";
 pub(crate) const IMPORT_SEAL_INCONSISTENT: &str = "IMPORT_SEAL_INCONSISTENT";
+pub(crate) const IMPORT_CLEANUP_FAILED: &str = "IMPORT_CLEANUP_FAILED";
+const CLEANUP_JOURNAL: &str = "card-cleanup.json";
 
 /// Ceiling for one card `GetObjectInfo` metadata dataset. It is a 52-byte header
 /// plus two bounded strings, so this bound can never describe image data.
@@ -329,6 +333,8 @@ pub(crate) struct CardImportSummary {
     pub records: usize,
     pub verified: usize,
     pub projections: u32,
+    pub frames: Vec<RealFrame>,
+    pub references: ReferenceFrames,
 }
 
 fn cancelled(cancel: &AtomicBool) -> Result<(), CardImportFailure> {
@@ -363,8 +369,8 @@ fn refusal_failure(refusal: CardImportRefusal) -> CardImportFailure {
 /// session parents are derived from the objects that actually matched (plus the
 /// verified records' provenance), so a changed folder handle after a reconnect
 /// cannot be mistaken for a missing source, while a NEF that appears in that same
-/// folder and is claimed by no record refuses the import. Objects in other folders
-/// (older photographs) are not this task's source and are never touched.
+/// folder and is claimed by no record refuses the import. Strictly older dated
+/// photographs in that folder are retained too. Unknown dates never prove age.
 pub(crate) fn bind_card_objects(
     records: &[CardCaptureRecord],
     already_verified: &[CardCaptureRecord],
@@ -470,6 +476,13 @@ pub(crate) fn bind_card_objects(
             )
         })
         .collect();
+    let provenance:Vec<_>=records.iter().chain(already_verified).collect();
+    // The complete source includes projection 1 even on import resume. Without
+    // that anchor, a partial list cannot silently classify omitted records as old.
+    let first_capture=if provenance.iter().any(|record|record.kind=="projection"&&record.index==1) {
+        provenance.iter().map(|record|chrono::NaiveDateTime::parse_from_str(&record.capture_date,
+            "%Y%m%dT%H%M%S").ok()).collect::<Option<Vec<_>>>().and_then(|dates|dates.into_iter().min())
+    } else {None};
     let mut unexpected: Vec<String> = Vec::new();
     for candidate in &inventory.candidates {
         if !advertised.contains(&candidate.storage_id) {
@@ -492,6 +505,10 @@ pub(crate) fn bind_card_objects(
             candidate.size,
             candidate.capture_date.clone(),
         )) {
+            continue;
+        }
+        if first_capture.is_some_and(|first|chrono::NaiveDateTime::parse_from_str(
+            &candidate.capture_date,"%Y%m%dT%H%M%S").is_ok_and(|date|date<first)) {
             continue;
         }
         unexpected.push(format!(
@@ -1170,7 +1187,8 @@ fn load_pending_task(
         ));
     }
     let data_status = manifest["dataStatus"].as_str().unwrap_or_default();
-    if !matches!(
+    let sealed = data_status == DATA_VERIFIED && manifest["completed"].as_bool() == Some(true);
+    if !sealed && !matches!(
         data_status,
         DATA_PENDING_IMPORT | DATA_IMPORTING | DATA_IMPORT_FAILED
     ) {
@@ -1179,7 +1197,7 @@ fn load_pending_task(
             format!("dataStatus {data_status:?} is not open for import"),
         ));
     }
-    if manifest["frames"]
+    if !sealed && manifest["frames"]
         .as_array()
         .is_some_and(|frames| !frames.is_empty())
     {
@@ -1232,6 +1250,12 @@ fn load_pending_task(
                 ),
             ));
         }
+    }
+    if sealed && !schema_four_completion_consistent(
+        Some(destination), Some(&profile), manifest["acquisitionStatus"].as_str(),
+        manifest["dataStatus"].as_str(), &records, parameters.projection_count,
+    ) {
+        return Err(CardImportRefusal::new(IMPORT_SEAL_INCONSISTENT, "cleanup requires a consistent local seal"));
     }
     for kind in ["preDark", "preFlat"] {
         let count = records.iter().filter(|record| record.kind == kind).count();
@@ -1500,7 +1524,14 @@ pub(crate) fn run_card_import(
                 value.error = Some(failure.message());
             }
         });
-        match persist_card_records(&root, &mut manifest, &records, status) {
+        // Deletion can have started only after the durable local seal. Never
+        // regress that seal or make already deleted sources require a download.
+        let persisted = if manifest["dataStatus"].as_str() == Some(DATA_VERIFIED) {
+            Ok(())
+        } else {
+            persist_card_records(&root, &mut manifest, &records, status)
+        };
+        match persisted {
             Ok(()) => (),
             Err(refusal) => reporter.message(
                 "ERR",
@@ -1593,6 +1624,10 @@ fn run_import_inner(
             continue;
         }
         if !target.is_file() {
+            if manifest["dataStatus"].as_str() == Some(DATA_VERIFIED) {
+                return Err(refusal_failure(CardImportRefusal::new(IMPORT_SOURCE_INVALID,
+                    "a sealed local file is missing; card cleanup is refused")));
+            }
             reporter.message(
                 "WARN",
                 format!(
@@ -1782,20 +1817,21 @@ fn run_import_inner(
     reporter.publish(|value| value.stage = "seal");
     seal_manifest(root, manifest, profile, records, parameters.projection_count)
         .map_err(refusal_failure)?;
+    cleanup_verified_card_records(camera, parameters, cancel, reporter, root, profile, records)?;
     let verified = records
         .iter()
         .filter(|record| record.state == DATA_VERIFIED && record.imported_file.is_some())
         .count();
     reporter.publish(|value| {
         value.status = IMPORT_STATUS_VERIFIED;
-        value.stage = "sealed";
+        value.stage = "cleaned";
         value.error = None;
         publish_counts(value, records);
     });
     reporter.message(
         "PASS",
         format!(
-            "card import sealed: {verified}/{} records verified with local file identities; dataStatus=verified, completed=true",
+            "card import sealed and SD cleanup confirmed: {verified}/{} local files verified; only this task's card objects removed",
             records.len()
         ),
     );
@@ -1803,7 +1839,176 @@ fn run_import_inner(
         records: records.len(),
         verified,
         projections: records.iter().filter(|record| record.kind == "projection").count() as u32,
+        frames: verified_frames(records,"projection"),
+        references: ReferenceFrames {
+            pre_dark: reference_frames(&verified_frames(records,"preDark")),
+            pre_flat: reference_frames(&verified_frames(records,"preFlat")),
+            post_flat: Vec::new(),post_dark: Vec::new(),
+        },
     })
+}
+
+/// Only callable after full local validation and seal. The owner checks the
+/// current identity and exact metadata immediately before one standard delete.
+pub(crate) fn delete_verified_card_object(
+    camera: &mut NativeCamera, object: &CardImportObject,
+    identity: &CameraIdentity, context: &CallContext,
+) -> Result<(), CameraError> {
+    camera.ensure_connected()?;
+    if !camera.d7100 || camera.health.identity.as_ref() != Some(identity)
+        || camera.health.live_view.active || camera.capture_pending {
+        return Err(device_refusal(IMPORT_IDENTITY_CHANGED, "the deletion session changed or is occupied"));
+    }
+    let candidate = &object.candidate;
+    if candidate.handle == 0 || candidate.handle == u32::MAX || candidate.storage_id == 0 {
+        return Err(device_refusal(IMPORT_CLEANUP_FAILED, "an exact non-wildcard handle is required"));
+    }
+    let metadata = camera.read_data(GET_OBJECT_INFO, &[candidate.handle], CARD_IMPORT_INFO_MAX, context)?;
+    let info = parse_card_object_info(&metadata)?;
+    if info.storage_id != candidate.storage_id || info.parent != candidate.parent
+        || info.format != candidate.format || info.size as u64 != candidate.size
+        || info.filename != candidate.filename || info.capture_date != candidate.capture_date {
+        return Err(device_refusal(IMPORT_OBJECT_CHANGED, "card metadata changed before deletion; no delete sent"));
+    }
+    context.check()?;
+    camera.transport.execute(DELETE_OBJECT, &[candidate.handle, 0], DataPhase::None, context)?
+        .success().map_err(|error| device_refusal(IMPORT_CLEANUP_FAILED, error))?;
+    // An ACK alone is insufficient. Verify absence from the fresh native listing.
+    let handles = parse_object_handles(&camera.read_data(GET_OBJECT_HANDLES,
+        &[candidate.storage_id, 0, 0], CARD_IMPORT_INFO_MAX, context)?)?;
+    if handles.contains(&candidate.handle) {
+        return Err(device_refusal(IMPORT_CLEANUP_FAILED, "DeleteObject acknowledged but the object is still present"));
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CardCleanupJournal {
+    schema_version: u32,
+    task_id: String,
+    /// Binds every original receipt and verified local identity, including order.
+    records_sha256: String,
+    states: Vec<String>,
+    status: String,
+}
+
+fn store_cleanup(root: &Path, journal: &CardCleanupJournal) -> Result<(), CardImportFailure> {
+    let path = root.join(CLEANUP_JOURNAL);
+    if path.exists() { reject_reparse(&path, IMPORT_PATH_ESCAPE).map_err(refusal_failure)?; }
+    let bytes = serde_json::to_vec_pretty(journal)
+        .map_err(|error| CardImportFailure::Failed(format!("{IMPORT_CLEANUP_FAILED}: {error}")))?;
+    crate::task_registry::atomic_store(&path, &bytes)
+        .map_err(|error| CardImportFailure::Failed(format!("{IMPORT_CLEANUP_FAILED}: cleanup journal commit failed: {error}")))
+}
+
+/// Metadata binding for cleanup deliberately ignores unrelated objects. Missing
+/// sources are reconciled only if a durable delete intent exists for that record.
+fn cleanup_binding(
+    records: &[CardCaptureRecord], journal: &CardCleanupJournal, inventory: &CardImportInventory,
+) -> Result<Vec<Option<CardImportObject>>, CardImportFailure> {
+    let mut owned = BTreeSet::new();
+    let mut bound = Vec::with_capacity(records.len());
+    for (position, record) in records.iter().enumerate() {
+        if !inventory.storages.iter().any(|storage| storage.id.0 == record.storage_id) {
+            return Err(refusal_failure(CardImportRefusal::new(IMPORT_STORAGE_CHANGED, "cleanup storage is missing")));
+        }
+        let named: Vec<_> = inventory.candidates.iter().filter(|candidate|
+            candidate.storage_id == record.storage_id
+            && candidate.filename.eq_ignore_ascii_case(&record.source_file_name)).collect();
+        if named.is_empty() && journal.states[position] != "pending" {
+            bound.push(None);
+            continue;
+        }
+        if named.len() != 1 {
+            return Err(refusal_failure(CardImportRefusal::new(
+                if named.is_empty() { IMPORT_OBJECT_MISSING } else { IMPORT_OBJECT_AMBIGUOUS },
+                format!("cleanup record={} kind={} has {} name candidates", record.index, record.kind, named.len()))));
+        }
+        let candidate = named[0];
+        if candidate.size != record.size || candidate.capture_date != record.capture_date
+            || candidate.parent != record.parent || journal.states[position] == "deleted" {
+            return Err(refusal_failure(CardImportRefusal::new(IMPORT_OBJECT_CHANGED,
+                "cleanup source changed or a previously deleted source reappeared; no further delete")));
+        }
+        if !owned.insert((candidate.storage_id, candidate.handle)) {
+            return Err(refusal_failure(CardImportRefusal::new(IMPORT_OBJECT_AMBIGUOUS, "two cleanup records claim one handle")));
+        }
+        bound.push(Some(CardImportObject { record_index: record.index, kind: record.kind.clone(), candidate: candidate.clone() }));
+    }
+    Ok(bound)
+}
+
+fn verify_cleanup_local(root: &Path, record: &CardCaptureRecord, cancel: &AtomicBool) -> Result<(), CardImportFailure> {
+    let target = record_target(root, record).map_err(refusal_failure)?;
+    let file = record.imported_file.as_ref().ok_or_else(||
+        refusal_failure(CardImportRefusal::new(IMPORT_SEAL_INCONSISTENT, "cleanup record has no verified local file")))?;
+    let (bytes, hash) = hash_file_cancellable(&target, cancel)?;
+    if record.state != DATA_VERIFIED || file.bytes != record.size || bytes != file.bytes || hash != file.sha256 {
+        return Err(refusal_failure(CardImportRefusal::new(IMPORT_TARGET_CONFLICT,
+            format!("{} failed its pre-delete length/hash verification", target.display()))));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cleanup_verified_card_records(
+    camera: &CameraAdapter, parameters: &crate::Parameters, cancel: &AtomicBool,
+    reporter: &CardImportReporter, root: &Path,
+    profile: &crate::capture_profile::CaptureProfile, records: &[CardCaptureRecord],
+) -> Result<(), CardImportFailure> {
+    reporter.publish(|value| value.stage = "cleaning_card");
+    // All local files are re-hashed before the first destructive command.
+    for record in records { verify_cleanup_local(root, record, cancel)?; }
+    let bytes = serde_json::to_vec(records).map_err(|error| CardImportFailure::Failed(error.to_string()))?;
+    let records_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let path = root.join(CLEANUP_JOURNAL);
+    let mut journal = if path.exists() {
+        reject_reparse(&path, IMPORT_PATH_ESCAPE).map_err(refusal_failure)?;
+        serde_json::from_slice::<CardCleanupJournal>(&fs::read(&path).map_err(|error|
+            CardImportFailure::Failed(format!("{IMPORT_CLEANUP_FAILED}: {error}")))?)
+            .map_err(|error| CardImportFailure::Failed(format!("{IMPORT_CLEANUP_FAILED}: invalid cleanup journal: {error}")))?
+    } else {
+        CardCleanupJournal { schema_version: 1, task_id: parameters.task_id.clone(),
+            records_sha256: records_sha256.clone(), states: vec!["pending".into(); records.len()], status: "pending".into() }
+    };
+    if journal.schema_version != 1 || journal.task_id != parameters.task_id
+        || journal.records_sha256 != records_sha256 || journal.states.len() != records.len()
+        || !matches!(journal.status.as_str(), "pending" | "cleaned")
+        || (journal.status == "cleaned" && journal.states.iter().any(|state| state != "deleted"))
+        || journal.states.iter().any(|state| !matches!(state.as_str(), "pending" | "deleting" | "deleted")) {
+        return Err(refusal_failure(CardImportRefusal::new(IMPORT_CLEANUP_FAILED, "cleanup journal does not match the sealed task")));
+    }
+    cancelled(cancel)?;
+    store_cleanup(root, &journal)?;
+    let storages: Vec<_> = records.iter().map(|record| record.storage_id).collect::<BTreeSet<_>>().into_iter().collect();
+    let inventory = camera.card_import_enumerate(&storages, cancel).map_err(|error| map_camera_failure(error, cancel))?;
+    verify_camera_identity(&inventory.identity, profile).map_err(refusal_failure)?;
+    // Validate the whole deletion set before sending the first DeleteObject.
+    let bound = cleanup_binding(records, &journal, &inventory)?;
+    for (position, object) in bound.iter().enumerate() {
+        cancelled(cancel)?;
+        if let Some(object) = object {
+            verify_cleanup_local(root, &records[position], cancel)?;
+            journal.states[position] = "deleting".into();
+            journal.status = "pending".into();
+            store_cleanup(root, &journal)?;
+            cancelled(cancel)?;
+            camera.card_import_delete(object, &inventory.identity, cancel)
+                .map_err(|error| map_camera_failure(error, cancel))?;
+            reporter.message("PASS", format!("SD cleanup confirmed kind={} index={} name={}",
+                object.kind, object.record_index, object.candidate.filename));
+        }
+        journal.states[position] = "deleted".into();
+        store_cleanup(root, &journal)?;
+    }
+    let after = camera.card_import_enumerate(&storages, cancel).map_err(|error| map_camera_failure(error, cancel))?;
+    verify_camera_identity(&after.identity, profile).map_err(refusal_failure)?;
+    cleanup_binding(records, &journal, &after)?;
+    cancelled(cancel)?;
+    journal.status = "cleaned".into();
+    store_cleanup(root, &journal)?;
+    Ok(())
 }
 
 fn publish_counts(value: &mut CardImportProgress, records: &[CardCaptureRecord]) {
@@ -1837,6 +2042,118 @@ fn map_camera_failure(error: CameraError, cancel: &AtomicBool) -> CardImportFail
     }
 }
 
+#[cfg(all(test, windows))]
+mod hardware_acceptance {
+    use super::*;
+    use crate::devices::camera::{CameraAdapter, CameraCaptureEvent, CardCapturePlan};
+    use std::io::Write;
+
+    /// Explicitly authorized camera component acceptance, separate from a full
+    /// beam/turntable scan. Ordinary offline test runs never execute this test.
+    #[test]
+    #[ignore = "requires explicitly authorized D7100 camera capture, import and exact test-file deletion"]
+    fn authorized_d7100_card_capture_import_cleanup() {
+        assert_eq!(std::env::var("MICRO_CT_HARDWARE_CARD_ACCEPTANCE").unwrap(),
+            "D7100-8322769-camera-only-capture-import-delete");
+        let out = PathBuf::from(std::env::var("MICRO_CT_HARDWARE_EVIDENCE_DIR").unwrap());
+        assert!(out.is_absolute());
+        fs::create_dir_all(&out).unwrap();
+        let mut journal = fs::OpenOptions::new().write(true).create_new(true)
+            .open(out.join("hardware-events.jsonl")).unwrap();
+        let mut record = |event: &str, data: serde_json::Value| {
+            let row = serde_json::json!({"at":chrono::Utc::now().to_rfc3339(),"event":event,"data":data});
+            writeln!(journal,"{row}").unwrap();journal.sync_all().unwrap();println!("{row}");
+        };
+        let camera = CameraAdapter::discover().unwrap();
+        let devices = camera.discover_list().unwrap();
+        let matches: Vec<_> = devices.iter().filter(|device|
+            device.device_id.to_lowercase().contains("vid_04b0&pid_0430")
+            && device.device_id.contains("#8322769#")).collect();
+        assert_eq!(matches.len(),1);
+        let health = camera.connect_selected(&matches[0].device_id).unwrap();
+        let identity = health.identity.clone().unwrap();
+        assert!(identity.serial.as_deref().unwrap().starts_with("8322769"));
+        assert_eq!(identity.model.trim(),"D7100");
+        let cancel = AtomicBool::new(false);
+        record("connected",serde_json::json!({"identity":identity,"battery":health.runtime_properties.get("batteryLevel")}));
+        let before = camera.card_import_enumerate(&[0x0002_0001],&cancel).unwrap();
+        let expected: Vec<_> = (6116..=6120).map(|index| {
+            let filename=format!("DSC_{index:04}.NEF");
+            let objects:Vec<_>=before.candidates.iter().filter(|object|object.filename==filename).collect();
+            assert_eq!(objects.len(),1,"ambiguous or missing UI test object {filename}");
+            let object=objects[0].clone();
+            assert_eq!(object.handle,169465828+index-6116,"UI-tested object identity changed");
+            assert_eq!(object.format,0x3800);object
+        }).collect();
+        record("inventory_before",serde_json::json!({"candidates":format!("{:?}",before.candidates),"uiTestObjects":expected.len()}));
+        let mut receipts=Vec::new();
+        for index in 1..=4 {
+            let cards=camera.read_card_storages().unwrap();
+            let plan=crate::devices::camera::plan_camera_cards(&camera.health(),&cards,1,
+                crate::devices::camera::CONSERVATIVE_NEF_BYTES).unwrap();
+            let plan=CardCapturePlan{storages:plan.storages.iter().map(|card|card.id).collect(),
+                allow_overflow:camera.health().capabilities.card_overflow&&plan.storages.len()>1,
+                expected_objects:1,early_release:true};
+            let operation=format!("authorized-component-early-{index}");
+            let (sender,receiver)=std::sync::mpsc::channel();
+            let worker_camera=camera.clone();let worker_operation=operation.clone();
+            let worker=std::thread::spawn(move||worker_camera.capture_to_card(plan,&worker_operation,
+                &AtomicBool::new(false),Some(sender)));
+            let mut early=0;
+            while let Ok(event)=receiver.recv() {
+                if let CameraCaptureEvent::EarlyExposureEnded{session_id,operation_id,..}=event {
+                    assert_eq!(session_id,identity_session(&camera));assert_eq!(operation_id,operation);early+=1;
+                    record("early_exposure_ended",serde_json::json!({"index":index,"operationId":operation_id,"sessionId":session_id}));
+                }
+            }
+            let outcome=worker.join().unwrap().unwrap();
+            assert!(outcome.exposure_ended);assert!(early<=1);
+            record("receipt",serde_json::json!({"index":index,"receipt":outcome.receipt,
+                "timing":camera.health().last_card_capture_timing,"earlyEvents":early}));
+            receipts.push(outcome.receipt);
+        }
+        let inventory=camera.card_import_enumerate(&[0x0002_0001],&cancel).unwrap();
+        assert_eq!(inventory.identity,identity);
+        let mut objects=expected;
+        for receipt in receipts {
+            let matches:Vec<_>=inventory.candidates.iter().filter(|object|object.handle==receipt.handle
+                && object.storage_id==receipt.storage_id&&object.filename==receipt.filename
+                && object.parent==receipt.parent&&object.size==receipt.size&&object.capture_date==receipt.capture_date).collect();
+            assert_eq!(matches.len(),1);objects.push(matches[0].clone());
+        }
+        fs::create_dir(out.join("frames")).unwrap();
+        let mut verified=Vec::new();
+        for (index,candidate) in objects.iter().enumerate() {
+            let object=CardImportObject{record_index:index as u32+1,kind:"projection".into(),candidate:candidate.clone()};
+            let target=out.join("frames").join(format!("frame-{:04}.nef",index+1));
+            let result=camera.card_import_download(&object,&target,&cancel,None).unwrap();
+            assert_eq!(hash_file_cancellable(&target,&cancel).unwrap(),(result.bytes,result.sha256.clone()));
+            record("local_verified",serde_json::json!({"object":candidate.filename,"path":target,"bytes":result.bytes,"sha256":result.sha256}));
+            verified.push((object,target,result.bytes,result.sha256));
+        }
+        // All local files pass the same production length/hash check before any deletion.
+        for (_,path,bytes,hash) in &verified {
+            assert_eq!(hash_file_cancellable(path,&cancel).unwrap(),(*bytes,hash.clone()));
+        }
+        record("all_local_sealed",serde_json::json!({"files":verified.len(),"scope":"camera components only; no scan manifest or X-ray/turntable acceptance"}));
+        for (object,path,bytes,hash) in &verified {
+            assert_eq!(hash_file_cancellable(path,&cancel).unwrap(),(*bytes,hash.clone()));
+            record("delete_intent",serde_json::json!({"candidate":format!("{:?}",object.candidate)}));
+            camera.card_import_delete(object,&identity,&cancel).unwrap();
+            record("deleted_confirmed",serde_json::json!({"filename":object.candidate.filename}));
+        }
+        let after=camera.card_import_enumerate(&[0x0002_0001],&cancel).unwrap();
+        let retained:Vec<_>=before.candidates.into_iter().filter(|candidate|
+            !objects.iter().any(|target|target.handle==candidate.handle)).collect();
+        assert_eq!(after.candidates,retained,"pre-existing card inventory must remain identical");
+        record("completed",serde_json::json!({"files":verified.len(),"otherObjectsRetained":after.candidates.len(),
+            "battery":camera.health().runtime_properties.get("batteryLevel"),"fullScanCertified":false}));
+        assert!(camera.disconnect_confirmed().unwrap().cleanup_confirmed);
+    }
+
+    fn identity_session(camera:&CameraAdapter)->String {camera.health().session_id.unwrap()}
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{scripted_card_adapter, ScriptedCameraConfig, ScriptedCameraProbe};
@@ -1855,9 +2172,10 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.cache/tests/ct-engine")
             .join(format!(
-                "{}-card-import-{topic}-{}",
+                "{}-card-import-{topic}-{}-{}",
                 chrono::Utc::now().format("%Y%m%d-%H%M%S"),
-                std::process::id()
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
             ));
         fs::create_dir_all(&root).unwrap();
         fs::write(
@@ -2186,6 +2504,7 @@ mod tests {
             capabilities: vec![
                 "HEARTBEAT_ACK".into(),
                 crate::scan::CARD_SETTLE_CAPABILITY.into(),
+                crate::scan::CARD_MOVE_RAMP_CAPABILITY.into(),
             ],
         };
         crate::scan::card_capture_policy(&identity, overflow).unwrap()
@@ -2281,7 +2600,7 @@ mod tests {
             filename: "DSC_8888.NEF".into(),
             format: 0x3800,
             size: NEF_BYTES,
-            capture_date: "20261011T120000".into(),
+            capture_date: "20261011T150000".into(),
         });
         assert_eq!(
             bind_card_objects(&records, &[], &inventory(unexpected)).unwrap_err().code,
@@ -2317,6 +2636,190 @@ mod tests {
             bind_card_objects(&records[1..], &[], &inventory(objects)).unwrap_err().code,
             IMPORT_OBJECT_UNEXPECTED
         );
+    }
+
+    #[test]
+    fn old_same_folder_objects_are_retained_only_with_strict_date_evidence() {
+        let records=standard_records(3,false);
+        let objects:Vec<_>=records.iter().map(|record|CardObjectCandidate{
+            storage_id:record.storage_id,handle:record.handle,parent:record.parent,
+            filename:record.source_file_name.clone(),format:record.format,size:record.size,
+            capture_date:record.capture_date.clone(),
+        }).collect();
+        for (date,accepted) in [("20250101T120000",true),("20261011T120100",false),
+            ("20261011T150000",false),("",false),("invalid",false)] {
+            let mut candidates=objects.clone();
+            let mut extra=objects[0].clone();extra.handle=0x9999;
+            extra.filename="OLD_OR_UNCLAIMED.NEF".into();extra.capture_date=date.into();
+            candidates.push(extra);
+            let inventory=CardImportInventory{identity:CameraIdentity::default(),examined:candidates.len(),
+                storages:vec![StorageInfo{id:StorageId(STORAGE_ONE),access:super::super::storage::StorageAccess::ReadWrite,
+                    capacity:super::super::storage::StorageCapacity{max_bytes:64*GIB,free_bytes:64*GIB,free_images:5000},
+                    storage_type:4,filesystem_type:3,description:String::new(),volume_label:String::new()}],candidates};
+            let result=bind_card_objects(&records,&[],&inventory);
+            if accepted {assert_eq!(result.unwrap().len(),records.len());}
+            else {assert_eq!(result.unwrap_err().code,IMPORT_OBJECT_UNEXPECTED);}
+        }
+    }
+
+    #[test]
+    fn cleanup_removes_only_receipt_objects_after_all_local_files_are_sealed() {
+        let (adapter, probe) = camera("cleanup-preserves-baseline", false);
+        let fixture = Fixture::new("cleanup-preserves-baseline", 3, false, &adapter);
+        fixture.write_manifest();
+        let mut objects = fixture.objects.clone();
+        let mut existing = objects[0].clone();
+        existing.handle = 0x9002;
+        existing.parent = PARENT_ONE;
+        existing.name = "PRE_EXISTING.NEF".into();
+        existing.date = "20260101T120000".into();
+        objects.push(existing.clone());
+        let mut jpeg = existing.clone();
+        jpeg.handle = 0x9003; jpeg.parent = PARENT_ONE; jpeg.format = 0x3801;
+        jpeg.name = "PRE_EXISTING.JPG".into(); objects.push(jpeg.clone());
+        fixture.script_objects(&probe, &objects);
+        let task_root = fs::canonicalize(fixture.task_root()).unwrap();
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let removed_for_hook = removed.clone();
+        probe.on_card_delete(move |handle| {
+            let manifest = read_manifest_value(&task_root).unwrap();
+            assert_eq!(manifest["dataStatus"], DATA_VERIFIED);
+            assert_eq!(manifest["completed"], true);
+            let records: Vec<CardCaptureRecord> = serde_json::from_value(manifest["captureRecords"].clone()).unwrap();
+            assert_eq!(records.len(), 23);
+            for record in &records { verify_cleanup_local(&task_root, record, &AtomicBool::new(false)).unwrap(); }
+            let journal: CardCleanupJournal = serde_json::from_slice(&fs::read(task_root.join(CLEANUP_JOURNAL)).unwrap()).unwrap();
+            assert!(journal.states.iter().any(|state| state == "deleting"));
+            removed_for_hook.lock().unwrap().push(handle);
+        });
+        run(&fixture, &adapter, &AtomicBool::new(false)).0.unwrap();
+        assert_eq!(probe.operation_count(DELETE_OBJECT), 23);
+        assert_eq!(removed.lock().unwrap().len(), 23);
+        assert_eq!(probe.operation_count(GET_OBJECT), 23);
+        let inventory = adapter.card_import_enumerate(&[STORAGE_ONE], &AtomicBool::new(false)).unwrap();
+        assert_eq!(inventory.candidates.len(), 1);
+        assert_eq!(inventory.candidates[0].handle, existing.handle);
+        assert_eq!(inventory.examined, 2, "both pre-existing NEF and JPEG remain on the card");
+        let journal: CardCleanupJournal = serde_json::from_slice(&fs::read(fixture.task_root().join(CLEANUP_JOURNAL)).unwrap()).unwrap();
+        assert_eq!(journal.status, "cleaned");
+        assert!(journal.states.iter().all(|state| state == "deleted"));
+        assert_eq!(probe.operation_count(0x100e), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_360_projections_survives_a_transient_journal_lock_after_320_deletes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (adapter, probe) = camera("cleanup-transient-journal-lock", false);
+        let fixture = Fixture::new("cleanup-transient-journal-lock", 360, false, &adapter);
+        fixture.write_manifest();
+        fixture.script(&probe);
+        let journal_path = fixture.task_root().join(CLEANUP_JOURNAL);
+        let lock_handle = fixture.objects[319].handle;
+        let release = Arc::new(Mutex::new(None));
+        let release_for_hook = release.clone();
+        probe.on_card_delete(move |handle| {
+            if handle == lock_handle {
+                let journal: CardCleanupJournal = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+                assert_eq!(journal.states.iter().filter(|state| *state == "deleted").count(), 319);
+                assert_eq!(journal.states[319], "deleting");
+                let held = fs::OpenOptions::new().read(true).share_mode(3).open(&journal_path).unwrap();
+                *release_for_hook.lock().unwrap() = Some(std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    drop(held);
+                }));
+            }
+        });
+        let (result, reporter) = run(&fixture, &adapter, &AtomicBool::new(false));
+        release.lock().unwrap().take().expect("the journal lock was exercised").join().unwrap();
+        assert_eq!(result.unwrap().verified, 380);
+        assert_eq!(probe.operation_count(GET_OBJECT), 380);
+        assert_eq!(probe.operation_count(DELETE_OBJECT), 380);
+        assert_eq!(probe.operation_count(0x100e), 0);
+        assert_eq!(reporter.progress.lock().unwrap().status, IMPORT_STATUS_VERIFIED);
+        let journal: CardCleanupJournal = serde_json::from_slice(&fs::read(fixture.task_root().join(CLEANUP_JOURNAL)).unwrap()).unwrap();
+        assert_eq!(journal.status, "cleaned");
+        assert!(journal.states.iter().all(|state| state == "deleted"));
+    }
+
+    #[test]
+    fn cleanup_failure_and_cancel_resume_without_redownload_or_capture() {
+        for scenario in ["denied", "no-effect", "cancel"] {
+            let (adapter, probe) = camera(scenario, false);
+            let fixture = Fixture::new(scenario, 3, false, &adapter);
+            fixture.write_manifest(); fixture.script(&probe);
+            let cancel = Arc::new(AtomicBool::new(false));
+            match scenario {
+                "denied" => probe.set_card_delete_responses(&[OK, 0x200f]),
+                "no-effect" => probe.set_card_delete_no_effect(true),
+                _ => { let flag = cancel.clone(); probe.on_card_delete(move |_| { flag.store(true, Ordering::SeqCst); }); }
+            }
+            let (result, reporter) = run(&fixture, &adapter, &cancel);
+            let error = result.unwrap_err();
+            assert!(matches!(error, CardImportFailure::Cancelled) || error.message().contains(IMPORT_CLEANUP_FAILED), "{}", error.message());
+            assert_ne!(reporter.progress.lock().unwrap().status, IMPORT_STATUS_VERIFIED);
+            assert_eq!(fixture.stored_manifest()["dataStatus"], DATA_VERIFIED);
+            assert_eq!(fixture.stored_manifest()["completed"], true);
+            let deletes = probe.operation_count(DELETE_OBJECT);
+            assert_eq!(deletes, if scenario == "denied" { 2 } else { 1 });
+            // A fresh session may renumber the remaining handles. Durable intents
+            // reconcile a delete that completed before cancellation/ack loss.
+            let (next, next_probe) = camera(&format!("{scenario}-resume"), false);
+            let remaining: Vec<_> = fixture.objects.iter().enumerate()
+                .filter(|(index, _)| scenario == "no-effect" || *index != 0)
+                .map(|(_, object)| { let mut object = object.clone(); object.handle += 0x2000; object }).collect();
+            fixture.script_objects(&next_probe, &remaining);
+            run(&fixture, &next, &AtomicBool::new(false)).0.unwrap();
+            assert_eq!(next_probe.operation_count(GET_OBJECT), 0);
+            assert_eq!(next_probe.operation_count(0x100e), 0);
+            assert_eq!(next_probe.operation_count(DELETE_OBJECT), remaining.len());
+            assert!(next.card_import_enumerate(&[STORAGE_ONE], &AtomicBool::new(false)).unwrap().candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn cleanup_retry_refuses_local_corruption_foreign_camera_missing_or_changed_objects() {
+        for scenario in ["local", "identity", "missing", "changed", "journal"] {
+            let (adapter, probe) = camera(scenario, false);
+            let fixture = Fixture::new(scenario, 3, false, &adapter);
+            fixture.write_manifest(); fixture.script(&probe);
+            probe.set_card_delete_responses(&[0x200f]);
+            assert!(run(&fixture, &adapter, &AtomicBool::new(false)).0.is_err());
+            let (next, next_probe) = camera(&format!("{scenario}-retry"), false);
+            let mut objects = fixture.objects.clone();
+            if scenario == "changed" { objects[1].date = "20260101T000000".into(); }
+            if scenario == "missing" { objects.remove(1); }
+            fixture.script_objects(&next_probe, &objects);
+            if scenario == "local" { fs::write(fixture.target(&fixture.records[1]), b"corrupt").unwrap(); }
+            if scenario == "identity" {
+                let mut manifest = fixture.stored_manifest();
+                manifest["captureProfile"]["identity"]["serial"] = json!("foreign-body");
+                write_manifest(&fixture.task_root(), &manifest).unwrap();
+            }
+            if scenario == "journal" {
+                let path = fixture.task_root().join(CLEANUP_JOURNAL);
+                let mut journal: CardCleanupJournal = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                journal.records_sha256 = "foreign".into(); store_cleanup(&fixture.task_root(), &journal).unwrap();
+            }
+            assert!(run(&fixture, &next, &AtomicBool::new(false)).0.is_err());
+            assert_eq!(next_probe.operation_count(DELETE_OBJECT), 0);
+            assert_eq!(next_probe.operation_count(GET_OBJECT), 0);
+            assert_eq!(fixture.stored_manifest()["dataStatus"], DATA_VERIFIED);
+        }
+    }
+
+    #[test]
+    fn delete_owner_rechecks_metadata_and_rejects_wildcards_without_a_delete() {
+        let (adapter, probe) = camera("delete-owner-check", false);
+        let fixture = Fixture::new("delete-owner-check", 3, false, &adapter);
+        fixture.script(&probe);
+        let inventory = adapter.card_import_enumerate(&[STORAGE_ONE], &AtomicBool::new(false)).unwrap();
+        let mut object = CardImportObject { record_index: 1, kind: "projection".into(), candidate: inventory.candidates[0].clone() };
+        object.candidate.size += 1;
+        assert!(adapter.card_import_delete(&object, &inventory.identity, &AtomicBool::new(false)).unwrap_err().to_string().contains(IMPORT_OBJECT_CHANGED));
+        object.candidate.handle = u32::MAX;
+        assert!(adapter.card_import_delete(&object, &inventory.identity, &AtomicBool::new(false)).is_err());
+        assert_eq!(probe.operation_count(DELETE_OBJECT), 0);
     }
 
     #[test]
@@ -2501,7 +3004,7 @@ mod tests {
             storage: STORAGE_ONE,
             handle: 0x7FFE,
             name: "DSC_7000.NEF".into(),
-            date: "20261011T120000".into(),
+            date: "20261011T150000".into(),
             parent: PARENT_ONE,
             format: 0x3800,
             bytes: synthetic_nef(0xDD),
@@ -2827,6 +3330,97 @@ mod tests {
             .device_command("camera_card_import", json!({}))
             .unwrap()
             .is_err());
+    }
+
+    #[test]
+    fn automatic_import_retains_the_task_on_stop_off_failure_or_bad_image() {
+        for scenario in ["stop", "off-failure", "bad-image"] {
+            let (adapter,probe)=camera(scenario,false);
+            let fixture=Fixture::new(scenario,3,false,&adapter);
+            fixture.script(&probe);
+            let mut engine=crate::Engine::new_with_storage(false,fixture.root.join("engine-data"));
+            engine.parameters=fixture.parameters.clone();
+            engine.task_registry.register(&fixture.parameters).unwrap();
+            fixture.write_manifest();
+            engine.camera=Some(adapter.clone());
+            engine.cached_camera_health=Some(adapter.health());
+            let (mut xray,xray_probe)=crate::devices::xray::test_worker(20.0,100.0);
+            if scenario=="off-failure" {
+                xray.beam_on(&AtomicBool::new(false)).unwrap();
+                xray_probe.ignore_off(true);
+            }
+            if scenario=="bad-image" {
+                let mut bytes=fixture.objects[0].bytes.clone();bytes[0]=0;
+                probe.set_card_object_bytes(fixture.objects[0].handle,bytes);
+            }
+            engine.xray=Some(xray);
+            engine.scan_stop_requested=scenario=="stop";
+            engine.enqueue_acquired_pending_import().unwrap();
+            let deadline=Instant::now()+Duration::from_secs(30);
+            while engine.operations.is_active()&&Instant::now()<deadline {
+                engine.tick();std::thread::sleep(Duration::from_millis(2));
+            }
+            xray_probe.ignore_off(false);
+            engine.xray.as_mut().unwrap().force_off().unwrap();
+            assert!(!engine.operations.is_active(),"{scenario}");
+            assert_eq!(engine.task_registry.pending_import_tasks().len(),1,"{scenario}");
+            assert!(!crate::scan::completed_manifest_exists(&fixture.parameters));
+            assert_ne!(fixture.stored_manifest()["dataStatus"],DATA_VERIFIED);
+            assert_eq!(probe.operation_count(0x100e),0,"never re-shoot after an import failure");
+            assert_eq!(probe.operation_count(0x100b),0,"never delete a card original");
+            if scenario=="stop" {
+                assert_eq!(probe.card_object_read_count(),0);
+                assert_eq!(engine.card_import_progress().status,IMPORT_STATUS_IDLE);
+            } else {
+                assert_eq!(engine.card_import_progress().status,IMPORT_STATUS_FAILED);
+                if scenario=="off-failure" {assert_eq!(probe.card_object_read_count(),0);}
+                else {assert_eq!(probe.card_object_read_count(),1);}
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_keeps_registry_pending_and_stop_interrupts_the_delete_worker() {
+        for scenario in ["delete-denied", "stop-during-delete"] {
+            let (adapter, probe) = camera(scenario, false);
+            let fixture = Fixture::new(scenario, 3, false, &adapter);
+            fixture.script(&probe);
+            let mut engine = crate::Engine::new_with_storage(false, fixture.root.join("engine-data"));
+            engine.parameters = fixture.parameters.clone();
+            engine.task_registry.register(&fixture.parameters).unwrap();
+            fixture.write_manifest();
+            engine.camera = Some(adapter.clone());
+            engine.cached_camera_health = Some(adapter.health());
+            let (xray, xray_probe) = crate::devices::xray::test_worker(20.0, 100.0);
+            engine.xray = Some(xray);
+            let (started, entered) = std::sync::mpsc::channel();
+            if scenario == "delete-denied" { probe.set_card_delete_responses(&[0x200f]); }
+            else { probe.stall_operation(DELETE_OBJECT, Duration::from_secs(3), started); }
+            engine.enqueue_acquired_pending_import().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut stopped = false;
+            while engine.operations.is_active() && Instant::now() < deadline {
+                engine.tick();
+                if !stopped && scenario == "stop-during-delete" && entered.try_recv().is_ok() {
+                    let before = Instant::now();
+                    engine.command("stop", json!({})).unwrap();
+                    assert!(before.elapsed() < Duration::from_millis(250), "Stop acceptance remains nonblocking");
+                    stopped = true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            for _ in 0..5 { engine.tick(); }
+            assert!(!engine.operations.is_active());
+            assert!(!xray_probe.output_enabled());
+            assert_ne!(engine.phase, crate::Phase::Completed);
+            assert_eq!(engine.task_registry.pending_import_tasks().len(), 1);
+            assert_eq!(fixture.stored_manifest()["dataStatus"], DATA_VERIFIED);
+            assert_eq!(probe.operation_count(GET_OBJECT), 23);
+            assert_eq!(probe.operation_count(0x100e), 0);
+            if scenario == "stop-during-delete" { assert!(stopped); }
+            let restored = crate::Engine::new_with_storage(false, fixture.root.join("engine-data"));
+            assert_eq!(restored.task_registry.pending_import_tasks().len(), 1, "cleanup remains retryable across restart");
+        }
     }
 
     #[test]

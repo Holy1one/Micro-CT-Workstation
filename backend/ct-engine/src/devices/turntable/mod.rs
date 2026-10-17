@@ -13,13 +13,15 @@ pub(crate) use nano::LineTransport;
 #[cfg(test)]
 pub(crate) use nano::tests::test_homed_nano;
 #[cfg(test)]
+pub(crate) use nano::tests::test_card_homed_nano;
+#[cfg(test)]
 pub(crate) use nano::tests::test_stopped_reference_nano;
 #[cfg(test)]
 pub(crate) use nano::tests::test_delayed_stop_nano;
 
 pub use nano::{
-    MoveTicket, NanoAdapter, NanoConnectionState, NanoError, NanoHealth, NanoIdentity, NanoStatus,
-    BAUD_RATE, EXPECTED_DEVICE, EXPECTED_PROTOCOL,
+    MoveOutcome, MoveTicket, NanoAdapter, NanoConnectionState, NanoError, NanoHealth, NanoIdentity,
+    NanoStatus, BAUD_RATE, EXPECTED_DEVICE, EXPECTED_PROTOCOL,
 };
 pub use planner::{
     confirmed_phase_mdeg, plan_projection, plan_relative, plan_to_phase,

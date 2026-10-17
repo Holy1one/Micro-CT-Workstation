@@ -10,7 +10,7 @@ The production drivers were flat files under `ct-engine/src/adapters`. That layo
 
 Production device code is organized by physical role under `ct-engine/src/devices/{xray,camera,turntable}`. Each directory exposes a small `mod.rs` surface and keeps its current vendor-specific implementation private. Cross-device transaction order remains in `scan.rs`, and authoritative safety and scan state remain in `ct-engine`.
 
-The current topology is PC-direct. A future Arduino-centered implementation will be added as an explicit controller-managed backend behind the same domain behavior. It will not replace the current backend silently and will not create a second uncoordinated scan authority.
+The current production topology is PC-direct. No controller-managed backend is scheduled by this decision. Any later user-requested topology change must start with active firmware and a verified protocol, preserve domain ownership, and update all affected consumers.
 
 ## Alternatives considered
 

@@ -2,6 +2,8 @@
 
 use super::types::{CameraDeviceInfo, CameraError, CameraIdentity, CameraProperty, CameraValue};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,6 +13,7 @@ pub const DEVICE_BUSY: u16 = 0x2019;
 pub const GET_DEVICE_INFO: u16 = 0x1001;
 pub const GET_OBJECT_INFO: u16 = 0x1008;
 pub const GET_OBJECT: u16 = 0x1009;
+pub const DELETE_OBJECT: u16 = 0x100b;
 pub const GET_PROPERTY_DESC: u16 = 0x1014;
 pub const GET_PROPERTY: u16 = 0x1015;
 pub const SET_PROPERTY: u16 = 0x1016;
@@ -85,6 +88,44 @@ pub(crate) trait CameraTransport {
         phase: DataPhase,
         context: &CallContext,
     ) -> Result<PtpResponse, CameraError>;
+}
+
+/// Owner-thread counters only; they add no I/O, synchronization or completion evidence.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TransportMetrics {
+    pub commands: u64,
+    pub elapsed_us: u64,
+    pub property_reads: u64,
+    pub descriptor_reads: u64,
+    pub event_polls: u64,
+}
+
+pub(crate) struct MeteredTransport {
+    pub inner: Box<dyn CameraTransport>,
+    pub metrics: Rc<RefCell<TransportMetrics>>,
+}
+
+impl CameraTransport for MeteredTransport {
+    fn discover(&mut self, context: &CallContext) -> Result<Vec<CameraIdentity>, CameraError> {
+        self.inner.discover(context)
+    }
+    fn open(&mut self, id: &str, context: &CallContext) -> Result<(), CameraError> {
+        self.inner.open(id, context)
+    }
+    fn close(&mut self) -> Result<(), CameraError> { self.inner.close() }
+    fn cancel(&mut self) -> Result<(), CameraError> { self.inner.cancel() }
+    fn execute(&mut self, code: u16, params: &[u32], phase: DataPhase,
+        context: &CallContext) -> Result<PtpResponse, CameraError> {
+        let started = Instant::now();
+        let result = self.inner.execute(code, params, phase, context);
+        let mut metrics = self.metrics.borrow_mut();
+        metrics.commands += 1;
+        metrics.elapsed_us += started.elapsed().as_micros() as u64;
+        metrics.property_reads += u64::from(code == GET_PROPERTY);
+        metrics.descriptor_reads += u64::from(code == GET_PROPERTY_DESC);
+        metrics.event_polls += u64::from(code == 0x90c7);
+        result
+    }
 }
 
 pub(crate) struct Cursor<'a> {
@@ -350,9 +391,11 @@ pub(crate) fn accepts(property: &CameraProperty, value: &CameraValue) -> bool {
         return property.supported_values.contains(value);
     }
     if let Some([min, max, step]) = property.range {
-        return value
-            .integer()
-            .is_some_and(|n| n >= min && n <= max && (n - min) % step == 0);
+        // An INT64 range can span more than i64::MAX even though each endpoint
+        // and candidate is representable. Never wrap the step-alignment test.
+        return step > 0 && value.integer().is_some_and(|n| {
+            n >= min && n <= max && (i128::from(n) - i128::from(min)) % i128::from(step) == 0
+        });
     }
     // An unconstrained property description does not prove a safe editable domain.
     false
@@ -511,4 +554,48 @@ pub(crate) fn parse_vendor_property_codes(bytes: &[u8]) -> Result<Vec<u16>, Came
         ));
     }
     Ok(codes)
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    fn signed_range(minimum: i64, maximum: i64, step: i64) -> CameraProperty {
+        let mut bytes = Vec::new();
+        bytes.extend(0x5007u16.to_le_bytes());
+        bytes.extend(7u16.to_le_bytes()); // INT64
+        bytes.push(1); // writable
+        bytes.extend(minimum.to_le_bytes());
+        bytes.extend(minimum.to_le_bytes());
+        bytes.push(1); // range form
+        for value in [minimum, maximum, step] {
+            bytes.extend(value.to_le_bytes());
+        }
+        parse_property(&bytes, "test", "Test range", 0x5007).unwrap()
+    }
+
+    #[test]
+    fn range_validation_handles_the_full_signed_span_without_overflow() {
+        let property = signed_range(i64::MIN, i64::MAX, 3);
+        assert!(accepts(&property, &CameraValue::Integer(i64::MIN)));
+        assert!(accepts(&property, &CameraValue::Integer(i64::MAX)));
+        // Wrapping subtraction would incorrectly accept MAX - 2 as a multiple of 3.
+        assert!(!accepts(&property, &CameraValue::Integer(i64::MAX - 2)));
+        assert!(!accepts(&property, &CameraValue::Integer(0)));
+    }
+
+    #[test]
+    fn range_validation_rejects_invalid_steps_and_preserves_normal_bounds() {
+        let mut property = signed_range(-6, 6, 3);
+        for value in [-6, -3, 0, 3, 6] {
+            assert!(accepts(&property, &CameraValue::Integer(value)));
+        }
+        for value in [-9, -5, 1, 7] {
+            assert!(!accepts(&property, &CameraValue::Integer(value)));
+        }
+        for range in [[-6, 6, 0], [-6, 6, -3], [6, -6, 3]] {
+            property.range = Some(range);
+            assert!(!accepts(&property, &CameraValue::Integer(0)));
+        }
+    }
 }

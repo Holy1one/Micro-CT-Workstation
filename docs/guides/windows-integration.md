@@ -1,75 +1,26 @@
 # Windows 集成边界
 
-Windows 安装目标为 Windows 10 x64 和 Windows 11 x64；Windows 11 x64 是当前真实硬件、GPU 与安装验收平台，Windows 10 尚需独立运行验收。其他平台构建只证明所运行的
-跨平台 UI、协议和纯逻辑检查。真实设备操作仍需本次目标的明确授权。
+安装目标为 Windows 10 / 11 x64；现有实际安装和桌面证据来自 Windows 11，Windows 10 尚需独立运行验收。设备分项记录见 [验证索引](../validation/README.md)，不等于当前整机能力认证。
 
-## 当前传输和进程
+## 进程与传输
 
-- `ct-workstation.exe`：Tauri 2 + WebView2；由 Windows MSI 安装，默认位置为 `%LOCALAPPDATA%\Programs\Micro-CT Workstation`，安装向导允许选择其他可写位置。引擎安装在相同目录并经 SHA-256 校验后启动。
-- `ct-engine.exe`：Rust，拥有设备、安全门控、采集状态机与离线重构。
-- 相机模块 `camera/{actor,wpd,ptp,nikon,capture,live_view}.rs` 使用原生 Windows WPD/PTP，COM 在专用线程创建、使用和释放，RAM NEF 由本次曝光/对象/传输事件及完整文件确认。
-- 重构方法编译进 `ct-engine`，通过 `ReconstructionMethod` 声明；FDK 使用 CPU 或
-  兼容的 wgpu GPU 路径，受限规模 CPU SIRT 可用。未采用独立算法插件运行时。
-- 控制与快照沿用 sidecar stdio 和版本化 JSONL envelope，不开放 localhost
-  设备控制服务。前端生产路径只能通过 Tauri 进入引擎。
+- ct-workstation.exe 为 Tauri 2 + WebView2 桌面应用。MSI 默认安装至当前用户 Programs/Micro-CT Workstation，也允许明确选择其他可写位置。
+- ct-engine.exe 与应用同目录安装，桌面启动先校验编译时记录的 SHA-256。引擎唯一拥有设备、安全、任务和离线重构，不向 C 盘缓存释放另一份引擎。
+- 设备控制只走 Tauri → JSONL stdio → ct-engine，不开放 localhost 设备控制服务，生产 IPC 错误不回退预览。
+- 相机 WPD COM 在线程内创建、使用和释放。存卡与 RAM 路径分别保持回执或文件完整性语义；不调用 DigiCamControl、不增加相机桥进程。
+- Live View 经当前用户 ACL、随机会话端点的 named pipe 传输有界 JPEG；JSONL 只传状态。专用会话、序号、尺寸、长度和 codec 校验不可绕过。
+- 重构算法内置 Rust；默认颜色入口自动处理后用 FDK，适用时尝试有验证门槛的 PWLS-Huber 修正。旧通用入口保留受预算限制的 CPU SIRT，CGLS 不可用，不引入算法插件运行时。
 
-[ADR 0003](../decisions/0003-native-wpd-camera-and-device-control.md) 记录原生 Rust WPD/PTP 与自主控制契约；当前源码已实现离线候选，硬件验收仍 BLOCKED。
-迁移后不再调用 DigiCamControl，不自动回退旧工具或模拟。禁止额外相机桥进程和
-算法插件的 [ADR 0002](../decisions/0002-no-out-of-process-camera-bridge-or-algorithm-plugins.md)
-继续有效。
+## 设备与状态所有权
 
-## 设备模块落点与领域入口
+生产落点为 backend/ct-engine/src/devices/{camera,turntable,xray}/。设备模块处理自身协议和证据，互不调用，不推进扫描。scan.rs 持有跨设备顺序，领域入口持有自主 HOME 等安全裁决。当前唯一生产拓扑为 PC 直控。
 
-生产设备代码按物理角色隔离，由 `ct-engine` 管理身份、生命周期和能力：
+HOME、连续出束、两秒重开、Stop/EOF 清理与未完成任务锁见 [原生控制](native-device-controls.md)。当前默认存卡的容量、早释放、导入和只删本次图片见 [存卡契约](../decisions/0004-camera-sd-card-acquisition.md)。旧 manifest 和原始 NEF 只读，当前算法输出独立版本缓存。
 
-- `backend/ct-engine/src/devices/turntable/nano.rs`：串口、身份/能力、心跳、运动确认、
-  警告和 STOP。
-- `backend/ct-engine/src/devices/camera/`：身份和能力、精确参数读回、原生 COM actor/WPD/PTP、必要 Nikon 协议、RAM capture 与 Live View。
-- `backend/ct-engine/src/devices/xray/moxtek.rs`：Moxtek 命令、实测回读、两秒重开
-  门控和 fail-closed 关束。
+## 构建、安装与验收
 
-设备模块不持有任务状态，不互相调用，不自行安排下一投影。`scan.rs` 持有扫描
-跨设备顺序；领域入口持有自主 HOME 等安全裁决。重构读取已封存、哈希验证的数据，
-不调用设备。PC 直控与未来 Arduino 主控的稳定边界见
-[dual-control-topology.md](../architecture/dual-control-topology.md)。
+按改动影响执行适用的 Rust、TypeScript、IPC、桌面或固件门禁；文档整理无需无关的全量构建。交付 MSI 必须核对包内应用与引擎同源身份、启动及正常退出，构建不自动安装。
 
-## 原生离线候选契约
+用户明确要求安装/更新后，可在授权范围内完成维护停机和安装；维护报告、进程退出、安装结果与二进制身份分别核验。保留旧包及可核验来源，不回退旧设备工具。release/ 只保留最新 MSI，来源、签名、许可和历史包归本机证据缓存，详情见 [安装与更新](desktop-update-distribution.md)。
 
-- 相机和转台独立连接、自检；多相机明确选中一个活动身份。完整厂商适配和正式
-  扫描首期仅 D7100 NEF，其他型号仅开放有证据的标准能力，不能证明 host-only
-  的捕获禁用，不向未知设备试发 Nikon 操作。
-- 专用相机 COM 线程、单一 Moxtek worker 与现有 Nano 串口 worker 保持各自唯一
-  通信所有权。长操作异步执行，监测不依赖 UI；Stop/OFF/EOF 保持优先，不等待
-  相机卡住或运动完成，受理与硬件确认分别表达。
-- 拍摄的可靠曝光结束与完整文件/哈希确认分开。正常末张投影及暂停按本次可靠
-  `ExposureEnded` 关束，提交仍需完整文件和匹配 `CAPTURE_DONE`；空场末张文件
-  确认后正常关束。Stop、故障和连续出束硬上限立即关束优先。
-- Live View 图像经引擎拥有、当前用户 ACL 和随机会话端点的本地 named pipe
-  传至 Tauri，再受控转发；JSONL 仅传状态。限制帧长、版本、session/seq 与 codec，
-  丢弃旧帧，慢消费者不阻塞 Stop。Live View 开启时拒绝捕获，不自动停预览拍摄。
-- 单拍与扫描目录/帧数/断点隔离，不自动开束。HOME 先确认关束；仅转台台架模式
-  需物理隔离确认，射线仍 UNKNOWN 并禁开束。普通运动固定生产方向，HOME 内部
-  有界反向退让保留。任务占用和未完成断点手动锁由引擎执行。
-- schema 3 冻结实际采集 profile；schema 2 保持原文件可读和离线重构，新后端拒绝
-  续扫。保留数值重构、缓存版本/hash 规则和只读原始 NEF。
-
-## Windows 验收与交付门槛
-
-离线候选必须完成适用的 Rust/TypeScript/IPC/布局门禁、固件候选源码重建与 host
-harness、同生产协调器的 transport/fake 故障测试，以及 Windows 候选 EXE 构建、
-启动和视觉检查。交付 `release/` 下唯一最新 MSI；构建来源、哈希、
-第三方许可、离线报告与 `BLOCKED` 实机项保存在 `.cache/tests/release/<version>/`。
-历史身份和验收记录只证明原构建，不作为当前安装入口。
-
-以下内容须在另行明确授权后用真实设备验收，离线通过不能替代：
-
-1. Nano 当前 flash 与候选逐字节一致性、真实方向、负载角度/回零精度、心跳、
-   STOP 和 `REARM + HOME` 恢复；VERSION/BUILD 字符串不证明 flash 一致。
-2. D7100 主机 RAM NEF、属性实际读回、Live View、拍摄事件关联、完整文件与取消
-   清理语义，以及 WPD 故障/卡住时的隔离行为。
-3. Moxtek 实测读回、联锁、急停、两秒重开、持续监测、OFF 写出/读回与故障闭锁。
-4. 联动扫描、连续两轮扫描、末张保持角度、暂停/停止清理及采集 profile 恢复。
-5. 目标 Windows/WebView2/GPU 环境的视觉、性能与部署；签名/安装器按发布范围验收。
-
-任何真实 adapter 都必须显式启用并经独立验收；不得从开发预览自动切换。没有真实
-硬件证据时报告“仅离线验证”，不标记 backend 为生产认证完成。
+真实固件、相机事件、Moxtek 实测/联锁、联动扫描及物理精度按具体版本和工况验收。VERSION/BUILD 字符串、模拟结果、成功安装或更清晰的预览均不能证明硬件安全或成像定量准确。没有本次设备动作证据时报告“仅离线验证”。

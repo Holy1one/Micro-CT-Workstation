@@ -64,8 +64,8 @@ constexpr uint8_t BUZZER_ON_LEVEL  = BUZZER_ACTIVE_HIGH ? HIGH : LOW;
 constexpr uint8_t BUZZER_OFF_LEVEL = BUZZER_ACTIVE_HIGH ? LOW  : HIGH;
 constexpr uint8_t PROTOCOL_VERSION = 2;
 #define DEVICE_TYPE_TEXT "RTS9060_NANO"
-#define FIRMWARE_VERSION_TEXT "2.2.0"
-#define FIRMWARE_BUILD_TEXT "20261010"
+#define FIRMWARE_VERSION_TEXT "2.3.0"
+#define FIRMWARE_BUILD_TEXT "20261011"
 constexpr uint32_t XRAY_WARNING_PERIOD_MS = 1000;
 constexpr uint32_t XRAY_WARNING_ON_MS = 500;
 constexpr uint8_t STEP_IDLE = LOW;
@@ -82,6 +82,7 @@ constexpr uint16_t DIR_SETUP_US = 100;       // 换向后到第一个脉冲
 constexpr uint32_t PERIOD_FAST_US = 2000;    // 巡航 500 Hz
 constexpr uint32_t PERIOD_HOME_SLOW_US = 8000;  // 回零最终复触发 125 Hz
 constexpr uint32_t PERIOD_START_US = 12000;  // 起步周期
+constexpr uint32_t PERIOD_MOVE_START_US = 4000; // 普通 MOVE 候选：250 Hz 起步；HOME 保留旧曲线
 constexpr uint32_t RAMP_STEP_US = 100;       // 每个脉冲加减速的周期步长
 
 constexpr uint32_t MOVE_SETTLE_MS = 150;       // 普通移动统一稳定时间，从末脉冲下降沿起算
@@ -521,14 +522,18 @@ static void serviceMotion() {
   if (!reachedMs(nowUs, g_nextStepDueUs)) return;
   if (g_stepsLeft == 0) { finishPhase(); return; }
 
-  // 线性加减速：头尾各 100 步以内调整周期
+  // 普通 MOVE 只给实际加减速保留脉冲，不在恢复起步周期后额外慢行。
+  // HOME 保留原来的最多 100 步、12 ms 起步曲线及最终 8 ms 接近。
+  const uint32_t periodStartUs = g_state == State::MOVE ? PERIOD_MOVE_START_US : PERIOD_START_US;
+  const uint32_t rampLimit = g_state == State::MOVE
+      ? (periodStartUs - g_periodMinUs + RAMP_STEP_US - 1UL) / RAMP_STEP_US : 100UL;
   uint32_t ramp = g_phaseTotal / 2UL;
-  if (ramp > 100UL) ramp = 100UL;
+  if (ramp > rampLimit) ramp = rampLimit;
   if (ramp == 0) ramp = 1UL;
   if (g_phaseDone < ramp && g_periodUs > g_periodMinUs) {
     g_periodUs = (g_periodUs > g_periodMinUs + RAMP_STEP_US) ? g_periodUs - RAMP_STEP_US : g_periodMinUs;
-  } else if (g_stepsLeft <= ramp && g_periodUs < PERIOD_START_US) {
-    g_periodUs = (g_periodUs + RAMP_STEP_US < PERIOD_START_US) ? g_periodUs + RAMP_STEP_US : PERIOD_START_US;
+  } else if (g_stepsLeft <= ramp && g_periodUs < periodStartUs) {
+    g_periodUs = (g_periodUs + RAMP_STEP_US < periodStartUs) ? g_periodUs + RAMP_STEP_US : periodStartUs;
   }
 
   stepPulseStart();
@@ -633,7 +638,7 @@ static void sendInfo(uint32_t id) {
   Serial.print(F(" PROTOCOL=")); Serial.print(PROTOCOL_VERSION);
   Serial.print(F(" BUILD=")); Serial.print(F(FIRMWARE_BUILD_TEXT));
   Serial.print(F(" BUZZER=")); Serial.print(BUZZER_INSTALLED ? 1 : 0);
-  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE,MOVE_SETTLE_150MS"));
+  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE,MOVE_SETTLE_150MS,MOVE_RAMP_4MS"));
 }
 
 static void beginMove(uint32_t id, int32_t target) {
@@ -654,7 +659,7 @@ static void beginMove(uint32_t id, int32_t target) {
   g_state = State::MOVE;
   writeDirection(g_direction);
   g_periodMinUs = PERIOD_FAST_US;
-  g_periodUs = PERIOD_START_US;
+  g_periodUs = PERIOD_MOVE_START_US;
   g_nextStepDueUs = micros() + DIR_SETUP_US;
 }
 
@@ -893,7 +898,7 @@ void setup() {
   Serial.print(F(" PROTOCOL=")); Serial.print(PROTOCOL_VERSION);
   Serial.print(F(" BUILD=")); Serial.print(F(FIRMWARE_BUILD_TEXT));
   Serial.print(F(" BUZZER=")); Serial.print(BUZZER_INSTALLED ? 1 : 0);
-  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE,MOVE_SETTLE_150MS"));
+  Serial.println(F(" CAPS=HEARTBEAT_ACK,XRAY_WARNING,RESTORE_REFERENCE,MOVE_SETTLE_150MS,MOVE_RAMP_4MS"));
   updateIndicators();
 }
 

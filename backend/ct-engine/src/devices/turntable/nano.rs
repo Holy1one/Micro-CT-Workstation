@@ -111,6 +111,19 @@ pub struct MoveTicket {
     pub position_pulses: i64,
 }
 
+/// One accepted ordinary move together with the single `CAPTURE_HOLD` STATUS the
+/// serial owner already read and qualified against that same ticket. Returning
+/// that position/CAPTURE_HOLD evidence upward removes the duplicate STATUS reads
+/// between `READY_TO_CAPTURE` and the exposure; it is valid only for the session
+/// and state generation that produced it, and a later wait (for example the
+/// continuous-output cooldown) still has to reread. It is never a new
+/// measurement and never a substitute for the matched READY line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveOutcome {
+    pub ticket: MoveTicket,
+    pub ready_status: NanoStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NanoConnectionState {
@@ -213,27 +226,15 @@ impl LineTransport for SerialLineTransport {
     fn read_line(&mut self, timeout: Duration) -> io::Result<Option<String>> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(position) = self.receive_buffer.iter().position(|byte| *byte == b'\n') {
-                let mut line = self.receive_buffer.drain(..=position).collect::<Vec<_>>();
-                while matches!(line.last(), Some(b'\n' | b'\r')) {
-                    line.pop();
-                }
-                return String::from_utf8(line)
-                    .map(Some)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+            if let Some(line) = take_buffered_line(&mut self.receive_buffer)? {
+                return Ok(Some(line));
             }
-            if self.receive_buffer.len() > MAX_LINE_BYTES {
-                self.receive_buffer.clear();
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "serial line exceeded 512 bytes",
-                ));
-            }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Ok(None);
             }
             self.port
-                .set_timeout((deadline - Instant::now()).min(Duration::from_millis(50)))
+                .set_timeout(remaining.min(Duration::from_millis(50)))
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
             let mut buffer = [0_u8; 64];
             match self.port.read(&mut buffer) {
@@ -248,6 +249,29 @@ impl LineTransport for SerialLineTransport {
             }
         }
     }
+}
+
+fn take_buffered_line(receive_buffer: &mut Vec<u8>) -> io::Result<Option<String>> {
+    let newline = receive_buffer.iter().position(|byte| *byte == b'\n');
+    // Bound the first frame, not the whole read buffer: one read may contain
+    // several valid lines, or the newline of an oversized fragmented line.
+    if newline.unwrap_or(receive_buffer.len()) > MAX_LINE_BYTES {
+        receive_buffer.clear();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serial line exceeded 512 bytes",
+        ));
+    }
+    if let Some(position) = newline {
+        let mut line = receive_buffer.drain(..=position).collect::<Vec<_>>();
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        return String::from_utf8(line)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+    }
+    Ok(None)
 }
 
 struct Session {
@@ -509,7 +533,7 @@ impl NanoAdapter {
     pub(crate) fn restore_reference_cancelled(&self,position:i64,cancel:Arc<AtomicBool>)->Result<NanoStatus,NanoError>{self.session()?.call_cancelled(|reply|WorkerCommand::RestoreReference(position,reply),COMMAND_TIMEOUT*3,cancel)}
     pub fn home_cancelled(&self,cancel:Arc<AtomicBool>)->Result<NanoStatus,NanoError>{self.session()?.call_cancelled(WorkerCommand::Home,HOME_TIMEOUT+COMMAND_TIMEOUT,cancel)}
     pub fn clear_fault_cancelled(&self,cancel:Arc<AtomicBool>)->Result<NanoStatus,NanoError>{self.session()?.call_cancelled(WorkerCommand::ClearFault,COMMAND_TIMEOUT*2,cancel)}
-    pub fn execute_plan_cancelled(&self,plan:&MotionPlan,cancel:Arc<AtomicBool>)->Result<MoveTicket,NanoError>{plan.validate()?;self.session()?.call_cancelled(|reply|WorkerCommand::ExecutePlan(plan.clone(),reply),MOVE_TIMEOUT+COMMAND_TIMEOUT,cancel)}
+    pub fn execute_plan_cancelled(&self,plan:&MotionPlan,cancel:Arc<AtomicBool>)->Result<MoveOutcome,NanoError>{plan.validate()?;self.session()?.call_cancelled(|reply|WorkerCommand::ExecutePlan(plan.clone(),reply),MOVE_TIMEOUT+COMMAND_TIMEOUT,cancel)}
     pub fn capture_done_cancelled(&self,command_id:u32,cancel:Arc<AtomicBool>)->Result<NanoStatus,NanoError>{self.session()?.call_cancelled(|reply|WorkerCommand::CaptureDone(command_id,reply),COMMAND_TIMEOUT*2,cancel)}
 
     pub fn move_abs(&self, angle_mdeg: i32) -> Result<MoveTicket, NanoError> {
@@ -569,7 +593,8 @@ impl NanoAdapter {
     }
 
     /// Rechecks the confirmed source and executes atomically on the serial owner.
-    pub fn execute_plan(&self, plan: &MotionPlan) -> Result<MoveTicket, NanoError> {
+    /// The reply carries the ticket plus the one qualified CAPTURE_HOLD STATUS.
+    pub fn execute_plan(&self, plan: &MotionPlan) -> Result<MoveOutcome, NanoError> {
         plan.validate()?;
         self.session()?.call(
             |reply| WorkerCommand::ExecutePlan(plan.clone(), reply),
@@ -594,7 +619,7 @@ enum WorkerCommand {
     Home(mpsc::Sender<Result<NanoStatus, NanoError>>),
     MoveAbs(i32, mpsc::Sender<Result<MoveTicket, NanoError>>),
     MoveRel(i32, mpsc::Sender<Result<MoveTicket, NanoError>>),
-    ExecutePlan(MotionPlan, mpsc::Sender<Result<MoveTicket, NanoError>>),
+    ExecutePlan(MotionPlan, mpsc::Sender<Result<MoveOutcome, NanoError>>),
     CaptureDone(u32, mpsc::Sender<Result<NanoStatus, NanoError>>),
     XrayWarning(bool, mpsc::Sender<Result<(), NanoError>>),
     Shutdown,
@@ -806,8 +831,24 @@ impl Worker {
                     .map_err(|error| NanoError::Transport(error.to_string()))?;
                 pending_heartbeat = Some((sequence, now));
             }
-            let line =
-                self.read_line((deadline - Instant::now()).min(Duration::from_millis(100)))?;
+            let read_deadline = pending_heartbeat.map_or(deadline, |(_, started)| {
+                deadline.min(started + HEARTBEAT_TIMEOUT)
+            });
+            let line = self.read_line(read_deadline.saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)))?;
+            // OS I/O and thread scheduling can return after the requested read
+            // slice. Recheck admission and both deadlines before accepting any
+            // ACK, terminal reply or HBACK as current completion evidence.
+            self.require_active_operation(command, arguments)?;
+            let received_at = Instant::now();
+            if received_at >= deadline {
+                return Err(NanoError::Timeout(format!("{command} {id}")));
+            }
+            if let Some((sequence, started)) = pending_heartbeat {
+                if received_at.duration_since(started) >= HEARTBEAT_TIMEOUT {
+                    return Err(NanoError::Timeout(format!("missing or late HBACK {sequence}")));
+                }
+            }
             let Some(line) = line else {
                 continue;
             };
@@ -954,6 +995,7 @@ impl Worker {
             return Err(NanoError::Safety("MOVE_ABS would reverse from the confirmed unwrapped position; use the phase planner".into()));
         }
         self.move_command("MOVE_ABS", angle_mdeg, target)
+            .map(|(ticket, _)| ticket)
     }
 
     fn move_rel(&mut self, delta_mdeg: i32) -> Result<MoveTicket, NanoError> {
@@ -961,13 +1003,14 @@ impl Worker {
         let source = self.status()?;
         planner::verify_ready(&source)?;
         self.move_rel_from(&source, delta_mdeg)
+            .map(|(ticket, _)| ticket)
     }
 
     fn move_rel_from(
         &mut self,
         source: &NanoStatus,
         delta_mdeg: i32,
-    ) -> Result<MoveTicket, NanoError> {
+    ) -> Result<(MoveTicket, NanoStatus), NanoError> {
         let target = source.position_pulses - planner::pulses_for_forward_mdeg(-delta_mdeg);
         if target < -planner::MAX_POSITION_PULSES {
             return Err(NanoError::Safety(
@@ -977,7 +1020,7 @@ impl Worker {
         self.move_command("MOVE_REL", delta_mdeg, target)
     }
 
-    fn execute_plan(&mut self, plan: &MotionPlan) -> Result<MoveTicket, NanoError> {
+    fn execute_plan(&mut self, plan: &MotionPlan) -> Result<MoveOutcome, NanoError> {
         plan.validate()?;
         let source = self.status()?;
         planner::verify_ready(&source)?;
@@ -986,10 +1029,14 @@ impl Worker {
                 "confirmed Nano source changed after motion planning".into(),
             ));
         }
-        let ticket = self.move_rel_from(&source, plan.protocol_delta_mdeg)?;
-        let status = self.status()?;
-        planner::verify_plan_capture_hold(plan, &ticket, &status)?;
-        Ok(ticket)
+        let (ticket, ready_status) = self.move_rel_from(&source, plan.protocol_delta_mdeg)?;
+        // The post-READY STATUS is read once and qualified here; the same evidence
+        // is returned upward so the coordinator does not repeat this query.
+        planner::verify_plan_capture_hold(plan, &ticket, &ready_status)?;
+        Ok(MoveOutcome {
+            ticket,
+            ready_status,
+        })
     }
 
     fn move_command(
@@ -997,7 +1044,7 @@ impl Worker {
         command: &str,
         angle_mdeg: i32,
         expected_target: i64,
-    ) -> Result<MoveTicket, NanoError> {
+    ) -> Result<(MoveTicket, NanoStatus), NanoError> {
         let (command_id, line) = self.command_lines(
             command,
             &angle_mdeg.to_string(),
@@ -1023,11 +1070,14 @@ impl Worker {
             )));
         }
         planner::verify_fixed_configuration(&status)?;
-        Ok(MoveTicket {
-            command_id,
-            angle_mdeg,
-            position_pulses,
-        })
+        Ok((
+            MoveTicket {
+                command_id,
+                angle_mdeg,
+                position_pulses,
+            },
+            status,
+        ))
     }
 
     fn capture_done(&mut self, command_id: u32) -> Result<NanoStatus, NanoError> {
@@ -1451,6 +1501,32 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn serial_line_limit_also_rejects_a_complete_oversized_line() {
+        let mut bytes = vec![b'x'; MAX_LINE_BYTES + 1];
+        bytes.extend(b"\nACK 1 PING\n");
+        let result = take_buffered_line(&mut bytes);
+        assert!(matches!(result, Err(ref error) if error.kind() == io::ErrorKind::InvalidData));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn serial_line_limit_preserves_fragments_and_multiple_bounded_lines() {
+        let mut bytes = b"ACK 1".to_vec();
+        assert_eq!(take_buffered_line(&mut bytes).unwrap(), None);
+        bytes.extend(b" PING\r\nPONG 1\n");
+        assert_eq!(take_buffered_line(&mut bytes).unwrap().as_deref(), Some("ACK 1 PING"));
+        assert_eq!(take_buffered_line(&mut bytes).unwrap().as_deref(), Some("PONG 1"));
+        let line = "x".repeat(MAX_LINE_BYTES);
+        bytes.extend(format!("{line}\n{line}\n").as_bytes());
+        for _ in 0..2 {
+            assert_eq!(take_buffered_line(&mut bytes).unwrap().as_deref(), Some(line.as_str()));
+        }
+        bytes.extend(vec![b'x'; MAX_LINE_BYTES + 1]);
+        assert_eq!(take_buffered_line(&mut bytes).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
     fn the_unified_settle_contract_is_reported_from_the_advertised_capabilities() {
         let mut identity = NanoIdentity {
             device: EXPECTED_DEVICE.into(),
@@ -1471,6 +1547,7 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        card_firmware:bool,
         protocol_events:Vec<String>,
         warning_response_delay:Duration,
         delayed_host_stop:Option<String>,
@@ -1500,6 +1577,7 @@ pub(crate) mod tests {
         fn new(state: Arc<Mutex<FakeState>>) -> Self {
             let mut initial = state.lock().unwrap();
             let mut identity = identity_line("READY", false);
+            if initial.card_firmware {identity=card_identity_line(identity);}
             if initial.restore_supported { identity.push_str(",RESTORE_REFERENCE"); }
             initial.queue.push_back(identity);
             drop(initial);
@@ -1522,6 +1600,7 @@ pub(crate) mod tests {
                     let wrong_device = state.wrong_device;
                     state.queue.push_back(format!("ACK {id} INFO"));
                     let mut identity = identity_line(&format!("INFO {id}"), wrong_device);
+                    if state.card_firmware {identity=card_identity_line(identity);}
                     if state.restore_supported { identity.push_str(",RESTORE_REFERENCE"); }
                     state.queue.push_back(identity);
                 }
@@ -1674,6 +1753,10 @@ pub(crate) mod tests {
         )
     }
 
+    fn card_identity_line(identity:String)->String{
+        format!("{},{}",identity.replace("VERSION=2.1.0","VERSION=2.3.0").replace("BUILD=20260918","BUILD=20261011"),"MOVE_SETTLE_150MS,MOVE_RAMP_4MS")
+    }
+
     fn status_line(
         id: &str,
         rearmed: bool,
@@ -1778,6 +1861,48 @@ pub(crate) mod tests {
             next_id: 1, heartbeat_sequence: 1,
             next_heartbeat: Instant::now() + Duration::from_secs(60),
         }
+    }
+
+    struct DelayedCommandTransport {
+        lines: VecDeque<(Duration, String)>,
+    }
+
+    impl LineTransport for DelayedCommandTransport {
+        fn write_line(&mut self, _line: &str) -> io::Result<()> { Ok(()) }
+        fn read_line(&mut self, _timeout: Duration) -> io::Result<Option<String>> {
+            let Some((delay, line)) = self.lines.pop_front() else { return Ok(None); };
+            thread::sleep(delay);
+            Ok(Some(line))
+        }
+    }
+
+    #[test]
+    fn command_rejects_a_terminal_received_after_its_deadline() {
+        let mut worker = home_test_worker(Arc::new(Mutex::new(FakeState::default())));
+        worker.transport = Box::new(DelayedCommandTransport { lines: VecDeque::from([
+            (Duration::ZERO, "ACK 1 PING".into()),
+            (Duration::from_millis(80), "PONG 1".into()),
+        ]) });
+        let result = worker.command_lines("PING", "", Duration::from_millis(40), |line, id| {
+            line == format!("PONG {id}")
+        });
+        assert!(matches!(result, Err(NanoError::Timeout(_))), "{result:?}");
+    }
+
+    #[test]
+    fn command_rejects_a_heartbeat_received_after_its_own_deadline() {
+        let mut worker = home_test_worker(Arc::new(Mutex::new(FakeState::default())));
+        worker.next_heartbeat = Instant::now();
+        worker.transport = Box::new(DelayedCommandTransport { lines: VecDeque::from([
+            (Duration::ZERO, "ACK 1 PING".into()),
+            (HEARTBEAT_TIMEOUT + Duration::from_millis(30), "HBACK 1".into()),
+            (Duration::ZERO, "PONG 1".into()),
+        ]) });
+        let result = worker.command_lines("PING", "", COMMAND_TIMEOUT, |line, id| {
+            line == format!("PONG {id}")
+        });
+        assert!(matches!(result, Err(NanoError::Timeout(_))), "{result:?}");
+        assert_eq!(worker.health.lock().unwrap().last_heartbeat_rtt_ms, None);
     }
 
     #[test]
@@ -2030,6 +2155,7 @@ pub(crate) mod tests {
         adapter
     }
     pub(crate) fn test_homed_nano()->Arc<NanoAdapter>{Arc::new(connected_homed_fake(Arc::new(Mutex::new(FakeState::default()))))}
+    pub(crate) fn test_card_homed_nano()->Arc<NanoAdapter>{Arc::new(connected_homed_fake(Arc::new(Mutex::new(FakeState{card_firmware:true,..Default::default()}))))}
     pub(crate) fn test_stopped_reference_nano(position:i64)->Arc<NanoAdapter>{
         let state=Arc::new(Mutex::new(FakeState{position_pulses:position,restore_supported:true,..Default::default()}));
         let mut nano=NanoAdapter::new();
@@ -2069,24 +2195,80 @@ pub(crate) mod tests {
         assert!(adapter.set_xray_warning(false).is_err());assert_eq!(adapter.health().state,NanoConnectionState::Fault);
     }
 
+    fn status_reads(state: &Arc<Mutex<FakeState>>) -> usize {
+        state
+            .lock()
+            .unwrap()
+            .writes
+            .iter()
+            .filter(|line| line.starts_with("STATUS "))
+            .count()
+    }
+
+    /// One ordinary move reads exactly two STATUS frames: the pre-plan source
+    /// freshness check and the single post-`READY_TO_CAPTURE` CAPTURE_HOLD
+    /// qualification. The qualified evidence is returned upward, so the
+    /// coordinator can verify the plan/ticket and the nominal view angle without
+    /// a third read, and the returned position proof still satisfies the
+    /// independent verifier.
+    #[test]
+    fn execute_plan_qualifies_the_capture_hold_with_one_returned_status() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut adapter = connected_homed_fake(state.clone());
+        let plan = planner::plan_projection(&adapter.status().unwrap(), -90000).unwrap();
+        let before = status_reads(&state);
+        let outcome = adapter.execute_plan(&plan).unwrap();
+        let during = status_reads(&state) - before;
+        assert_eq!(
+            during, 2,
+            "a move must read one source STATUS and one post-READY CAPTURE_HOLD STATUS, saw {during}"
+        );
+        assert_eq!(outcome.ready_status.state, "CAPTURE_HOLD");
+        assert_eq!(outcome.ready_status.capture_id, outcome.ticket.command_id);
+        assert_eq!(outcome.ready_status.position_pulses, plan.target_pulses);
+        assert_eq!(
+            outcome.ready_status.target_pulses,
+            outcome.ready_status.position_pulses
+        );
+        // The one returned copy is the complete position evidence; no extra
+        // STATUS read is needed to keep the nominal-view proof.
+        planner::verify_plan_capture_hold(&plan, &outcome.ticket, &outcome.ready_status).unwrap();
+        assert_eq!(
+            planner::confirmed_phase_mdeg(outcome.ready_status.position_pulses),
+            plan.quantized_phase_mdeg,
+            "the returned evidence still carries this view's planned phase"
+        );
+        adapter.capture_done(outcome.ticket.command_id).unwrap();
+        adapter.disconnect();
+    }
+
     #[test]
     fn relative_full_circle_and_phase_wrap_use_the_actual_serial_worker() {
         let state = Arc::new(Mutex::new(FakeState::default()));
         let mut adapter = connected_homed_fake(state.clone());
         let first = planner::plan_relative(&adapter.status().unwrap(), 342000).unwrap();
-        let ticket = adapter.execute_plan(&first).unwrap();
-        planner::verify_plan_capture_hold(&first, &ticket, &adapter.status().unwrap()).unwrap();
-        planner::verify_plan_released(&first, &adapter.capture_done(ticket.command_id).unwrap())
+        let outcome = adapter.execute_plan(&first).unwrap();
+        // The single STATUS returned with the move already carries the position
+        // evidence the independent verifier needs; no extra read is required.
+        planner::verify_plan_capture_hold(&first, &outcome.ticket, &outcome.ready_status)
             .unwrap();
+        planner::verify_plan_released(
+            &first,
+            &adapter.capture_done(outcome.ticket.command_id).unwrap(),
+        )
+        .unwrap();
         let wrap = planner::plan_to_phase(&adapter.status().unwrap(), 18000).unwrap();
-        let ticket = adapter.execute_plan(&wrap).unwrap();
-        assert_eq!(ticket.position_pulses, -100800);
-        planner::verify_plan_released(&wrap, &adapter.capture_done(ticket.command_id).unwrap())
-            .unwrap();
+        let outcome = adapter.execute_plan(&wrap).unwrap();
+        assert_eq!(outcome.ticket.position_pulses, -100800);
+        planner::verify_plan_released(
+            &wrap,
+            &adapter.capture_done(outcome.ticket.command_id).unwrap(),
+        )
+        .unwrap();
         let circle = planner::plan_relative(&adapter.status().unwrap(), 360000).unwrap();
-        let ticket = adapter.execute_plan(&circle).unwrap();
-        assert_eq!(ticket.position_pulses, -196800);
-        adapter.capture_done(ticket.command_id).unwrap();
+        let outcome = adapter.execute_plan(&circle).unwrap();
+        assert_eq!(outcome.ticket.position_pulses, -196800);
+        adapter.capture_done(outcome.ticket.command_id).unwrap();
         adapter.disconnect();
         assert!(state
             .lock()
@@ -2103,7 +2285,9 @@ pub(crate) mod tests {
         for round in 0..2 {
             for angle in [0, -72000, -144000, -216000, -288000] {
                 let plan = planner::plan_projection(&adapter.status().unwrap(), angle).unwrap();
-                let ticket = adapter.execute_plan(&plan).unwrap();
+                let outcome = adapter.execute_plan(&plan).unwrap();
+                let ticket = outcome.ticket;
+                planner::verify_plan_capture_hold(&plan, &ticket, &outcome.ready_status).unwrap();
                 assert_eq!(
                     ticket.position_pulses,
                     -(round * 96000) + i64::from(angle) * 96000 / 360000

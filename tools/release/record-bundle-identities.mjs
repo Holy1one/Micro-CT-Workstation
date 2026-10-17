@@ -14,6 +14,7 @@ const compiled=readFileSync(join(root,'.cache/cargo/release/ct-workstation.exe')
 const restored=Buffer.from(bytes);Buffer.from('__TAURI_BUNDLE_TYPE_VAR_UNK').copy(restored,offset);
 if(!restored.equals(compiled)&&!bytes.equals(compiled))throw Error('Installed application does not match the compiled app and MSI marker');
 const engine=readFileSync(join(dirname(path),'ct-engine.exe'));
+if(!bytes.includes(Buffer.from(sha(engine))))throw Error('MSI application embedded engine identity differs from its adjacent engine');
 if(!engine.equals(readFileSync(join(root,'backend/src-tauri/binaries/ct-engine-x86_64-pc-windows-msvc.exe'))))throw Error('Installed engine differs from the source build');
 const identity={kind:'msi',marker,markerOffset:offset,verificationMethod:'msi-package-files',artifactSha256:sha(readFileSync(join(output,'micro-ct-workstation_'+version+'_windows_x86_64.msi'))),applicationExeSha256:sha(bytes),engineSha256:sha(engine)};
 writeFileSync(join(output,'bundle-identities.json'),JSON.stringify({msi:identity},null,2)+'\n',{flag:'wx'});

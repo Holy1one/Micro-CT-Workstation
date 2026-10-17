@@ -463,18 +463,45 @@ pub(crate) fn atomic_store(path: &Path, bytes: &[u8]) -> Result<(), String> {
 pub(crate) fn atomic_store_cancelled(path:&Path,bytes:&[u8],cancel:&AtomicBool)->Result<(),String>{
     if cancel.load(Ordering::SeqCst){return Err("Persistent write cancelled".into());}
     let parent = path.parent().ok_or("Storage path has no parent")?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("Persistent directory {}: {error}", parent.display()))?;
     let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|error| error.to_string())?.as_nanos();
     let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), suffix));
     let result = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|error| error.to_string())?;
-        file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|error| error.to_string())?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)
+            .map_err(|error| format!("Persistent staging create {}: {error}", temporary.display()))?;
+        file.write_all(bytes).and_then(|_| file.sync_all())
+            .map_err(|error| format!("Persistent staging write/sync {}: {error}", temporary.display()))?;
         drop(file);
-        if cancel.load(Ordering::SeqCst){return Err("Persistent write cancelled before commit".into());}
-        fs::rename(&temporary, path).map_err(|error| error.to_string())
+        commit_atomic_store(&temporary, path, cancel)
     })();
     if result.is_err() { let _ = fs::remove_file(&temporary); }
     result
+}
+
+fn commit_atomic_store(temporary: &Path, path: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    #[cfg(windows)]
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Persistent write cancelled before commit".into());
+        }
+        match fs::rename(temporary, path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Readers without FILE_SHARE_DELETE can briefly deny replacement
+                // of an existing Windows journal. Retry only the same atomic
+                // rename; never delete/truncate the prior durable record.
+                #[cfg(windows)]
+                if matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                return Err(format!("Persistent atomic commit {}: {error}", path.display()));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +513,66 @@ mod tests {
         fs::create_dir_all(&root).unwrap(); root
     }
     fn parameters(root: &Path) -> Parameters { Parameters { task_id:"scan-a".into(),save_path:root.to_string_lossy().into(),projection_count:2,angle_step_deg:180.0,exposure_ms:200.0 } }
+    #[cfg(windows)]
+    fn hold_without_delete_share(path: &Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+        OpenOptions::new().read(true).share_mode(3).open(path).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_store_retries_a_transient_windows_destination_lock() {
+        let root = root("transient-commit-lock");
+        let path = root.join("card-cleanup.json");
+        atomic_store(&path, b"old durable journal").unwrap();
+        let held = hold_without_delete_share(&path);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(held);
+        });
+        let result = atomic_store(&path, b"new durable journal");
+        release.join().unwrap();
+        result.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new durable journal");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_store_persistent_windows_lock_keeps_the_previous_journal() {
+        let root = root("persistent-commit-lock");
+        let path = root.join("card-cleanup.json");
+        atomic_store(&path, b"old durable journal").unwrap();
+        let _held = hold_without_delete_share(&path);
+        let started = std::time::Instant::now();
+        assert!(atomic_store(&path, b"must not commit").is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(fs::read(&path).unwrap(), b"old durable journal");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_store_cancellation_during_windows_commit_retry_keeps_the_journal() {
+        let root = root("cancel-commit-lock");
+        let path = root.join("card-cleanup.json");
+        atomic_store(&path, b"old durable journal").unwrap();
+        let _held = hold_without_delete_share(&path);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let cancellation = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            signal.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let result = atomic_store_cancelled(&path, b"must not commit", &cancel);
+        cancellation.join().unwrap();
+        assert!(result.unwrap_err().contains("cancelled before commit"));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(fs::read(&path).unwrap(), b"old durable journal");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
     fn checkpoint(parameters: &Parameters) {
         let root = acquisition_root(parameters); fs::create_dir_all(&root).unwrap();
         fs::write(root.join("preparation-checkpoint.json"), serde_json::to_vec(&json!({"schemaVersion":3,"scanId":parameters.task_id,"projectionCount":2,"exposureMs":200.0,"stage":"geometry","captureProfile":crate::capture_profile::test_profile(),"maxXraySec":300,"voltageKv":20.0,"currentUa":100.0})).unwrap()).unwrap();

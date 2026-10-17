@@ -31,6 +31,8 @@ export function TaskRecoveryDialog({ snapshot, pending, stale, run, onClose, onS
       {!unchangedConfirmed && !snapshot.homed && <button disabled={pending || stale || !snapshot.preflightPassed} onClick={() => act({ type: "home" })}>Controlled HOME</button>}
     </div>
     <p>Unchanged-position recovery checks the current controller position and retained files without moving the turntable. A lost reference needs compatible controller firmware; unsupported or inconsistent positions remain blocked.</p>
+    <p>SD recovery preserves confirmed card receipts and checks the original camera, frozen settings, card objects and acquisition journal. An exposure without a receipt must be reconciled before continuing; it is never silently counted or repeated.</p>
+    {snapshot.lastError && <p role="alert">{englishDisplayText(snapshot.lastError)}</p>}
     <hr />
     <label className="recovery-confirm"><input type="checkbox" checked={abandonConfirmed} onChange={event => setAbandonConfirmed(event.target.checked)} /> Explicitly abandon this task and retain every existing file.</label>
     <button disabled={!abandonConfirmed || pending || stale || !lock.locked || ["running", "finishing", "stopping"].includes(snapshot.phase) || snapshot.operations.some(operation => ["queued", "running", "cancelling"].includes(operation.status))} onClick={() => act({ type: "abandon_scan" })}>Abandon task and retain files</button>

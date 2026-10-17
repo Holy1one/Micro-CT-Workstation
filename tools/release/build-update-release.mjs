@@ -21,13 +21,25 @@ if(existsSync(join(output,filename)))throw Error('Refusing to overwrite the fina
 mkdirSync(output,{recursive:true});
 run(process.execPath,[join(root,'tools/release/collect-release-licenses.mjs'),output]);
 run(process.execPath,[join(root,'tools/release/prepare-installer-ui.mjs')]);
+// Prepare before the CLI resolves external binaries as well as in its hook.
+run(process.execPath,[join(root,'tools/build/prepare-engine-sidecar.mjs'),'--release']);
 // Bundling stamps the installed app with MSI identity independently of the internal build executable.
 run(process.execPath,[join(root,'tools/build/run-tauri.mjs'),'build','--bundles','msi']);
+const engineBytes=readFileSync(join(root,'backend/src-tauri/binaries/ct-engine-x86_64-pc-windows-msvc.exe'));
+if(!readFileSync(join(root,'.cache/cargo/release/ct-workstation.exe')).includes(Buffer.from(sha(engineBytes))))throw Error('Compiled application engine identity differs from the bundle input; refuse delivery');
 const directory=join(root,'.cache/cargo/release/bundle/msi');
 const files=readdirSync(directory).filter(name=>name.endsWith('.msi')&&name.includes(version));
 if(files.length!==1)throw Error('Expected exactly one current-version MSI');
 run('pwsh',['-NoProfile','-File',join(root,'tools/release/verify-installer-ui.ps1'),'-Path',join(directory,files[0])]);
 copyFileSync(join(directory,files[0]),join(output,filename));
+// Validate files extracted from this MSI before it becomes the latest delivery.
+const extracted=join(output,'extracted');
+run(join(process.env.LOCALAPPDATA,'tauri/WixTools314/dark.exe'),['-nologo','-x',extracted,join(output,filename),'-o',join(output,'extracted.wxs')]);
+const application=join(output,'application');
+mkdirSync(application,{recursive:true});
+copyFileSync(join(extracted,'File/Path'),join(application,'ct-workstation.exe'));
+copyFileSync(join(extracted,'File/Bin_ct_engine.exe'),join(application,'ct-engine.exe'));
+run(process.execPath,[join(root,'tools/release/record-bundle-identities.mjs'),join(application,'ct-workstation.exe')]);
 const sourceCommit=execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim();
 const dirty=Boolean(execFileSync('git',['status','--porcelain'],{cwd:root,encoding:'utf8'}).trim());
 const sourceFiles=execFileSync('git',['ls-files','--cached','--others','--exclude-standard','-z'],{cwd:root,encoding:'utf8'}).split('\0').filter(Boolean).filter(file=>existsSync(join(root,file))).sort();

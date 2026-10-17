@@ -1,6 +1,6 @@
 # 前端基本功能与后端接口规范
 
-日期：2026-10-05；2026-10-06按当前源码重新核对接口。供后续模型重新设计前端使用。本文件说明必须保留的功能、流程、接口与安全语义，不规定布局、字体、颜色、控件尺寸或视觉方案。本轮继续后端验收并保留使用者已确认的 Camera/Turntable 两栏重设计。
+本文维护当前必须保留的功能、接口与安全语义；布局与尺寸规则见 frontend/AGENTS.md 和现行样式。源码字段和能力快照是事实源，不作为某次重设计的交接提示词。
 
 ## 1. 事实源与边界
 
@@ -10,9 +10,8 @@
 
 检测到Tauri runtime即使用生产adapter，IPC失败不得回退浏览器模拟。developer_preview明确NO HARDWARE，不生产真实NEF/设备证据。未知、未连接、超时、失联、清理未确认不能显示为OFF、正常或安全。软件门禁不替代现场屏蔽、联锁、急停及操作规程。
 
-当前源码及 MSI 版本为 0.9.12；源码/离线测试不等于签名、发布或实机认证。旧候选及 rc1/rc2/rc3 证据只认证各自范围，见[接口验收记录](../validation/README.md)。
+当前版本从 package.json、backend/Cargo.toml 与 tauri.conf.json 核对；安装身份、实机分项和重构边界见[验证索引](../validation/README.md)。源码、离线测试、安装和硬件认证分别报告。
 
-当前验收累计到第 21 轮，完整历史按构建归属见 [后端重验证记录](../validation/README.md)。当前两栏候选 host `56EC7FABF9770334302CF270B5504891CFCB12C1199621D2950D797A6F03ECA8`，实际内嵌引擎 `6C2E587F3522046681E632C89CD889C063B3C800DFCB14FBF6CF27A61EE412C7`；现有离线门禁 Rust 328 passed / 0 failed / 7 ignored、Node 166、typecheck/module-map PASS（Rust 本轮未重跑）。T2–T6、T8–T11 已有对应候选的实机分项证据；**T7 第 19 轮 PASS**：机身 driveMode=1，1/5/15/30 s 独立 NEF 共五张，关联 C101/C102/ExposureEnded、完整文件/hash、capture-ID 内存预览、34 项恢复与三次 app/engine 0/0。使用者确认独立照片不增加扫描 imageCount。**F-12 原 WPD 0x8007001F 失败保留，第19轮两次30s及第21轮相机重启后的1s/30s均成功，根因与重启因果未确证，不标已修复**。历史 LV 帧统计仍仅认证其原候选；本轮没有重新测长时 LV。HOME/MOVE、射线、真实扫描、重构精度和更新维护锁仍按各自边界 BLOCKED/仅离线验证；不能宣称完整硬件可扫描。两栏视觉已由使用者确认保留，见 [重设计留档](../validation/README.md)。
 
 ## 2. 请求、响应与完成
 
@@ -25,23 +24,26 @@
 
 前端按`engineSessionId`、单调`snapshotSequence`接收最新快照。会话更换淘汰旧响应，低序号/迟到快照不能覆盖当前状态。长操作初次返回是受理，不是完成：保存该响应的`operationId`，继续读取同引擎会话的`operations[]`，核对相同`operationId`及`deviceSessionId`、设备、kind和terminal status。
 
-会话字段不能混为一谈：`EngineSnapshot.engineSessionId`是引擎生命周期opaque标识，不规定32hex格式。当前`Operation.deviceSessionId`由领域入队时确定：相机操作使用当时的`CameraHealth.sessionId`；发现/连接尚无相机会话时回退到engineSessionId；其它设备及安全、任务存储、维护操作使用engineSessionId。**一处已知例外**：活动相机会话期间的 `camera_live_view_stop` 以设备标签 `camera_cleanup` 入队，因此其 `deviceSessionId` 回退为 engineSessionId（不是相机连接会话）——按 `deviceSessionId` 分组的前端逻辑必须容忍这一条。关联长操作应保存受理记录本身的deviceSessionId，不能要求所有记录都等于engineSessionId，也不能用后续重连产生的camera.sessionId替换旧记录。`CameraHealth.sessionId`及`CapturedImage.sessionId`是稳定相机连接/capture会话32hex；**`liveView.sessionId` 与 `liveViewControls.sessionId` 是同一个「每次 Start 新建」的 32hex LV nonce，二者必须相等**（不是两个独立 nonce），且独立于稳定连接会话。完整照片的captureId、operationId与相机操作receipt相互核对；LV像素核对自己的nonce，不跨层替换。
+HOME 与手动 MOVE 的界面等待上限为 360 秒，覆盖 Nano 的 300 秒运动时限及前后读回；其他普通设备操作保持 110 秒，打开扫描工程保持 300 秒。终态失败、清理未确认和会话改变仍立即结束等待并报告，只有关联的 completed 回执才能显示完成。界面等待不延长设备安全时限、不重发指令、不自动 Stop。
 
-`DeviceOperation.status`为`queued/running/cancelling/completed/cancelled/failed/cleanup_unconfirmed/rejected`；字段包括`stage/cancelRequested/error/startedAt/updatedAt`。只有匹配完成记录和领域读回才能报告成功；cancelRequested不等于清理完成，cleanup_unconfirmed必须保持错误/锁。`rejected` 表示**设备拒绝了请求值、会话仍然健康**（见 §5 第 10 轮补充）：它是终态（前端等待器必须在此停止轮询），但**不是设备故障**——不要显示 fault、不要要求重连，应展示逐键原因并允许在同一会话内改正后重试。Stop优先绕过普通命令队列，使未执行/迟到普通请求失效。命令pending期间继续轮询，状态读取与Stop保持可用。
+会话字段不能混为一谈：`EngineSnapshot.engineSessionId`是引擎生命周期opaque标识，不规定32hex格式。当前`Operation.deviceSessionId`由领域入队时确定：相机操作使用当时的`CameraHealth.sessionId`；发现/连接尚无相机会话时回退到engineSessionId；其它设备及安全、任务存储、维护操作使用engineSessionId。一处已知例外**：活动相机会话期间的 `camera_live_view_stop` 以设备标签 `camera_cleanup` 入队，因此其 `deviceSessionId` 回退为 engineSessionId（不是相机连接会话）——按 `deviceSessionId` 分组的前端逻辑必须容忍这一条。关联长操作应保存受理记录本身的deviceSessionId，不能要求所有记录都等于engineSessionId，也不能用后续重连产生的camera.sessionId替换旧记录。`CameraHealth.sessionId`及`CapturedImage.sessionId`是稳定相机连接/capture会话32hex；**`liveView.sessionId` 与 `liveViewControls.sessionId` 是同一个「每次 Start 新建」的 32hex LV nonce，二者必须相等**（不是两个独立 nonce），且独立于稳定连接会话。完整照片的captureId、operationId与相机操作receipt相互核对；LV像素核对自己的nonce，不跨层替换。
+
+`DeviceOperation.status`为`queued/running/cancelling/completed/cancelled/failed/cleanup_unconfirmed/rejected`；字段包括`stage/cancelRequested/error/startedAt/updatedAt`。只有匹配完成记录和领域读回才能报告成功；cancelRequested不等于清理完成，cleanup_unconfirmed必须保持错误/锁。`rejected` 表示可修正的领域拒绝；相机参数拒绝、未建立射线会话的发现失败和扫描输出目录准入拒绝按各自 device/kind 呈现（见[错误码目录](frontend-error-codes.md)）：它是终态（前端等待器必须在此停止轮询），操作拒绝本身不新增设备故障，仍须保留快照已有故障和锁；相机参数拒绝展示逐键原因并允许按当前会话资格改正后重试。Stop优先绕过普通命令队列，使未执行/迟到普通请求失效。命令pending期间继续轮询，状态读取与Stop保持可用。
 
 `DeviceOperation.kind`是操作种类：相机控制保留完整命令名（如camera_capture），连接/断开/HOME等可用connect/disconnect/home；不能用命令字面值强行匹配全部kind。`stage`是操作生命周期细节（如queued/device_io/registry_persistence/cleanup_requested/confirmed），不同于`workstation.scanFlow.stage`的扫描阶段。真正扫描提示的`prompt.stage`是geometry/preReferences/placeSample；前端只回传引擎当前提示，不凭操作stage推导下一扫描阶段。接口没有通用subtype字段，不能自己加一个来驱动后端。
 
-**字段精度补遗（第 14 轮接口库存复核，完整清单见 `.cache/tests/desktop/20261007-140000-interface-inventory-v2/summary.md`）**：
+**字段与请求精度**：
+
 - `deviceControls.taskLock.retained` 是**任务记录数组** `RetainedTaskRecord[]`（每项 `{parameters:{taskId,savePath,projectionCount,angleStepDeg,exposureMs},status,registeredAt,updatedAt}`），**不是布尔**；空数组在 JS 里是真值，判断"是否有保留任务"必须用 `length`。`taskLock` 的键固定为 `locked/reason/taskId/savePath/status/retained`。
-- **请求载荷约定（第 17 轮实机探测，`.cache/tests/desktop/20261007-200000-t2-envelope/`）**：① 缺 `command` 键或 `command.type` 非字符串 → 传输层报"missing required key command" / "Command type is required"；② 未知命令 → `ENGINE:UNKNOWN_COMMAND`；③ 未连接时读设备 → `ENGINE:NANO_NOT_CONNECTED` / `ENGINE:CAMERA_NOT_READY`（连接状态先于字段校验）；④ **额外未知字段被忽略**（前向兼容；不要指望拼错字段会报错——`camera_apply_properties` 的**属性键**是例外，会被严格拒绝）；⑤ `camera_connect` 的 `deviceId` **必须是字符串**：省略、`null`、空白串或非字符串类型都被视为"未显式选择设备"，结果是**发现刷新**（operation kind `camera_discover`，不连接、不报错、不锁故障）——前端必须按 kind 判断，不得把发现回执当连接成功；`acknowledgeUnconfirmedCleanup` 只在严格等于布尔 `true` 时生效。
-- `deviceControls.camera.lastSeenAt`（string|null，相机 worker 最近可见时间，与 session/连接证据分开判断）与连接帧的 `capturedAtMs`（引擎侧采集时间；新鲜度仍以 session + sequence 判定）由引擎发送，**前端类型已声明并经判别测试固定**（第 15 轮补齐：`types.ts` 的 `CameraHealth.lastSeenAt`、`cameraControls.ts` 的 `CameraLiveFrame.capturedAtMs`；录制快照与 Rust 转发层各有一条断言防止再次漏声明）。
+- **请求载荷约定**：① 缺 `command` 键或 `command.type` 非字符串 → 传输层报"missing required key command" / "Command type is required"；② 未知命令 → `ENGINE:UNKNOWN_COMMAND`；③ 未连接时读设备 → `ENGINE:NANO_NOT_CONNECTED` / `ENGINE:CAMERA_NOT_READY`（连接状态先于字段校验）；④ **额外未知字段被忽略**（前向兼容；不要指望拼错字段会报错——`camera_apply_properties` 的**属性键**是例外，会被严格拒绝）；⑤ `camera_connect` 的 `deviceId` **必须是字符串**：省略、`null`、空白串或非字符串类型都被视为"未显式选择设备"，结果是**发现刷新**（operation kind `camera_discover`，不连接、不报错、不锁故障）——前端必须按 kind 判断，不得把发现回执当连接成功；`acknowledgeUnconfirmedCleanup` 只在严格等于布尔 `true` 时生效。
+- `deviceControls.camera.lastSeenAt`（string|null，相机 worker 最近可见时间，与 session/连接证据分开判断）与连接帧的 `capturedAtMs`（引擎侧采集时间；新鲜度仍以 session + sequence 判定）由引擎发送，**前端类型已声明并经判别测试固定**。
 - `disabledReasons` 的**键集因实现而异**：生产引擎用 `hardwareCertification`/`capture`/`liveView`/`autofocus`/`focusStep`/`captureReady`（键存在即该项不可用，值为原因文本）；浏览器预览用 `scanNef`。前端不得按预览键集硬编码。
-- **无生产调用点的接口条目（完整性参考，勿误认为是契约缺口）**：当前修订有 7 个 EngineCommand 类型在生产渲染层没有调用点——`camera_identity`、`preset_list`、`preset_load`、`preset_compare`、`turntable_identity`、`xray_identity`、`xray_status`（只出现在 `camera-draft.ts` 的同步分类集合里）；另有 1 个自定义 Tauri IPC `resolve_camera_capture_directory` 无 importer。它们**仍然有效且已在实机走过只读路径**（第 16 轮：`camera_status`/`camera_identity`/`turntable_identity` 均 ok，`turntable_status` 未连接时正确返回 `NANO_NOT_CONNECTED`；`camera_disconnect` 350 ms、断开后可立即重连）。前端可以按需接入，但不得假设"没有调用点即不存在"或把它当作已废弃而删掉契约。
-- 错误码规模：当前修订共 **130** 个字符串（125 个命令拒绝码形如 `ENGINE:<CODE>`、3 个仅 operation 失败串、2 个仅 `cfg(test)`），规范正文只逐条解释了其中 42 个。**完整逐码目录（触发条件 / 是否 fault 或加锁 / 四类前端呈现建议 / 源码行）见 [引擎错误码目录](frontend-error-codes.md)**；前端处理约定：未在目录或规范中出现的码必须**原样显示**并记入会话日志，不得归入成功/OFF/正常/安全；只需按 `failed`/`rejected`/`cleanup_unconfirmed` 终态与是否锁故障分流，不得按码静默吞掉。注意 `rejected` 是**操作状态**而非错误码（130 个码中没有任何一个本身是 `rejected`），命令级的值拒绝等价物是 `CAMERA_PROPERTY_UNSUPPORTED_VALUE`。
+- 已声明接口是否仍有效以 Rust DTO、领域入口、Tauri 注册及生产消费方为准；当前 UI 没有调用点不能单独证明废弃，也不应将历史接口库存当作现行调用数量。
+- 错误码、触发条件和呈现建议见[引擎错误码目录](frontend-error-codes.md)，具体拒绝与故障语义以当前入口和操作结果为准。未知码保留原文并记日志，按 failed/rejected/cleanup_unconfirmed 与实际故障锁分流，不静默吞掉或归为成功；rejected 是操作状态。
 
 准备窗口提交需要自己的请求代次：同会话/任务转换才能接收prepare→preflight结果；提交中不可重复提交/关闭/跳其它参数入口，Stop仍可用。Stop或异常任务/会话更换使旧请求失效，迟到成功不得关闭新窗口或继续发送preflight。已提交原子参数不会因关窗口自动撤销。
 
-0.9.10：桌面首次状态读取与命令等待引擎 bootstrap（最长 15 秒），不把正常启动误报成通信故障；真正启动失败或超时仍显示错误，已送达命令不重试。未连接设备属于初始状态。设备连接、相机固定配置、存储目录及射线参数的缺项在 Scan Preparation 中展示；提交后的进度、同次日志、未通过原因及修正建议保留在准备窗口。页面可用状态只是快照的只读展示，不替代引擎完整 Preflight；清理未确认和真实失联仍保留全局错误与领域锁。
+桌面启动：桌面首次状态读取与命令等待引擎 bootstrap（最长 15 秒），不把正常启动误报成通信故障；真正启动失败或超时仍显示错误，已送达命令不重试。未连接设备属于初始状态。设备连接、相机固定配置、存储目录及射线参数的缺项在 Scan Preparation 中展示；提交后的进度、同次日志、未通过原因及修正建议保留在准备窗口。页面可用状态只是快照的只读展示，不替代引擎完整 Preflight；清理未确认和真实失联仍保留全局错误与领域锁。
 
 ## 3. 五组菜单与功能去向
 
@@ -75,7 +77,7 @@
 
 基本与Advanced共用camera连接会话关联的摄影草稿。首次确认读回可载入草稿，不写设备；后续外部变化不能静默覆盖用户草稿。更改父属性草稿不预测子属性已生效，必须明确Apply后重新描述/读回才解锁依赖。快门是扫描exposureMs唯一来源，按原生code/精确分数计算，不能另设可写扫描曝光或四舍五入。
 
-`CameraProperty`保留`key/label/code/dataType/supported/readable/nativeWritable/effective/writable/disabledReason/options/supportedValues/range/actual/target/confirmed/error`。原生writable不等于当前可写。只有引擎允许的属性及选项可交互；不支持、只读、当前无效、未确认或占用时灰禁并给理由。枚举用下拉，option分别按supported/enabled禁用；真实数值range不能被少数标签缩窄。actual、target和未Apply草稿分开显示，null/confirmed=false/error表示UNKNOWN。
+`CameraProperty`保留`key/label/code/dataType/supported/readable/nativeWritable/effective/writable/disabledReason/options/supportedValues/range/actual/target/confirmed/error`。原生writable不等于当前可写。只有引擎允许的属性及选项可交互；不支持、只读、当前无效、未确认或占用时灰禁并给理由。枚举用下拉，option分别按supported/enabled禁用；真实数值range不能被少数标签缩窄。actual、target和未Apply草稿分开显示，null/confirmed=false/error表示未知。主相机面板的无值参数与未知只读值以主题主文字色的 `—` 占位，tooltip/可访问名称继续说明 Unknown；陈旧快照不展示旧值为当前读数，也不清除用户草稿。已确认的 0/Off 和显式草稿保持原值；连接、清理、定位参考及射线安全状态不使用这个占位规则。
 
 Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些选项仍取实际descriptor；分类只是展示建议，不规定布局：
 
@@ -97,7 +99,7 @@ Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些�
 | 摄影Apply | `{type:"camera_apply_properties",properties:Record<string,number|string>,presetId?:string}` | 明确写入+串行读回；只用原生数值/字符串；整请求先校验，部分失败保留真实/未知状态，不伪回滚。**设备拒绝请求值（部分 Apply）不锁故障、不断开会话**：该操作 `status` 为 **`rejected`**，`preflight` 失效，前端提示逐键原因并允许在同一会话内改正后重试（第 10 轮实机验证，见 §5 补充）。只有真正的传输/会话失败才按 `failed` + 故障处理 |
 | 正常独立照片 | `{type:"camera_capture"}` | 有动作，不自动开束/AF/停LV；完整登记后才成功 |
 | 隔离诊断捕获 | `{type:"camera_test_capture",directory?:string}` | 当前契约存在；不作为正常前端保存入口，目录权限/隔离由域校验 |
-| LV启停 | `{type:"camera_live_view_start"}` / `{type:"camera_live_view_stop"}` | 动作与读回关联；inactive→Start生成新LV会话。`camera_live_view_stop` 是相机命名操作：若该相机操作进行中，Stop 会走有界（6 s）清理等待后按结果返回（第 9 轮审计 §5）。前端应等待操作回执，不要重发 |
+| LV启停 | `{type:"camera_live_view_start"}` / `{type:"camera_live_view_stop"}` | 动作与读回关联；inactive→Start生成新LV会话。`camera_live_view_stop` 是相机命名操作：若该相机操作进行中，Stop 会走有界（6 s）清理等待后按结果返回。前端应等待操作回执，不要重发 |
 | AF/步进 | `{type:"camera_autofocus"}` / `{type:"camera_focus",step:number}` | 实际capabilities及领域有界校验，不能仅凭按钮或镜头类别证明可驱动 |
 | 预设列表/导出 | `{type:"preset_list"}` / `{type:"preset_export"}` | 只读；export结果在deviceControls.exportJson |
 | 加载/比较/删除 | `{type:"preset_load",id:string}` / `{type:"preset_compare",id:string}` / `{type:"preset_delete",id:string}` | Load只草稿，Compare只读；删除持久预设，非设备写 |
@@ -108,13 +110,15 @@ Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些�
 
 新后端静态参数门禁：`camera_focus.step`必须为i32范围内、非零整数且−500至500；缺失、零、小数、超范围在enqueue前拒绝，不产生操作receipt或Fault。D161的物理MF option3只读，UI选项与写入校验一致。LV active时普通camera_apply_properties在入队前一律拒绝，包含空对象或全部no-op，不停止LV；只读摄影Read/preset List/Compare与专用LV read/configure按各自能力保留。前端不能把no-op当作LV期间摄影Apply许可。
 
-本轮实机确认并已修复（2026-10-06 第 2 轮）：入队前校验只覆盖 `step` 的数值范围；「LV 未开启」与拍摄未就绪这类资格不足原先**不在入队前拒绝**，而是在相机 worker 内失败并触发 `fault_latched` 与自动 Stop，导致整个相机会话被断开（见重验证记录 F-03/F-04）。现在工作副本已在入队前按已发布的 readiness 拒绝：`camera_capture` 与 `camera_test_capture`（两者走同一条 worker 路径）→ `ENGINE:CAMERA_CAPTURE_UNQUALIFIED`；`camera_focus` → `ENGINE:CAMERA_FOCUS_UNQUALIFIED`；`camera_autofocus` → `ENGINE:CAMERA_AUTOFOCUS_UNQUALIFIED`。
+相机资格不足在入队前拒绝，不生成 operation 或触发全局故障：camera_capture/camera_test_capture → CAMERA_CAPTURE_UNQUALIFIED，camera_focus → CAMERA_FOCUS_UNQUALIFIED，camera_autofocus → CAMERA_AUTOFOCUS_UNQUALIFIED。真实传输与设备故障仍按故障路径处理。
 
-拍摄门禁使用 `capture_readiness()`，覆盖 worker 中**能在无设备往返时判断**的全部条件（策略读回 + LV OFF + 已确认只读的 `infoDisplayErrorStatus` 运行诊断）。它**不等于** worker 的全部条件：worker 仍会做新鲜读取并在失败时 fail-closed 断开——参数与冻结 profile 比对、新鲜 `GET_PROPERTY LV_STATUS`、`recordingMedia` 新鲜回读（`capture.rs`），这些**不可能**在入队前证明。因此"门禁通过"只保证已发布状态未显示未就绪，**不保证拍摄一定成功**；成功后仍失败的情形会以 fault + 断连收场。
+主相机面板直接显示 Photo destination 与实际读回值。新连接会话在设备确实广告可写 SD 目标时将 `recordingMedia=0` 放入草稿，只在操作员明确 Apply 后写入并确认；Read/reload 保留实际值。继承 RAM 时引擎拒绝独立单拍与新扫描的下载；只有当前会话明确选择并 Apply Host RAM=1 才授权本地传输，值已经为 1 时也提交该明确选择。其他参数 Apply、Read/reload、重连和重启不授权。SD 下所有暗场、空场与投影统一存卡。旧 RAM 任务保留冻结内容，完成清理并明确放弃后才可创建新的 SD 任务。
 
-就绪状态在快照里没有独立布尔字段：未就绪 = `deviceControls.camera.capabilities.disabledReasons` 中存在 `"captureReady"` 键（键缺失=就绪），键值是引擎给出的原因文本。**该映射的键是 capabilities 布尔项的子集/变体，键存在即该项不可用**：`hardwareCertification`、`capture`（未证明主机 RAM 捕获）、`liveView`（LV 未广告）、`autofocus`、`focusStep`，以及 LV 资格路径写入的**动态镜头键**（如镜头/焦点相关原因）；对应布尔字段为 `hostCapture`/`scanNef`/`liveView`。实机某台 D7100 的观察键集是 `[autofocus, captureReady, focusStep, hardwareCertification]`——因为该机身 `hostCapture`/`liveView` 为真，所以 `capture`/`liveView` 未出现。只判断 `captureReady` 即可门禁拍摄，其余键用于对应入口的灰禁原因。静态输入校验、连接状态与 `LIVE_VIEW_CAPTURE_FORBIDDEN` 仍先于上述门禁，前端必须继续自行灰禁未就绪入口。
+独立单拍按实际目标选择门禁：RAM 使用 `capture_readiness()` / `disabledReasons.captureReady`；SD 使用 `card_capture_readiness()` / `disabledReasons.cardCaptureReady`，并要求 `capabilities.cardCapture`。SD 使用固定卡参数策略，成功只显示存卡结果，不下载预览、不需要照片根目录。两种门禁均覆盖无设备往返可判断的策略读回、LV OFF 和已确认只读的运行诊断；worker 仍鲜读参数、目标、LV、卡容量并校验事务证据，失败继续 fail closed。
 
-`camera_apply_properties` 的拒绝原因不再折叠为单一 `UNSUPPORTED_CAMERA_PROPERTIES`（F-02 已修），前端应按以下码给出具体原因：`LIVE_VIEW_APPLY_FORBIDDEN`（LV 期间含空对象/no-op）、`INVALID_CAMERA_PARAMETER_COUNT`（空或 >64 项）、`CAMERA_PROPERTY_UNDESCRIBED`、`CAMERA_FOCUS_MODE_LOCKED`、`CAMERA_PROPERTY_WRITE_UNSUPPORTED`、`CAMERA_PROPERTY_UNSUPPORTED_VALUE`（不可写/值不在当前描述支持集）、`CAMERA_PROPERTY_DEPENDENCY_UNMET`（父参数依赖未满足）、`CAMERA_PARAMETER_SESSION_UNAVAILABLE`（仅当连接状态在同一次请求内发生竞态时才可能出现；稳态下连接问题先返回 `CAMERA_NOT_READY`）。
+就绪原因由 `deviceControls.camera.capabilities.disabledReasons` 发布。拍摄入口按已确认实际目标选 `captureReady` 或 `cardCaptureReady`，RAM 额外检查 `hostTransferOptIn`；原因键缺失仍需对应捕获能力、目标确认和单张数量成立。`hardwareCertification`、`capture`、`liveView`、`autofocus`、`focusStep` 及动态镜头键继续用于各自入口，不能用 RAM 的拒绝原因灰禁已就绪 SD。静态输入、占用、连接与 Live View 禁令仍先于拍摄门禁。
+
+`camera_apply_properties` 的拒绝原因不再折叠为单一 `UNSUPPORTED_CAMERA_PROPERTIES`，前端应按以下码给出具体原因：`LIVE_VIEW_APPLY_FORBIDDEN`（LV 期间含空对象/no-op）、`INVALID_CAMERA_PARAMETER_COUNT`（空或 >64 项）、`CAMERA_PROPERTY_UNDESCRIBED`、`CAMERA_FOCUS_MODE_LOCKED`、`CAMERA_PROPERTY_WRITE_UNSUPPORTED`、`CAMERA_PROPERTY_UNSUPPORTED_VALUE`（不可写/值不在当前描述支持集）、`CAMERA_PROPERTY_DEPENDENCY_UNMET`（父参数依赖未满足）、`CAMERA_PARAMETER_SESSION_UNAVAILABLE`（仅当连接状态在同一次请求内发生竞态时才可能出现；稳态下连接问题先返回 `CAMERA_NOT_READY`）。
 
 **拒绝码的实际顺序（按源码，前端排错时按此顺序理解）**：
 
@@ -122,21 +126,23 @@ Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些�
 1. 连接/隔离状态：`CAMERA_NOT_READY` / `CAMERA_NOT_CONNECTED`（`camera_live_view_stop` 的空闲短路除外）。**它先于所有请求字段校验**——例如相机未连接时 `camera_focus{step:0}` 返回 `CAMERA_NOT_READY`，不是 `INVALID_CAMERA_FOCUS_STEP`。`CAMERA_ALREADY_CONNECTED` 也在此层之后、任何入队之前：已连接（未隔离）时带非空 `deviceId` 再发 `camera_connect` 会被拒绝，不锁故障、不隔离、不断开会话（无 `deviceId` 的发现刷新不受影响）。
 2. 命令自身输入：`INVALID_CAMERA_FOCUS_STEP`、`INVALID_LIVE_VIEW_SESSION` / `STALE_LIVE_VIEW_SESSION`、`INVALID_LIVE_VIEW_CONTROLS`、`INVALID_PARAMETERS`、以及 apply 的属性分类码。
 3. 拍摄的 Live View 禁令：`LIVE_VIEW_CAPTURE_FORBIDDEN`。**它先于拍摄目录校验**——LV 正在运行且 `savePath` 为空时 `camera_capture` 返回 `LIVE_VIEW_CAPTURE_FORBIDDEN`，不是 `CAMERA_CAPTURE_ROOT_REQUIRED`。
-4. 拍摄目录校验：`CAMERA_CAPTURE_ROOT_REQUIRED`、`CAMERA_CAPTURE_DIRECTORY_REQUIRES_ROOT`、`INVALID_CAPTURE_DIRECTORY`、`CAPTURE_DIRECTORY_IS_SCAN_TASK`。
+4. RAM 拍摄目录校验：`CAMERA_CAPTURE_ROOT_REQUIRED`、`CAMERA_CAPTURE_DIRECTORY_REQUIRES_ROOT`、`INVALID_CAPTURE_DIRECTORY`、`CAPTURE_DIRECTORY_IS_SCAN_TASK`；SD 单拍不创建或校验本地图像目录。
 5. 预设 id：`PRESET_NOT_FOUND`。
 6. 已发布 readiness：`CAMERA_CAPTURE_UNQUALIFIED`、`CAMERA_FOCUS_UNQUALIFIED`、`CAMERA_AUTOFOCUS_UNQUALIFIED` —— 最后一层，只在请求本身与目录都已合法后才可能返回。
 
 同一请求可能同时不满足多项，前端只应显示引擎实际返回的那一个码；不要自己按"哪一项更重要"重新排序。
 
-**重要边界一（Apply 部分失败的后果，第 10 轮起已放宽）**：`camera_apply_properties` 中只要有一个属性被机身拒绝，操作以 **`rejected`** 结束并携带逐键原因（如 `Camera parameter application partial: {"whiteBalance": "camera command failed: PTP response 0x201c"}`）；`preflight` 被失效（fail-closed：不得用未验证的 profile 开始扫描），但**不锁 `fault_latched`、不触发全局 Stop、不隔离相机会话**，因此可以在同一会话内改正后重试或还原原值。前端仍应把"写值"当作需要判断的动作：写前保存本次鲜读原值、只写已确认过（`confirmed=true`）的值、并在 `rejected` 后明确展示被拒键与原因。只有真实的传输/会话失败才按 `failed` + 故障处理：**目前唯一计入 `rejected` 的 PTP 码是 `PTP response 0x201c`（InvalidDevicePropValue）**，且必须同时满足「文本以 `Live View control application incomplete: ` 或 `Camera parameter application partial: ` 开头」并「不含 `camera unavailable:` / `camera I/O failed:` / `camera timeout:` / `camera session isolated:` / `camera operation cancelled` / `camera busy:` / `camera capability unavailable:` / `camera safety check failed:` 任一标记」。其它任何 PTP 码（如 `0x2019`）与上述任一传输标记都仍然是 `failed` + 故障处置。历史行为（一次错误取值即全局故障 + 会话隔离）见 §5 F-10 与重验证记录。
+**Apply 部分失败的边界**：`camera_apply_properties` 中只要有一个属性被机身拒绝，操作以 **`rejected`** 结束并携带逐键原因（如 `Camera parameter application partial: {"whiteBalance": "camera command failed: PTP response 0x201c"}`）；`preflight` 被失效（fail-closed：不得用未验证的 profile 开始扫描），但**不锁 `fault_latched`、不触发全局 Stop、不隔离相机会话**，因此可以在同一会话内改正后重试或还原原值。前端仍应把"写值"当作需要判断的动作：写前保存本次鲜读原值、只写已确认过（`confirmed=true`）的值、并在 `rejected` 后明确展示被拒键与原因。只有真实的传输/会话失败才按 `failed` + 故障处理：**目前唯一计入 `rejected` 的 PTP 码是 `PTP response 0x201c`（InvalidDevicePropValue）**，且必须同时满足「文本以 `Live View control application incomplete: ` 或 `Camera parameter application partial: ` 开头」并「不含 `camera unavailable:` / `camera I/O failed:` / `camera timeout:` / `camera session isolated:` / `camera operation cancelled` / `camera busy:` / `camera capability unavailable:` / `camera safety check failed:` 任一标记」。其它任何 PTP 码（如 `0x2019`）与上述任一传输标记都仍然是 `failed` + 故障处置。历史故障只按原版本记录，不作为当前接口语义。
 
 **重要边界二（F-05，已按方案 A 处置）**：`CameraProperty` 的 `range`/`options`/`supportedValues` 是**原生格式域**，不等于机身上实际接受的离散值集合；实测机身会拒绝区间内的值（PTP `0x201c`）。**处置结果**：该值拒绝现在记为 `rejected`（不是设备故障，会话保留、`preflight` 失效），前端据此提示逐键原因并允许在同一会话内改正后重试；决策记录与实机证据见[重验证记录 §5d/§5p](../validation/README.md)。前端仍应只提供已确认过的值并解释格式域与实测值域的差别。
 
 **故障锁的清除路径**：`fault_latched` 是**跨设备共享**的全局锁，唯一清除点是**预检成功**（`preflight`）；在此之前 `xray_toggle` 一律返回 `FAULT_RECOVERY_REQUIRED`。`acknowledgeUnconfirmedCleanup` **不会**清除它（只退役那台不可用的相机代理并释放相机清理锁），相机再次掉线或清理未确认也会重新置位。因此前端不能把"恢复入口成功"当成"系统已无故障"。
 
-`preset_load` 仍使用旧的粗粒度 `UNSUPPORTED_CAMERA_PROPERTIES`。仍须准备处理 `DEVICE_CLEANUP_UNCONFIRMED`。**当前 `src/` 尚无任何新码映射，也无 `acknowledgeUnconfirmedCleanup` 调用入口**（独立验证项 V-05）：新前端需要自行补错误码文案、确认对话框与恢复流程；这些是新增能力，不会破坏现有代码。
+`preset_load` 仍使用旧的粗粒度 `UNSUPPORTED_CAMERA_PROPERTIES`。仍须准备处理 `DEVICE_CLEANUP_UNCONFIRMED`。前端已通过 engine/native-labels.ts、deviceControls.ts 映射拒绝原因和处理建议。引擎仅在明确 deviceId、隔离且清理未确认的相机上接受 acknowledgeUnconfirmedCleanup:true；当前生产 UI 未提交该字段，不能把普通重连冒充已确认释放或绕过共享故障锁。
 
 ### 4.2 独立照片边界
+
+SD 独立单拍只确认本次卡回执，不自动导入或显示本地预览；完整扫描的自动导入另走扫描收尾。以下文件登记与照片预览契约针对显式选择的 RAM 路径。
 
 当前完整主机捕获仅D7100 RAM NEF。独立入口可用已确认M/P/A/S、自动ISO/WB及有证据AF模式，不隐式AF；只保证单个验证完整host NEF，未承诺一次物理曝光。多重曝光没有当前运行时状态字段或准入门禁；Scan Preparation 显示机身检查提示，不能把USB连接或菜单变灰解释为OFF。Live View开启期间严格拒捕获，不能自动停预览→拍摄→恢复。
 
@@ -160,11 +166,11 @@ Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些�
 
 引擎到桌面为受控ACL named pipe二进制帧，renderer消费JPEG IPC。帧必须匹配当前LV nonce、sequence>afterSeq、合法JPEG与尺寸/大小限制；使用现有`validateLiveFrame`。active且暂未产生新鲜新帧时返回null；inactive调用报`ENGINE:LV_NOT_ACTIVE`，撤销/陈旧会话也明确报错，不能把所有错误当null。**瞬时管道错误要与上述三类区分**（第 18 轮实测：8 秒 32 次取帧中出现 1 次 `os error 233`／`ERROR_PIPE_NOT_CONNECTED`，随后立即恢复，LV 未中断、引擎无 fault）：遇到这类可自愈的管道读错误时，前端应保留最近解码画面并标 STALE、下一拍重试，**不得**据此断开 LV、重连相机或报设备故障；只有 `LV_NOT_ACTIVE`、nonce/会话不匹配、`validateLiveFrame` 拒绝这三类才是"该预览会话已失效"的终态。暂无帧/暂时错误保留最近解码内存画面并标STALE；新鲜匹配帧才LIVE。禁止应用保存LV像素、临时JPEG、帧日志或磁盘缓存；data URL保持有界当前/待退旧帧。Stop/断开/隔离/会话改变清引用、淘汰未完成decode。设备停止确认与回到Equipment分别表达，不把关闭画面当安全清理。
 
-**已修复（2026-10-06 第 7 轮实机验证，第 9 轮加固）**：Live View 开启期间的全局 Stop 原先会让相机进入 `cleanup_unconfirmed` 并被隔离（相机/连接命令一律 `DEVICE_CLEANUP_UNCONFIRMED`），正常退出也会挂起；根因是 Stop 先取消了相机会话，导致 `EndLiveView (0x9202)` 事务不再返回。现在 Stop 会在取消之前先用**有效会话**结束 Live View（有界 **5 s**，且**不因相机忙碌而跳过**），实机结果：Stop **947–1077 ms**、`cleanupConfirmed=true`、`phase=stopped`、无故障锁，随后 `camera_connect` 与 `camera_read_properties` **直接成功**，正常退出 **app 0 / engine 0**。前端仍需在 Stop 期间展示"正在安全停止"并等待引擎快照确认，不得自行推断完成；`acknowledgeUnconfirmedCleanup` 与 `DEVICE_CLEANUP_UNCONFIRMED` 保留为异常/旧会话的二线恢复路径。若机身被其它上位机留在 Live View，引擎在 connect 时会**先尝试自己清掉**（`force_live_view_off`）；**清不掉时仍拒绝连接**并报 `camera safety check failed: camera Live View could not be cleared in software (LV_STATUS=…)`，此时需要操作员检查机身（该自动清除成功的路径尚无实机执行证据，只能说"不需要为常规情形按键"）。
+**Live View 停止清理**：Live View 开启期间的全局 Stop 原先会让相机进入 `cleanup_unconfirmed` 并被隔离（相机/连接命令一律 `DEVICE_CLEANUP_UNCONFIRMED`），正常退出也会挂起；根因是 Stop 先取消了相机会话，导致 `EndLiveView (0x9202)` 事务不再返回。现在 Stop 会在取消之前先用**有效会话**结束 Live View（有界 **5 s**，且**不因相机忙碌而跳过**），实机结果：Stop **947–1077 ms**、`cleanupConfirmed=true`、`phase=stopped`、无故障锁，随后 `camera_connect` 与 `camera_read_properties` **直接成功**，正常退出 **app 0 / engine 0**。前端仍需在 Stop 期间展示"正在安全停止"并等待引擎快照确认，不得自行推断完成；`acknowledgeUnconfirmedCleanup` 与 `DEVICE_CLEANUP_UNCONFIRMED` 保留为异常/旧会话的二线恢复路径。若机身被其它上位机留在 Live View，引擎在 connect 时会**先尝试自己清掉**（`force_live_view_off`）；**清不掉时仍拒绝连接**并报 `camera safety check failed: camera Live View could not be cleared in software (LV_STATUS=…)`，此时需要操作员检查机身（该自动清除成功的路径尚无实机执行证据，只能说"不需要为常规情形按键"）。
 
-**第 9 轮补充（F-09，已实机验证）**：Live View 的控制事务（`camera_live_view_read`/`camera_live_view_configure`）在单线程相机 worker 上有 **2 s** 上限（`LV_CONTROL_TIMEOUT`；实测正常读回仅 **66 ms**、LV 启动 192 ms，余量约 10–30 倍）。若某个 LV 控制操作在飞时立即按 Stop，修复前会让 end-LV 事务被堵住并在 **6.2 s** 后以 `cleanup_unconfirmed` + fault 收场；修复后同一序列 **815 ms** 干净停止。前端要求：**不要并发发送 LV 控制命令**，也不要在 LV 控制尚未完成时按 Stop（引擎已能处理，但会让 Stop 变慢）；LV 控制超时按故障级展示并等待引擎状态。
+**Live View 控制超时**：Live View 的控制事务（`camera_live_view_read`/`camera_live_view_configure`）在单线程相机 worker 上有 **2 s** 上限（`LV_CONTROL_TIMEOUT`；实测正常读回仅 **66 ms**、LV 启动 192 ms，余量约 10–30 倍）。若某个 LV 控制操作在飞时立即按 Stop，修复前会让 end-LV 事务被堵住并在 **6.2 s** 后以 `cleanup_unconfirmed` + fault 收场；修复后同一序列 **815 ms** 干净停止。前端要求：**不要并发发送 LV 控制命令**，也不要在 LV 控制尚未完成时按 Stop（引擎已能处理，但会让 Stop 变慢）；LV 控制超时按故障级展示并等待引擎状态。
 
-**第 10 轮补充（F-05/F-10，已实机验证）**：设备**拒绝了请求值**（部分 Apply / LV 控制 apply 不完整，例如 `cameraZoom` 实测返回 `PTP 0x201c`）**不再**锁 `fault`、不再自动 Stop、也不断开会话；该操作的 `status` 为 **`rejected`**（新状态，区别于 `failed`），`lastError` 与聚合日志给出逐键原因，`preflight` 仍被失效（fail-closed：不允许用未验证的 profile 开始扫描）。前端应把 `rejected` 呈现为「可修正的拒绝」：保留会话、提示具体键与原因、允许在同一会话内改正后重试或还原，不要显示设备故障或要求重新连接。真正的传输/会话失败仍为 `failed` 且按故障处理。
+**可修正的参数拒绝**：设备**拒绝了请求值**（部分 Apply / LV 控制 apply 不完整，例如 `cameraZoom` 实测返回 `PTP 0x201c`）**不再**锁 `fault`、不再自动 Stop、也不断开会话；该操作的 `status` 为 **`rejected`**（新状态，区别于 `failed`），`lastError` 与聚合日志给出逐键原因，`preflight` 仍被失效（fail-closed：不允许用未验证的 profile 开始扫描）。前端应把 `rejected` 呈现为「可修正的拒绝」：保留会话、提示具体键与原因、允许在同一会话内改正后重试或还原，不要显示设备故障或要求重新连接。真正的传输/会话失败仍为 `failed` 且按故障处理。
 
 ## 6. 转台与射线
 
@@ -181,7 +187,9 @@ Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些�
 | timer | `{type:"timer_toggle"}` | 仅浏览器预览兼容入口；当前生产明确拒绝XRAY_STAGE_LOCKED，不展示成可用的硬件定时器 |
 | 历史连接兼容/重试 | `{type:"connect",adapter:"developer_preview"|"real_hardware"}` / `{type:"disconnect"}` / `{type:"retry_device",device:"turntable"|"camera"|"xray"}` | 生产connect只连接Nano，adapter=developer_preview拒绝；disconnect走全局清理。retry camera仅刷新发现，不隐式选择设备；其 operation kind 现为 `camera_discover`（不再是 `connect`，F-06 已修），因此前端不会把发现回执误当连接成功。无 deviceId 的 `camera_connect` 同样使用 `camera_discover`；只有带明确 deviceId 才是 `connect`。新前端使用分设备显式入口 |
 
-位置读数消费`confirmedAngleDeg`和Nano status，不用目标角度冒充实测。扫描/暂停/收尾/停止清理/重构及保留taskLock锁住手动参数/对焦/运动，受控恢复HOME例外。STOP、OFF及只读状态持续可用。
+位置读数消费`confirmedAngleDeg`和Nano status，不用目标角度冒充实测。未知或陈旧的位置显示 `— °` 并保留未知原因提示；`REFERENCE UNKNOWN` 仍明确显示，已确认零位保留数值。扫描/暂停/收尾/停止清理/重构及保留taskLock锁住手动参数/对焦/运动，受控恢复HOME例外。STOP、OFF及只读状态持续可用。
+
+转台标题标签只表达连接（CONNECTED/DISCONNECTED；快照陈旧为UNKNOWN），motion state放在提示中；位置与REFERENCE UNKNOWN继续独立显示。普通Stop/故障清理可保留健康空闲设备会话，完成回执仍必须等待OFF/STOP及相机空闲确认；正在调用、曝光未决或清理失败的相机继续隔离。显式Disconnect、退出与更新维护关闭连接。连接保留不撤销持久任务锁、故障锁或重新预检/建立运动基准的要求。空闲相机会话保留路径目前仅离线验证，不继承此前关闭再连接的硬件验收。
 
 转台栏固定高度不变：位置与按钮/运动控件各30px，状态行保持单行省略并保留完整 tooltip。底部只留一个入口：无保留任务时 Prepare scan / Preflight，有锁时 Resume / end retained task，后接进度条；不叠放重复恢复按钮。
 
@@ -217,6 +225,7 @@ Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些�
 ```ts
 { type: "prepare_scan",
   taskId: string, projectionCount: number, maxXraySec: number,
+  earlyRelease?: boolean, // default true; frozen at scan start
   geometry: { sodMm: number, objectToDetectorMm: number, detectorWidthMm: number,
     centerOffsetXMm: number, centerOffsetYMm: number,
     rotationDirection: "clockwise" | "counterclockwise",
@@ -228,7 +237,11 @@ Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些�
 
 prepare成功的同会话/同任务响应后调用`{type:"preflight",restore?:boolean,confirmUsbAutoShutdownRelease?:boolean}`。新任务不带恢复覆盖；恢复需明确本次confirmUsbAutoShutdownRelease。Preflight/Start/恢复鲜读比较，不写快门/RAM/burst，不自动停LV。自动配置、未知、漂移、未Apply均阻塞；展示`cameraScanReadiness.issues[]`的key/actual/requirement/remedy并允许转Advanced，关闭提示不解除门禁。相机预检按当前已确认参数逐项检查；界面使用英文参数标签、实际值、要求和建议呈现，原始错误保留在日志与 Copy details。高级设置左右栏目撑满标题和固定按钮区之间的可用高度。
 
-当前 profile 6 固定 M/Auto ISO OFF/MF/固定 WB/RAM NEF，以及严格 C0 OFF、ADL OFF4、HDR OFF 或仅未广告时的 NEF 互斥证明。旧 profile 1–5 保持原 hash 和只读重构能力，不续扫；新任务和恢复使用 profile 6。
+SD 扫描的 `earlyRelease` 默认 true，Scan Preparation 的 “Move as soon as exposure ends” 允许关闭，快照 `workstation.scanSetup.earlyRelease` 回显引擎接受值。每张单独识别 D1A4 bit15 1→0；缺失时等本张唯一存卡回执持久化再释放，不等待一个必达的早事件、不沿用前帧证据。下一张仍必须等前张回执和本位点到位，关闭即使用串行存卡时序。该选项属于扫描调度，扫描开始后冻结，不改变摄影 profile、回执或 manifest schema；环境验收标志不再控制生产扫描选择。
+
+完整 SD 扫描安全收尾并登记 acquired 后自动启动现有 USB 卡导入，下载前再次确认 X-ray OFF。拍摄阶段仍零图像载荷；投影导入 `frames/frame-NNNN.nef`，暗场与空场导入 `references/pre-dark|pre-flat/frame-NNNN.nef`。全部本地文件完整性/hash 和封存通过后，只删除本次回执对应的卡图片并确认不存在，随后显示流程 Completed；已有卡文件保留。导入期间显示传输，清卡阶段显示 Verifying and removing this scan’s SD images；失败显示原错误，不伪报已清卡。Stop 优先取消；清卡失败保持本地 verified 清单及剩余卡对象、待处理任务，现有 Card import 入口跨重启重试清卡，不重复下载/拍摄。相机常驻面板保持三行双列：第三行 Color temperature / Photo destination，Long exposure NR 在 Advanced 设置中保留。运行状态栏减少顶部留白，给卡状态、统计及完整进度条留足间距。
+
+当前固定摄影策略适用于 RAM profile 6 与 SD profile 7：M、Auto ISO OFF、MF、固定 WB、单 NEF、严格 C0 OFF、ADL OFF4、HDR OFF 或仅未广告时的 NEF 互斥证明。采集目标分别为 RAM/SD；SD 使用独立卡策略及 schema 4。旧 profile 1–5 保持原 hash 和只读重构能力，不续扫；当前任务按实际冻结的 profile 验证。
 
 ### 7.2 扫描事务和控制
 
@@ -256,6 +269,8 @@ prepare成功的同会话/同任务响应后调用`{type:"preflight",restore?:bo
 扫描准备中的 **Stacked scintillator scan** 勾选后展开最多 5 行，按射线入射方向填写材料、发光颜色和厚度；完整行数就是记录层数，空行忽略，半填行禁止 prepare。`ReconstructionGeometry.scintillatorLayers` 为可选字段并由引擎冻结，旧几何无需迁移。
 
 重构入口提供 **Monochrome / Multicolor** 手动选择，`start_reconstruction.options={mode,materialCalibrationPath?}`。默认单色，波段由引擎按实测参考可靠性自动选择；多色按已记录层发光颜色选观测，当前颜色流程只启用 FDK。Multicolor 可选择原生 JSON 标定文件，内容由引擎校验；未标定只显示颜色响应。旧无 options 调用仍保留旧缓存和方法语义。
+
+默认单色/多色重构沿用现有入口，由引擎自动执行颜色无关缺陷修补、暗空场平衡、去噪、轴校准与锥束 FDK，单色非材料模式再尝试通过独立验证门槛的 PWLS-Huber 粗修正。v3 自动预览按有符号 P1–P99.5 拉伸，科学体和原始数据不被显示操作修改。质量提示明确估计区域与未通过的修正，不要求操作员配置处理流水线；当前 task5 的质量限制见[自动重构记录](../validation/automatic-cbct-2026-10-15.md)。
 
 `reconstruction_preview` 增加可选 `colors:number[]`（逐体素交错 RGB）、`colorLegend:string[]`、`materialLabels:boolean`、`mode`、`selectedBand`。桌面壳验证灰度及谱结果封存哈希、RGB 元数据/字节数/哈希，读完再次核对会话和 cachePath；前端在提交显示前校验所有字节。三切片和 3D 布局不变，MIP 显示灰度峰值处的颜色，避免分别取三个颜色的峰值合成虚假的材料组合。公共量化覆盖外仍显示灰度；图例区分颜色响应与已标定基材料。无 WebGL2 时关闭 3D，只显示状态。
 
@@ -292,7 +307,7 @@ prepare成功的同会话/同任务响应后调用`{type:"preflight",restore?:bo
 
 UpdateState字段：updateId/phase/currentVersion/targetVersion/channel/kind/source/downloadedBytes/totalBytes/verified/notice/error。phase为idle/checking/no-update/available/downloading/verifying/ready/preparing/applying/cancelled/failed；kind=msi/nsis/development。成功notice是status，不是error；失败/旧回执/未完成不能变成功。检查最新稳定版本；有更新才提供下载，完成验证才提供安装；当前版本不低于最新版本显示已是最新版，查询失败保留错误和重试。正常菜单隐藏渠道、源地址和离线导入，安全验证继续由后端执行。
 
-后端控制URL、公钥、kind和安装目标；renderer不能传任意下载源、信任key或target路径。公开HTTPS mirror→GitHub及离线签名包共同验证manifest/artifact原始签名、版本、目标、类型、大小/hash、防降级。当前仅交付Windows x64 MSI；升级保留现有安装位置，支持安装、卸载和Repair。0.9.11原目录升级及两次Repair已有单独授权的验收；未来未发行版本不伪造升级PASS。线上GitHub发布未授权，Authenticode未配置。
+后端控制URL、公钥、kind和安装目标；renderer不能传任意下载源、信任key或target路径。公开HTTPS mirror→GitHub及离线签名包共同验证manifest/artifact原始签名、版本、目标、类型、大小/hash、防降级。当前仅交付Windows x64 MSI；升级保留现有安装位置，支持安装、卸载和Repair。历史升级和 Repair 只认证原包；当前构建、签名与安装身份按发行证据核对。用户明确要求安装后按既有授权执行；公开发布须有相应请求，不从历史说明推定授权。
 
 安装前`softwareUpdatePreparation`必须匹配本engine session/op，ready/maintenanceLocked/noActiveTransactions及设备confirmed或明确never-owned。活动扫描/LV/拍摄/运动/重构/busy/保留任务锁拒安装。unknown或清理未确认维持锁。普通Stop使旧ready失效但不解维护锁；匹配cancel需清理确认，不自动重连、恢复LV、开束或放弃任务。权威报告→owned engine EOF0→App正常exit0→helper→安装/替换→真实新启动核对receipt，任一步不能仅用进程exit0替代安全报告。
 
@@ -300,7 +315,7 @@ UpdateState字段：updateId/phase/currentVersion/targetVersion/channel/kind/sou
 
 保留上述功能和精确IPC，单独验证读/写/未知/拒绝/迟到/取消路径。使用现有生产adapter和domain helpers；改类型须同步Rust/Tauri/preview及测试。仅界面重排不修改设备协议、扫描事务、安全门禁或原始数据。源代码边界与动作授权仍按仓库AGENTS执行。
 
-真实硬件未验证的新增LV控制、镜头资格与完整扫描须明确待验；不能把离线fixture、模拟照片或旧版本实机结果升级为新版本认证。当前profile 6不含多重曝光门禁。机身OFF检查是操作前置条件；提示不产生机器OFF证据，不覆盖引擎readiness，不写人工确认字段。一次物理曝光与C101/C102的对应关系仍需独立实测。
+真实硬件未验证的新增LV控制、镜头资格与完整扫描须明确待验；不能把离线fixture、模拟照片或旧版本实机结果升级为新版本认证。当前RAM/SD profile不含多重曝光的人工确认门禁。机身OFF检查是操作前置条件；提示不产生机器OFF证据，不覆盖引擎readiness，不写人工确认字段。一次物理曝光与C101/C102的对应关系仍需独立实测。
 
 ## 11. 失败呈现、Troubleshooting 与全英文呈现层
 
@@ -331,4 +346,3 @@ UpdateState字段：updateId/phase/currentVersion/targetVersion/channel/kind/sou
 
 - 扫描准备窗口（`ScanPreparationDialog.tsx`）与 Camera Advanced（`CameraSettingsDialog.tsx`）是**固定高度仪器**：header 与 footer 不动，`WorkstationDialog` 新增可选 `footer`/`footerNote` 槽；只有 `.scan-readiness-report__table`（readiness 报告）与 `.camera-advanced__pane`（参数面板）两个受界限的弹窗区域可滚动，`.modal-card__body` 仍可滚动。固定控制台栏目一律不得新增栏内滚动。
 - Camera Advanced 为左侧 8 项导航 + 右侧单 pane：5 个摄影分组（9+5+10+7+3=34）+ `Other described parameters`（由实时 descriptor 编译，保证引擎新增属性不被隐藏）+ Presets + Read-only diagnostics。切换分组只改本地展示状态，不发命令、不 Apply、不丢草稿；基本栏与高级页共用同一 `model` 草稿与同一 Apply。
-

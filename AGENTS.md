@@ -25,7 +25,7 @@
 - frontend/preview 仅用于离线浏览器开发，不接触真实设备。生产 IPC 失败不得回退到模拟成功。
 - 相机、射线和转台设备模块互不调用；跨设备扫描顺序由扫描协调器持有，独立 HOME 安全裁决由领域入口持有。
 - 设定值不得冒充实测值；UNKNOWN、超时、失联和关束未确认不得显示或处理为正常、安全完成。
-- 相机和转台可独立连接、自检；正式扫描的 D7100 NEF 采集按冻结 profile 明确选择主机 RAM 或相机存储卡（存卡迁移见 `docs/decisions/0004-camera-sd-card-acquisition-plan.md`：扫描循环零图像载荷，安全收尾后经授权的 USB 导入并校验封存，未验证不得重构）。其他设备能力以身份、实际描述及可验证语义为依据，不试发未知厂商操作。
+- 相机和转台可独立连接、自检；正式扫描的 D7100 NEF 采集按冻结 profile 明确选择主机 RAM 或相机存储卡（存卡迁移见 `docs/decisions/0004-camera-sd-card-acquisition.md`：扫描循环零图像载荷，安全收尾后经授权的 USB 导入并校验封存，未验证不得重构）。其他设备能力以身份、实际描述及可验证语义为依据，不试发未知厂商操作。
 - Live View 开启时拒绝拍摄；独立拍摄、Live View、手动旋转不自动开束。普通转台运动只沿既有生产方向，HOME 保留固件内部有界反向退让。
 - HOME 在射线已连接时先关束读回确认，结束不自动开束；台架物理隔离确认不能覆盖曾连接射线后的 UNKNOWN。
 - 扫描、暂停、清理、重构和持久未完成任务占用期间保持手动控制锁；Stop 和状态读取始终可用。放弃任务必须完成清理并保留全部文件。
@@ -36,7 +36,7 @@
 
 ## 目录和变更纪律
 
-目录职责见 directory-map.md。结构化 modules.json、edges.json 和 directory-policy.json 是自动检查依据，必须与新增、移动和接口变化同步更新。新的顶层或领域职责目录需要人工明确批准；在已有职责内拆分实现也须更新相邻说明、路径归属和引用。不得预建无实现目录。
+目录职责见 directory-map.md。结构化 modules.json、edges.json 和 directory-policy.json 是自动检查依据，必须与新增、移动和接口变化同步更新。当前目标所需、现有职责内的可逆文件拆分或目录整理可直接完成；新增目标之外的领域职责或改变系统边界时先明确范围。不得预建无实现目录；第二份工作目录仍遵循上级的明确批准约定。
 
 生产源码分别位于 frontend/、backend/、firmware/；backend/ 包含 ct-engine/ 领域引擎、src-tauri/ 桌面壳和唯一 Cargo workspace 清单及锁文件。维护资源集中 assets/；工具在 tools/；外部测试在 tests/；详细资料在 docs/。禁止把临时输出混入这些维护目录。
 
@@ -52,6 +52,6 @@
 
 ## 验证要求
 
-按 modules.json 运行影响模块门禁。基本检查：npm.cmd run module-map:check、npm.cmd run typecheck、npm.cmd run build、cargo test --manifest-path backend/Cargo.toml --workspace。本机完整验证可用 npm.cmd run verify；外部测试套件仅在本机存在时运行。
+按实际影响范围选择 modules.json 中的适用门禁。纯文档或规则整理检查事实、引用、格式和 npm.cmd run module-map:check；前端行为修改运行 typecheck、build 及相关测试；Rust 行为修改运行对应模块测试，跨 IPC/安全/发布链再覆盖全部相关消费方。本机完整验证可用 npm.cmd run verify；外部测试套件仅在本机存在时运行，不为低影响可逆修改添加镜像实现的测试。
 
-设备、安全、IPC 和发布变更覆盖相应控制链。目录迁移核对源码内容、资源哈希、依赖引用、桌面构建和正常启动/退出；运行时不连接真实设备。交付列出 PASS、FAIL、BLOCKED、命令及未测边界。无本次硬件证据时明确写“仅离线验证”。
+设备、安全、IPC 和发布变更覆盖相应控制链。生产源码或运行资源迁移核对内容、哈希、依赖引用，并验证相关构建和正常启动/退出；文档迁移检查引用与归属。离线运行不连接真实设备。交付列出 PASS、FAIL、BLOCKED、命令及未测边界。无本次硬件证据时明确写“仅离线验证”。

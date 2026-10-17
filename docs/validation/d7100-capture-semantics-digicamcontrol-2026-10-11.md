@@ -1,5 +1,7 @@
 # digiCamControl 拍摄语义对照（2026-10-11，D7100 主机 RAM 单拍无 NEF 的参考取证）
 
+> 历史范围：该轮只读外部语义对照；当时无 NEF 的诊断不代表当前状态，也不授权调用 DigiCamControl。当前原生事务见 [ADR 0003](../decisions/0003-native-wpd-camera-and-device-control.md)。
+
 本文件只做**只读**外部参考阅读，目的是给实机缺陷（`docs/validation/card-sd-migration-hardware-2026-10-11.md` 第 7 节：
 `InitiateCapture` 被接受、机身确实曝光、但引擎在截止时间内未见曝光结束/完成事件、无 NEF）提供可引用的
 第二方证据。**不触碰硬件、不修改任何源码、不提交**。本文件本身不构成硬件验收。
@@ -232,4 +234,3 @@
 | `DevicePropChanged` / `StoreFull` / `ObsoleteEvent` | `0x4006` / `0x400A` / `0xC104` | `Nikon/NikonBase.cs:108-112` | `PROPERTY_CHANGED` / `STORE_FULL` / 噪音 |
 | `RecordingMedia` | `0xD10B` | `Nikon/NikonBase.cs:96`（写入 `:1103-1105`） | `RECORDING_MEDIA`（`nikon.rs:49`） |
 | 连拍计数 | `0xD1B4` | **参考实现未定义** | `continuousShootingCount`（`nikon.rs:98-102`） |
-

@@ -8,11 +8,11 @@
 
 三维渲染链路如下：
 
-1. `frontend/src/App.tsx` 根据 `useSceneFallback()` 的结果，在实时 Canvas 和静态降级图之间选择。
+1. `frontend/src/App.tsx` 根据 `useSceneFallback()` 的结果，在实时 Canvas 和不可用文字状态之间选择。
 2. `frontend/src/scene/LiveSceneCanvas.tsx` 创建 React Three Fiber `Canvas`、正交相机和轨道控制器，并按投影包围盒自动取景（取景数学在 `frontend/src/scene/scene-fit.ts`）。
 3. `frontend/src/scene/EquipmentScene.tsx` 是设备几何的主入口，负责光源、转台与样品、相机、光束和光轴线；`frontend/src/scene/stage-surroundings.tsx` 负责上半球球壁与桌面圆盘（当前半径 4000，桌面高度取 `RING_TRACK.bottomY`，即 y=-112）。
 4. `frontend/src/scene/scene-config.ts` 集中保存光轴坐标、设备尺寸、转台参数、相机约束和视角预设。
-5. `frontend/src/scene/StaticSceneFallback.tsx` 在 WebGL 不可用或 WebGL 上下文丢失时展示静态图片。
+5. `frontend/src/scene/StaticSceneFallback.tsx` 在 WebGL 不可用或 WebGL 上下文丢失时展示文字原因，不显示旧场景图片。
 
 `EquipmentScene` 当前组合的程序化组件为：
 
@@ -338,17 +338,19 @@ connect-src ipc: http://ipc.localhost
 6. 检查模型材质、贴图色彩空间、透明件和灯光效果。
 7. 验证 `iso`、`front`、`top` 三个相机预设以及 OrbitControls 缩放边界。
 8. 验证源焦点、样品、闪烁体、镜头仍共线，且 Z 顺序未改变。
-9. 更新四张静态 fallback 图片。
+9. 检查 WebGL 不可用及 context 丢失时的文字状态，不维护静态图片副本。
 10. 分别执行浏览器开发、Vite 构建产物和 Tauri 桌面打包/运行验证。
+
+设备几何依据 scene-config.ts、活动组件和实际渲染。生成概念图仅用于视觉研究，不作为几何接触、物理角度或安全状态证据；姿态和束流只显示引擎已确认状态。
 
 ## 13. 资料来源
 
-- `frontend/src/scene/EquipmentScene.tsx:21-173`：光束、设备组件、转台旋转、光轴线和灯光实现。
-- `frontend/src/scene/scene-config.ts:3-69`：光轴常量、设备尺寸、相机约束、视角预设和启动断言。
+- `frontend/src/scene/EquipmentScene.tsx`：光束、设备组件、转台旋转、光轴线和灯光实现。
+- `frontend/src/scene/scene-config.ts`：光轴常量、设备尺寸、相机约束、视角预设和启动断言。
 - `frontend/src/scene/LiveSceneCanvas.tsx`：正交相机（`FRUSTUM_HEIGHT = 1200`，`near`/`far` 为 ±9000）、按投影包围盒自动取景、以 fit 为基准的 OrbitControls 缩放范围、`prefers-reduced-motion` 对阻尼的取消，以及 WebGL 上下文丢失处理。
 - `frontend/src/scene/scene-fit.ts`：`collectSceneBounds`（含 `excludeFromFit` / `includeInFit` 规则）与 `computeFitZoom`、`FRUSTUM_HEIGHT`、`FIT_WIDTH`、`FIT_HEIGHT`。
 - `tests/frontend/scene-framing.test.mjs`：三个预设下取景不越界的数值回归测试。
-- `frontend/src/scene/StaticSceneFallback.tsx:3-29`：静态降级原因和图片路径规则。
-- `frontend/src/App.tsx:343-373`：实时场景与静态 fallback 的选择入口。
+- `frontend/src/scene/StaticSceneFallback.tsx`：不可用原因与文字状态。
+- `frontend/src/App.tsx`：实时场景与不可用状态的选择入口。
 - `frontend/vite.config.mjs`：前端构建输出目录 `.cache/frontend/dist/client`。
-- `backend/src-tauri/tauri.conf.json:6-20`：Tauri 前端产物目录、CSP 和打包配置。
+- `backend/src-tauri/tauri.conf.json`：Tauri 前端产物目录、CSP 和打包配置。

@@ -71,7 +71,7 @@ impl MoxtekAdapter {
                     state.raw.set_operation_cancel(None);
                     let result = state.raw.force_off();
                     state.deadline = None;
-                    let mut value=state.raw.health();if state.fault.is_some(){value.last_error=state.fault.clone();}
+                    let mut value=state.raw.health();if state.fault.is_some(){value.last_error=state.fault.clone();value.monitor_interruption=None;}
                     *health.lock().unwrap_or_else(|p| p.into_inner()) = value;
                     let _ = reply.send(result);
                 }
@@ -85,13 +85,14 @@ impl MoxtekAdapter {
                             generation != epoch.load(Ordering::SeqCst) || at.elapsed() >= interval)
                     } else { last_poll.elapsed() >= interval };
                     if state.deadline.is_some_and(|limit| Instant::now() >= limit) {
+                        state.raw.clear_monitor_interruption();
                         epoch.fetch_add(1, Ordering::SeqCst);
                         state.last_monitor = None;
                         let result = state.raw.force_off();
                         state.deadline = None;
                         let mut value = state.raw.health();
                         state.fault = Some(match result { Ok(_) => "Continuous X-ray hard limit reached; OFF confirmed".into(), Err(error) => format!("Continuous X-ray hard limit reached; OFF unconfirmed: {error}") });
-                        value.last_error = state.fault.clone();
+                        value.last_error = state.fault.clone();value.monitor_interruption=None;
                         *health.lock().unwrap_or_else(|p| p.into_inner()) = value;
                     } else if poll_due {
                         // Background polling is cancellable too: OFF must not wait
@@ -104,15 +105,21 @@ impl MoxtekAdapter {
                         let result = if emitting { state.monitor(generation) } else { state.raw.refresh_status() };
                         state.raw.set_operation_cancel(None);
                         *active_cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                        if (result.is_err() && !matches!(result, Err(XrayError::Cancelled)))
+                        if matches!(result, Err(XrayError::MonitorInterrupted(_))) {
+                            // OFF was independently confirmed. Keep owners and queued
+                            // capture evidence alive; the scan coordinator owns recovery.
+                            state.deadline = None;
+                            state.last_monitor = None;
+                        } else if (result.is_err() && !matches!(result, Err(XrayError::Cancelled)))
                             || (!emitting && result.is_ok() && state.raw.health().beam_on) {
+                            state.raw.clear_monitor_interruption();
                             state.fault=Some(result.as_ref().err().map(|e|e.to_string()).unwrap_or_else(||"Unexpected beam ON outside a verified operation".into()));
                             epoch.fetch_add(1, Ordering::SeqCst);
                             state.last_monitor = None;
                             let _ = state.raw.force_off();
                         }
                         let mut value = state.raw.health();
-                        if state.fault.is_some() { value.last_error = state.fault.clone(); }
+                        if state.fault.is_some() { value.last_error = state.fault.clone();value.monitor_interruption=None; }
                         *health.lock().unwrap_or_else(|p| p.into_inner()) = value;
                         last_poll = Instant::now();
                     }
@@ -127,7 +134,7 @@ impl MoxtekAdapter {
                         state.raw.set_operation_cancel(None);
                         state.raw.set_external_cancel(None);
                         *active_cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                        let mut value=state.raw.health();if state.fault.is_some(){value.last_error=state.fault.clone();}
+                        let mut value=state.raw.health();if state.fault.is_some(){value.last_error=state.fault.clone();value.monitor_interruption=None;}
                         *health.lock().unwrap_or_else(|p| p.into_inner()) = value;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {},
@@ -150,8 +157,9 @@ impl MoxtekAdapter {
         let generation = self.shared.epoch.load(Ordering::SeqCst);
         self.shared.jobs.try_send((generation, Box::new(move |state, token| {
             let result = if token.load(Ordering::SeqCst) { Err(XrayError::Cancelled) } else { job(state, token) };
-            if let Err(error)=result.as_ref(){if matches!(error,XrayError::Transport(_)|XrayError::Protocol(_)|XrayError::Safety(_)){state.last_monitor=None;state.fault=Some(error.to_string());}}
-            let mut value=state.raw.health();if state.fault.is_some(){value.last_error=state.fault.clone();}
+            if matches!(result, Err(XrayError::MonitorInterrupted(_))) { state.deadline=None;state.last_monitor=None; }
+            if let Err(error)=result.as_ref(){if matches!(error,XrayError::Transport(_)|XrayError::ReadTimeout(_)|XrayError::Protocol(_)|XrayError::Safety(_)){state.raw.clear_monitor_interruption();state.last_monitor=None;state.fault=Some(error.to_string());}}
+            let mut value=state.raw.health();if state.fault.is_some(){value.last_error=state.fault.clone();value.monitor_interruption=None;}
             *health.lock().unwrap_or_else(|p|p.into_inner())=value;
             let _ = reply.send(result);
         }))).map_err(|_| XrayError::Transport("Moxtek queue full or worker unavailable".into()))?;
@@ -190,6 +198,14 @@ impl MoxtekAdapter {
         self.call(move |s,token|{if let Some(fault)=s.fault.as_ref(){return Err(XrayError::Safety(fault.clone()));}s.raw.set_external_cancel(Some(cancel.clone()));s.last_monitor=None;s.deadline=Some(deadline);s.raw.beam_on_until(&token,deadline)},None)
     }
     pub fn refresh_status(&mut self) -> Result<XrayHealth, XrayError> { self.call(|s,_| { s.last_monitor=None; s.raw.refresh_status() }, None) }
+    pub(crate) fn recover_monitor(&mut self, cancel: Arc<AtomicBool>) -> Result<XrayHealth, XrayError> {
+        self.call(move |s,_| {
+            if let Some(fault)=s.fault.as_ref(){return Err(XrayError::Safety(fault.clone()));}
+            s.raw.set_external_cancel(Some(cancel));
+            s.last_monitor=None;
+            s.raw.recover_monitor()
+        }, None)
+    }
     pub fn refresh_off_status(&mut self) -> Result<XrayHealth, XrayError> { self.call(|s,_| { s.last_monitor=None; s.raw.refresh_off_status() }, None) }
     pub fn refresh_emission_status(&mut self) -> Result<XrayHealth, XrayError> { let generation=self.shared.epoch.load(Ordering::SeqCst);self.call(move |s,_| s.monitor(generation), None) }
     pub fn refresh_emission_status_shared(&mut self,cancel:Arc<AtomicBool>)->Result<XrayHealth,XrayError>{let generation=self.shared.epoch.load(Ordering::SeqCst);self.call(move|s,_|{s.raw.set_external_cancel(Some(cancel.clone()));if cancel.load(Ordering::SeqCst){return Err(XrayError::Cancelled);}s.monitor(generation)},None)}

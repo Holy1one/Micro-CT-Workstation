@@ -9,7 +9,7 @@
 //! `ptp::parse_card_object_info`, which shares none of the RAM tolerance.
 
 use super::ptp::{invalid, Cursor};
-use super::types::CameraError;
+use super::types::{CameraError, CameraHealth};
 use serde::Serialize;
 
 /// Bounded `GetStorageIDs` cardinality. A camera advertising more than this is
@@ -24,18 +24,21 @@ const RESERVED_STORAGE_ID: u32 = 0xffff_ffff;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct StorageId(pub u32);
 
-/// PTP `AccessCapability`. Object deletion is not capture, so capability 2
-/// ("read-only with object deletion") remains read-only for planning.
+/// PTP `AccessCapability` for host object access. Keep capabilities 1 and 2
+/// distinct; neither authorizes host writes or proves body-capture readiness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum StorageAccess {
     ReadWrite,
     ReadOnly,
+    ReadOnlyWithDeletion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct StorageCapacity {
     pub max_bytes: u64,
     pub free_bytes: u64,
+    /// Device estimate at current capture settings, not a measured file-count cap.
+    /// Zero still means unavailable; 0xffffffff is unknown.
     pub free_images: u32,
 }
 
@@ -54,6 +57,8 @@ pub struct StorageInfo {
 pub struct CardPlan {
     pub storages: Vec<StorageInfo>,
     pub writable_bytes: u64,
+    /// For body capture: whole frames budgeted from usable free bytes and reserve.
+    /// Raw device estimates remain in each storage's capacity.free_images.
     pub writable_images: u32,
 }
 
@@ -96,7 +101,8 @@ pub fn parse_storage_info(bytes: &[u8]) -> Result<StorageInfo, CameraError> {
     let filesystem_type = c.u16()?;
     let access = match c.u16()? {
         0 => StorageAccess::ReadWrite,
-        1 | 2 => StorageAccess::ReadOnly,
+        1 => StorageAccess::ReadOnly,
+        2 => StorageAccess::ReadOnlyWithDeletion,
         _ => return Err(invalid("unknown PTP storage access capability")),
     };
     let max_bytes = u64::from_le_bytes(c.take(8)?.try_into().unwrap());
@@ -186,10 +192,72 @@ pub fn plan_cards(
     })
 }
 
-/// Conservative per-frame byte upper bound for a D7100 14-bit lossless DX NEF.
-/// The Nikon manual's DX 14-bit lossless example is about 28.5 MB; this bound keeps
-/// headroom for a busier scene instead of pretending to know the real file size.
-pub const CONSERVATIVE_NEF_BYTES: u64 = 64 * 1024 * 1024;
+/// Per-frame planning reserve for D7100 14-bit lossless DX NEF, selected by the
+/// operator at 32 MiB. Existing measured files fit this reserve; it is a storage
+/// estimate, not a guaranteed maximum or a reason to relax actual card errors.
+/// Zero/unknown remaining exposures and runtime storage errors remain enforced.
+pub const CONSERVATIVE_NEF_BYTES: u64 = 32 * 1024 * 1024;
+
+/// D7100 body-initiated capture is distinct from sending USB objects to a store.
+/// Keep AccessCapability unchanged: ReadOnly still forbids host object writes.
+/// This exception is limited to the negotiated native D7100 card session; actual
+/// InitiateCapture/storage errors still fail the capture without retry or RAM fallback.
+pub fn plan_camera_cards(
+    health: &CameraHealth,
+    infos: &[StorageInfo],
+    frames: u32,
+    per_frame_bytes: u64,
+) -> Result<CardPlan, String> {
+    super::properties::require_card_destination(health).map_err(|error| error.to_string())?;
+    if !health.identity.as_ref().is_some_and(|identity|
+        ["Nikon Corporation", "Nikon"].iter().any(|name|identity.manufacturer.trim().eq_ignore_ascii_case(name))
+            && matches!(identity.model.trim().to_ascii_uppercase().as_str(),"D7100"|"NIKON D7100")
+            && identity.backend == "windows_wpd_nikon_d7100")
+        || health.backend != "windows_wpd_nikon_d7100"
+    {
+        return Err("CAMERA_CARD_CAPTURE_UNSUPPORTED".into());
+    }
+    if frames == 0 { return Err("CARD_TASK_EMPTY".into()); }
+    if per_frame_bytes == 0 { return Err("CARD_FRAME_BOUND_UNKNOWN".into()); }
+    let required = u64::from(frames).checked_mul(per_frame_bytes).ok_or("CARD_CAPACITY_OVERFLOW")?;
+    // Only removable body-capture media, never ROM or a virtual host-RAM store.
+    let mut storages: Vec<_> = infos.iter().filter(|info| info.storage_type == 4).cloned().collect();
+    if storages.is_empty() { return Err("CARD_READ_ONLY".into()); }
+    if storages.len() > 2 { return Err("CARD_CAPACITY_UNKNOWN".into()); }
+    // D7100 may enumerate an unavailable first slot with bytes remaining but
+    // zero remaining exposures. With negotiated overflow, the body already
+    // starts on the usable slot: no mid-exposure StoreFull event is expected.
+    // Keep both storage datasets and access flags; only freeze their start order.
+    if health.capabilities.card_overflow && storages.len() == 2
+        && storages[0].capacity.free_images == 0 && storages[1].capacity.free_images > 0
+    {
+        storages.swap(0, 1);
+    }
+    let mut writable_bytes = 0u64;
+    let mut writable_images = 0u32;
+    for storage in storages.iter().take(if health.capabilities.card_overflow { 2 } else { 1 }) {
+        let capacity = storage.capacity;
+        if capacity.max_bytes == 0 || capacity.max_bytes == u64::MAX
+            || capacity.free_bytes > capacity.max_bytes || capacity.free_images == u32::MAX
+        { return Err("CARD_CAPACITY_UNKNOWN".into()); }
+        // A zero count can reflect LOCK, a full card or another capture refusal:
+        // its bytes must not help a task pass. Positive counts are estimates at
+        // the body's current settings, and are kept as diagnostics rather than
+        // overriding the operator-selected byte reserve for compressed NEFs.
+        if capacity.free_images == 0 { continue; }
+        writable_bytes = writable_bytes.checked_add(capacity.free_bytes).ok_or("CARD_CAPACITY_OVERFLOW")?;
+        let usable_images = u32::try_from(capacity.free_bytes / per_frame_bytes).map_err(|_| "CARD_CAPACITY_OVERFLOW")?;
+        writable_images = writable_images.checked_add(usable_images).ok_or("CARD_CAPACITY_OVERFLOW")?;
+    }
+    if writable_bytes < required || writable_images < frames { return Err("CARD_CAPACITY_INSUFFICIENT".into()); }
+    Ok(CardPlan { storages, writable_bytes, writable_images })
+}
+
+/// Include the unchanged ten dark and ten flat references in scan capacity.
+pub fn plan_camera_task_cards(health: &CameraHealth, infos: &[StorageInfo], projections: u32) -> Result<CardPlan, String> {
+    if projections == 0 { return Err("CARD_TASK_EMPTY".into()); }
+    plan_camera_cards(health, infos, task_card_frames(projections), CONSERVATIVE_NEF_BYTES)
+}
 
 /// Frames one scan writes to the card: 10 pre-dark + 10 pre-flat references plus
 /// every projection. A card plan must cover all of them, not only the projections.
@@ -445,13 +513,18 @@ mod tests {
             parse_storage_info(&storage_info_bytes(3, 2, 0, GIB, 0, 0, "ram", "")).unwrap().access,
             StorageAccess::ReadWrite
         );
-        for capability in [1u16, 2] {
+        for (capability, access) in [
+            (1u16, StorageAccess::ReadOnly),
+            (2, StorageAccess::ReadOnlyWithDeletion),
+        ] {
             assert_eq!(
                 parse_storage_info(&storage_info_bytes(3, 2, capability, GIB, 0, 0, "", ""))
                     .unwrap()
                     .access,
-                StorageAccess::ReadOnly
+                access
             );
+            let info = parse_storage_info(&storage_info_bytes(4, 2, capability, GIB, GIB, 10, "", "")).unwrap();
+            assert_eq!(plan_cards(&[info], 1, 1).unwrap_err(), "CARD_READ_ONLY");
         }
         for capability in [3u16, 4, 0xffff] {
             assert!(parse_storage_info(&storage_info_bytes(3, 2, capability, GIB, 0, 0, "", ""))
@@ -784,7 +857,7 @@ mod tests {
         // A card that cannot cover the whole task refuses before any device action.
         assert_eq!(
             plan_task_cards(
-                &[sized_info(16 * GIB, 500, StorageAccess::ReadWrite)],
+                &[sized_info(380 * CONSERVATIVE_NEF_BYTES - 1, 500, StorageAccess::ReadWrite)],
                 360,
                 CONSERVATIVE_NEF_BYTES
             )
@@ -834,5 +907,119 @@ mod tests {
             plan_task_cards(&single, 360, u64::MAX).unwrap_err(),
             "CARD_CAPACITY_OVERFLOW"
         );
+    }
+
+    #[test]
+    fn d7100_32_mib_budget_covers_380_frames_and_keeps_byte_and_zero_count_refusals() {
+        let camera=super::super::scripted_camera(super::super::ScriptedCameraConfig{card_capture:true,..Default::default()});
+        let health=camera.health();
+        let required=380 * 32 * 1024 * 1024;
+        let mut card=read_only(1,16*GIB,380);card.capacity.free_bytes=required;
+        assert!(plan_camera_task_cards(&health,&[card.clone()],360).is_ok());
+        card.capacity.free_bytes-=1;
+        assert_eq!(plan_camera_task_cards(&health,&[card.clone()],360).unwrap_err(),"CARD_CAPACITY_INSUFFICIENT");
+        card.capacity.free_bytes=16*GIB;card.capacity.free_images=379;
+        assert_eq!(plan_camera_task_cards(&health,&[card.clone()],360).unwrap().writable_images,512);
+        card.capacity.free_images=0;
+        assert_eq!(plan_camera_task_cards(&health,&[card],360).unwrap_err(),"CARD_CAPACITY_INSUFFICIENT");
+    }
+
+    #[test]
+    fn d7100_zero_exposure_card_contributes_neither_bytes_nor_budgeted_frames() {
+        let camera = super::super::scripted_camera(super::super::ScriptedCameraConfig {
+            card_capture: true, ..Default::default()
+        });
+        let mut health = camera.health();
+        health.capabilities.card_overflow = true;
+        // Actual reported capacities: the unavailable slot adds no exposures.
+        let mut slot_one = read_only(0x0001_0001, 15_514_730_496, 0);
+        slot_one.capacity.free_bytes = 9_270_755_328;
+        let mut slot_two = read_only(0x0002_0001, 15_923_150_848, 201);
+        slot_two.access = StorageAccess::ReadOnlyWithDeletion;
+        slot_two.capacity.free_bytes = 10_773_594_112;
+        let stores = [slot_one, slot_two];
+        assert_eq!(plan_camera_task_cards(&health, &stores, 360).unwrap_err(), "CARD_CAPACITY_INSUFFICIENT");
+        let plan = plan_camera_task_cards(&health, &stores, 301).unwrap();
+        assert_eq!(plan.writable_images, 321);
+        assert_eq!(plan.writable_bytes, 10_773_594_112);
+        assert_eq!(plan.storages[0].id, StorageId(0x0002_0001));
+        assert_eq!(plan.storages[0].access, StorageAccess::ReadOnlyWithDeletion);
+        assert_eq!(plan_camera_task_cards(&health, &stores, 302).unwrap_err(), "CARD_CAPACITY_INSUFFICIENT");
+    }
+
+    #[test]
+    fn unlocked_d7100_measured_cards_use_32_mib_budget_and_preserve_body_estimates() {
+        let camera=super::super::scripted_camera(super::super::ScriptedCameraConfig{card_capture:true,..Default::default()});
+        let mut health=camera.health();
+        let mut first=read_only(0x0001_0001,15_514_730_496,173);
+        first.access=StorageAccess::ReadOnlyWithDeletion;first.capacity.free_bytes=9_270_755_328;
+        let mut second=read_only(0x0002_0001,15_923_150_848,201);
+        second.access=StorageAccess::ReadOnlyWithDeletion;second.capacity.free_bytes=10_773_594_112;
+        let stores=[first,second];
+        // A second card cannot contribute before overflow is negotiated.
+        assert_eq!(plan_camera_task_cards(&health,&stores,360).unwrap_err(),"CARD_CAPACITY_INSUFFICIENT");
+        health.capabilities.card_overflow=true;
+        let plan=plan_camera_task_cards(&health,&stores,360).unwrap();
+        assert_eq!(plan.storages,stores);
+        assert_eq!(plan.writable_bytes,20_044_349_440);
+        assert_eq!(plan.writable_images,597);
+        assert!(plan_camera_task_cards(&health,&stores,577).is_ok());
+        assert_eq!(plan_camera_task_cards(&health,&stores,578).unwrap_err(),"CARD_CAPACITY_INSUFFICIENT");
+        let mut empty=stores.clone();
+        empty[0].capacity.free_bytes=15_514_664_960;empty[0].capacity.free_images=290;
+        empty[1].capacity.free_bytes=15_923_085_312;empty[1].capacity.free_images=297;
+        assert_eq!(plan_camera_task_cards(&health,&empty,360).unwrap().writable_images,936);
+        assert!(plan_camera_task_cards(&health,&empty,916).is_ok());
+        assert_eq!(plan_camera_task_cards(&health,&empty,917).unwrap_err(),"CARD_CAPACITY_INSUFFICIENT");
+        empty[0].capacity.free_images=u32::MAX;
+        assert_eq!(plan_camera_task_cards(&health,&empty,360).unwrap_err(),"CARD_CAPACITY_UNKNOWN");
+    }
+
+    #[test]
+    fn d7100_body_capture_retains_usb_read_only_and_checks_remaining_task_capacity() {
+        let camera=super::super::scripted_camera(super::super::ScriptedCameraConfig{card_capture:true,..Default::default()});
+        let health=camera.health();
+        let mut card=read_only(1,64*GIB,5000);card.capacity.free_bytes=32*GIB;
+        let plan=plan_camera_task_cards(&health,&[card.clone()],360).unwrap();
+        assert_eq!(plan.storages,vec![card.clone()]);assert_eq!(plan.writable_bytes,32*GIB);
+        assert_eq!(plan_cards(&[card.clone()],1,1).unwrap_err(),"CARD_READ_ONLY");
+        let mut measured_identity=health.clone();measured_identity.identity.as_mut().unwrap().model="D7100".into();
+        assert!(plan_camera_cards(&measured_identity,&[card.clone()],1,CONSERVATIVE_NEF_BYTES).is_ok());
+        card.capacity.free_bytes=GIB;
+        assert_eq!(plan_camera_task_cards(&health,&[card.clone()],360).unwrap_err(),"CARD_CAPACITY_INSUFFICIENT");
+        card.capacity.free_bytes=32*GIB;card.capacity.free_images=379;
+        assert_eq!(plan_camera_task_cards(&health,&[card.clone()],360).unwrap().writable_images,1024);
+        card.capacity.free_images=u32::MAX;
+        assert_eq!(plan_camera_task_cards(&health,&[card],360).unwrap_err(),"CARD_CAPACITY_UNKNOWN");
+    }
+
+    #[test]
+    fn d7100_body_capture_does_not_relax_unknown_models_rom_or_unproved_overflow() {
+        let camera=super::super::scripted_camera(super::super::ScriptedCameraConfig{card_capture:true,..Default::default()});
+        let mut health=camera.health();let card=read_only(1,64*GIB,5000);
+        health.identity.as_mut().unwrap().model="D7200".into();
+        assert_eq!(plan_camera_cards(&health,&[card.clone()],1,CONSERVATIVE_NEF_BYTES).unwrap_err(),"CAMERA_CARD_CAPTURE_UNSUPPORTED");
+        health.identity.as_mut().unwrap().model="NIKON D7100".into();
+        health.capabilities.card_capture=false;assert!(plan_camera_cards(&health,&[card.clone()],1,CONSERVATIVE_NEF_BYTES).is_err());
+        health.capabilities.card_capture=true;
+        let mut rom=card.clone();rom.storage_type=2;
+        assert_eq!(plan_camera_cards(&health,&[rom],1,CONSERVATIVE_NEF_BYTES).unwrap_err(),"CARD_READ_ONLY");
+        let mut full=card.clone();full.capacity.free_bytes=0;full.capacity.free_images=0;
+        assert_eq!(plan_camera_cards(&health,&[full.clone(),card.clone()],1,CONSERVATIVE_NEF_BYTES).unwrap_err(),"CARD_CAPACITY_INSUFFICIENT");
+        health.capabilities.card_overflow=true;
+        let plan=plan_camera_cards(&health,&[full,card],1,CONSERVATIVE_NEF_BYTES).unwrap();assert_eq!(plan.storages.len(),2);
+    }
+
+    #[test]
+    fn d7100_zero_exposure_first_slot_is_not_the_frozen_start_storage() {
+        let camera=super::super::scripted_camera(super::super::ScriptedCameraConfig{card_capture:true,..Default::default()});
+        let mut health=camera.health();health.capabilities.card_overflow=true;
+        let unavailable=read_only(0x0001_0001,16*GIB,0);
+        let usable=read_only(0x0002_0001,16*GIB,227);
+        let plan=plan_camera_cards(&health,&[unavailable.clone(),usable.clone()],4,CONSERVATIVE_NEF_BYTES).unwrap();
+        assert_eq!(plan.storages,vec![usable.clone(),unavailable.clone()]);
+        assert_eq!(plan.writable_images,512);
+        health.capabilities.card_overflow=false;
+        assert_eq!(plan_camera_cards(&health,&[unavailable,usable],4,CONSERVATIVE_NEF_BYTES).unwrap_err(),"CARD_CAPACITY_INSUFFICIENT");
     }
 }

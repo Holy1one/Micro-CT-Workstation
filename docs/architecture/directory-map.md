@@ -30,4 +30,4 @@ Rust workspace 清单与唯一锁文件位于 backend/{Cargo.toml,Cargo.lock}，
 - directory-policy.json：重要边界下允许存在的直接子目录。
 - module-graph.md：由 tools/verify/gen-module-graph.mjs 生成，禁止手工维护。
 
-新增、移动或删除维护路径时，同步 JSON、引用和相邻说明，并运行 npm.cmd run module-map:check。新的领域目录须先获得人工批准。
+新增、移动或删除维护路径时，同步 JSON、引用和相邻说明，并运行 npm.cmd run module-map:check。当前目标所需的现有职责内整理可直接执行；新增目标之外的领域职责或系统边界变化先明确范围。

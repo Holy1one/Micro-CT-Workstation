@@ -71,6 +71,7 @@ export class WorkstationAdapter implements EngineAdapter {
   readonly kind = "developer_preview" as const;
   private workflow: ScanWorkflow;
   private revision = 0;
+  private earlyRelease = true;
   private snapshotSequence = 0;
   private controls?: PreviewDeviceControls;
   private get nativeControls(): PreviewDeviceControls { return this.controls ??= new PreviewDeviceControls(this.workflow); }
@@ -118,6 +119,7 @@ export class WorkstationAdapter implements EngineAdapter {
       }
       case "prepare_scan": {
         this.requirePreparationAccess();
+        if (command.earlyRelease !== undefined && typeof command.earlyRelease !== "boolean") throw new Error("INVALID_SCAN_PREPARATION");
         const task = command.taskId.trim();
         if (!task || task.length > 128 || /[<>:"/\\|?*\x00-\x1f]/.test(task)
           || /[. ]$/.test(task) || /^(?:cameracaptures|con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(task)
@@ -129,6 +131,7 @@ export class WorkstationAdapter implements EngineAdapter {
         const exposure = this.nativeControls.camera.connected && shutter?.readable && shutter.dataType===6 && shutter.confirmed && !shutter.error && shutter.actual !== null && (shutter.target===null||shutter.target===shutter.actual) ?  shutterExposureMs(shutter.actual, shutter.code) : null;
         if (exposure === null || exposure < 0.125 || exposure > 30000) throw new Error("CONFIRMED_NATIVE_SHUTTER_REQUIRED");
         wf.setParams({ taskId: task, projectionCount: command.projectionCount, maxXraySec: command.maxXraySec, exposureMs: exposure });
+        this.earlyRelease = command.earlyRelease ?? true;
         wf.camera.configure(`${wf.params.savePath}/${task}`);
         this.scanFlow.geometry = geometry;
         this.scanFlow.prompt = null;
@@ -308,7 +311,9 @@ export class WorkstationAdapter implements EngineAdapter {
         break;
       case "update_scan_setup":
         if (command.setup.exposureMs !== undefined) throw new Error("EXPOSURE_EDIT_REQUIRES_CAMERA_APPLY");
+        if (command.setup.earlyRelease !== undefined && typeof command.setup.earlyRelease !== "boolean") throw new Error("INVALID_PARAMETERS");
         wf.setParams(command.setup);
+        if (command.setup.earlyRelease !== undefined) this.earlyRelease = command.setup.earlyRelease;
         this.prepared = false;
         break;
     }
@@ -684,6 +689,7 @@ export class WorkstationAdapter implements EngineAdapter {
         angleStepDeg: step,
         exposureMs: wf.params.exposureMs,
         maxXraySec: wf.params.maxXraySec,
+        earlyRelease: this.earlyRelease,
       },
       consoleLogs: wf.logs.map((entry) => ({ ...entry })),
       frames: wf.frames.map((frame) => ({

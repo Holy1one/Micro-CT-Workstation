@@ -13,7 +13,7 @@ npm.cmd run tauri:dev
 npm.cmd run installer:build
 ~~~
 
-Windows x64 安装包兼容目标为 Windows 10 和 Windows 11，使用 MSI 提供目录选择、开始菜单/桌面快捷方式，以及修改、修复、卸载。installer:build 输出 release/micro-ct-workstation_<version>_windows_x86_64.msi，该目录只保留最新安装包；构建来源、签名和许可证在 .cache/tests/release/<version>/，许可证同时安装。随包提供 WebView2 引导安装器（缺少运行时时自动联网安装）；开发构建需要 MSVC Build Tools、Rust MSVC toolchain 和 Node.js。网页 build 只更新前端构建输出。安装须由用户自行启动。
+Windows x64 安装包兼容目标为 Windows 10 和 Windows 11，使用 MSI 提供目录选择、开始菜单/桌面快捷方式，以及修改、修复、卸载。installer:build 输出 release/micro-ct-workstation_<version>_windows_x86_64.msi，该目录只保留最新安装包；构建来源、签名和许可证在 .cache/tests/release/<version>/，许可证同时安装。随包提供 WebView2 引导安装器（缺少运行时时自动联网安装）；开发构建需要 MSVC Build Tools、Rust MSVC toolchain 和 Node.js。网页 build 只更新前端构建输出。构建与安装分别执行；用户明确要求安装或更新后，可在授权范围内完成维护停机、安装和身份核验。
 
 ## 目录与资料
 

@@ -25,7 +25,16 @@ use super::types::*;
 use serde::Serialize;
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Acceptance measurement only. On this D7100 the raw `0xD1A4` value carried
+/// `0x0000_8000` at the trigger notification and cleared it at the notification
+/// ~t+0.34 s after the shutter, ~2.5 s before the card completion. The bit's
+/// meaning is **not** documented by any reference, so it stays a diagnostic
+/// correlate by default. The separate L1 acceptance switch permits early move
+/// release only; it never substitutes for `ObjectAdded`/`CaptureComplete`.
+/// Promotion requires a separate recorded decision after hardware acceptance.
+const D1A4_RUNNING_STATE_BIT: u32 = 0x0000_8000;
 
 /// Validates a file name the import derives from an acquisition record before it is
 /// joined to the task directory. Only a plain relative name is accepted: no path
@@ -104,6 +113,9 @@ pub struct CardCapturePlan {
     pub storages: Vec<StorageId>,
     pub allow_overflow: bool,
     pub expected_objects: u32,
+    /// Frozen for this operation by the scan coordinator. Missing early
+    /// evidence never weakens the ObjectAdded + CaptureComplete receipt gate.
+    pub early_release: bool,
 }
 
 /// One confirmed card object: the parsed metadata plus whether it arrived on the
@@ -394,21 +406,26 @@ fn card_profile_readback(health: &CameraHealth) -> Result<CameraProperties, Came
     Ok(values)
 }
 
-/// Re-reads the device and refuses a receipt when the frozen card profile, the
-/// card destination or Live View OFF cannot be confirmed again. This mirrors the
-/// RAM `confirm_frozen_capture` without its SDRAM-only runtime diagnostic, which
-/// by definition cannot describe a card destination.
+/// The independent card button uses the same proven capture policy as a scan,
+/// without requiring a turntable or a local image directory.
+pub fn card_capture_readiness(health:&CameraHealth)->Result<(),CameraError>{
+    require_card_destination(health)?;
+    card_profile_readback(health)?;
+    super::properties::require_capture_runtime_diagnostic(health)
+}
+
+/// Freshly reads every frozen value, card destination and Live View OFF once at
+/// each transaction boundary. Descriptions belong to this connected owner;
+/// capability/photographic change events invalidate the operation instead of
+/// silently requalifying it. Runtime notifications never launch a full sweep.
 fn confirm_frozen_card_profile(
     camera: &mut NativeCamera,
     expected: &CameraProperties,
     context: &CallContext,
 ) -> Result<(), CameraError> {
-    camera.read_properties(context)?;
-    if card_profile_readback(&camera.health)? != *expected {
-        return Err(invalid(
-            "runtime notification changed frozen card capture parameters; receipt refused",
-        ));
-    }
+    camera.read_frozen_values(expected, context)?;
+    // read_frozen_values compares every fresh native value with expected; a
+    // second traversal of those cached values cannot add evidence.
     let live_view = camera.read_data(GET_PROPERTY, &[LV_STATUS as u32], 16, context)?;
     if live_view != [0] {
         return Err(invalid(
@@ -416,37 +433,64 @@ fn confirm_frozen_card_profile(
         ));
     }
     require_card_destination(&camera.health)?;
+    camera.confirm_runtime_status_diagnostic(context)?;
     Ok(())
 }
 
-/// Accepts one `0x4006` property notification exactly as the RAM scan path does:
-/// card capture is a fixed-scan operation, so an automatic-exposure output
-/// notification is never admitted (`accept_automatic_output_notification`
-/// returns false for `scan_policy == true`) and only the runtime-diagnostic path
-/// can accept it, after the frozen card profile is confirmed again. Anything
-/// else is refused by the caller with the property name.
-///
-/// The card destination owns its runtime confirmation: the shared SDRAM
-/// confirmation requires `recordingMedia=1` and would therefore reject every card
-/// session. Only the advertised read-only runtime diagnostic is accepted here,
-/// through the destination-aware confirmation with the card media value, and the
-/// frozen card profile is confirmed again afterwards. Every other property change
-/// stays refused with its native code.
+/// These display-only properties grant no capture or storage admission. Preserve
+/// their notifications in the raw event journal, invalidate stale displayed
+/// values, and let explicit reads/idle notifications refresh them. Repeated
+/// descriptor/value reads while a card exposure is pending add no capture proof.
+fn defer_display_notification(
+    camera: &mut NativeCamera,
+    code: u16,
+    context: &CallContext,
+) -> Result<(), CameraError> {
+    context.check()?;
+    let (key, _, _, kind) = RUNTIME_DIAGNOSTICS.iter()
+        .find(|row| row.2 == code)
+        .ok_or_else(|| invalid("card display notification has no documented property"))?;
+    if !camera.info.as_ref().is_some_and(|info| info.properties.contains(&code)) {
+        return Err(invalid("card display notification property is not advertised"));
+    }
+    let property = camera.health.runtime_properties.get_mut(*key)
+        .ok_or_else(|| invalid("card display notification native descriptor missing"))?;
+    if property.code != code || !property.supported || !property.readable
+        || property.native_writable || property.writable || property.error.is_some()
+        || !matches!(property.data_type, 1..=8)
+        || kind.is_some_and(|kind| property.data_type != kind) {
+        return Err(invalid("card display notification requires a qualified read-only scalar descriptor"));
+    }
+    property.property.actual = None;
+    property.property.confirmed = false;
+    Ok(())
+}
+
+/// Refresh admission diagnostics, defer the three frequent display-only ones.
+/// Photographic/unknown changes still refuse the operation immediately; silent
+/// frozen-value drift is caught by the mandatory final read before any receipt.
+/// A notification never proves completion, object identity or card writability.
 fn accept_property_notification(
     camera: &mut NativeCamera,
-    expected: &CameraProperties,
     event: &NikonEvent,
     context: &CallContext,
 ) -> Result<bool, CameraError> {
-    if event.parameter != INFO_DISPLAY_ERROR_STATUS as u32 {
-        return Ok(false);
+    if event.parameter == INFO_DISPLAY_ERROR_STATUS as u32 {
+        camera.confirm_runtime_diagnostic_for(context, 0)
+            .map_err(|error| capture_event_error(camera, error.to_string()))?;
+    } else {
+        let Ok(code) = u16::try_from(event.parameter) else { return Ok(false); };
+        if matches!(code, LV_PROHIBIT | CONTINUOUS_SHOOTING_COUNT | EXPOSURE_REMAINING) {
+            defer_display_notification(camera, code, context)
+                .map_err(|error| capture_event_error(camera, error.to_string()))?;
+            return Ok(true);
+        }
+        if !camera.read_catalog_runtime(code, context)
+            .map_err(|error| capture_event_error(camera, error.to_string()))? {
+            return Ok(false);
+        }
     }
-    camera
-        .confirm_runtime_diagnostic_for(context, 0)
-        .map_err(|error| capture_event_error(camera, error.to_string()))?;
-    confirm_frozen_card_profile(camera, expected, context)
-        .map(|_| true)
-        .map_err(|error| capture_event_error(camera, error.to_string()))
+    Ok(true)
 }
 
 /// Records one consumed event batch in the same capture diagnostics the RAM path
@@ -493,8 +537,40 @@ fn record_event_batch(
     });
 }
 
-fn completion_count(events: &[NikonEvent]) -> usize {
-    events
+/// Enables the H6a exposure-end acceptance measurement only. **Off by default**, so
+/// a production card transaction keeps its exact I/O and event contract and issues
+/// no read for deferred display notifications. An acceptance run sets
+/// `MICRO_CT_CARD_EARLY_END_ACCEPTANCE=1`; the resulting `early_end_*` values stay
+/// diagnostics and never release a move or complete an operation.
+fn early_end_acceptance_enabled() -> bool {
+    #[cfg(test)]
+    return super::tests::CardAcceptanceSwitch::diagnostic_enabled();
+    #[cfg(not(test))]
+    std::env::var("MICRO_CT_CARD_EARLY_END_ACCEPTANCE").is_ok_and(|value| value == "1")
+}
+
+/// Pure acceptance-measurement step. It records, at most once, the first raw
+/// `0xD1A4` value seen with the running-state bit cleared after that bit had been
+/// observed set during the same operation. It is deliberately free of any
+/// association decision: the receipt still requires ObjectAdded + CaptureComplete.
+fn observe_d1a4(
+    value: Option<u32>,
+    elapsed_ms: u64,
+    running_seen: &mut bool,
+    timing: &mut CardCaptureTiming,
+) {
+    let Some(value) = value else { return };
+    if timing.early_end_observed_ms.is_some() {
+        return;
+    }
+    if value & D1A4_RUNNING_STATE_BIT != 0 {
+        *running_seen = true;
+    } else if *running_seen {
+        timing.early_end_observed_ms = Some(elapsed_ms);
+        timing.early_end_value = Some(value);
+    }
+}
+fn completion_count(events: &[NikonEvent]) -> usize {    events
         .iter()
         .filter(|event| event.code == CAPTURE_COMPLETE_CARD)
         .count()
@@ -509,6 +585,38 @@ pub(crate) fn capture_to_card(
     operation_id: &str,
     sender: &Option<Sender<CameraCaptureEvent>>,
     context: &CallContext,
+) -> Result<CardCaptureOutcome, CameraError> {
+    let started = Instant::now();
+    let before = *camera.transport_metrics.borrow();
+    let mut timing = CardCaptureTiming {
+        session_id: camera.health.session_id.clone(),
+        operation_id: operation_id.into(),
+        ..Default::default()
+    };
+    let result = capture_to_card_inner(camera, plan, operation_id, sender, context, started, &mut timing);
+    let after = *camera.transport_metrics.borrow();
+    timing.total_ms = started.elapsed().as_millis() as u64;
+    timing.completed = result.is_ok();
+    timing.usb_commands = after.commands - before.commands;
+    timing.usb_call_ms = (after.elapsed_us - before.elapsed_us) as f64 / 1000.0;
+    timing.property_reads = after.property_reads - before.property_reads;
+    timing.descriptor_reads = after.descriptor_reads - before.descriptor_reads;
+    timing.event_polls = after.event_polls - before.event_polls;
+    camera.health.last_card_capture_timing = Some(timing);
+    result.map_err(|error| {
+        if let Some(batch) = camera.health.last_capture_event_diagnostic.as_mut()
+            .filter(|batch| batch.operation_id == operation_id) {
+            if batch.response.error.is_none() { batch.response.error = Some(error.to_string()); }
+        }
+        error
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_to_card_inner(
+    camera: &mut NativeCamera, plan: &CardCapturePlan, operation_id: &str,
+    sender: &Option<Sender<CameraCaptureEvent>>, context: &CallContext,
+    started: Instant, timing: &mut CardCaptureTiming,
 ) -> Result<CardCaptureOutcome, CameraError> {
     camera.ensure_connected()?;
     require_card_destination(&camera.health)?;
@@ -533,30 +641,13 @@ pub(crate) fn capture_to_card(
             "card overflow continuation events are not advertised".into(),
         ));
     }
-    // Freeze the scan profile, then prove it survives a fresh device read. Two
+    // Freeze the confirmed profile, drain old evidence, then prove every actual
+    // value again before triggering. Two
     // planned storages without the continuation flag are accepted: the object
     // then has to come from the primary storage, which the association enforces
     // instead of trusting the listing order.
     let expected_profile = card_profile_readback(&camera.health)?;
-    camera.read_properties(context)?;
-    if card_profile_readback(&camera.health)? != expected_profile {
-        return Err(invalid(
-            "camera parameters changed since the confirmed card capture profile",
-        ));
-    }
-    require_card_destination(&camera.health)?;
-    let live_view = camera
-        .transport
-        .execute(
-            GET_PROPERTY,
-            &[LV_STATUS as u32],
-            DataPhase::Read { max: 16 },
-            context,
-        )?
-        .data()?;
-    if live_view != [0] {
-        return Err(invalid("card capture requires current confirmed Live View OFF"));
-    }
+    // drain_events includes bounded DeviceReady; no duplicate readiness call.
     camera.drain_events(context)?;
     confirm_frozen_card_profile(camera, &expected_profile, context)?;
     let session = camera
@@ -580,15 +671,26 @@ pub(crate) fn capture_to_card(
         queue_drained: true,
         accepted: false,
     });
-    // The standard PTP still-capture operation, with parameter `0xFFFFFFFF` and
-    // zero image payload. The reference library's card path sends exactly this
-    // opcode (`CameraControl.Devices/BaseMTPCamera.cs:82` constant, used at
-    // `Nikon/NikonBase.cs:1872`); a Nikon private capture code is never sent on
-    // the card path, and an unproven opcode is never probed.
-    camera
+    // Standard InitiateCapture takes StorageID and ObjectFormatCode. Zero lets
+    // the body choose its current card/format; 0xFFFFFFFF is the private RAM
+    // trigger's parameter, not a valid default StorageID (real D7100: 0x2008).
+    // The MIT reference card branch calls 0x100E without RAM parameters;
+    // libgphoto2 ptp.h documents the standard explicit [0, 0] form.
+    timing.precheck_ms = started.elapsed().as_millis() as u64;
+    let trigger_started = Instant::now();
+    let response = camera
         .transport
-        .execute(INITIATE_CAPTURE, &[0xffffffff], DataPhase::None, context)?
-        .success()?;
+        .execute(INITIATE_CAPTURE, &[0, 0], DataPhase::None, context)?;
+    timing.trigger_ms = trigger_started.elapsed().as_millis() as u64;
+    if response.code == 0x2008 {
+        // A concrete InvalidStorageID admission rejection did not start this
+        // exposure. Transport failure/timeout/general errors keep it unknown.
+        camera.capture_pending = false;
+        camera.pending_capture = None;
+    }
+    response.success().map_err(|error| {
+        CameraError::Command(format!("InitiateCapture 0x100E StorageID=0 Format=0: {error}"))
+    })?;
     camera.pending_capture.as_mut().unwrap().accepted = true;
     let mut association = CardAssociation::new(
         &session,
@@ -598,6 +700,10 @@ pub(crate) fn capture_to_card(
     );
     let mut batch_sequence = 0u64;
     let mut event_batches = Vec::new();
+    // The caller freezes this choice before the trigger; it cannot change while
+    // this frame is in flight. OFF retains the original reads and event order.
+    let early_release = plan.early_release;
+    let mut running_bit_seen = false;
     loop {
         context.check()?;
         let result = camera.events(context);
@@ -622,6 +728,7 @@ pub(crate) fn capture_to_card(
             );
         }
         let events = result?;
+        let batch_had_events = !events.is_empty();
         // Preserve reliable physical termination before any later rejection in
         // this batch, exactly as the RAM loop does: the association's own
         // duplicate and session rules decide whether the completion counts.
@@ -630,6 +737,7 @@ pub(crate) fn capture_to_card(
             .accept_completion(completion_count(&events), session_now.as_deref())
             .map_err(|rule| capture_event_error(camera, rule))?
         {
+            timing.exposure_ended_observed_ms = Some(started.elapsed().as_millis() as u64);
             camera.capture_pending = false;
             camera.pending_capture = None;
             if let Some(batch) = camera.health.last_capture_event_diagnostic.as_mut() {
@@ -638,7 +746,7 @@ pub(crate) fn capture_to_card(
             emit(
                 sender,
                 CameraCaptureEvent::ExposureEnded {
-                    session_id: session.clone(),
+                    observed_at: Some(std::time::Instant::now()), session_id: session.clone(),
                     operation_id: operation_id.into(),
                 },
                 context,
@@ -676,6 +784,7 @@ pub(crate) fn capture_to_card(
                     association
                         .confirm_object(event.parameter, info)
                         .map_err(|rule| capture_event_error(camera, rule))?;
+                    timing.object_added_observed_ms = Some(started.elapsed().as_millis() as u64);
                     emit(
                         sender,
                         CameraCaptureEvent::ObjectAdded {
@@ -705,7 +814,38 @@ pub(crate) fn capture_to_card(
                     )))
                 }
                 PROPERTY_CHANGED => {
-                    if accept_property_notification(camera, &expected_profile, &event, context)? {
+                    // Read only on the existing D1A4 notification, with either
+                    // acceptance switch enabled. The first observed 1->0 may
+                    // release a move under L1, but never changes the association.
+                    if event.parameter == LV_PROHIBIT as u32
+                        && timing.early_end_observed_ms.is_none()
+                        && (early_release || early_end_acceptance_enabled())
+                    {
+                        let value = camera
+                            .read_data(GET_PROPERTY, &[LV_PROHIBIT as u32], 16, context)
+                            .ok()
+                            .filter(|bytes| bytes.len() >= 4)
+                            .map(|bytes| {
+                                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                            });
+                        observe_d1a4(
+                            value,
+                            started.elapsed().as_millis() as u64,
+                            &mut running_bit_seen,
+                            timing,
+                        );
+                        if early_release && timing.early_end_observed_ms.is_some() {
+                            emit(
+                                sender,
+                                CameraCaptureEvent::EarlyExposureEnded {
+                                    observed_at: Some(std::time::Instant::now()), session_id: session.clone(),
+                                    operation_id: operation_id.into(),
+                                },
+                                context,
+                            )?;
+                        }
+                    }
+                    if accept_property_notification(camera, &event, context)? {
                         continue;
                     }
                     let property = camera
@@ -732,7 +872,11 @@ pub(crate) fn capture_to_card(
         if association.is_complete() {
             break;
         }
-        thread::sleep(Duration::from_millis(CARD_POLL_MS));
+        // A nonempty batch may already have the next ObjectAdded/completion
+        // queued. Drain it now; throttle only empty polls while awaiting evidence.
+        if !batch_had_events {
+            thread::sleep(Duration::from_millis(CARD_POLL_MS));
+        }
     }
     // DeviceReady and an empty event queue finish this operation's association
     // boundary. A late, duplicate or mismatched event belongs to no frame of this
@@ -758,7 +902,7 @@ pub(crate) fn capture_to_card(
         );
         for event in events {
             if event.code == PROPERTY_CHANGED {
-                if accept_property_notification(camera, &expected_profile, &event, context)? {
+                if accept_property_notification(camera, &event, context)? {
                     continue;
                 }
             }
@@ -829,6 +973,7 @@ mod tests {
             storages,
             allow_overflow,
             expected_objects: 1,
+            early_release: crate::devices::camera::CardAcceptanceSwitch::release_enabled(),
         }
     }
 
@@ -877,6 +1022,270 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_device_ready_refuses_card_trigger_without_arming_exposure() {
+        let (mut camera, probe, context) = card_camera(false);
+        probe.fail_transport_operation(DEVICE_READY);
+        assert!(capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP,
+            &None, &context).is_err());
+        assert_eq!(trigger_count(&probe), 0);
+        assert!(!camera.capture_pending && camera.pending_capture.is_none());
+    }
+
+    #[test]
+    fn early_end_acceptance_diagnostic_records_only_a_running_bit_clear() {
+        let mut timing = CardCaptureTiming::default();
+        let mut running = false;
+        // The trigger notification carries the running bit; nothing is recorded.
+        observe_d1a4(Some(0x0000_8000), 60, &mut running, &mut timing);
+        assert!(running);
+        assert_eq!(timing.early_end_observed_ms, None);
+        assert_eq!(timing.early_end_value, None);
+        // The exposure-end notification clears it: recorded once with its value.
+        observe_d1a4(Some(0x0400_0000), 1_380, &mut running, &mut timing);
+        assert_eq!(timing.early_end_observed_ms, Some(1_380));
+        assert_eq!(timing.early_end_value, Some(0x0400_0000));
+        // A later value never replaces the first observation.
+        observe_d1a4(Some(0x0000_0000), 4_100, &mut running, &mut timing);
+        assert_eq!(timing.early_end_observed_ms, Some(1_380));
+        assert_eq!(timing.early_end_value, Some(0x0400_0000));
+        // A cleared bit without ever seeing it set is never an observation, and a
+        // failed read changes nothing.
+        let mut fresh = CardCaptureTiming::default();
+        let mut unseen = false;
+        observe_d1a4(Some(0x0400_0000), 900, &mut unseen, &mut fresh);
+        observe_d1a4(None, 950, &mut unseen, &mut fresh);
+        assert_eq!(fresh.early_end_observed_ms, None);
+        assert_eq!(fresh.early_end_value, None);
+    }
+
+    #[test]
+    fn l1_event_is_opt_in_once_correlated_and_does_not_change_the_receipt() {
+        use super::super::tests::CardAcceptanceSwitch;
+        let mut outcomes = Vec::new();
+        let mut traces = Vec::new();
+        for (release, diagnostic) in [(false, false), (false, true), (true, false)] {
+            let _switch = CardAcceptanceSwitch::new(release, diagnostic);
+            let (mut camera, probe, context) = card_camera(false);
+            probe.set_card_object(HANDLE, card_object(PRIMARY.0, 26_673_241, "DSC_0001.NEF"));
+            probe.queue_card_capture(vec![
+                vec![(PROPERTY_CHANGED, LV_PROHIBIT as u32)],
+                vec![(PROPERTY_CHANGED, LV_PROHIBIT as u32)],
+                vec![(PROPERTY_CHANGED, LV_PROHIBIT as u32)],
+                vec![(OBJECT_ADDED, HANDLE)],
+                vec![(CAPTURE_COMPLETE_CARD, 0)],
+            ], vec![0x8000, 0x0400_0000]);
+            let mark = probe.requests().len();
+            let (tx, rx) = mpsc::channel();
+            outcomes.push(capture_to_card(&mut camera, &plan(vec![PRIMARY], false),
+                OP, &Some(tx), &context).unwrap());
+            let events: Vec<_> = rx.try_iter().collect();
+            let early: Vec<_> = events.iter().filter(|event|
+                matches!(event, CameraCaptureEvent::EarlyExposureEnded { .. })).collect();
+            assert_eq!(early.len(), usize::from(release));
+            if release {
+                assert!(matches!(early[0], CameraCaptureEvent::EarlyExposureEnded { session_id, operation_id, .. }
+                    if session_id == SESSION && operation_id == OP));
+                assert_eq!(serde_json::to_value(early[0]).unwrap()["type"], "early_exposure_ended");
+                assert!(matches!(events[0], CameraCaptureEvent::EarlyExposureEnded { .. }));
+            }
+            assert_eq!(events.iter().filter(|event|
+                matches!(event, CameraCaptureEvent::ExposureEnded { .. })).count(), 1);
+            assert_eq!(events.iter().filter(|event|
+                matches!(event, CameraCaptureEvent::ObjectAdded { .. })).count(), 1);
+            let timing = camera.health.last_card_capture_timing.as_ref().unwrap();
+            assert_eq!(timing.early_end_observed_ms.is_some(), release || diagnostic);
+            let requests = &probe.requests()[mark..];
+            let raw_reads = requests.iter().filter(|(code, params)|
+                *code == GET_PROPERTY && params == &[LV_PROHIBIT as u32]).count();
+            assert_eq!(raw_reads, if release || diagnostic { 2 } else { 0 });
+            traces.push(requests.iter().filter(|(code, params)|
+                !(*code == GET_PROPERTY && params == &[LV_PROHIBIT as u32])).cloned().collect::<Vec<_>>());
+            assert_eq!(trigger_count(&probe), 1);
+            assert!(NEVER_READ.iter().all(|code| probe.operation_count(*code) == 0));
+        }
+        assert!(outcomes.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(traces.windows(2).all(|pair| pair[0] == pair[1]));
+
+        // A cleared value without the same operation's running bit proves nothing.
+        let _switch = CardAcceptanceSwitch::new(true, false);
+        let (mut camera, probe, context) = card_camera(false);
+        probe.set_card_object(HANDLE, card_object(PRIMARY.0, 26_673_241, "DSC_0001.NEF"));
+        probe.queue_card_capture(vec![vec![(PROPERTY_CHANGED, LV_PROHIBIT as u32)],
+            vec![(OBJECT_ADDED, HANDLE), (CAPTURE_COMPLETE_CARD, 0)]], vec![0x0400_0000]);
+        let (tx, rx) = mpsc::channel();
+        capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &Some(tx), &context).unwrap();
+        assert!(rx.try_iter().all(|event| !matches!(event, CameraCaptureEvent::EarlyExposureEnded { .. })));
+    }
+
+    #[test]
+    fn card_display_notifications_defer_reads_and_never_prove_completion() {
+        let (mut camera, probe, context) = card_camera(false);
+        let original = card_profile_readback(&camera.health).unwrap();
+        probe.set_capture_value_change(LV_PROHIBIT, CameraValue::Integer(1 << 16));
+        probe.set_card_object(HANDLE, card_object(PRIMARY.0, 26_673_241, "DSC_0001.NEF"));
+        probe.set_capture_events(vec![
+            vec![NikonEvent { code: PROPERTY_CHANGED, parameter: LV_PROHIBIT as u32 }],
+            vec![NikonEvent { code: PROPERTY_CHANGED, parameter: CONTINUOUS_SHOOTING_COUNT as u32 }],
+            vec![NikonEvent { code: PROPERTY_CHANGED, parameter: EXPOSURE_REMAINING as u32 }],
+            vec![object_added(HANDLE)], vec![completed()],
+        ]);
+        let outcome = capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &None, &context).unwrap();
+        assert!(outcome.exposure_ended);
+        assert_eq!(card_profile_readback(&camera.health).unwrap(), original);
+        assert!(probe.calls().iter().all(|code| !NEVER_READ.contains(code)));
+        for key in ["liveViewProhibitCondition", "continuousShootingCount", "exposureRemaining"] {
+            let diagnostic = &camera.health.runtime_properties[key];
+            assert!(!diagnostic.confirmed && diagnostic.actual.is_none(), "stale display value: {key}");
+        }
+        // Explicit refresh remains available and reads the real changed value.
+        camera.read_properties(&context).unwrap();
+        let refreshed = &camera.health.runtime_properties["liveViewProhibitCondition"];
+        assert!(refreshed.confirmed);
+        assert_eq!(refreshed.actual, Some(CameraValue::Integer(1 << 16)));
+
+        let (mut camera, probe, _) = card_camera(false);
+        let context = self::context(60);
+        probe.set_capture_events(vec![vec![NikonEvent { code: PROPERTY_CHANGED, parameter: LV_PROHIBIT as u32 }]]);
+        let (tx, rx) = mpsc::channel();
+        assert!(capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &Some(tx), &context).is_err());
+        assert!(camera.capture_pending);
+        assert!(!rx.try_iter().any(|event| matches!(event, CameraCaptureEvent::ExposureEnded { .. })));
+    }
+
+    #[test]
+    fn card_runtime_notification_cannot_hide_frozen_parameter_drift() {
+        for (code, value) in [(0x500f, 400), (RECORDING_MEDIA, 1), (BURST_NUMBER, 2)] {
+            let (mut camera, probe, context) = card_camera(false);
+            probe.set_capture_value_change(code, CameraValue::Integer(value));
+            probe.set_card_object(HANDLE, card_object(PRIMARY.0, 26_673_241, "DSC_0001.NEF"));
+            probe.set_capture_events(vec![
+                vec![NikonEvent { code: PROPERTY_CHANGED, parameter: LV_PROHIBIT as u32 }],
+                vec![object_added(HANDLE), completed()],
+            ]);
+            let (tx, rx) = mpsc::channel();
+            assert!(capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &Some(tx), &context).is_err());
+            // Preserve physical termination, but never return a receipt for silent drift.
+            assert!(!camera.capture_pending);
+            assert_eq!(rx.try_iter().filter(|event| matches!(event, CameraCaptureEvent::ExposureEnded { .. })).count(), 1);
+            assert!(camera.health.last_capture_event_diagnostic.as_ref().unwrap().response.error.is_some());
+        }
+    }
+
+    #[test]
+    fn normal_card_notifications_do_not_repeat_photographic_sweeps() {
+        let (mut camera, probe, context) = card_camera(false);
+        let frozen = card_profile_readback(&camera.health).unwrap();
+        let read_mark = probe.requests().len();
+        let call_mark = probe.calls().len();
+        let codes = [LV_PROHIBIT, EXPOSURE_REMAINING, CONTINUOUS_SHOOTING_COUNT,
+            LV_PROHIBIT, CONTINUOUS_SHOOTING_COUNT, CONTINUOUS_SHOOTING_COUNT];
+        probe.set_card_object(HANDLE, card_object(PRIMARY.0, 26_673_241, "DSC_0001.NEF"));
+        let mut batches: Vec<_> = codes.iter().map(|code| vec![NikonEvent {
+            code: PROPERTY_CHANGED, parameter: *code as u32,
+        }]).collect();
+        batches.push(vec![object_added(HANDLE), completed()]);
+        probe.set_capture_events(batches);
+        capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &None, &context).unwrap();
+        let reads = probe.requests();
+        let reads = &reads[read_mark..];
+        for key in frozen.keys() {
+            let code = camera.health.properties[key].code as u32;
+            assert_eq!(reads.iter().filter(|(op, params)| *op == GET_PROPERTY_DESC && params == &[code]).count(), 0, "descriptor sweep: {key}");
+            assert_eq!(reads.iter().filter(|(op, params)| *op == GET_PROPERTY && params == &[code]).count(), 2, "value sweep: {key}");
+        }
+        for code in codes {
+            assert!(!reads.iter().any(|(op, params)| matches!(*op, GET_PROPERTY_DESC | GET_PROPERTY)
+                && params == &[code as u32]), "display notification launched I/O: 0x{code:04X}");
+        }
+        let timing = camera.health.last_card_capture_timing.as_ref().unwrap();
+        assert!(timing.completed && timing.exposure_ended_observed_ms.is_some());
+        assert_eq!(timing.session_id.as_deref(), Some(SESSION));
+        assert_eq!(timing.operation_id, OP);
+        assert_eq!(timing.usb_commands as usize, probe.calls().len() - call_mark);
+        assert!(timing.usb_commands < 100, "{timing:?}");
+        assert_eq!(timing.descriptor_reads, 2, "only D1B2 boundary descriptions: {timing:?}");
+        assert!(probe.calls().iter().all(|code| !NEVER_READ.contains(code)));
+    }
+
+    #[test]
+    fn deferred_display_notifications_still_require_native_qualification() {
+        for code in [LV_PROHIBIT, CONTINUOUS_SHOOTING_COUNT, EXPOSURE_REMAINING] {
+            let key = RUNTIME_DIAGNOSTICS.iter().find(|row| row.2 == code).unwrap().0;
+            for invalid in ["unadvertised", "missing", "writable", "nonscalar"] {
+                let (mut camera, probe, context) = card_camera(false);
+                match invalid {
+                    "unadvertised" => camera.info.as_mut().unwrap().properties.retain(|value| *value != code),
+                    "missing" => { camera.health.runtime_properties.remove(key); },
+                    "writable" => camera.health.runtime_properties.get_mut(key).unwrap().property.native_writable = true,
+                    "nonscalar" => camera.health.runtime_properties.get_mut(key).unwrap().property.data_type = 9,
+                    _ => unreachable!(),
+                }
+                probe.set_capture_events(vec![vec![NikonEvent { code: PROPERTY_CHANGED, parameter: code as u32 }]]);
+                let (tx, rx) = mpsc::channel();
+                assert!(capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &Some(tx), &context).is_err(), "{key}: {invalid}");
+                assert!(camera.capture_pending);
+                assert!(rx.try_iter().all(|event| !matches!(event, CameraCaptureEvent::ExposureEnded { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn admission_notification_keeps_fresh_destination_check() {
+        let (mut camera, probe, context) = card_camera(false);
+        probe.set_capture_value_change(RECORDING_MEDIA, CameraValue::Integer(1));
+        probe.set_capture_events(vec![vec![NikonEvent { code: PROPERTY_CHANGED, parameter: INFO_DISPLAY_ERROR_STATUS as u32 }]]);
+        let error = capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &None, &context).unwrap_err();
+        assert!(error.to_string().contains("recording media"), "{error}");
+        assert!(camera.capture_pending);
+    }
+
+    #[test]
+    fn late_display_notifications_are_retained_without_delaying_the_boundary() {
+        let (mut camera, probe, context) = card_camera(false);
+        let read_mark = probe.requests().len();
+        probe.set_card_object(HANDLE, card_object(PRIMARY.0, 26_673_241, "DSC_0001.NEF"));
+        probe.set_capture_events(vec![vec![object_added(HANDLE), completed()],
+            vec![NikonEvent { code: PROPERTY_CHANGED, parameter: CONTINUOUS_SHOOTING_COUNT as u32 }]]);
+        let outcome = capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &None, &context).unwrap();
+        assert_eq!(outcome.receipt.handle, HANDLE);
+        assert!(camera.health.last_capture_event_diagnostic.as_ref().unwrap().event_batches.iter()
+            .flat_map(|batch| &batch.response.events).any(|event| event.parameter == CONTINUOUS_SHOOTING_COUNT as u32));
+        assert!(probe.requests()[read_mark..].iter().all(|(op, params)| !matches!(*op, GET_PROPERTY | GET_PROPERTY_DESC)
+            || params != &[CONTINUOUS_SHOOTING_COUNT as u32]));
+    }
+
+    #[test]
+    fn fresh_frozen_value_failure_or_drift_before_capture_never_triggers() {
+        for fail_read in [false, true] {
+            let (mut camera, probe, context) = card_camera(false);
+            if fail_read { probe.fail_transport_operation(GET_PROPERTY); }
+            else { probe.set_actual("iso", CameraValue::Integer(400)); }
+            assert!(capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &None, &context).is_err());
+            assert_eq!(trigger_count(&probe), 0);
+            assert!(!camera.capture_pending);
+            let timing = camera.health.last_card_capture_timing.as_ref().unwrap();
+            assert!(!timing.completed && timing.exposure_ended_observed_ms.is_none());
+        }
+    }
+
+    #[test]
+    fn photographic_or_device_info_change_and_live_view_on_still_refuse_receipt() {
+        for event in [NikonEvent { code: PROPERTY_CHANGED, parameter: 0x500f },
+            NikonEvent { code: DEVICE_INFO_CHANGED, parameter: 0 }] {
+            let (mut camera, probe, context) = card_camera(false);
+            probe.set_capture_events(vec![vec![event]]);
+            assert!(capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &None, &context).is_err());
+            assert!(camera.capture_pending);
+        }
+        let (mut camera, probe, context) = card_camera(false);
+        probe.set_capture_value_change(LV_STATUS, CameraValue::Integer(1));
+        probe.set_card_object(HANDLE, card_object(PRIMARY.0, 26_673_241, "DSC_0001.NEF"));
+        probe.set_capture_events(vec![vec![object_added(HANDLE), completed()]]);
+        assert!(capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP, &None, &context).unwrap_err().to_string().contains("Live View OFF"));
+        assert!(!camera.capture_pending);
+    }
+
+    #[test]
     fn single_card_exposure_confirms_one_object_and_transfers_no_image_bytes() {
         let (mut camera, probe, context) = card_camera(false);
         probe.set_card_object(HANDLE, card_object(PRIMARY.0, 26_673_241, "DSC_0001.NEF"));
@@ -912,7 +1321,7 @@ mod tests {
         // did, and the outcome carries no local image evidence at all.
         assert!(!camera.capture_pending);
         assert!(camera.pending_capture.is_none());
-        // Exactly one standard still capture with parameter `0xFFFFFFFF`, never the
+        // Exactly one standard still capture with StorageID/Format [0, 0], never the
         // private SDRAM trigger: the reference library's card path sends
         // `InitiateCapture 0x100E` (`CameraControl.Devices/BaseMTPCamera.cs:82`,
         // used at `Nikon/NikonBase.cs:1872`) and its host/SDRAM path is the one that
@@ -935,7 +1344,7 @@ mod tests {
             .filter(|(code, _)| *code == INITIATE_CAPTURE)
             .collect();
         assert_eq!(trigger.len(), 1);
-        assert_eq!(trigger[0].1, vec![0xffffffff]);
+        assert_eq!(trigger[0].1, vec![0, 0]);
         // Zero image payload: the only reads after the trigger are the event
         // queue, the property readback and one bounded metadata dataset for the
         // associated handle.
@@ -1285,6 +1694,27 @@ mod tests {
         assert!(matches!(error, CameraError::Unsupported(_)), "{error}");
         assert!(error.to_string().contains("card capture"));
         assert_eq!(trigger_count(&probe), 0);
+    }
+
+    #[test]
+    fn invalid_storage_rejection_has_no_pending_exposure_but_uncertain_failures_still_do() {
+        for (code, pending) in [(0x2008, false), (0x2002, true)] {
+            let (mut camera, probe, context) = card_camera(false);
+            probe.set_initiate_capture_response(code);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let error = capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP,
+                &Some(sender), &context).unwrap_err();
+            assert!(error.to_string().contains(&format!("0x{code:04x}")), "{error}");
+            assert_eq!(camera.capture_pending, pending);
+            assert_eq!(camera.pending_capture.is_some(), pending);
+            assert!(receiver.try_recv().is_err()); // Never fabricate ExposureEnded.
+            assert_eq!(trigger_count(&probe), 1); // Never replay the trigger.
+        }
+        let (mut camera, probe, context) = card_camera(false);
+        probe.fail_transport_operation(INITIATE_CAPTURE);
+        assert!(capture_to_card(&mut camera, &plan(vec![PRIMARY], false), OP,
+            &None, &context).is_err());
+        assert!(camera.capture_pending && camera.pending_capture.is_some());
     }
 
     #[test]

@@ -1,225 +1,35 @@
-# 存卡迁移实机台架记录（2026-10-11，仅转台与相机）
+# D7100 原生事件与转台台架关键证据（2026-10-11）
 
-本记录只覆盖用户本次明确授权的实机动作：转台连接与身份读取、D7100 发现与显式选择、
-控制器固件 2.2.0 烧录与读回校验、以及烧录后经生产引擎复核卡策略门禁。**未出束、未运动、
-未拍摄**；射线源本次未连接、未上电，因此 P5/P6 与存卡扫描端到端保持 BLOCKED。
-`hardwareCertified` 保持 `false`。
+历史实测摘要。保留第 7/9/10 节编号，供源码与回归用例追溯事件判据；过期任务清单、当时设备状态和后续授权请求已移除。当前存卡、自动导入及精确清卡见 [ADR 0004](../decisions/0004-camera-sd-card-acquisition.md)。
 
-## 1 设备与端口核对
+本轮为指定 D7100 与 Nano 的相机/转台台架，未连接射线；不证明负载侧角度准确性或整机辐射成像。原始完整记录另保存在 [历史摘要](history.md) 所列保护快照中。
 
-| 项目 | 实测 |
-| --- | --- |
-| 转台控制器 | `USB-SERIAL CH340 (COM7)`，`USB\VID_1A86&PID_7523\7&3A944CE5&0&2` |
-| 相机 | `D7100`，`USB\VID_04B0&PID_0430\8322769` |
-| 引擎 | 生产模式 `ct-engine.exe`（无 `--preview`），SHA-256 记于各运行目录 `engine.sha256` |
-| 驱动方式 | `.cache/tools/drive-engine.ps1`：JSONL v2 信封，逐条请求/逐条响应，证据可回放 |
+## 7 主机 RAM 早期失败与未关联事件
 
-JSONL v2 信封字段为 snake_case（`engine_session_id`/`protocol_version`/`request_id`/`error_code`），
-且除 `snapshot` 外每个请求的 `payload` 必须自带 `"type": "<command>"`，否则引擎在任何设备动作前
-返回 `COMMAND_PAYLOAD_MISMATCH`。证据：`.cache/tests/hardware/20261011-p2-readonly-{a,b}`。
+早期捕获错误地等待完成/曝光结束事件，截止时未取得 NEF，操作为 cleanup_unconfirmed，相机会话隔离，退出码 1。诊断收到 0x4006 PropertyChanged、参数 0xD1B4；该属性通知不构成曝光结束或图像提交证据，不能据其计时推定拍摄成功。
 
-## 2 烧录前基线（只读）
+另一次被中断操作留下 0xC101、参数 0x0B000001，后续连接空闲时出现并按未关联对象退役会话。即使后续引入可选完成排空窗口，该对象事件也不能获得捕获信用。0x90C7 是 GetEvent 轮询操作，不能称为拍摄操作码。
 
-- 转台身份：`RTS9060_NANO` v2.1.1 / build 20261009 / 协议 2，能力仅
-  `HEARTBEAT_ACK, XRAY_WARNING, RESTORE_REFERENCE` —— **未公布 `MOVE_SETTLE_150MS`**；
-  状态 `LOCKED`、`homed=false`、`referenceValid=false`、`positionPulses=-95733`、
-  `pulsesPerRev=96000`、`microsteps=8`。证据：`.cache/tests/hardware/20261011-p2-readonly-c`。
-- 相机发现：1 台，`D7100`，后端 `windows_wpd_unverified`，设备 ID
-  `\\?\usb#vid_04b0&pid_0430#8322769#{6ac27878-a6fa-4155-ba85-f98f491d4f33}`。
-  证据：`.cache/tests/hardware/20261011-p2-readonly-d`。
-- 显式选择后身份与能力：后端 `windows_wpd_nikon_d7100`、厂商 `Nikon Corporation`、
-  序列号 `83227690000000000000000000000000`；协商能力 `hostCapture`/`scanNef`/`liveView`/
-  `properties`/`cardCapture`/`cardOverflow` = true，`autofocus`/`focusStep` = false；
-  实测属性读回可用（`recordingMedia` 确认值 0 = 机身存储卡，电量 100%，`exposureMinMs` 0.125 /
-  `exposureMaxMs` 30000）；会话干净关闭（引擎报告 `camera cleanup=true`、`STOP confirmed=true`，
-  退出码 0）。证据：`.cache/tests/hardware/20261011-p2-readonly-e`。
-- 由此得到的关键结论：**已刷固件 2.1.1 不满足 `card_capture_policy` 的固定候选**（2.2.0 /
-  20261010 + `MOVE_SETTLE_150MS`），在该状态下任何卡目标预检都会被 `CARD_FIRMWARE_UNVERIFIED`
-  拒绝——这是 fail-closed 的正确行为，但卡路径无法在旧镜像上被演练。
+这是当时的 FAIL；后续判据修复与复测见下文，不代表当前 RAM 路径不可用，也不是重拍或清理相机缓冲的授权。
 
-## 3 实机发现并修复的问题：已发布就绪度与目的不一致
+## 8 HOME 与规定方向运动
 
-`cameraScanReadiness` 原先无条件按主机 RAM 目的计算。真实机身在确认存卡（`recordingMedia=0`）时，
-界面因此报告"未就绪 · 要求 Host RAM (1)"并提示操作员把机身切回 RAM，而预检实际冻结的是
-schema-7 卡 profile；控制器固件门禁也只在预检被拒后才可见。
+明确授权后，HOME 用时 4796 ms；1° 两次为 1844/1868 ms，2° 为 2407 ms，5° 为 4001 ms。生产方向、参考建立、匹配 CAPTURE_HOLD 及释放均取得控制器证据。
 
-修复（`399aa55`）：就绪度改为跟随**相机自己确认的目的**，卡目的时公布 `cardSettleFirmware`
-门禁，并与预检共用同一份控制器准入函数（`card_capture_policy_for`），两者不会再分歧；
-主机 RAM 目的的报告保持不变。回归测试
-`device_controls::tests::published_readiness_describes_the_destination_the_camera_confirmed`。
+这些总耗时包含串口与引擎往返，不能分离证明“末脉冲下降沿后精确等待 150 ms”，也不证明负载侧实际角度。原始记录：.cache/tests/hardware/20261011-home-settle/。
 
-## 4 固件烧录（本次授权动作）
+## 9 RAM 对象提交成功与迟到 C102
 
-| 步骤 | 命令与结果 |
-| --- | --- |
-| 构建候选 | `npm.cmd run firmware:build` → PASS `flash=14196 / 30720`、`RAM=1476 / 2048`；源身份 34818 字节 / SHA-256 `2843f57e…`（与 `build-config.json` 固定候选一致）；产物 `.hex` 39949 字节 / SHA-256 `542c9f30…`，`.bin` 14196 字节 / SHA-256 `79e54f1b…` |
-| 读回旧镜像（回滚备份） | `avrdude -p atmega328p -c arduino -P COM7 -b 57600 -U flash:r:…:i` → 32768 字节，非 0xFF 数据 15839 字节，SHA-256 `d283c9de…`（存于 `.cache/tests/hardware/20261011-firmware-flash/before-flash.hex`，未纳入版本控制） |
-| 写入并校验 | `-U flash:w:…rts9060_nano.hex:i -U flash:v:…:i` → `Writing 14196 bytes`、`14196 bytes of flash verified`（两次校验均通过），退出码 0 |
-| 生产引擎复核 | 重新连接后 `turntable_identity`：`RTS9060_NANO` **v2.2.0 / build 20261010**，能力含 **`MOVE_SETTLE_150MS`**；相机确认存卡时 `cameraScanReadiness = {issues: [], ready: true}` |
+按与当前操作关联的 C101 接受图像可用、读取对象并校验落盘后，得到真实 NEF：27,308,012 字节，SHA-256 c33242ab34a9d3c8e314c48f77e15ac37c6569854965c24d89c80cda5f724bc8。操作 completed / confirmed；文件提交前 captureCompleteCount=0、exposureEndedObserved=false，清理确认后退出 0。
 
-最后一行是本迁移目前最强的实机证据：控制器固件门禁与卡目的就绪度**经生产代码路径**同时通过
-（`NanoIdentity::advertises_move_settle_150ms()` + `card_capture_policy` + 目的感知就绪度）。
-证据：`.cache/tests/hardware/20261011-firmware-flash/`。
+文件登记后实际又到达 0xC102、参数 0，旧空闲守卫以 unassociated capture or device event while idle 退役会话。因而只能说该事件在提交前可缺失或迟到，不能说真实机身“从不发送 C102”。完整文件成功与后续会话可用性是两个验收项。
 
-## 5 状态
+原始记录：.cache/tests/hardware/20261011-capture-retest/。该次测试后切回存卡并读回确认的证据在 .cache/tests/hardware/20261011-restore-card-mode/；不作为现在机身状态。
 
-| 项 | 状态 | 说明 |
-| --- | --- | --- |
-| 转台连接/身份/状态读回 | **PASS（实机）** | COM7、2.2.0 身份与能力读回 |
-| D7100 发现与显式选择、能力协商、属性读回 | **PASS（实机）** | 含 `cardCapture`/`cardOverflow` 协商 |
-| 固件候选构建、烧录与读回校验 | **PASS（实机）** | 14196 字节写入并两次校验通过，回滚镜像已留 |
-| 卡策略固件门禁 + 目的感知就绪度 | **PASS（实机）** | 经生产引擎复核 |
-| 150 ms 末脉冲下降沿实测间隔 | **部分 PASS（实机）** | HOME 后 1°/1°/2°/5° 相对运动全部完成并到达 CAPTURE_HOLD→IDLE；实测脉冲速率 ≈2.01 ms/脉冲（≈497 脉冲/秒），零脉冲截距 ≈1319 ms（协议与稳定等待的上界）。**150 ms 本身仍无法与协议开销分离**，见第 8 节 |
-| 单卡/Overflow 触发、结束与续存、Stop/心跳、图像质量 | **BLOCKED** | 需授权拍摄与运动 |
-| 主机 RAM 单张真实拍摄 | **PASS（实机）** | 完成判据改为关联 `0xC101` 后：写入并登记 27,308,012 字节 NEF（sha256 `c33242ab…`）；随后迟到的 `0xC102` 造成的会话隔离已由提交后排空窗口修复，并实机复测"连拍两张不重连"通过。见第 9、10 节 |
-| 存卡扫描端到端、1000 秒截止、温度/OFF/联锁、采集至重构全链、RAM/SD 对照提速 | **BLOCKED** | 射线源本次未连接、未上电 |
+## 10 有界迟到完成吸收与连续两张复测
 
-**未验证即不得声称**：真实 `InitiateCapture`/`ObjectAdded`/`CaptureComplete`/`StoreFull` 语义、
-真实卡对象内容与 WPD 传输边界、150 ms 实测间隔、整机联动与提速。`hardwareCertified` 保持
-`false`；本记录仅为**授权台架检查**，不构成硬件认证。
+提交后增加 5 秒排空窗口，只接受同一已提交操作、同一会话的一次可选 C102。仅写诊断，不产生 ExposureEnded、提交信用、传输或新拍摄；窗口外、重复完成及任何未关联 C101 继续失效安全拒绝。
 
-**回滚**：如需回到烧录前镜像，用 `before-flash.hex` 以同一 avrdude 参数执行
-`-U flash:w:<backup>:i`；该文件是本机唯一证据，删除前须确认已被长期保留。
+实际连续两张、中间不重连，操作用时 10,164/10,117 ms；文件分别为 21,948,627/21,554,548 字节。会话 connected=true、isolated=false、cleanupConfirmed=true，lateCompletionAbsorbedCount=1，随后明确切回存卡并读回，退出 0。
 
-## 6 转台运动与 150 ms 时序实测（已授权，被引擎拒绝）
-
-授权后以 `turntable_relative` 请求 1°/1°/2°/5° 四次小角度运动。四次请求都被**引擎自身的安全
-判据拒绝**（操作 `stage=failed`，日志 `safety error: motion requires confirmed IDLE, HOME and
-valid reference`），每次拒绝后引擎按既定策略补发 `stop`。`plan_relative` 在任何串口 MOVE 之前
-就返回错误，因此**没有任何机械动作**发生。证据：`.cache/tests/hardware/20261011-motion-settle/`
-（含请求/响应 JSONL、拒绝日志，以及随后只读复核的状态）。
-
-原因与结论：烧录前那次只读连接看到的 `homed=false`/`referenceValid=false`/`state=LOCKED` 仍然
-成立，而生产运动入口要求已确认 IDLE + HOME + 有效参考。因此：
-
-- **150 ms 末脉冲下降沿实测间隔仍为 BLOCKED**：必须先执行 HOME（台架模式需操作员确认射线物理
-  隔离；本次射线未连接）才能做任何运动，HOME 是另一次需要单独授权的机械动作。
-- 该拒绝本身是**正确的 fail-closed 行为**（不是缺陷）：引擎在没有可信参考时拒绝相对运动。
-- 另需注意：拒绝后的 `stop` 使控制器回到 `LOCKED` 且脉冲计数归零（`positionPulses=0`，
-  原先为 -95733）。这不代表发生了运动，但说明该计数在无有效参考时不可作为位置证据。
-
-## 7 单张真实拍摄（主机 RAM，不出束）：实机 FAIL，已定位
-
-授权后做了两次尝试。第一次因驱动在操作仍在运行时关闭 stdin 而被中止（相机实际已完成一次曝光，
-但引擎未能接收其事件）；第二次在**等操作排空后**再关闭 stdin，得到了完整证据链。
-
-| 观测 | 值 |
-| --- | --- |
-| `camera_apply_properties {recordingMedia:1}` | 接受，属性读回确认 |
-| `camera_capture` 操作终态 | `cleanup_unconfirmed`，`error = camera timeout: camera owner deadline; COM session isolated; cleanup unconfirmed` |
-| 事件诊断 `lastCaptureEventDiagnostic` | `operationCode=37063 (0x90C7 = **GetEvent 事件轮询**，不是拍摄操作码；拍摄操作码需另行取证)`、`responseCode=8193 (0x2001 OK)`、`eventCount=1`、`captureCompleteCount=0`、`exposureEndedObserved=false` |
-| 收到的事件 | `code=16390 (0x4006 PropertyChanged)`、`parameter=53684 (0xD1B4 连拍计数)` —— **机身确实完成了一次曝光** |
-| 输出文件 | `CameraCaptures/` 为空，**没有 NEF** |
-| 会话结果 | `isolated=true`、`cleanupConfirmed=false`，引擎按 fail-closed 隔离会话并以退出码 1 结束（`EOF safety cleanup unconfirmed`） |
-
-第一次尝试留下的孤立事件（后续连接时被判定为故障）为
-`camera safety check failed: unassociated capture or device event while idle: code=0xC101,
-parameter=0x0B000001; session retired`。
-
-**结论（必须写入交付说明）**：真实 D7100 在主机 RAM 拍摄路径上，本引擎等待的曝光结束/完成事件
-在截止时间内**没有到达**（`exposureEndedObserved=false`、`captureCompleteCount=0`），而机身以
-`0x4006 PropertyChanged(0xD1B4)` 表示已曝光、并（在第一次尝试中）以 **`0xC101`** 一类 RAM 对象
-事件表示结果——与脚本化模型假设的 `0x400D`/曝光结束语义不一致。引擎的处置是正确的
-（超时即隔离、清理未确认即失败退出），但**主机 RAM 单拍在本机身上尚不可用**；这属于
-**实机 FAIL**，不是离线可发现的问题。下一步需要事件级跟踪与（或）完成判据修正，属于新的实现批次。
-
-**当前设备状态（需人工处置）**：相机会话处于隔离状态，机身 SDRAM 中可能残留一张未取回的图像。
-在再次尝试前建议**断电重启相机**（或另行授权清理该 RAM 缓冲对象）；转台停在 `LOCKED`、
-`positionPulses=0`、`homed=false`、`referenceValid=false`，未发生任何运动。
-
-## 8 HOME 与转台运动实测（授权后完成）
-
-授权 HOME 后执行：`turntable_connect` → `turntable_bench_mode {enabled:true,
-physicallyIsolated:true}` → **`turntable_home`** → 1°/1°/2°/5° 相对运动。注意 `home`（恢复变体）
-会以 `PREFLIGHT_REQUIRED` 拒绝，台架独立 HOME 必须用 `turntable_home`。
-
-| 操作 | 实测时长 | 结果 |
-| --- | --- | --- |
-| `turntable_home` | **4796 ms** | `stage=confirmed`；完成后 `homed=true`、`referenceValid=true`、`hallActive=true`、`rearmed=true`、`state=IDLE`、`positionPulses=targetPulses=-2400` |
-| `turntable_relative` 1°（267 脉冲） | 1844 ms / 1868 ms | 完成；`verify_plan_capture_hold` 与 `verify_plan_released` 均通过 |
-| `turntable_relative` 2°（533 脉冲） | 2407 ms | 同上 |
-| `turntable_relative` 5°（1333 脉冲） | 4001 ms | 同上 |
-
-由 267/533/1333 脉冲三点拟合：**≈2.01 ms/脉冲（≈497 脉冲/秒）**，零脉冲截距 **≈1319 ms**。
-该截距包含 MOVE 受理、固件 150 ms 稳定等待、`READY_TO_CAPTURE`、`CAPTURE_DONE`、引擎侧多次
-`STATUS` 往返与调度——**150 ms 稳定时间落在其中但无法用本协议分离**：固件只在
-`READY_TO_CAPTURE <id> POS=<pos>` 里回报结果，不回报末脉冲下降沿或稳定耗时，而引擎在运动期间
-被 worker 占用，外部也无法在 SETTLING 窗口内采样。
-
-因此本项的**实机结论**是：HOME、参考建立、生产方向相对运动、CAPTURE_HOLD 握手与释放全部在真实
-控制器上成立（这已经排除了"运动完成判据只靠 ACK"的风险）；而"末脉冲下降沿 → 150 ms → READY"
-的**严格隔离测量仍为 BLOCKED**，需要固件侧诊断字段或串口级跟踪（属新的实现批次）。
-
-证据：`.cache/tests/hardware/20261011-home-settle/`（`plan-home.json`、`responses-home.jsonl`，
-含被拒的 `home` 变体与成功路径的完整请求/响应）。
-
-## 9 主机 RAM 单张拍摄复测（PASS，含一处残留问题）
-
-依据 digiCamControl 对照结论（`docs/validation/d7100-capture-semantics-digicamcontrol-2026-10-11.md`）
-把完成判据从"必须 `0xC102`"改为"**与本操作关联的 `0xC101` 即充分**"，并加 30 s 对象到达窗口
-（`dffbde1`）。相机断电重启后复测：`retry_device` → `camera_connect` → `camera_read_properties`
-→ `camera_apply_properties {recordingMedia:1}` → `camera_read_properties` → `set_capture_root`
-→ `camera_capture`。
-
-| 观测 | 值 |
-| --- | --- |
-| 操作终态 | `camera_capture: completed`，`stage=confirmed` |
-| 输出 | `CameraCaptures/7189499f…-op-6.nef`，**27,308,012 字节**，SHA-256 `c33242ab34a9d3c8e314c48f77e15ac37c6569854965c24d89c80cda5f724bc8` |
-| 引擎日志 | `[PASS] Single host NEF output saved and registered with complete file/hash evidence` |
-| 事件批次 4 | `[{0x4006,0xD1B4}, {49409 = 0xC101, 0x0B000001}, {0x4006,0xD1A4}]` |
-| 诊断 | `exposureObserved=true`、`captureCompleteCount=0`、`exposureEndedObserved=false` |
-| 引擎退出 | **0**，`camera cleanup=true`、`STOP confirmed=true` |
-
-**这证实了对照研究的推断**：真实 D7100 在 SDRAM 拍摄中**从不发送 `0xC102`/`0x400D`**，图像可用信号
-就是关联的 `0xC101`；旧判据等一个永不出现的事件，所以必然超时。修复后单张拍摄在真机上闭环。
-
-**残留问题（fail-closed 但应修）**：本次会话在拍摄成功、文件登记之后收到**迟到的 `0xC102`**
-（参数 `0x00000000`），空闲期判据把它当作"未关联的拍摄/设备事件"，于是
-`lastError = camera safety check failed: unassociated capture or device event while idle: code=0xC102,
-parameter=0x00000000; session retired`，会话被退役（`isolated=true`，`cleanupConfirmed=true`，
-进程仍正常退出）。后果是：**每次成功单拍后相机都会进入隔离态**，操作员必须再点一次重连。
-安全上仍是 fail-closed（没有错误提交、没有开束、没有丢文件），但可用性受损。
-
-**建议的后续修法（保守）**：提交成功后保留一个短的"提交后排空窗口"，在该窗口内到达的
-`0xC102`（可选完成信号）按"该操作的迟到完成证据"记录，而不是按未关联事件退役会话；窗口之外的
-事件、以及 `0xC101` 一类**对象**事件，继续保持今天的 fail-closed 处置。
-
-证据：`.cache/tests/hardware/20261011-capture-retest/`（计划、请求/响应、引擎哈希与 git rev）。
-
-**相机已恢复到存卡目的**：第 9 节的主机 RAM 复测把 `recordingMedia` 写为 1，复测后已用
-`camera_apply_properties {recordingMedia:0}` 写回并经读回确认（`actual=0`、`confirmed=true`，
-会话 `connected=true`、`isolated=false`、`lastError` 为空，引擎退出 0）。证据：
-`.cache/tests/hardware/20261011-restore-card-mode/`。
-
-**需求确认（操作员 2026-10-11 明确）**：存卡模式下拍摄完成后**不向电脑传输图像**，图像只保留在
-相机 SD 卡；本迁移的扫描路径因此不请求任何图像载荷（只发一次 `0x100E` 与一次 64 KiB 级
-`GetObjectInfo` 收据），任务以 `acquired_pending_import` 结束并保持重构关闭；只有操作员显式发起
-USB 导入时才传输、校验并封存。
-
-## 10 残留隔离问题已修复并实机复测（连拍两张不重连）
-
-修法（`154dccd`）：提交成功后开一个 **5 s 的提交后排空窗口**（编译期断言 ≥1 s 且 < 75 s owner
-截止），窗口内到达的、**属于该已提交操作**的 `0xC102` 记为迟到完成证据（新增
-`lateCompletionAbsorbedCount`/`lateCompletionParameter` 诊断字段），**只写诊断**：不置
-`exposure_ended`、不发 `ExposureEnded`、不给提交信用、不触发传输或新拍摄；窗口外的 `0xC102`、
-没有已提交操作的 `0xC102`、窗口内重复的第二个 `0xC102`，以及任何 `0xC101` 对象事件，全部保持
-原 fail-closed 退役。窗口在 cleanup 时丢弃，永不跨会话。
-
-实机复测（相机在存卡模式下开始，测试中切到 SDRAM，结束后写回存卡）：
-
-| 观测 | 值 |
-| --- | --- |
-| 连续两次 `camera_capture`（中间**不重连**） | 两次都 `stage=confirmed`、`status=completed`（10,164 ms / 10,117 ms） |
-| 输出 | `…-op-6.nef` 21,948,627 字节；`…-op-7.nef` 21,554,548 字节（两张不同尺寸的真实曝光） |
-| 会话状态 | `connected=true`、**`isolated=false`**、`cleanupConfirmed=true`、`phase=idle`、`lastError` 为空 |
-| 迟到完成吸收 | `lateCompletionAbsorbedCount=1`、`lateCompletionParameter=0` |
-| 拍摄期诊断 | `exposureObserved=true`、`captureCompleteCount=0`（真机确实不发 `0xC102`） |
-| 同会话内切回存卡 | `camera_apply_properties {recordingMedia:0}` 接受，读回 `actual=0`、`confirmed=true` |
-| 引擎退出 | 0，`camera cleanup=true`、`STOP confirmed=true` |
-
-结论：**"拍完不能接着拍"这一可用性缺陷已在真机闭环**——连续拍摄、切换存储目的都不需要重连；
-而真正的未知事件仍然 fail-closed。证据：`.cache/tests/hardware/20261011-capture-twice/`。
-
-**仍需声明**：5 s 窗口是依据参考实现秒级等待的工程选择（库本身没有拍摄截止），若某机身把
-`0xC102` 推迟到 5 s 之后，会话仍会 fail-closed 退役（可用性问题可能重现，但不会误提交）；
-`0xC102` 与 `0xC101` 的确切语义仍属实机观察，不是厂商文档保证。
+原始记录：.cache/tests/hardware/20261011-capture-twice/。该有限复测支持所列可用性修复，不认证所有机身模式、USB 故障、当前构建全工况或 CT 精度。参考语义对照见 [D7100 取证记录](d7100-capture-semantics-digicamcontrol-2026-10-11.md)。

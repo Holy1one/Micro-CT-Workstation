@@ -288,6 +288,11 @@ pub(crate) fn refresh_property_controls(health: &mut CameraHealth) {
             for option in &mut property.options{option.label=format!("原生值 {:?}（包围类型未验证）",option.value);option.enabled=false;option.reason=property.disabled_reason.clone();}
         }
     }
+    if health.capabilities.card_capture {
+        if let Err(error)=super::card_capture::card_capture_readiness(health){
+            health.capabilities.disabled_reasons.insert("cardCaptureReady".into(),error.to_string());
+        }else{health.capabilities.disabled_reasons.remove("cardCaptureReady");}
+    }else{health.capabilities.disabled_reasons.remove("cardCaptureReady");}
     if health.capabilities.host_capture {
         // One shared admission decision for both the published `captureReady`
         // reason and the domain-entry pre-enqueue gate, so the two can never
@@ -420,7 +425,9 @@ pub(crate) fn require_card_destination(health: &CameraHealth) -> Result<(), Came
             "recording media destination is not confirmed readback".into(),
         ));
     }
-    if !property.supported_values.contains(&CameraValue::Integer(0)) {
+    // D7100 can describe D10B as UINT8 range [0, 2, 1] with no enum list.
+    // Use the same descriptor admission as Apply: both forms must prove 0.
+    if !value_supported(property, &CameraValue::Integer(0)) {
         return Err(CameraError::Unsupported(
             "this body does not advertise the card destination".into(),
         ));
@@ -440,6 +447,10 @@ pub fn capture_readiness(health: &CameraHealth) -> Result<(), CameraError> {
             "Live View开启期间禁止拍摄；请先明确停止预览".into(),
         ));
     }
+    require_capture_runtime_diagnostic(health)
+}
+
+pub(crate) fn require_capture_runtime_diagnostic(health:&CameraHealth)->Result<(),CameraError>{
     let diagnostic = health
         .runtime_properties
         .get("infoDisplayErrorStatus")

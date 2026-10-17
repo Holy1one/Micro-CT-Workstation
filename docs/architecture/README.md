@@ -1,129 +1,80 @@
 # Micro-CT 软件架构
 
-本文是当前软件架构的入口。源码和测试是最终事实源；本文负责解释模块职责、调用方向和安全边界。机器可读的路径归属在 [`docs/architecture/modules.json`](../../docs/architecture/modules.json)，强依赖在 [`docs/architecture/edges.json`](../../docs/architecture/edges.json)。
+本文维护当前模块职责、调用方向和安全边界。源码、配置和测试是事实源；版本来自 package.json 与 backend 的配置，验收身份见 [验证索引](../validation/README.md)。路径归属与语义依赖分别由 [modules.json](modules.json)、[edges.json](edges.json) 检查。
 
 ## 当前生产链路
 
-```text
-React UI
-  │ EngineCommand / EngineSnapshot
-  ▼
-Tauri invoke
-  │ engine_command / engine_snapshot
-  ▼
-EngineClient
-  │ versioned JSONL over stdio
-  ▼
-ct-engine ─────────────── authoritative state and safety policy
-  ├─ scan coordinator ─── one projection transaction at a time
-  └─ devices
-      ├─ xray/Moxtek ───── single serial owner, readback and autonomous watchdog
-      ├─ camera/WPD ────── native PTP/Nikon COM owner, events and host files
-      └─ turntable/Nano ── serial owner, negative REL planner and confirmed capture hold
-```
+~~~text
+React UI → Tauri invoke → EngineClient → JSONL stdio → ct-engine
+                                                      ├─ scan coordinator
+                                                      ├─ offline reconstruction
+                                                      └─ devices
+                                                         ├─ Moxtek serial owner
+                                                         ├─ WPD/PTP camera owner
+                                                         └─ Nano serial owner
+~~~
 
-数据与控制只向下流动，完整快照只向上返回。React、Tauri、3D 场景和设备驱动都不得维护第二份生产扫描状态。`ct-engine` 是设备连接、预检、安全门控、扫描阶段和提交进度的唯一所有者。
+PC 直接控制三类设备，ct-engine 是任务、设备、安全状态和扫描事务的唯一权威；设备模块互不调用。扫描协调器编排跨设备顺序，独立 HOME 的安全裁决留在领域入口。当前不存在已实施的 Arduino 中心控制 backend。
 
 ## 模块边界
 
-- `backend/ct-engine/src/devices/xray/`：只处理 X 射线源 I/O、测量回读和 fail-closed 关束；不决定何时允许曝光。
-- `backend/ct-engine/src/devices/camera/`：处理原生 WPD/PTP 身份和能力、明确选择、参数读回、D7100 RAM NEF、关联曝光/文件事件、Live View 和支持的对焦；不得静默回退到存储卡。
-- `backend/ct-engine/src/devices/turntable/`：只处理 Nano 身份、协议、运动确认、警告输出和急停；不推进扫描进度。
-- `backend/ct-engine/src/scan.rs`：编排参考帧、操作员门控与原有投影事务；只在设备证据完整后提交图像。
-- `backend/ct-engine/src/reconstruction.rs`：读取已封存的扫描数据，离线校正并生成重构体与预览缓存；不调用设备。
-- `backend/ct-engine/src/lib.rs`：领域命令、安全门控、完整快照和 JSONL DTO。
-- `backend/ct-engine/src/software_update.rs`：维护占用、更新前设备清理及本会话/操作关联的权威报告；不持有下载、签名或安装逻辑。
-- `backend/src-tauri/`：操作系统能力与 sidecar 转发；不拥有设备或扫描状态。
-- `src/engine/`：前端契约、生产客户端和浏览器预览；预览不得访问真实硬件。
-- `src/scene/`：只读可视化；不发送领域命令。
+| 路径 | 职责 |
+|---|---|
+| backend/ct-engine/src/lib.rs、device_controls.rs | 领域命令、安全门控、完整快照与操作结果 |
+| backend/ct-engine/src/scan.rs、scan_project.rs、task_registry.rs | 采集编排、持久事务、项目核验与任务登记 |
+| backend/ct-engine/src/devices/xray/ | Moxtek I/O、设定与实测、重开间隔及失效安全关束 |
+| backend/ct-engine/src/devices/camera/ | 原生 WPD/PTP、身份与能力、参数、Live View、存卡与主机文件证据 |
+| backend/ct-engine/src/devices/turntable/ | Nano 身份、协议、位置与 capture-hold 确认、STOP |
+| backend/ct-engine/src/reconstruction*.rs | 只读已验证扫描、自动处理、科学体和版本缓存，不调用设备 |
+| backend/ct-engine/src/software_update.rs | 维护占用与关联设备清理报告 |
+| backend/src-tauri/ | OS、IPC、受控媒体读取、进程生命周期及更新传输 |
+| frontend/src/engine/、frontend/src/platform/ | UI 契约与桌面入口；生产错误不回退模拟 |
+| frontend/src/scene/ | 只读设备与重构显示，不发送领域命令 |
+| frontend/preview/ | 离线开发模拟，不接触真实设备，不生成生产证据 |
 
-## 运行流程
+## 命令与设备证据
 
-1. UI 将操作转换为 `EngineCommand`，不直接调用设备。
-2. Tauri 将命令转成带协议版本、请求 ID 和单调序号的 JSONL 请求。
-3. `ct-engine` 校验 envelope、模式、当前 phase 和安全条件。
-4. 长操作由后台 job 持代理和输入执行，主循环定时处理健康、操作结果、超时和 EOF；唯一引擎应用结果。Stop/OFF 优先，监测不依赖 UI 轮询。扫描由扫描线程按参考帧阶段和投影事务执行。操作员弹窗的确认由引擎校验，取消使本轮任务安全结束并保留断点。
-5. 每次响应返回完整 `EngineSnapshot`，UI 按引擎会话和快照序号接收新状态，分别展示受理、取消请求、清理未知与完成。
-6. IPC、设备、超时或未知状态失败时，引擎进入 fail-closed 路径并优先关束。
+命令经过版本、会话、请求 ID、序号、占用及安全校验，长操作异步执行，结果由唯一引擎提交。监测不依赖 UI 轮询；Stop/OFF/EOF 优先。UI 分别显示受理、拒绝、清理未知和完成；设定值、目标角度、未知状态不能冒充实测或安全证据。
 
-新扫描先由 `prepare_scan` 原子提交任务 ID、投影数、连续出束上限及全部实测几何，再运行预检；路径仅取相机栏的 `Parameters.savePath`，曝光仅从已确认的原生快门派生。取消准备窗口不发设备命令、不提交半套参数、不创建文件或任务锁；预检成功后不再重复填写几何。相机核心配置只由明确 Apply 写入；预检、开始和恢复鲜读比较，不自动停止 Live View、不写快门/RAM/单张数量。开始后拍十张前暗场，自动开束拍十张前空场并关束，确认装样后执行投影核心。末张投影按本次可靠 ExposureEnded 关束，完整文件/哈希与匹配 ticket 释放后提交并封存清单，不再要求取样或拍摄后参考。重构只使用前暗场和前空场。重构 worker 的真实事件携带序号和时间，以稳定 ID、`source=reconstruction` 进入聚合 `consoleLogs`，界面不再生成重复事件。完成后首次从底部 Reconstruction 区请求重构才开始计算；缓存经清单与文件哈希校验后复用。FDK 在 CPU 和兼容 GPU 中按首帧实测与至少 15% 加速门槛选路，GPU 故障全量回退 CPU；小规模扫描可用受预算限制的 CPU SIRT；CGLS 继续置灰。3D View 仅展示由底部入口打开的结果，不提供重构按钮。
+相机和转台可独立连接、自检；完整扫描须整套预检。参数只在明确 Apply 后写入并读回；预检、开始和恢复鲜读比较，不自动停止 Live View 或改写摄影参数。完整厂商适配首期为 D7100 NEF，其他型号只开放有证据的标准能力。
 
-扫描前空场只开束一次，整组连续拍摄并在最后一张文件确认后关束；整组不能在 `maxXraySec` 内安全完成时关束报故障，不逐张循环开束。厂商要求每次关束后至少 2 秒才可再次开束。正常投影跨角度连续出束，仅在出束上限、暂停、停止、故障和最终结束时关束。
+Live View 使用有界内存、随机会话 named pipe 和最新帧策略，验证 ACL、版本、序号、长度、尺寸及 JPEG，不把实时像素写入 JSONL 或临时文件。LV 期间拒绝拍摄；专用控制仅接受当前会话的已广告能力。摄影目录、属性依赖与通道限制见 [相机矩阵](native-camera-capability-matrix.md)。
 
-### 离线重构预处理与显示
+## 采集与精确清卡
 
-重构从线性 Bayer 蓝通道和暗场差分中稳健拟合完整圆形发光屏边缘，要求足够的角度支持；此路径要求近正视圆屏，不支持未经标定的倾斜屏幕。先按完整圆的外接正方形复制原分辨率 ROI，再统一重采样全部暗场、空场和投影，随后暗空场校正及 FDK/SIRT。方形留 1% 屏缘拟合余量和整数插值护边，上下半圆使用同一边界；原始 NEF 只读。`reconstruction/<method>/` 保存独立的 `detector-crops.f32le`、暗空场均值与方差、`projections.f32le`、`detector-quality.bin` 和 `preprocessing.json`，记录整数方形坐标、屏宽、带余量采样宽度、方向、噪声下限、哈希与逐投影质量计数。实测屏直径定义物理比例，采样 pitch 显式计入 1% 余量，不把较小区域放大为完整屏宽。计算盒覆盖整个屏直径在等中心的物理范围，不再缩至 90%。
+prepare_scan 原子提交任务、投影数、出束上限与实测几何；路径取唯一图片根目录，曝光取已确认原生快门。取消准备不创建任务锁或设备动作。前暗场 10 张、前空场 10 张，空场连续一次开束，关束后提示装样；跨投影连续出束，结束不拍后参考。
 
-噪声下限采用裁剪暗场样本方差并计入暗场均值不确定性，最低 1 ADU；它是删失近似，不是恢复高衰减区的真实值。作 0.7 像素归一化高斯平滑，仅在完整圆最外侧 98%–100% 半径渐隐，不再排除 94% 半径以外的一圈。有正参考增益的低增益像素仍参与重建，质量标记 5 只作警告，不按阈值整片置零；真正无参考增益和饱和像素另行标记。20% 原始无效比例门限保留，按整个圆计数，不按低增益阈值缩小分母。CPU/GPU 保存全角度覆盖诊断，但默认预览直接显示完整有符号科学体的下采样，绝不以覆盖交集隐藏下半体或其他不完整区域。低信号、低增益和部分角度覆盖区域可能有伪影，不作定量准确性保证。
+默认存卡采用 schema 4 / profile 7，扫描中零图像载荷；显式选择主机 RAM 才采用 schema 3 / profile 6。存卡早释放默认开启，每张最多一个未完成拍摄；可靠曝光结束可提前释放并预取下一位点，下一张触发仍等前张回执持久化及当前到位。末张保持确认角度，无额外整圈 MOVE 或 HOME。
 
-`reconstruction_preprocess.rs` 在源平面用共轭扇束射线估计水平轴修正：固定共同比较射线、分离拟合/验证角度、搜索不超过记录位置的 ±16 探测器像素，要求两组误差均改善超过 10%、最优点在内部且一致。不能满足则保留记录值。`calibration.json` 分开保存采集记录、候选值、实际值、误差与采用原因，不修改 manifest，不估计无证据的垂直偏移或倾角。实测暗空场仍为校正依据，不自动启用亮度漂移拟合或旧数据的背景混合增强。科学体保留有符号数值，默认预览窗下限为零。缓存版本为 5，校验预处理和校准记录哈希，旧的裁切预览缓存不复用。
+安全收尾后自动导入，再次确认 OFF，逐文件校验并封存。仅对本次回执唯一匹配且本地副本已验证的卡对象记录删除意图、精确删除并鲜读确认；其他照片保留。失败保留本地成果、剩余对象和恢复记录，全部清卡及终态登记完成后才报告完整流程完成。细节见 [存卡契约](../decisions/0004-camera-sd-card-acquisition.md)。
 
-开始重构时继续展示设备；仅在重构完成且预览数据加载校验成功后自动展示结果。Equipment／Result 是独立显示按钮，不发送重构或设备命令；Start Reconstruction 只负责启动计算。用户切回设备后，普通快照轮询不会抢回结果视图。
+## 安全、停止与恢复
 
-## 投影事务
+所有开束共用 Moxtek adapter；已确认关束后至少 2 秒才再开束。maxXraySec 是连续出束硬上限；300 秒关束间隔是项目策略。空场无法整组完成时关束报错，不自动循环。Stop、联锁、失联、超时和未知状态优先尝试关束与停止运动，未知 OFF 不报告安全完成。
 
-```text
-turntable prescribed negative MOVE_REL + unwrapped arrival/phase confirmation
-  -> XRAY_WARNING asserted
-  -> X-ray setpoints + verified beam ON
-  -> camera capture -> correlated ExposureEnded -> complete host file + SHA-256
-  -> Nano CAPTURE_DONE
-  -> manifest/progress commit
-  -> next confirmed MOVE_REL while beam remains monitored ON
-  -> verified beam OFF at time limit, pause, stop, or final exposure
-```
+首次生产扫描建立 HOME 参考；后续是否可用依当前设备证据，STOP、复位、失联或故障失效参考。恢复核验冻结参数、卡回执或本地 hash，以及连续位置证据，必要时受控 HOME；文件一致不证明跨 HOME 的物理配准。
 
-最后一张投影提交后，真实扫描保持转台在该张的确认角度；关束、警告输出关闭及最终 manifest 写入成功后报告完成。投影提交时已确认 Nano 的位置和文件；收尾不重复校验整批影像或读取最终 Nano STATUS，也不再发送整圈 `MOVE_ABS` 或 HOME 命令。
+Pause 在完整事务边界关束并保留任务。Resume 重新比较当前证据，受理不等于已恢复。操作员 Stop 完成清理和登记后结束当前采集并保留所有文件；退出、断开或自动故障保留中断任务以便恢复。清理或持久写入失败保持锁。已结束目录仍在时不可复用；仅保存根可读且任务目录明确不存在才撤销旧登记，不能把读错误或断盘当删除证据。
 
-每次应用启动后的首次生产扫描必须执行一次 HOME；同一设备会话中的后续扫描可以沿用这次 HOME 建立的参考，但每次预检和启动前均重新读取 Nano STATUS；STOP、故障、掉电、失联或无效参考不能由软件缓存绕过。应用关闭保持 STOP 失效安全动作。中断任务经过预检、必要的 HOME 和文件完整性校验后可以从下一未提交投影继续；文件哈希与参数校验不证明跨 HOME 的物理角度配准，重构精度需另行验证。
+## 内置自动重构与显示
 
-每段连续出束受 `maxXraySec` 限制；开始下一投影前和转台到位后检查剩余出束预算，若不足以完成曝光确认，先关束确认、按单调时钟累计 300 秒关束间隔，再继续尚未开始的曝光。已开始的曝光若异常拖延至硬上限仍必须关束并报告故障，不能为了完成图像越过上限。300 秒是本项目的软件策略，不是已查到的 Moxtek 厂商固定冷却规格；厂商《70kV 12W MagPro Operation Manual》要求再次开束前至少关束 2 秒，并限制机壳温度不高于 65°C。剩余时间估算使用已完成投影的有效工作耗时（排除实际冷却等待），另计尚需等待的关束间隔及预计后续间隔。移动期间持续监测出束。暂停只在完整事务边界生效。界面 Stop 请求普通结束并等待工作线程的关束读回；它不锁存软件急停。真实故障、掉线和超时必须尝试关束与停止运动，不能跳过关束确认。再次扫描必须重新预检并在启动前重读当前 Nano 证据；旧预检结果、停止后的参考和软件缓存均不能复用。硬件急停及 Nano STOP 保护继续有效。
+默认单色/多色入口使用 spectral/v3-<input-hash> 独立缓存：参考驱动、颜色无关的亮暗及色彩缺陷检测，同通道局部增益修补，暗空场平衡、带质量标记的负对数、小型缺失射线估计、归一化去噪、轴校准与锥束 FDK。真实边缘和支架受保护，插补区域记录为估计，不作为定量颜色测量。
 
-## 暂停与结束任务
+单色非材料模式另尝试 64³、八轮 PWLS-Huber 粗网格锥束修正，拟合角度与独立验证角度均改善且幅度受限才采用；不通过则保留 FDK。自动预览使用有符号 P1–P99.5 拉伸，科学体保留 float32。旧无 options 调用、旧方法缓存与 v2 保持各自数值和显示约定，不能把旧版的零下限或固定轴搜索范围当作 v3 规则。
 
-Pause 保留当前采集、冻结配置和持久任务锁，完成当前事务并确认 OFF 后进入 Paused，可直接 Resume。操作员按 Stop 则明确结束当前采集：并行请求设备清理，等待扫描线程返回、OFF/相机清理确认和任务登记原子写入，随后将未完成任务标为 abandoned，释放任务占用并清空当前任务选择；全部图像、清单和日志保留。结束后用新的任务 ID/目录重新准备、预检和必要的 HOME，不向已结束任务追加。设备清理或登记写入失败仍保留锁并报告故障。关闭应用、断开及自动故障停止保留中断任务以便受控恢复，不自动放弃。重复 Stop 不取消已经开始的 complete/abandon 终态登记写入，旧代次结果仅允许这两种未取消的登记完成回到引擎提交。
+FDK 的 CPU/GPU 路径经首帧数值对照和实测加速门槛选路，GPU 失败全量 CPU 重算。旧通用方法保留预算限制的 CPU SIRT，CGLS 没有后端并保持禁用；当前颜色入口只使用 FDK。屏幕 ROI、几何和参数来自记录及可核验参考，不改写原始 NEF 或 manifest。新算法与显示增强不证明材料身份、实际空间分辨率或 CT 定量精度。细节见 [自动重构记录](../validation/automatic-cbct-2026-10-15.md)、[叠层成像决策](../decisions/stacked-scintillator-material-imaging.md)。
 
-## 删除采集目录后的登记核对
-
-持久登记表位于 `%LOCALAPPDATA%/MicroCTWorkstation/active-task.json`，记录 unfinished 和 completed/abandoned 任务。结束记录不再永久占用一个已经删除的目录：只有保存根目录可读且任务目录的 `symlink_metadata` 明确为 NotFound 才撤销对应登记，随后可复用该 taskId。现存目录、仅缺少清单、不可读根目录、掉线盘符及失效链接都不构成删除证据。后台核对只在无采集线程、无操作占用且当前设备清理满足条件时提交；保留任务目录被删除时清除任务选择与旧预检/恢复证据，不清设备故障。当前 worker 的任务锁不受文件夹删除影响。新 Start 在取得设备准入证据后再次核对路径；已确认删除的结束记录可与新登记一起原子提交，无须等待轮询。文件冲突在新登记前拒绝；冲突竞态只撤销经磁盘核对确实尚未持久化的保留名额。
-
-## 当前与未来控制拓扑
-
-当前唯一生产实现是 PC 直接控制三类设备。未来 Arduino 中心拓扑的兼容策略见 [dual-control-topology.md](dual-control-topology.md)。未来实现可以替换设备通信拓扑，但不能搬走 `ct-engine` 的安全权威、事务提交规则或对外命令语义。
-
-## 阅读顺序
-
-1. [directory-map.md](directory-map.md)：每个目录及子目录的功能定位。
-2. [execution-flows.md](execution-flows.md)：启动、命令、扫描、停止和恢复的执行逻辑。
-3. [dual-control-topology.md](dual-control-topology.md)：PC 直控与未来 Arduino 主控的双线边界。
-4. [module-graph.md](module-graph.md)：由声明文件生成的模块依赖图。
-
-## 原生相机与自主设备
-
-当前源码通过原生 Windows WPD/PTP 控制相机；D7100 RAM NEF 是当前完整采集事务和正式扫描首期适配对象；已实现的摄影参数与操作子集不等于覆盖相机全部厂商功能。其他型号只开放有证据的标准属性。COM 对象由相机线程持有，Moxtek 与 Nano 各有单一串口所有者。Live View JPEG走当前用户 ACL、随机端点、会话/序号/codec/长度验证的引擎 named pipe（单帧上限 4 MiB，JPEG 宽高上限 4096×3072；Tauri 侧连接、读取、校验与 ACK 共用同一 250 ms 期限，前端不得按更大尺寸或更长超时设计），再由 Tauri转发；NEF经原生完整下载、文件/hash确认后由引擎登记，照片预览提取内嵌 JPEG。JSONL v2仅承载控制、状态、登记及内部端点握手，不承载实时图像。
-
-Live View全链使用内存：原生最新帧槽、named pipe和前端有界JPEG data URL均不保存实时图像文件。端点轮换的短暂缺失/busy只在原250ms期限内重试；暂无新帧返回null。UI保留最近已解码画面并标记STALE，收到当前会话的新帧后恢复LIVE；停止、隔离、断开或会话变更清除画面，迟到结果不得返回。data URL避免浏览器Blob存储的潜在磁盘溢写。
-
-摄影目录仍34项；LV另有`CameraHealth.liveViewControls={sessionId,properties}`，仅`cameraZoom`（D1A3）和`focusMode`（D061）。显式`camera_live_view_read {sessionId}`及`camera_live_view_configure {sessionId,controls}`要求当前LV会话、实际广告、鲜读/读回及原生整数 descriptor（D1A3按类型1–8的当前宽度读写、值域保持0–255；D061仍严格UINT8；SET期间类型变化不得确认目标）；唯两键，不提供任意setter。普通摄影Apply仍拒LV，LV控制不入扫描profile或摄影预设。D0E1 lensSort、D1A6照片/电影选择器、D1F2 activeSlot保留原生只读诊断（未广告UNKNOWN，nativeWritable保留而不开放写）。LV驱动还需实际操作支持、fresh lensSort=1、selector=0及D061资格：模式0允许AF，0/4允许有界step；AF-F2禁止有界motor，物理MF3禁止写与motor。lensSort=1本身不证明驱动能力。
-
-相机属性快照分别提供本机supported、原生nativeWritable、当前effective/writable、disabledReason及每个options条目的supported/enabled/reason。属性描述和当前确认读回是依据；前端只消费这些结果，枚举用下拉菜单，无效或不支持的属性/选项变灰。模式、图像格式、白平衡、测光等父属性Apply后重新读取描述与实际值，再判定子属性。自动ISO开启时手动ISO仍控制基准值，NEF+JPEG尺寸仍控制JPEG部分，HDR在NEF下只允许OFF。功能对照及证据见[native-camera-capability-matrix.md](native-camera-capability-matrix.md)。
-
-相机与转台独立连接、自检；两者使用常驻栏目，相机高级设置与基本栏共用会话草稿。扫描保存至根目录/任务 ID；正常独立单拍仅保存至同一根目录/`CameraCaptures`，不增加扫描帧数或 manifest。保留目录名、已有清单、目录别名与原子不覆盖检查；诊断 `camera_test_capture` 才可传显式隔离目录。扫描要求固定 M、Auto ISO OFF、MF、固定 WB，以及包围/ADL/HDR的严格关闭或等价证明；独立单拍允许已确认的 P/A/S、自动 ISO/WB 和支持的 AF 模式，但不隐式触发 AF，仍要求单个主机 RAM NEF输出、与本操作关联的C101对象（C102完成可选）、完整文件及 hash。Live View 开启时拒绝拍摄。完整登记后 `deviceControls.camera.lastCapturedImage` 提供 capture ID、会话、操作、大小与哈希；Tauri 的照片预览只接收 capture ID，由引擎 descriptor 解析并复核大小/hash，不接受 renderer 任意路径。HOME 内部保留固件有界反向退让；台架物理隔离确认仍显示射线 UNKNOWN，禁止开束。
-
-持久任务登记锁跨重启和 taskId 切换保留，允许连接修复和只读状态；参数、对焦与普通运动仍锁定。同一任务的受控恢复预检需明确确认本次 USB 自动关断释放，按 schema 3 冻结 V/I、Exposure、maxXraySec 和实际相机 profile 重建会话，随后受控 HOME 和文件哈希校验。缺失/坏登记 fail closed；可识别任务仅在完整清理后显式放弃，保留文件与原目录。schema 2 继续只读重构及版本 5 合法缓存校验，新后端拒绝续扫。
-
-schema 3 清单的新采集 profile 使用内部版本 6，冻结 RAM 记录介质、单个主机输出数量、快门属性码、固定 WB 及自动化参数证明。包围要求本次广告的 `0xD0C0` UINT8 descriptor 和鲜读 OFF=0；D7100 ADL 要求鲜读 OFF=4。HDR 已广告时必须读回 OFF=0；仅未广告时允许已确认 NEF=4 的互斥证明。规范 hash 覆盖固定策略版本 3。曝光延迟 OFF 为 3；标准 `0x500D` 使用 0.1 ms 单位，Nikon `0xD100` 使用原生分数。旧 profile 1–5 保留原字段、编码、hash、文件与只读重构能力，拒绝续扫，不改写旧清单。当前策略、设备身份和实际冻结参数均匹配才可受控恢复。
-
-D7100 的 `0xD161` 对焦模式 3 为硬件 MF、4 为软件 MF，两者均符合确定性采集；0/1/2 为自动对焦，扫描继续拒绝。冻结 profile 保留实际模式值，不把硬件 MF 改写为软件 MF。
+底部 Reconstruction 区启动计算，完成且预览校验成功后显示结果；Equipment / Result 仅切换显示，普通轮询不抢走用户选择。3D View 不重复提供重构入口。
 
 ## 更新维护与验证边界
 
-`prepare_software_update` 先拒绝扫描、暂停、收尾、拍摄、运动、Live View、重构、busy及持久任务锁，再建立独立维护占用。引擎执行 STOP/OFF 与相机清理，返回 `softwareUpdatePreparation` 的本次 `sessionId`、`operationId`、`status`、`ready`、`maintenanceLocked`、各设备 confirmed/never-owned/unknown、`noActiveTransactions` 和错误。UNKNOWN或清理未确认不会授权更新；全未建立设备会话可走明确 never-owned 分支，设备显示仍保持 UNKNOWN。普通 Stop 不清除维护占用，并使旧 ready 报告失效；匹配操作的取消只在清理已确认时释放占用，不自动放弃任务、重连设备或恢复预览/出束。
+更新先取得本会话/操作的维护锁与设备清理报告，UNKNOWN 或未确认清理不能授权安装。Tauri 只运行安装目录中哈希匹配的引擎；更新 helper 等待原应用及 owned engine 正常退出。退出码、签名、下载、安装结果与硬件安全分别核验。用户明确要求安装可按授权完成；安装不自动连接、运动或开束。
 
-Tauri 更新器只消费匹配的领域报告，再发送 EOF并等待 owned engine 正常 exit0；helper 还须等待原应用正常退出。进程 exit0、签名正确或文件下载完成均不能代替设备安全报告。安装结果也独立于旧应用的安全退出。发行链、安装身份及双签名说明见 [Windows更新与分发](../guides/desktop-update-distribution.md)。
+当前设备分项证据与已知质量限制见 [验证索引](../validation/README.md)，不把旧版分项验收提升为当前整机认证。构建与安装规范见 [更新维护](../guides/desktop-update-distribution.md)。
 
-## 验证记录
+## 阅读顺序
 
-叠层颜色重构使用引擎的独立版本目录，原 NEF、旧 manifest 和旧方法缓存保留。预检冻结最多五层的顺序、发光颜色和厚度；自动颜色观测与两基材料反演均由引擎计算，桌面壳只读取经过封存哈希验证的灰度/RGB 预览，场景只读。材料标签需实测标定匹配和独立样点校验；细节见 [叠层成像策略](../decisions/stacked-scintillator-material-imaging.md)。
-
-当前验收摘要见 [validation](../validation/README.md)。架构说明只维护控制边界与执行机制，不承载多轮任务流水。
+1. [目录职责](directory-map.md) 与 [模块图](module-graph.md)。
+2. [执行流程](execution-flows.md)。
+3. [前端功能及接口](frontend-functional-spec.md)、[错误码](frontend-error-codes.md)。
+4. [原生控制决策](../decisions/0003-native-wpd-camera-and-device-control.md) 与 [存卡契约](../decisions/0004-camera-sd-card-acquisition.md)。

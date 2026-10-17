@@ -214,6 +214,14 @@ struct Script {
     capture_value_changes: BTreeMap<u16, CameraValue>,
     events: VecDeque<Vec<NikonEvent>>,
     capture_events: Vec<Vec<NikonEvent>>,
+    /// Optional per-trigger scripts for L1 tests; empty preserves old fixtures.
+    card_capture_scripts: VecDeque<(Vec<Vec<NikonEvent>>, Vec<u32>)>,
+    d1a4_values: VecDeque<u32>,
+    on_card_trigger: Option<Box<dyn FnMut() + Send>>,
+    on_card_object_read: Option<Box<dyn FnMut() + Send>>,
+    on_card_delete: Option<Box<dyn FnMut(u32) + Send>>,
+    card_delete_responses: VecDeque<u16>,
+    card_delete_no_effect: bool,
     raw: Vec<u8>,
     lv: bool,
     mismatch: Option<u16>,
@@ -223,6 +231,7 @@ struct Script {
     capture_started: Option<Instant>,
     capture_started_signal: Option<mpsc::Sender<()>>,
     fail_code: Option<u16>,
+    initiate_capture_response: Option<u16>,
     panic_code: Option<u16>,
     close_failure: bool,
     device_info: Option<Vec<u8>>,
@@ -232,6 +241,7 @@ struct Script {
     notify_runtime_after_set: bool,
     device_ready_responses: VecDeque<u16>,
     get_event_responses: VecDeque<u16>,
+    cleanup_device_busy_polls: usize,
     property_responses: BTreeMap<(u16, u16), VecDeque<u16>>,
     busy_on_capture: bool,
     complete_after_download: bool,
@@ -271,7 +281,7 @@ impl Script {
         for (id, access, max_bytes, free_bytes, free_images) in cards {
             ids.extend(id.to_le_bytes());
             let mut info = Vec::new();
-            info.extend((0u16).to_le_bytes()); // StorageType fixed disk
+            info.extend((4u16).to_le_bytes()); // StorageType removable read/write medium
             info.extend((2u16).to_le_bytes()); // FilesystemType DCF
             info.extend(access.to_le_bytes());
             info.extend(max_bytes.to_le_bytes());
@@ -400,6 +410,13 @@ impl Script {
                     parameter: 0xffff0001,
                 }],
             ],
+            card_capture_scripts: VecDeque::new(),
+            d1a4_values: VecDeque::new(),
+            on_card_trigger: None,
+            on_card_object_read: None,
+            on_card_delete: None,
+            card_delete_responses: VecDeque::new(),
+            card_delete_no_effect: false,
             raw: synthetic_nef(),
             lv: false,
             mismatch: None,
@@ -409,6 +426,7 @@ impl Script {
             capture_started: None,
             capture_started_signal: None,
             fail_code: None,
+            initiate_capture_response: None,
             panic_code: None,
             close_failure: false,
             device_info: None,
@@ -418,6 +436,7 @@ impl Script {
             notify_runtime_after_set: false,
             device_ready_responses: VecDeque::new(),
             get_event_responses: VecDeque::new(),
+            cleanup_device_busy_polls: 0,
             property_responses: BTreeMap::new(),
             busy_on_capture: false,
             complete_after_download: false,
@@ -604,6 +623,9 @@ impl CameraTransport for Fake {
                 b
             }
             GET_PROPERTY if params[0] as u16 == LV_STATUS => vec![s.lv as u8],
+            GET_PROPERTY if params[0] as u16 == LV_PROHIBIT && !s.d1a4_values.is_empty() => {
+                s.d1a4_values.pop_front().unwrap().to_le_bytes().to_vec()
+            }
             GET_PROPERTY => {
                 let property = params[0] as u16;
                 if s.unreadable_property == Some(property) {
@@ -667,6 +689,7 @@ impl CameraTransport for Fake {
                 let events = s.capture_events.clone();
                 s.events.extend(events);
                 let changes = s.capture_value_changes.clone();
+                if let Some(value) = changes.get(&LV_STATUS) { s.lv = value.integer() == Some(1); }
                 s.values.extend(changes);
                 s.capture_started = Some(Instant::now());
                 if s.busy_on_capture {
@@ -685,10 +708,20 @@ impl CameraTransport for Fake {
                 // Standard PTP still capture, the only trigger the card path may
                 // send. The private SDRAM code stays asserted above, so a card
                 // test that reached `CAPTURE_RAM` would already fail.
-                assert_eq!(params, [0xffffffff]);
-                let events = s.capture_events.clone();
+                assert_eq!(params, [0, 0]);
+                if let Some(code) = s.initiate_capture_response {
+                    if code != OK { return Ok(PtpResponse { code, data: vec![] }); }
+                }
+                if let Some(observe) = s.on_card_trigger.as_mut() { observe(); }
+                let events = if let Some((events, values)) = s.card_capture_scripts.pop_front() {
+                    s.d1a4_values = values.into();
+                    events
+                } else {
+                    s.capture_events.clone()
+                };
                 s.events.extend(events);
                 let changes = s.capture_value_changes.clone();
+                if let Some(value) = changes.get(&LV_STATUS) { s.lv = value.integer() == Some(1); }
                 s.values.extend(changes);
                 s.capture_started = Some(Instant::now());
                 if let Some(signal) = s.capture_started_signal.as_ref() {
@@ -697,6 +730,10 @@ impl CameraTransport for Fake {
                 vec![]
             }
             GET_EVENT => {
+                if s.cancels > 0 && s.cleanup_device_busy_polls > 0 {
+                    s.cleanup_device_busy_polls -= 1;
+                    return Err(CameraError::DeviceBusy("Windows WPD: device busy (0x800700AA)".into()));
+                }
                 // Reaching the next event poll proves the capture pipeline has
                 // returned from GET_OBJECT and validated its complete NEF.
                 if s.calls.contains(&GET_OBJECT) {
@@ -748,13 +785,34 @@ impl CameraTransport for Fake {
                 .ok_or_else(|| {
                     CameraError::Unsupported("scripted object handles are not scripted".into())
                 })?,
+            DELETE_OBJECT => {
+                assert_eq!(params.len(), 2);
+                assert_eq!(params[1], 0);
+                assert_ne!(params[0], u32::MAX);
+                assert!(matches!(phase, DataPhase::None));
+                let code = s.card_delete_responses.pop_front().unwrap_or(OK);
+                if code != OK { return Ok(PtpResponse { code, data: vec![] }); }
+                if let Some(observe) = s.on_card_delete.as_mut() { observe(params[0]); }
+                if !s.card_delete_no_effect {
+                    s.card_object_info.remove(&params[0]);
+                    s.card_object_bytes.remove(&params[0]);
+                    for payload in s.object_handles.values_mut() {
+                        let handles: Vec<_> = super::storage::parse_object_handles(payload)?.into_iter()
+                            .filter(|handle| *handle != params[0]).collect();
+                        *payload = (handles.len() as u32).to_le_bytes().to_vec();
+                        for handle in handles { payload.extend(handle.to_le_bytes()); }
+                    }
+                }
+                vec![]
+            }
             GET_OBJECT => {
                 // Additive card import mode resolves the object bytes by the
                 // requested handle, so a bounded card download can be scripted
                 // per object. Without a scripted card answer the single RAM
                 // object answer is unchanged.
                 if let Some(bytes) = s.card_object_bytes.get(&params[0]) {
-                    let bytes = bytes.clone();
+                    let bytes=bytes.clone();
+                    if let Some(observe)=s.on_card_object_read.as_mut(){observe();}
                     s.card_object_reads += 1;
                     if let Some((count, flag)) = s.cancel_after_object_reads.clone() {
                         if s.card_object_reads >= count {
@@ -845,7 +903,63 @@ impl Default for ScriptedCameraConfig {
 pub(crate) fn scripted_camera(config: ScriptedCameraConfig) -> CameraAdapter { scripted_camera_with_probe(config).0 }
 #[derive(Clone)]
 pub(crate) struct ScriptedCameraProbe { script:Arc<Mutex<Script>> }
+thread_local! {
+    static CARD_ACCEPTANCE_SWITCHES: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+}
+/// Test overrides stay on the test thread. Release is frozen into the capture
+/// plan before it reaches the camera owner; production environment is untouched.
+pub(crate) struct CardAcceptanceSwitch {
+    saved: Option<(bool, bool)>,
+}
+impl CardAcceptanceSwitch {
+    pub(crate) fn new(release: bool, diagnostic: bool) -> Self {
+        let saved = CARD_ACCEPTANCE_SWITCHES.with(|value| value.replace(Some((release, diagnostic))));
+        Self { saved }
+    }
+    pub(crate) fn release_enabled() -> bool {
+        CARD_ACCEPTANCE_SWITCHES.with(|value| value.get().map(|switches| switches.0))
+            .unwrap_or_else(|| std::env::var("MICRO_CT_CARD_EARLY_RELEASE").is_ok_and(|value| value == "1"))
+    }
+    pub(crate) fn diagnostic_enabled() -> bool {
+        CARD_ACCEPTANCE_SWITCHES.with(|value| value.get().map(|switches| switches.1))
+            .unwrap_or_else(|| std::env::var("MICRO_CT_CARD_EARLY_END_ACCEPTANCE").is_ok_and(|value| value == "1"))
+    }
+}
+impl Drop for CardAcceptanceSwitch {
+    fn drop(&mut self) {
+        CARD_ACCEPTANCE_SWITCHES.with(|value| value.set(self.saved));
+    }
+}
+#[test]
+fn acceptance_switches_are_isolated_between_parallel_test_threads() {
+    let _switch = CardAcceptanceSwitch::new(true, true);
+    std::thread::spawn(|| {
+        let _switch = CardAcceptanceSwitch::new(false, false);
+        assert!(!CardAcceptanceSwitch::release_enabled());
+        assert!(!CardAcceptanceSwitch::diagnostic_enabled());
+    }).join().unwrap();
+    assert!(CardAcceptanceSwitch::release_enabled());
+    assert!(CardAcceptanceSwitch::diagnostic_enabled());
+    {
+        let _nested = CardAcceptanceSwitch::new(false, false);
+        assert!(!CardAcceptanceSwitch::release_enabled());
+    }
+    assert!(CardAcceptanceSwitch::release_enabled());
+}
 impl ScriptedCameraProbe {
+    pub(crate) fn busy_property_reads(&self, count: usize) {
+        self.script.lock().unwrap().property_responses.insert(
+            (GET_PROPERTY_DESC, NIKON_PROPERTIES[0].2), vec![DEVICE_BUSY;count].into());
+    }
+    pub(crate) fn on_card_trigger(&self, observe: impl FnMut() + Send + 'static) {
+        self.script.lock().unwrap().on_card_trigger = Some(Box::new(observe));
+    }
+    /// Queued scripts use the production native event parser and UINT32 reads.
+    pub(crate) fn queue_card_capture(&self, batches: Vec<Vec<(u16, u32)>>, values: Vec<u32>) {
+        let events = batches.into_iter().map(|batch| batch.into_iter()
+            .map(|(code, parameter)| NikonEvent { code, parameter }).collect()).collect();
+        self.script.lock().unwrap().card_capture_scripts.push_back((events, values));
+    }
     pub(crate) fn set_actual(&self,key:&str,value:CameraValue){let code=NIKON_PROPERTIES.iter().find(|entry|entry.0==key).expect("known scripted property").2;self.script.lock().unwrap().values.insert(code,value);}
     pub(crate) fn write_count(&self)->usize{self.script.lock().unwrap().calls.iter().filter(|code|**code==SET_PROPERTY).count()}
     pub(crate) fn live_view_stop_count(&self)->usize{self.script.lock().unwrap().calls.iter().filter(|code|**code==STOP_LV).count()}
@@ -861,6 +975,8 @@ impl ScriptedCameraProbe {
     /// Faults are injected only at the scripted transport boundary; the real
     /// camera owner, event association and file commit remain under test.
     pub(crate) fn fail_transport_operation(&self,opcode:u16){self.script.lock().unwrap().fail_code=Some(opcode);}
+    pub(crate) fn set_initiate_capture_response(&self,code:u16){self.script.lock().unwrap().initiate_capture_response=Some(code);}
+    pub(crate) fn set_capture_value_change(&self,code:u16,value:CameraValue){self.script.lock().unwrap().capture_value_changes.insert(code,value);}
     pub(crate) fn set_exposure_delay(&self,delay:Duration){self.script.lock().unwrap().exposure_delay=delay;}
     pub(crate) fn set_transfer_delay(&self,delay:Duration){self.script.lock().unwrap().transfer_delay=delay;}
     pub(crate) fn operation_count(&self,opcode:u16)->usize{self.script.lock().unwrap().calls.iter().filter(|code|**code==opcode).count()}
@@ -872,6 +988,18 @@ impl ScriptedCameraProbe {
     /// Scripts one storage's object listing.
     pub(crate) fn set_object_handles(&self, id: u32, handles: &[u32]) {
         self.script.lock().unwrap().script_object_handles(id, handles);
+    }
+    pub(crate) fn set_card_delete_responses(&self, responses: &[u16]) {
+        self.script.lock().unwrap().card_delete_responses = responses.iter().copied().collect();
+    }
+    pub(crate) fn set_card_delete_no_effect(&self, no_effect: bool) {
+        self.script.lock().unwrap().card_delete_no_effect = no_effect;
+    }
+    pub(crate) fn stall_operation(&self, opcode: u16, duration: Duration, entered: mpsc::Sender<()>) {
+        self.script.lock().unwrap().stall = Some((opcode, duration, entered));
+    }
+    pub(crate) fn on_card_delete(&self, observe: impl FnMut(u32) + Send + 'static) {
+        self.script.lock().unwrap().on_card_delete = Some(Box::new(observe));
     }
     /// Replace the event batches released by the next trigger, as
     /// `(code, parameter)` pairs. `scan.rs` and the domain tests cannot name the
@@ -899,6 +1027,7 @@ impl ScriptedCameraProbe {
     /// object bytes. A length shorter than the scripted ObjectInfo size is the
     /// truncated-transfer case; nothing here fabricates a length.
     pub(crate) fn set_card_object_bytes(&self,handle:u32,bytes:Vec<u8>){self.script.lock().unwrap().card_object_bytes.insert(handle,bytes);}
+    pub(crate) fn on_card_object_read(&self,observe:impl FnMut()+Send+'static){self.script.lock().unwrap().on_card_object_read=Some(Box::new(observe));}
     /// Additive card import mode: raise this cancellation flag once `count`
     /// `GetObject` reads have completed. Deterministic, no timing.
     pub(crate) fn cancel_after_object_reads(&self,count:usize,flag:Arc<AtomicBool>){self.script.lock().unwrap().cancel_after_object_reads=Some((count,flag));}
@@ -910,6 +1039,7 @@ impl ScriptedCameraProbe {
     /// Script the body Live View state a fresh `GET_PROPERTY [LV_STATUS]` reads.
     pub(crate) fn set_live_view_state(&self,active:bool){self.script.lock().unwrap().lv=active;}
     pub(crate) fn calls(&self)->Vec<u16>{self.script.lock().unwrap().calls.clone()}
+    pub(crate) fn transport_lifecycle(&self)->(usize,usize,usize){let script=self.script.lock().unwrap();(script.opens,script.cancels,script.closes)}
     pub(crate) fn requests(&self)->Vec<(u16,Vec<u32>)>{self.script.lock().unwrap().requests.clone()}
     /// Every read phase as `(opcode, max)`. A card operation must show metadata,
     /// property and event reads only: no `GetObject` and no image-sized read.
@@ -1009,6 +1139,45 @@ fn card_script(config: ScriptedCameraConfig) -> Script {
         script.raw.truncate(170);
     }
     script
+}
+
+#[test]
+fn card_storage_inspection_retains_usb_read_only_evidence_and_plans_body_capture_without_trigger() {
+    let (camera, probe) = scripted_camera_with_probe(ScriptedCameraConfig {
+        card_capture: true, card_overflow: true, ..Default::default()
+    });
+    probe.set_storages(&[(65537, 2, 16 * 1024 * 1024 * 1024, 9 * 1024 * 1024 * 1024, 233)]);
+    let cards = camera.read_card_storages().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].id.0, 65537);
+    assert_eq!(cards[0].access, super::storage::StorageAccess::ReadOnlyWithDeletion);
+    assert_eq!(cards[0].capacity.free_images, 233);
+    assert_eq!(super::storage::plan_cards(&cards, 1, 1).unwrap_err(), "CARD_READ_ONLY");
+    let planned = camera.plan_card_storages(6).unwrap();
+    assert_eq!(planned.storages, cards);
+    assert_eq!(planned.writable_bytes, 9 * 1024 * 1024 * 1024);
+    probe.set_storages(&[
+        (65537, 1, 15_514_730_496, 9_270_755_328, 0),
+        (131073, 2, 15_923_150_848, 10_773_594_112, 201),
+    ]);
+    let refused = camera.plan_card_storages(360).unwrap_err().to_string();
+    for detail in ["CARD_CAPACITY_INSUFFICIENT", "requiredFrames=380", "planningReserveMiB=32", "zero remaining exposures", "ReadOnlyWithDeletion", "\"ReadOnly\""] {
+        assert!(refused.contains(detail), "missing {detail}: {refused}");
+    }
+    // Real post-unlock metadata: the positive 173+201 estimates must not mask
+    // 597 frames of usable 32 MiB byte budget. The actor only reads metadata.
+    probe.set_storages(&[
+        (65537, 2, 15_514_730_496, 9_270_755_328, 173),
+        (131073, 2, 15_923_150_848, 10_773_594_112, 201),
+    ]);
+    let unlocked=camera.plan_card_storages(360).unwrap();
+    assert_eq!(unlocked.writable_images,597);
+    assert_eq!(unlocked.writable_bytes,20_044_349_440);
+    assert_eq!(unlocked.storages[0].capacity.free_images,173);
+    assert_eq!(unlocked.storages[1].capacity.free_images,201);
+    for code in [INITIATE_CAPTURE, CAPTURE_RAM, GET_OBJECT, 0x101b, 0x100a] {
+        assert_eq!(probe.operation_count(code), 0);
+    }
 }
 /// The actor-proxy card kit, so a scan coordinator can run a card scan offline
 /// through the same `CameraAdapter` every scan test uses.
@@ -1160,7 +1329,7 @@ fn device_info_catalog_card(
     properties.push(LV_STATUS);
     properties.push(INFO_DISPLAY_ERROR_STATUS);
     properties.push(LV_PROHIBIT);
-    properties.extend([0x5001, 0xd1b0, 0xd1b1, 0xd1b3, 0xd1b4]);
+    properties.extend([0x5001, 0xd1b0, 0xd1b1, 0xd1b3, 0xd1b4, EXPOSURE_REMAINING]);
     properties.extend([LENS_SORT,LV_SELECTOR,ACTIVE_SLOT,LV_ZOOM,LV_FOCUS_MODE]);
     if standard_properties_only {
         properties.retain(|code| *code < 0x9000);
@@ -1210,7 +1379,7 @@ fn lv_bytes() -> Vec<u8> {
     b.extend(jpeg());
     b
 }
-fn synthetic_nef() -> Vec<u8> {
+pub(crate) fn synthetic_nef() -> Vec<u8> {
     // Hand-built, fully bounded TIFF CFA payload used only for file-integrity
     // tests. It is explicitly synthetic and not a scientific Nikon sample.
     let mut b = vec![0; 256];
@@ -1882,8 +2051,8 @@ fn property_only_exposure_notification_never_completes_or_commits_a_capture() {
     // The reference library treats `0x4006` purely as "refresh this property"
     // (digiCamControl Nikon/NikonBase.cs:2326-2328) and defines no `0xD1B4`, so
     // this notification is a diagnostic and never commit evidence.
-    let context = CallContext {
-        deadline: Instant::now() + Duration::from_millis(300),
+    let mut context = CallContext {
+        deadline: Instant::now() + Duration::from_secs(15),
         epoch: 1,
         generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
     };
@@ -1902,6 +2071,9 @@ fn property_only_exposure_notification_never_completes_or_commits_a_capture() {
         )
         .unwrap();
     let destination = output("property-only-exposure");
+    // Connect's descriptor sweep must not consume the no-object capture budget
+    // under parallel test load, otherwise the trigger is never exercised.
+    context.deadline = Instant::now() + Duration::from_secs(1);
     let result = super::capture::capture(
         &mut camera,
         &destination,
@@ -2171,6 +2343,21 @@ fn d1a4_runtime_notifications_with_busy_reads_keep_frozen_profile_and_commit_cur
 }
 
 #[test]
+fn cancelled_background_poll_does_not_cancel_the_new_disconnect_request() {
+    for opcode in [GET_EVENT, GET_LV] {
+        let script = Arc::new(Mutex::new(Script::new()));
+        let camera = connected(script.clone());
+        if opcode == GET_LV { camera.start_live_view().unwrap(); }
+        let (started, receive) = mpsc::channel();
+        script.lock().unwrap().stall = Some((opcode, Duration::from_millis(350), started));
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        let health = camera.disconnect_confirmed().unwrap();
+        assert!(health.cleanup_confirmed && !health.connected, "opcode={opcode:X}");
+        assert_eq!(script.lock().unwrap().closes, 1);
+    }
+}
+
+#[test]
 fn d1a4_runtime_notification_cannot_hide_frozen_iso_media_or_burst_drift() {
     for (code, value) in [(0x500f, 400), (RECORDING_MEDIA, 0), (BURST_NUMBER, 2)] {
         let mut s = Script::new();
@@ -2202,6 +2389,7 @@ fn d1a4_runtime_notification_cannot_hide_frozen_iso_media_or_burst_drift() {
 #[test]
 fn detached_cleanup_survives_repeated_stop_and_confirms_only_same_session_c102() {
     let mut s = Script::new();
+    s.cleanup_device_busy_polls = 4;
     s.exposure_delay = Duration::from_millis(2500);
     s.values.insert(0xd100, CameraValue::Integer((5 << 16) | 2));
     s.descriptor_values
@@ -2238,7 +2426,7 @@ fn detached_cleanup_survives_repeated_stop_and_confirms_only_same_session_c102()
     assert!(d.pending_at_start && d.exposure_ended_observed && d.close_confirmed);
     assert_eq!(d.session_id, original_session);
     assert_eq!(d.wait_limit_ms, 4500);
-    assert!(d.poll_count > 0);
+    assert!(d.poll_count > 4, "WPD DeviceBusy must retry within the original cleanup deadline");
     assert!(!path.exists());
     let s = script.lock().unwrap();
     assert_eq!(s.closes, 1);
@@ -4426,7 +4614,7 @@ fn exposure_event_is_distinct_from_file_commit_and_hash_matches() {
         .unwrap();
     let events: Vec<_> = rx.try_iter().collect();
     assert!(
-        matches!(&events[0], CameraCaptureEvent::ExposureEnded {session_id,operation_id} if session_id == &session && operation_id == "operation-123")
+        matches!(&events[0], CameraCaptureEvent::ExposureEnded {session_id,operation_id, .. } if session_id == &session && operation_id == "operation-123")
     );
     assert!(matches!(
         events.last(),

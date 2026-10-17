@@ -25,6 +25,10 @@ mod preprocessing;
 pub mod spectral;
 #[path = "reconstruction_channels.rs"]
 mod channels;
+#[path = "reconstruction_defects.rs"]
+mod defects;
+#[path = "reconstruction_refine.rs"]
+mod refinement;
 #[path = "material_decomposition.rs"]
 pub mod material;
 
@@ -187,6 +191,18 @@ struct Manifest {
     voltage_kv: f64,
     #[serde(default)]
     capture_profile: Option<crate::capture_profile::CaptureProfile>,
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    max_xray_sec: Option<u32>,
+    #[serde(default)]
+    capture_destination: Option<crate::capture_profile::CaptureDestination>,
+    #[serde(default)]
+    acquisition_status: Option<String>,
+    #[serde(default)]
+    data_status: Option<String>,
+    #[serde(default)]
+    capture_records: Vec<crate::scan::CardCaptureRecord>,
     completed: bool,
     projection_count: u32,
     geometry: Geometry,
@@ -354,9 +370,12 @@ fn read_manifest(scan_dir: &Path) -> Result<(Manifest, String), String> {
     let digest = hash_file(&path)?.1;
     let manifest: Manifest = serde_json::from_reader(File::open(path).map_err(io_error)?)
         .map_err(|error| format!("invalid scan manifest: {error}"))?;
-    if !matches!(manifest.schema_version,2|3) || !manifest.completed { return Err("scan is not sealed".into()); }
-    if manifest.schema_version==3 {
-        manifest.capture_profile.as_ref().ok_or("Schema 3 capture profile is missing")?.validate()?;
+    if !matches!(manifest.schema_version,2|3|4) || !manifest.completed { return Err("scan is not sealed".into()); }
+    if matches!(manifest.schema_version,3|4) {
+        manifest.capture_profile.as_ref().ok_or("Frozen capture profile is missing")?.validate()?;
+    }
+    if manifest.schema_version==4 {
+        validate_card_manifest(&manifest)?;
     }
     if manifest.frames.len() != manifest.projection_count as usize || manifest.frames.len() < 3 {
         return Err("projection count does not match manifest".into());
@@ -388,6 +407,41 @@ fn read_manifest(scan_dir: &Path) -> Result<(Manifest, String), String> {
         return Err("FDK needs equally spaced full-circle angles without a duplicate endpoint".into());
     }
     Ok((manifest, digest))
+}
+
+/// Reuse the acquisition/import seal rule and bind every card record to the
+/// exact local input reconstruction will hash. A completion bit alone cannot
+/// admit a card scan that is pending import, incomplete or internally mixed.
+fn validate_card_manifest(manifest: &Manifest) -> Result<(), String> {
+    if manifest.stage.as_deref()!=Some("completed")
+        || !manifest.max_xray_sec.is_some_and(crate::scan::scan_xray_seconds_valid)
+        || !crate::scan::schema_four_completion_consistent(
+            manifest.capture_destination,manifest.capture_profile.as_ref(),
+            manifest.acquisition_status.as_deref(),manifest.data_status.as_deref(),
+            &manifest.capture_records,manifest.projection_count)
+    { return Err("Card scan is not acquired, imported and sealed as verified".into()); }
+    let expected=manifest.frames.len()+manifest.references.pre_dark.len()+manifest.references.pre_flat.len();
+    if manifest.capture_records.len()!=expected { return Err("Card records do not cover every reconstruction input".into()); }
+    let mut seen=std::collections::HashSet::new();
+    for record in &manifest.capture_records {
+        let imported=record.imported_file.as_ref().ok_or("Card record lacks a verified local file")?;
+        if !seen.insert((record.kind.as_str(),record.index)) || imported.index!=record.index || imported.bytes!=record.size {
+            return Err("Card record identity or file size is inconsistent".into());
+        }
+        let matches=match record.kind.as_str() {
+            "projection"=>manifest.frames.iter().find(|frame|frame.index==record.index)
+                .is_some_and(|frame|frame.path==imported.path&&frame.bytes==imported.bytes&&frame.sha256==imported.sha256
+                    && (frame.angle_deg-imported.angle_deg).abs()<1e-6),
+            "preDark"|"preFlat"=>{
+                let group=if record.kind=="preDark"{&manifest.references.pre_dark}else{&manifest.references.pre_flat};
+                group.iter().find(|frame|frame.index==record.index)
+                    .is_some_and(|frame|frame.path==imported.path&&frame.bytes==imported.bytes&&frame.sha256==imported.sha256)
+            }
+            _=>false,
+        };
+        if !matches { return Err("Card record does not match its sealed reconstruction input".into()); }
+    }
+    Ok(())
 }
 
 /// Read-only project opening uses exactly the same sealed-data and integrity
@@ -1201,8 +1255,10 @@ fn reconstruct_prepared(request: &ReconstructionRequest, progress: &Mutex<Recons
                 drop(selected_gpu.take());
                 drop(volume);
                 drop(coverage);
-                return reconstruct_inner(request, progress, false,
-                    Some(format!("GPU failed at view {}; full CPU recomputation", index + 1)));
+                return reconstruct_prepared(request, progress, false,
+                    Some(format!("GPU failed at view {}; full CPU recomputation", index + 1)),
+                    manifest, manifest_sha256, root, prepared,
+                    if quantitative_support {Some(axis)} else {None});
             }
         } else {
             backproject(&mut volume, &mut coverage, &projection, angle, pitch, voxel,
@@ -1237,7 +1293,8 @@ fn reconstruct_prepared(request: &ReconstructionRequest, progress: &Mutex<Recons
                 drop(coverage);
                 return reconstruct_prepared(request, progress, false,
                     Some("GPU final readback failed; full CPU recomputation".into()), manifest,
-                    manifest_sha256, root, prepared, Some(axis));
+                    manifest_sha256, root, prepared,
+                    if quantitative_support {Some(axis)} else {None});
             }
         }
     }
@@ -1487,6 +1544,36 @@ mod tests {
         assert!(find_screen(&dark,&dark).is_err());
         let cropped=remap(&flat,&map,false).unwrap();
         assert!(cropped[128*DETECTOR_N+128]>200.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_preprocessed_candidate() {
+        // Explicit offline experiment only. Never publish into the scan's
+        // production caches or replace an existing experiment result.
+        let scan = PathBuf::from(std::env::var("CT_SCAN_DIR").expect("CT_SCAN_DIR"));
+        let root = PathBuf::from(std::env::var("CT_DIAGNOSTIC_DIR").expect("CT_DIAGNOSTIC_DIR"));
+        let allowed = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.cache/tests/ct-engine").canonicalize().unwrap();
+        let root = root.canonicalize().unwrap();
+        assert!(root.starts_with(allowed));
+        assert!(!root.join("result.json").exists(), "preserve completed experiment");
+        let (manifest, manifest_sha256) = read_manifest(&scan).unwrap();
+        let prepared = root.join("projections.f32le");
+        assert_eq!(fs::metadata(&prepared).unwrap().len(),
+            (manifest.frames.len() * DETECTOR_N * DETECTOR_N * 4) as u64);
+        assert_eq!(fs::metadata(root.join("detector-quality.bin")).unwrap().len(),
+            (manifest.frames.len() * DETECTOR_N * DETECTOR_N) as u64);
+        let axis = serde_json::from_reader(File::open(root.join("axis-input.json")).unwrap()).unwrap();
+        let progress = Mutex::new(ReconstructionProgress {
+            status: "running", percent: 0, message: String::new(), events: Vec::new(),
+        });
+        let result = reconstruct_prepared(
+            &ReconstructionRequest { scan_dir: scan, method: ReconstructionMethod::Fdk },
+            &progress, false, Some("offline detector-repair experiment; fixed original axis".into()),
+            &manifest, manifest_sha256, &root, &prepared, Some(axis),
+        ).unwrap();
+        println!("Offline candidate: {}", result.volume_path.display());
     }
 
     #[test]

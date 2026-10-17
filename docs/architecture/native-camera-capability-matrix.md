@@ -7,7 +7,7 @@
 - 相机型号、命令列表、属性列表及本次 descriptor/readback 决定支持范围；已知代码和标签只是目录，不能制造设备支持。未声明属性保留禁用占位，不试发私有操作。
 - `supportedValues`、`range`、`dataType`、`nativeWritable` 保留设备证据；`supported`、`effective`、`writable`、`disabledReason`、`options` 表达当前能力及依赖。实际值、草稿目标、写入成功、读回确认分别保存。
 - 所有相机通信和 COM 对象归相机 owner。领域入口持有扫描/手动占用和跨设备裁决；相机不调用射线或转台，独立拍摄和 Live View 不自动开束。
-- 正式采集仍限定 D7100 主机 RAM NEF。能配置某种摄影参数，不代表当前后端能用该模式捕获。未知、超时、失联、取消清理未确认均不能作为成功或安全证据。
+- 正式采集限定 D7100 单 NEF，默认 SD 存卡，显式选择并 Apply 主机目标后可用 RAM 路径。能配置某种摄影参数，不代表当前后端能用该模式捕获。未知、超时、失联、取消清理未确认均不能作为成功或安全证据。
 
 活动实现入口：
 
@@ -52,7 +52,7 @@
 
 ### 多重曝光的证据边界
 
-[Nikon CCP2官方帮助](https://nikonimglib.com/ccp2/onlinehelp/en/07_ccp_window_01.html)把Multiple exposure列为机身操作且状态不显示；本实现没有已验证的对应PTP属性。当前profile 6不含该运行时状态、人工确认字段或准入门禁，旧profile仅保留只读解码与原hash校验。
+[Nikon CCP2官方帮助](https://nikonimglib.com/ccp2/onlinehelp/en/07_ccp_window_01.html)把Multiple exposure列为机身操作且状态不显示；本实现没有已验证的对应PTP属性。当前RAM profile 6 / SD profile 7不含该运行时状态、人工确认字段或准入门禁，旧profile仅保留只读解码与原hash校验。
 
 操作员在预检前查看机身拍摄菜单并选择 `Multiple exposure mode → Off`，检查指示器没有亮起或闪烁。UM pp.142–143说明常亮表示已开启、闪烁表示正在记录。USB连接不构成OFF证据；LV中拍摄会复位的规则不能转化为本应用隐式试拍（本应用LV期间禁止拍摄）。关机结束正在记录的一组，也不能被软件解释为当前series模式已读回OFF。
 
@@ -62,7 +62,7 @@ UM p.144只明确说正在记录多重曝光时“部分菜单项”会变灰，
 
 当前 `NIKON_PROPERTIES`目录实际包含34个 D7100摄影/采集参数候选，新增 `bracketing`；另有单独的只读运行诊断目录。这是已实现子集，不是“全部厂商功能完备”的声明。每项只在设备实际声明且成功描述后可读；可写还要求设备写权限、当前依赖、已确认实际值和未被占用。未声明的 TIFF、未压缩 RAW、自然光自动、亮部重点测光等通用选项显示为不支持。
 
-当前新源码另有2项独立LV目录，不能加到摄影34项或预设/profile里：`CameraHealth.liveViewControls={sessionId|null,properties{cameraZoom,focusMode}}`。2026-10-06 已在本轮 rc3 候选上取得实机证据：LV Start 生成独立 32hex nonce、`cameraZoom`(0xD1A3)/`focusMode`(0xD061) 描述与鲜读、`cameraZoom` 写入+读回成功、约 32 秒仅内存传输、停止后旧 nonce 报 `STALE_LIVE_VIEW_SESSION`；`focusMode` 因当前物理 MF 开关锁定而只读，写入路径仍未实机验证。不改写[已签rc2独立验收](../validation/README.md)，完整结果见[后端重验证记录](../validation/README.md)。
+独立LV目录含2项，不进入摄影34项目录、预设或扫描profile：CameraHealth.liveViewControls={sessionId,properties:{cameraZoom,focusMode}}。每次Start生成独立nonce；读、写与返回都核对当前会话和实际广告，旧会话请求拒绝。已记录的早期分项证据包括cameraZoom读写、内存传输和旧nonce拒绝；focusMode写入、镜头驱动和所有禁止条件仍按具体构建/镜头验收，见[验证索引](../validation/README.md)。
 
 | 参数键 / 代码 | 标签或原生值依据 | 当前依赖、限制和处理 | MIT / 官方依据 |
 | --- | --- | --- | --- |
@@ -77,7 +77,7 @@ UM p.144只明确说正在记录多重曝光时“部分菜单项”会变灰，
 | `rawCompression` / `D016` | 0无损压缩、1压缩；2未压缩仅设备声明才支持 | 仅格式4–7有效；D7100说明书只列前两种 | NB 963–978；UM 67 |
 | `crop` / `D030` | D7100覆盖：0 DX、1 1.3x | 不继承通用FX/5:4标签；变更后重读图像尺寸等描述 | D71 81–94 |
 | `imageSize` / `5003` | PTP字符串，保留设备返回的真实尺寸 | 控制JPEG；纯NEF4无效；NEF+JPEG5–7仍可按描述设置JPEG尺寸；裁切改变可选尺寸 | NB 933–960；UM 67–68 |
-| `whiteBalance` / `5005` | 2自动、4晴天、5荧光灯、6白炽灯、7闪光灯、8010阴天、8011阴影、8012色温、8013预设 | 先写白平衡并重读，再应用子参数；扫描 profile 6只接受已确认固定档位，拒2及已声明的自然光自动8016 | NB 236–247、1459–1499 |
+| `whiteBalance` / `5005` | 2自动、4晴天、5荧光灯、6白炽灯、7闪光灯、8010阴天、8011阴影、8012色温、8013预设 | 先写白平衡并重读，再应用子参数；扫描 RAM profile 6 / SD profile 7只接受已确认固定档位，拒2及已声明的自然光自动8016 | NB 236–247、1459–1499 |
 | `whiteBalanceFluorescent` / `D14F` | 0–6为七种光源标签 | 仅白平衡=5有效 | NB 806–827、1496–1497 |
 | `whiteBalanceTemperature` / `D01E` | NB 的0–30色温索引标签；实际编码以 descriptor 为准 | 仅白平衡=8012有效；不将索引直接当Kelvin写入 | NB 830–874、1498–1499 |
 | `exposureCompensation` / `5010` | 原生有符号值，显示EV | 保留实际描述；M模式下不伪称它一定改变快门/光圈或射线 | NB 1502–1575 |
@@ -85,7 +85,7 @@ UM p.144只明确说正在记录多重曝光时“部分菜单项”会变灰，
 | `centerWeightedArea` / `D059` | D7100：6、8、10、13 mm、全画面平均 | 测光模式=2；非CPU镜头的有效直径限制仍需镜头证据；NB重复10mm及通用12mm标签不能照搬 | NB 734–750；UM 236 |
 | `driveMode` / `5013` | D6：1单张、2CH、8010CL、8011自拍、8012抬镜、8016安静、8017遥控 | 设备只读时禁写；CT要求单张1；其余设置不等于支持对应采集事务 | D6 190–209 |
 | `burstNumber` / `5018` | UINT16，真实范围由 descriptor 决定 | 扫描和独立主机单拍均要求1；不能误用D10B作数量 | NB 1053–1069；`prepare_host_capture` |
-| `recordingMedia` / `D10B` | 0存储卡、1SDRAM | 明确 Apply选择RAM并读回1；预检/开始/恢复不隐式修复；禁止卡回退 | NB 96、1099–1105 |
+| `recordingMedia` / `D10B` | 0存储卡、1SDRAM | 明确 Apply选择SD=0或RAM=1并读回；主机传输须当前会话显式许可；预检/开始/恢复不隐式修复或切换目标 | NB 96、1099–1105 |
 | `focusMode` / `D161` | 0 AF-S、1 AF-C、2 AF-A、3物理MF、4软件MF | 物理MF3锁定选择器；CT接受3/4，拒绝AF；不保存假焦点位置 | NB 1646–1694；D6 471–475 |
 | `exposureDelay` / `D06A` | D6覆盖：0=3秒、1=2秒、2=1秒、3关闭 | CT要求3；不能沿用通用0关闭的假设 | D6 213–228 |
 | `longExposureNoiseReduction` / `D06B` | 0关闭、1开启 | CT要求0，避免确定性曝光/处理事务改变 | NB 513、982–989；`profile_readback` |
@@ -96,7 +96,7 @@ UM p.144只明确说正在记录多重曝光时“部分菜单项”会变灰，
 | `flashCompensation` / `D124` | 有符号原生值，NB按六分之一EV显示 | 实际类型/范围决定写入；不借用long setter的字节数 | NB 712–730 |
 | `flashSyncSpeed` / `D074` | 0=1/320自动FP、1=1/250自动FP、2–8=1/250至1/60 | 以设备枚举筛选；不把这些设置当受控曝光结束证据 | NB 590–610 |
 | `bracketing` / `D0C0` | UINT8，0关闭、1开启 | 本次广告、严格descriptor及鲜读0才证明OFF；未广告、错类型或读取失败阻扫描，不盲读/写；错类型不提供OFF标签或no-op成功 | GP `Bracketing`；UM 136–139 |
-| `activeDLighting` / `D14E` | 0极高、1高、2标准、3低、4关闭、5自动 | D7100物理适用，profile6要求OFF=4并冻结；未广告或读取失败仍UNKNOWN并阻扫描，不作不适用 | NB 672–689；UM 113、139 |
+| `activeDLighting` / `D14E` | 0极高、1高、2标准、3低、4关闭、5自动 | D7100物理适用，RAM/SD固定profile要求OFF=4并冻结；未广告或读取失败仍UNKNOWN并阻扫描，不作不适用 | NB 672–689；UM 113、139 |
 | `hdrMode` / `D130` | MIT映射0关闭、1单张、2系列 | NEF/NEF+JPEG不允许开启，OFF仍可用；扫描已广告时必须鲜读OFF=0，ON/error/矛盾拒绝；仅未广告时可用确认NEF=4的互斥证明 | NB 653–667；UM 115；`profile_readback` |
 | `hdrExposureDifference` / `D131` | 通用MIT候选0自动、1/2/3 EV | D7100用户手册只列Mode/Strength，不能假定另有此属性；未声明禁用；开启HDR且JPEG格式才有效 | NB 634–649；UM 115–116 |
 | `hdrSmoothing` / `D132` | 0高、1标准、2低、3自动、4极高；D7100显示为HDR强度 | HDR开启且JPEG格式才有效；标签来自继承映射，用户手册不提供PTP数字认证 | NB 614–630；UM 116 |
@@ -113,9 +113,9 @@ UM p.144只明确说正在记录多重曝光时“部分菜单项”会变灰，
 | --- | --- | --- |
 | 显式发现、选择、连接、断开 | 已实现 | `actor`与`wpd`；无参数连接拒绝隐式选择；未知型号仅标准已描述能力。无 `deviceId` 的 `camera_connect`（含 `retry_device{device:"camera"}`）只做发现，operation kind 为 `camera_discover`，受理记录不声明已连接；有明确 `deviceId` 才为 `connect`；清理未确认时需显式 `acknowledgeUnconfirmedCleanup` |
 | DeviceInfo、vendor属性扩展 | 已实现 | `nikon::connect`仅在D7100身份绑定且90CA被声明时读取，保留原始/有效列表和诊断哈希 |
-| 单拍RAM NEF、CT捕获 | 事务已实现；P0独立照片已分项验证；完整CT联动仍待实机验收 | 固定扫描与独立摄影有不同admission；两者均校验单host NEF、LV OFF、session/operation、与本操作关联的C101对象（C102完成可选）、完整文件/hash和原子不覆盖。多重曝光已退出运行时准入，预检前在机身确认关闭；USB连接不证明它关闭。一个host文件不证明一次物理曝光；新的独立自动模式与完整CT联动仍未由P0证明。未就绪（`captureReady`/`independent_readback` 未通过）时 `camera_capture` 在入队前拒绝为 `CAMERA_CAPTURE_UNQUALIFIED`，不置 Fault、不断开会话 |
+| 单拍 RAM NEF、SD 存卡与 CT 捕获 | 原生事务已实现；已有分项实测 | RAM 要求当前会话显式主机许可、关联 C101、完整文件/hash；C102 可选。SD 要求唯一卡对象与完成事件、严格元数据和持久回执，扫描零图像载荷。两者均要求 LV OFF、session/operation 和各自 readiness；默认 SD 的后续导入与精确清卡见 [ADR 0004](../decisions/0004-camera-sd-card-acquisition.md)。一个文件不证明一次物理曝光。 |
 | 独立JPEG/TIFF、RAW+JPEG双对象采集 | 禁用 | 当前对象解析与提交仅接受NEF，缺少多对象关联和格式确认事务；更改格式不会扩展捕获能力 |
-| AF | 已实现候选；新增LV资格仅离线 | NB `AutoFocus` 1853–1858、90C1；实际操作列表及DeviceReady门禁；LV需fresh lensSort=1、照片selector=0、D061 mode0；物理MF/AF-F/未知镜头资格禁用，不以lensSort单项推断motor。能力未广告时 `camera_autofocus` 入队前拒绝为 `CAMERA_AUTOFOCUS_UNQUALIFIED` |
+| AF | 已实现；镜头与工况按各自证据验收 | NB `AutoFocus` 1853–1858、90C1；实际操作列表及DeviceReady门禁；LV需fresh lensSort=1、照片selector=0、D061 mode0；物理MF/AF-F/未知镜头资格禁用，不以lensSort单项推断motor。能力未广告时 `camera_autofocus` 入队前拒绝为 `CAMERA_AUTOFOCUS_UNQUALIFIED` |
 | 镜头步进 | 已实现候选；新增LV资格仅离线 | NB 1799–1807、9204；LV开启、步数有界、fresh lensSort1/selector0/D061 mode0或4及实际操作支持；AF-F2禁止有界motor、hardMF3禁写motor；不将脉冲计数当绝对焦点。LV未激活或 `focusStep` 未广告时 `camera_focus` 入队前拒绝为 `CAMERA_FOCUS_UNQUALIFIED` |
 | Live View启停 | 已实现；P0流与EOF清理已分项验证 | NB 1697–1724、9201/9202，原生读取D1A2确认；开启期间前后端拒绝拍摄，不自动停后拍再恢复 |
 | Live View网格、准线、显示缩放 | 已实现 | React纯显示；CSS显示缩放不改变相机D1A3，也不制造拍摄/对焦命令 |
@@ -125,7 +125,7 @@ UM p.144只明确说正在记录多重曝光时“部分菜单项”会变灰，
 | Host Mode/Lock、Application Mode | 未作为普通参数开放 | NB 416–431、D8 228–247；初始化没有证明必须自动90C2(1)，不可为解除只读而隐式改变模式 |
 | 卡格式化、删除、设备复位 | 未开放 | 参考实现有此类操作；它们不属于主机NEF采集所需能力，不能作为错误恢复自动执行 |
 | 电池与LV禁止条件 | 已实现按声明的只读原始诊断 | `RUNTIME_DIAGNOSTICS`含5001电池UINT8及D1A4禁止条件UINT32；不混入摄影profile，不把未知位/原始状态当整体健康保证 |
-| 镜头类型、卡槽及LV驱动资格 | 已新增只读运行证据及保守LV资格；仅离线 | LensSort D0E1：NB554–567；ActiveSlot D1F2：NB571–586；D1A6照片/电影selector及D061 LV焦点已入专用模型。D0E1/D1A6/D1F2只按本次广告读取，缺席UNKNOWN，保留nativeWritable但不开放setter；D1A4仍为原始诊断，不声称全部镜头/禁止条件已完备 |
+| 镜头类型、卡槽及LV驱动资格 | 已实现只读运行证据及保守LV资格，非全工况认证 | LensSort D0E1：NB554–567；ActiveSlot D1F2：NB571–586；D1A6照片/电影selector及D061 LV焦点已入专用模型。D0E1/D1A6/D1F2只按本次广告读取，缺席UNKNOWN，保留nativeWritable但不开放setter；D1A4仍为原始诊断，不声称全部镜头/禁止条件已完备 |
 | D1B2显示诊断 | 已实现原始读回 | `runtime_properties`保留实际数字及semanticStatus=unknown；不能仅由0/1映射判断真实故障/正常，也不能由LCD PC字样判断健康 |
 
 ## Live View全链与不落盘边界
@@ -146,12 +146,11 @@ UM p.144只明确说正在记录多重曝光时“部分菜单项”会变灰，
 
 ## 仍需保留的限制
 
-1. **P0独立NEF/LV分项PASS，全面认证仍BLOCKED。** 指定0070包已有新NEF、C101/C102、完整文件/hash、参数恢复及30秒UI LV证据；这不覆盖所有摄影选项、自动摄影模式、镜头驱动、持续长时LV或完整CT联动。新 profile 6门禁及照片登记实现另有离线回归，不能由旧包证据直接升级为当前候选硬件认证。
-2. **LV资格已新增，实机仍待验。** 当前源码把D061专用LV控制、D1A6/LensSort/ActiveSlot只读证据纳入有据的保守判定，D1A4保留原始诊断；不是全部镜头和禁止条件的完备覆盖。两项LV控制的会话绑定、只读描述与拒绝路径已在本轮实机确认（T5/T6，见[后端重验证记录](../validation/README.md)）；成功 setter 写回的实机证据以本轮验收资料为准，fresh 镜头驱动资格因相机已从 Windows 枚举消失仍需重新连接后复核，旧rc2实机结果不认证新setter或nonce契约。
-3. **HDR配置不等于HDR捕获。** NEF互斥已处理；参考手册还限制闪光、包围、电影和特殊快门。当前未读取全部物理条件，不提供HDR采集事务或自动化健康保证。
-4. **自定义Picture Control和点击AF尚未完成。** 安全扩展顺序为已声明只读名称/头字段、坐标验证、显式操作能力，再实现控制；不能自动写未知私有扩展或扩大扫描profile。
-5. **原 rc1 固定自动化缺口已确认。** 当前 profile 6 要求 C0 严格 OFF、ADL OFF4、固定 WB 及 HDR 原生 OFF/NEF 互斥证明。新任务通过鲜读核对参数，保留会话、事件关联和主机文件完整性校验；完整 CT 联动仍需实机验收。
-6. **参考实现的静默错误和标签不直接沿用。** MTP `SetProperty` 497–615会捕获并记录部分错误；NB尺寸setter会跳过所有含RAW格式，而D7100官方规则只说明NEF尺寸固定；NB中央重点标签重复10mm。生产端保持严格编码、读回和准确型号覆盖。
+1. 设备证据按构建、相机、镜头和工况记录。已有独立 NEF/LV 及后续小规模联动分项 PASS，不能认证当前全部参数、长时预览、联锁或物理精度，见[验证索引](../validation/README.md)。
+2. LV 驱动需当前操作广告、鲜读 lensSort/照片选择器/D061 及 DeviceReady；未知镜头、物理 MF 和 AF-F 的限制不能由历史 setter 成功覆盖。
+3. HDR 配置不等于 HDR 捕获；当前不提供已验证 HDR 采集事务。自定义 Picture Control 完整编辑和点击 AF 也不能从通用目录推定可用。
+4. RAM profile 6 / SD profile 7 共用严格摄影策略，目标和事务分别验证；单个 NEF 文件不证明机身多重曝光已关闭，人工菜单检查不构造机器 OFF 证据。
+5. 参考实现中的静默写入错误和通用标签不直接沿用；生产端严格检查编码、实际型号描述和写后读回。
 
 ## 固定扫描、独立摄影与预览访问
 
@@ -161,14 +160,14 @@ UM p.144只明确说正在记录多重曝光时“部分菜单项”会变灰，
 
 Advanced的preset Compare只把supported/readable/confirmed、无error的actual作为证据；未知或保留旧值即使相等也显示UNKNOWN。WorkstationDialog改为mount焦点和最新callback refs，持续snapshot不抢输入焦点。[163257实际组件浏览器回归](../../.cache/tests/frontend/20261005-163257-dialog-focus-fix/result.json)PASS且明确UI_ONLY_NO_HARDWARE。摄影34项、LV2项及运行诊断分别展示；9205区域AF、自定义Picture Control编辑、Bulb/Time、视频/JPEG/多对象事务仍未实现。
 
-相机核心参数只有明确 Apply 才串行写入并读回；`prepare_scan` 只原子提交任务与完整几何，用确认快门派生曝光。预检、开始、恢复和扫描事务鲜读比较，不自动停 LV、不写快门/RAM/burst。当前清单 schema 3 中的 profile 版本为 6，冻结 WB、C0/ADL/HDR 证明及实际采集参数，规范 hash 纳入固定策略版本 3。旧 profile 1–5 原 hash 和只读重构保持，拒绝追加投影。HDR 只有未广告时可使用已确认 NEF=4 的互斥证明；已广告的 ON、错误或矛盾读回仍拒绝。
+相机核心参数只有明确 Apply 才串行写入并读回；`prepare_scan` 只原子提交任务与完整几何，用确认快门派生曝光。预检、开始、恢复和扫描事务鲜读比较，不自动停 LV、不写快门/RAM/burst。RAM 使用 schema 3 / profile 6，默认 SD 使用 schema 4 / profile 7 并冻结卡策略；两者冻结 WB、C0/ADL/HDR 证明及实际采集参数，规范 hash 纳入固定策略版本 3。旧 profile 1–5 原 hash 和只读重构保持，拒绝追加投影。HDR 只有未广告时可使用已确认 NEF=4 的互斥证明；已广告的 ON、错误或矛盾读回仍拒绝。
 
-独立摄影允许已确认的M/P/A/S、自动ISO/WB及支持的AF模式；不会隐式触发AF。只有实际自动模式决定的ISO/快门/光圈输出可变化；RAM介质、NEF格式、单host输出数量、会话及C101对象/文件证据仍严格校验。此入口保证一个验证完整的主机 NEF。90C0、一个与本操作关联的C101对象、完整长度/hash、秒级对象窗口、多对象拒绝和取消门禁保持（C102完成可选：可早到、迟到或不到，且仅作诊断）。Bulb/Time、JPEG和多对象采集不会因此开放。
+SD 独立单拍使用固定卡参数策略并只确认回执，不生成本地照片预览；以下独立自动摄影与文件预览契约适用于已明确授权的 RAM 路径。独立摄影允许已确认的M/P/A/S、自动ISO/WB及支持的AF模式；不会隐式触发AF。只有实际自动模式决定的ISO/快门/光圈输出可变化；RAM介质、NEF格式、单host输出数量、会话及C101对象/文件证据仍严格校验。此入口保证一个验证完整的主机 NEF。90C0、一个与本操作关联的C101对象、完整长度/hash、秒级对象窗口、多对象拒绝和取消门禁保持（C102完成可选：可早到、迟到或不到，且仅作诊断）。Bulb/Time、JPEG和多对象采集不会因此开放。
 
 正常 `camera_capture` 从唯一 `Parameters.savePath`根目录派生 `CameraCaptures`子目录，renderer不能换成任意路径；显式目录仅用于诊断 `camera_test_capture`且仍检查已有扫描清单、目录别名和不覆盖。完整文件提交后登记 capture ID、会话、operation ID、bytes及hash。照片预览只接收 capture ID，Tauri再次核对登记、大小/hash，复用 NEF内嵌 JPEG；无内嵌 JPEG时报预览不可用，不另写 JPEG临时文件。浏览器模拟只报告 NO HARDWARE，不登记或制造真实照片。
 
 ## 验证边界
 
-本机P0证据：[0070 result](../../.cache/tests/desktop/20261005-004700-0070-nef/result.json)、[新NEF与C101/C102](../../.cache/tests/desktop/20261005-004700-0070-nef/captured-nef.json)。EXE SHA-256 `0070808c9fb206d4745ba039bcd1eb4c13d19e0a12fef3d164be93797637862c`；engine SHA-256 `f8f074d75518e4cf0304e630c683ba643e8f5f23be882b00687ee03e3b191ffa`。新文件23,476,423字节，SHA-256 `b20e4b1b15e1c97541befc9dbe482f15ff7dabd2a9910304527b6b0028e7c2f9`；参数恢复PASS；UI LV 30.1096秒、首帧后missing=0、实时像素文件=0，期间存在STALE/首次暂无帧记录。App/engine均strict exit0；关闭前独立 LV-stop终态快照未保留，不能据此扩大该单项验收。测试明确无射线/Nano运动、fullLinkedHardwareCertified=false。上述tmp本机过程证据不进入Git。
+历史指定 P0 包证据（不代表当前交付）：[0070 result](../../.cache/tests/desktop/20261005-004700-0070-nef/result.json)、[新NEF与C101/C102](../../.cache/tests/desktop/20261005-004700-0070-nef/captured-nef.json)。EXE SHA-256 `0070808c9fb206d4745ba039bcd1eb4c13d19e0a12fef3d164be93797637862c`；engine SHA-256 `f8f074d75518e4cf0304e630c683ba643e8f5f23be882b00687ee03e3b191ffa`。新文件23,476,423字节，SHA-256 `b20e4b1b15e1c97541befc9dbe482f15ff7dabd2a9910304527b6b0028e7c2f9`；参数恢复PASS；UI LV 30.1096秒、首帧后missing=0、实时像素文件=0，期间存在STALE/首次暂无帧记录。App/engine均strict exit0；关闭前独立 LV-stop终态快照未保留，不能据此扩大该单项验收。测试明确无射线/Nano运动、fullLinkedHardwareCertified=false。上述tmp本机过程证据不进入Git。
 
-历史 profile 5 策略的 [offline PASS](../../.cache/tests/ct-engine/20261005-profile5-final/result.json) 与 [simulation-only PASS](../../.cache/tests/camera/20261005-fixed-automation-audit/preview-final-result.json) 仅认证对应历史实现。当前策略为 profile 6，不能沿用旧包的硬件结论。当前及历史验收见 [后端重验证记录](../validation/README.md)；完整扫描、射线联动和重构精度仍需要实机证据。
+历史 profile 5 策略的 [offline PASS](../../.cache/tests/ct-engine/20261005-profile5-final/result.json) 与 [simulation-only PASS](../../.cache/tests/camera/20261005-fixed-automation-audit/preview-final-result.json) 仅认证对应历史实现。当前策略为 RAM profile 6 / SD profile 7，不能沿用旧包的硬件结论。当前及历史验收见 [后端重验证记录](../validation/README.md)；后续小规模联动已有分项实测；当前版本全部工况、物理精度和定量成像不能由旧包或有限实测推定，见验证索引。

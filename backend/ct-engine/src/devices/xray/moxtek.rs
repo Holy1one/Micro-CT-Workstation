@@ -23,7 +23,9 @@ const BAUD_RATE: u32 = 57_600;
 // OEM D2XX read timeout is five seconds, although its queue wait is about
 // one second. Monitoring uses a shared five-second pair budget with cancellable
 // reads; OFF retains one second per transaction and commands are never replayed.
-const MONITOR_READ_BUDGET: Duration = Duration::from_secs(5);
+// One pending reply, not command replay. OFF/cancellation and the continuous
+// output deadline still preempt every 50 ms read slice.
+const MONITOR_READ_BUDGET: Duration = Duration::from_secs(10);
 const ENABLE_STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PACKET_HEADER: u8 = 0x1B;
 const CMD_SET_VOLTAGE: u8 = 0x40;
@@ -56,6 +58,9 @@ const MAX_CASE_TEMPERATURE_C: f64 = 65.0;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct XrayHealth {
+    /// Internal evidence; never inferred from a message or exposed as safe ON.
+    #[serde(skip)]
+    pub(crate) monitor_interruption: Option<(Instant, String)>,
     pub connected: bool,
     pub port: Option<String>,
     pub serial: Option<String>,
@@ -73,9 +78,33 @@ pub struct XrayHealth {
     pub last_error: Option<String>,
 }
 
+impl XrayHealth {
+    /// Numeric telemetry changes within one advisory episode are still exposed
+    /// in health, but must not erase scan receipts from the bounded event log.
+    pub(crate) fn new_telemetry_warning(&self, previous: Option<&Self>) -> Option<&str> {
+        let warning = self.telemetry_warning.as_deref()?;
+        fn kind(text: &str) -> &str {
+            if text.starts_with("Moxtek measured telemetry outside advisory limits") {
+                "Moxtek measured telemetry outside advisory limits"
+            } else {
+                text
+            }
+        }
+        let unchanged = previous.is_some_and(|previous| {
+            previous.telemetry_warning.as_deref().is_some_and(|text| kind(text) == kind(warning))
+                && previous.port == self.port
+                && previous.serial == self.serial
+                && previous.set_voltage_kv == self.set_voltage_kv
+                && previous.set_current_ua == self.set_current_ua
+        });
+        (!unchanged).then_some(warning)
+    }
+}
+
 impl Default for XrayHealth {
     fn default() -> Self {
         Self {
+            monitor_interruption: None,
             connected: false,
             port: None,
             serial: None,
@@ -100,6 +129,8 @@ pub enum XrayError {
     Cancelled,
     Discovery(String),
     Transport(String),
+    ReadTimeout(String),
+    MonitorInterrupted(String),
     Protocol(String),
     Parameter(String),
     Safety(String),
@@ -111,6 +142,8 @@ impl fmt::Display for XrayError {
             Self::Cancelled=>write!(f,"Moxtek operation cancelled"),
             Self::Discovery(message) => write!(f, "discovery error: {message}"),
             Self::Transport(message) => write!(f, "transport error: {message}"),
+            Self::ReadTimeout(message) => write!(f, "read timeout: {message}"),
+            Self::MonitorInterrupted(message) => write!(f, "monitor interrupted; OFF confirmed: {message}"),
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
             Self::Parameter(message) => write!(f, "parameter error: {message}"),
             Self::Safety(message) => write!(f, "safety error: {message}"),
@@ -177,6 +210,9 @@ impl RawMoxtekAdapter {
 
     pub fn health(&self) -> XrayHealth {
         self.health.clone()
+    }
+    pub(super) fn clear_monitor_interruption(&mut self) {
+        self.health.monitor_interruption = None;
     }
 
     pub(super) fn set_operation_cancel(&mut self, cancel: Option<std::sync::Arc<AtomicBool>>) {
@@ -286,6 +322,7 @@ impl RawMoxtekAdapter {
         self.require_off(&final_setpoints, &status)?;
         self.apply_health(&final_setpoints, &status);
         self.requested_setpoint = Some((voltage_kv, current_ua));
+        self.health.monitor_interruption = None;
         Ok(self.health())
     }
 
@@ -351,6 +388,7 @@ impl RawMoxtekAdapter {
             Err(error) => {
                 self.health.connected = false;
                 self.health.beam_off_confirmed = false;
+                self.health.monitor_interruption = None;
                 self.health.last_error = Some(error.to_string());
                 Err(error)
             }
@@ -361,6 +399,9 @@ impl RawMoxtekAdapter {
     /// fail closed. Measured-channel drift is telemetry only: it is returned as
     /// a detailed warning while the device-accepted setpoint remains authoritative.
     pub fn refresh_emission_status(&mut self) -> Result<XrayHealth, XrayError> {
+        if let Some((_, reason)) = &self.health.monitor_interruption {
+            return Err(XrayError::MonitorInterrupted(reason.clone()));
+        }
         let result: Result<(Setpoints, Status, Option<String>), XrayError> = (|| {
             let (requested_voltage, requested_current) =
                 self.requested_setpoint.ok_or_else(|| {
@@ -436,18 +477,63 @@ impl RawMoxtekAdapter {
                 Ok(self.health())
             }
             Err(error) => {
+                let off_started = Instant::now();
                 let cleanup = self.force_off_inner();
                 if matches!(error, XrayError::Cancelled) && cleanup.is_ok() {
                     self.health.last_error = None;
                     return Err(XrayError::Cancelled);
                 }
                 let error = match cleanup {
+                    Ok(()) if matches!(error, XrayError::ReadTimeout(_)) => {
+                        let reason = error.to_string();
+                        self.health.monitor_interruption = Some((off_started, reason.clone()));
+                        XrayError::MonitorInterrupted(reason)
+                    }
                     Ok(()) => error,
                     Err(cleanup) => XrayError::Safety(format!("{error}; OFF unconfirmed: {cleanup}")),
                 };
                 self.health.last_error = Some(error.to_string());
                 Err(error)
             }
+        }
+    }
+
+    /// Read-only requalification after a monitor timeout and verified OFF.
+    /// The coordinator owns when a new exposure is allowed. No ON is sent here.
+    pub(super) fn recover_monitor(&mut self) -> Result<XrayHealth, XrayError> {
+        if self.health.monitor_interruption.is_none() {
+            return Err(XrayError::Safety("No monitor interruption to recover".into()));
+        }
+        let result = (|| {
+            let (kv, ua) = self.requested_setpoint.ok_or_else(|| XrayError::Safety("Missing session setpoints".into()))?;
+            for index in 0..2 {
+                if index > 0 {
+                    for _ in 0..10 {
+                        if self.operation_cancelled() { return Err(XrayError::Cancelled); }
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                let (setpoints, status) = self.read_monitored_pair()?;
+                self.require_off(&setpoints, &status)?;
+                if !within_setpoint_tolerance(&setpoints, kv, ua) || status.locked
+                    || !status.temperature_c.is_finite() || status.temperature_c > MAX_CASE_TEMPERATURE_C {
+                    return Err(XrayError::Safety("Monitor recovery readback failed setpoint/interlock/temperature checks".into()));
+                }
+                self.apply_health(&setpoints, &status);
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.health.monitor_interruption = None;
+                self.health.last_error = None;
+                Ok(self.health())
+            }
+            Err(XrayError::ReadTimeout(reason)) => {
+                self.force_off_inner().map_err(|error| XrayError::Safety(format!("Recovery OFF unconfirmed: {error}")))?;
+                Err(XrayError::MonitorInterrupted(reason))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -612,6 +698,9 @@ impl RawMoxtekAdapter {
     }
 
     fn beam_on_inner(&mut self, cancel: &AtomicBool, output_deadline: Option<Instant>) -> Result<(), XrayError> {
+        if self.health.monitor_interruption.is_some() {
+            return Err(XrayError::Safety("Monitor recovery required before beam ON".into()));
+        }
         if cancel.load(Ordering::SeqCst)||self.operation_cancelled(){return Err(XrayError::Cancelled);}
         if !self.health.beam_off_confirmed || self.last_off.is_none() {
             return Err(XrayError::Safety(
@@ -879,7 +968,7 @@ impl RawMoxtekAdapter {
             budget = budget.min(limit.saturating_duration_since(started));
         }
         let result = if budget.is_zero() {
-            Err(XrayError::Transport(format!("query cycle deadline reached before command 0x{command:02X}")))
+            Err(XrayError::ReadTimeout(format!("query cycle deadline reached before command 0x{command:02X}")))
         } else {
             transact_transport(transport, command, payload, expected_length, budget, ||
                 self.operation_cancelled() || self.output_deadline.is_some_and(|limit| Instant::now() >= limit))
@@ -934,6 +1023,8 @@ fn transact_transport(
         .read_cancellable(&mut response, read_deadline.saturating_duration_since(Instant::now()), &cancelled)
         .map_err(|error| if error.kind() == std::io::ErrorKind::Interrupted && cancelled() {
             XrayError::Cancelled
+        } else if error.kind() == std::io::ErrorKind::TimedOut {
+            XrayError::ReadTimeout(format!("read failed for command 0x{command:02X}: {error}"))
         } else { XrayError::Transport(format!("read failed for command 0x{command:02X}: {error}")) })?;
     if cancelled() { return Err(XrayError::Cancelled); }
     if response.len() < 3
@@ -991,7 +1082,7 @@ fn validate_setpoint(voltage_kv: f64, current_ua: f64) -> Result<(), XrayError> 
 }
 
 fn is_transport_timeout(error: &XrayError) -> bool {
-    matches!(error, XrayError::Transport(message) if {
+    matches!(error, XrayError::ReadTimeout(_)) || matches!(error, XrayError::Transport(message) if {
         let message = message.to_ascii_lowercase();
         message.contains("timed out") || message.contains("timeout")
     })
@@ -1060,6 +1151,31 @@ fn raw_to_temp(raw: u16) -> f64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn changing_telemetry_in_one_warning_episode_keeps_event_log_bounded() {
+        let mut health = super::XrayHealth {
+            set_voltage_kv: Some(4.0), set_current_ua: Some(10.0), ..Default::default()
+        };
+        let mut previous = None;
+        let mut events = Vec::new();
+        for sample in 0..500 {
+            health.telemetry_warning = Some(format!(
+                "Moxtek measured telemetry outside advisory limits: measured=4.{sample} kV/0 uA"
+            ));
+            if let Some(message) = health.new_telemetry_warning(previous.as_ref()) {
+                events.push(message.to_owned());
+            }
+            previous = Some(health.clone());
+        }
+        assert_eq!(events.len(), 1, "numeric fluctuations must not evict capture receipts");
+        assert!(health.telemetry_warning.as_ref().unwrap().contains("4.499"), "latest telemetry remains available");
+        let recovered = super::XrayHealth { telemetry_warning: None, ..health.clone() };
+        assert!(health.new_telemetry_warning(Some(&recovered)).is_some(), "a new episode remains visible");
+        let changed_setpoint = super::XrayHealth { set_current_ua: Some(20.0), ..health.clone() };
+        assert!(changed_setpoint.new_telemetry_warning(Some(&health)).is_some());
+        let ack_warning = super::XrayHealth { telemetry_warning: Some("enable ACK diagnostic".into()), ..health.clone() };
+        assert!(ack_warning.new_telemetry_warning(Some(&health)).is_some(), "different diagnostics remain visible");
+    }
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -1761,8 +1877,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn active_monitor_waits_past_one_second_without_replaying_any_command() {
-        let (mut raw, state, armed, _, budgets) = delayed_fixture(Duration::from_millis(1100));
+    fn active_monitor_waits_past_previous_five_second_limit_without_replaying_any_command() {
+        let (mut raw, state, armed, _, budgets) = delayed_fixture(Duration::from_millis(6100));
         raw.beam_on(&AtomicBool::new(false)).unwrap();
         let before = state.lock().unwrap().writes.len();
         budgets.lock().unwrap().clear();
@@ -1786,10 +1902,68 @@ pub(crate) mod tests {
         assert!(started.elapsed() >= MONITOR_READ_BUDGET);
         assert!(started.elapsed() < MONITOR_READ_BUDGET + Duration::from_secs(1));
         assert!(error.to_string().contains("received=0/8"));
+        assert!(matches!(error,XrayError::MonitorInterrupted(_)));
         assert!(raw.health().beam_off_confirmed);
         let state = state.lock().unwrap();
         assert!(!state.enabled);
         assert_eq!(state.beam_enable_times.len(), 1);
+    }
+
+    #[test]
+    fn monitor_timeout_keeps_owner_and_requires_two_fresh_off_checks_before_reenable() {
+        let state=Arc::new(Mutex::new(FakeState::default()));
+        let mut raw=connected_adapter(state.clone());
+        raw.set_parameters(20.0,100.0).unwrap();
+        raw.last_off=Some(Instant::now()-Duration::from_secs(3));
+        raw.beam_on(&AtomicBool::new(false)).unwrap();
+        state.lock().unwrap().next_read_timeout=true;
+        assert!(matches!(raw.refresh_emission_status(),Err(XrayError::MonitorInterrupted(_))));
+        let off_at=raw.last_off.unwrap();
+        assert!(raw.health().connected && raw.health().beam_off_confirmed);
+        let mut owner=super::super::worker::MoxtekAdapter::from_raw(raw);
+        let before=state.lock().unwrap().writes.len();
+        let health=owner.recover_monitor(Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(health.monitor_interruption.is_none() && health.beam_off_confirmed);
+        let writes=state.lock().unwrap().writes[before..].to_vec();
+        assert_eq!(writes.iter().map(|p|p[1]).collect::<Vec<_>>(),[CMD_GET_SETPOINTS,CMD_GET_STATUS,CMD_GET_SETPOINTS,CMD_GET_STATUS]);
+        assert_eq!(state.lock().unwrap().beam_enable_times.len(),1,"recheck never issues ON");
+        owner.beam_on(&AtomicBool::new(false)).unwrap();
+        assert!(state.lock().unwrap().beam_enable_times[1].duration_since(off_at)>=MIN_REENABLE_INTERVAL);
+        owner.force_off().unwrap();
+    }
+
+    #[test]
+    fn monitor_recovery_rejects_interlock_and_cancel_without_reenabling() {
+        for cancelled in [false,true] {
+            let state=Arc::new(Mutex::new(FakeState::default()));
+            let mut raw=connected_adapter(state.clone());raw.set_parameters(20.0,100.0).unwrap();
+            raw.last_off=Some(Instant::now()-Duration::from_secs(3));raw.beam_on(&AtomicBool::new(false)).unwrap();
+            state.lock().unwrap().next_read_timeout=true;
+            assert!(matches!(raw.refresh_emission_status(),Err(XrayError::MonitorInterrupted(_))));
+            state.lock().unwrap().locked=!cancelled;
+            let mut owner=super::super::worker::MoxtekAdapter::from_raw(raw);
+            assert!(owner.recover_monitor(Arc::new(AtomicBool::new(cancelled))).is_err());
+            assert_eq!(state.lock().unwrap().beam_enable_times.len(),1);
+            assert!(!state.lock().unwrap().enabled);
+        }
+    }
+
+    #[test]
+    fn repeated_recovery_read_timeouts_keep_off_and_do_not_close_or_reenable_owner() {
+        let state=Arc::new(Mutex::new(FakeState::default()));
+        let mut raw=connected_adapter(state.clone());raw.set_parameters(20.0,100.0).unwrap();
+        raw.last_off=Some(Instant::now()-Duration::from_secs(3));raw.beam_on(&AtomicBool::new(false)).unwrap();
+        state.lock().unwrap().next_read_timeout=true;
+        assert!(matches!(raw.refresh_emission_status(),Err(XrayError::MonitorInterrupted(_))));
+        let mut owner=super::super::worker::MoxtekAdapter::from_raw(raw);
+        for _ in 0..3 {
+            state.lock().unwrap().next_read_timeout=true;
+            assert!(matches!(owner.recover_monitor(Arc::new(AtomicBool::new(false))),Err(XrayError::MonitorInterrupted(_))));
+            let health=owner.health();assert!(health.connected&&health.beam_off_confirmed&&health.monitor_interruption.is_some());
+            assert_eq!(state.lock().unwrap().beam_enable_times.len(),1);
+        }
+        assert!(owner.recover_monitor(Arc::new(AtomicBool::new(false))).is_ok());
+        assert_eq!(state.lock().unwrap().beam_enable_times.len(),1);
     }
 
     #[test]

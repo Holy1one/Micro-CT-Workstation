@@ -197,6 +197,7 @@ export interface ScanSetup {
   angleStepDeg: number;
   exposureMs: number;
   maxXraySec: number;
+  earlyRelease?: boolean;
 }
 
 export type ScanSetupUpdate = Partial<Omit<ScanSetup, "angleStepDeg">>;
@@ -205,6 +206,7 @@ export interface ScanPreparation {
   taskId: string;
   projectionCount: number;
   maxXraySec: number;
+  earlyRelease?: boolean;
   geometry: ReconstructionGeometry;
 }
 
@@ -360,6 +362,14 @@ export interface CameraHealth {
   lastDeviceInfoChangedDiagnostic?: CameraEventDiagnostic | null;
   lastCleanupDiagnostic?: CameraCleanupDiagnostic | null;
   lastCaptureEventDiagnostic?: CameraCaptureEventDiagnostic | null;
+  lastCardCaptureTiming?: {
+    sessionId: string | null; operationId: string;
+    precheckMs: number; triggerMs: number;
+    exposureEndedObservedMs: number | null; objectAddedObservedMs: number | null;
+    totalMs: number; completed: boolean;
+    usbCommands: number; usbCallMs: number; propertyReads: number; descriptorReads: number; eventPolls: number;
+    earlyEndObservedMs?: number | null; earlyEndValue?: number | null;
+  } | null;
   runtimeProperties?: Record<string, CameraRuntimeProperty>;
   capabilities: CameraCapabilities; properties: Record<string, CameraProperty>; liveView: CameraLiveView;
   liveViewControls?: CameraLiveViewControls;

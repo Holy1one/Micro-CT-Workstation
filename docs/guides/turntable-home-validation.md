@@ -1,6 +1,6 @@
 # 霍尔零点与转台 HOME 的直接验证实验
 
-状态：已执行部分真实设备诊断；负载侧物理角度准确性仍未验收。本文包含实验规程与现有证据的边界。
+本文是按需使用的验证规程，不是自动执行任务；历史端口与固件身份不作为当前连接参数。状态：已执行部分真实设备诊断；负载侧物理角度准确性仍未验收。本文包含实验规程与现有证据的边界。
 
 2026-09-29 的只读链路探测已确认：`COM8` 的 CH340 设备响应 `RTS9060_NANO`、`VERSION=2.1.0`、`PROTOCOL=2`、`BUILD=20260918`；`PING`、`INFO`、`STATUS`、`GET_HALL` 均有回复。其状态为 `LOCKED`、`reference=0`、`homed=0`、`hall=0`，`GET_HALL` 返回 `HALL 6 0`。这只证明通信与一次静态电平读取，未发生运动，也不证明霍尔边沿或 HOME 精度。原始记录在 `.cache/tests/turntable/20260929-serial-identify/`。
 
@@ -14,13 +14,13 @@
 
 准确性要求先冻结为 `E`（允许的负载侧零位角误差，单位度）和 `E_H`（允许的单次霍尔边沿散布，`E_H ≤ E`）。由成像系统的几何误差预算给出，例如若半径 `R` 处允许切向位移 `d`，则 `E ≤ atan(d/R) × 180/π`，并考虑其他误差分配。不得观察结果后放宽这两个阈值。外部测角系统的校准扩展不确定度 `U95` 应不大于 `E_H/10`；达不到时更换量具或降低能宣称的精度。当前项目没有冻结的 `E`、`E_H`、`R`、`d` 数值，因此尚不能宣称“精度合格”。
 
-## 当前实现与实验改造边界
+## 现行实现与历史诊断边界
 
-PC 端 `ct-engine` 只发送 `HOME`，要求 `HOME_DONE <id> POS=0`，再检查 `STATUS` 中 `IDLE`、`rearmed`、`homed`、`reference`；零位写入发生在 Nano 固件侧。2026-09-29 经用户授权，从指定封存文件恢复固件草稿到 `.cache/tests/turntable/20260929-firmware-recovery/rts9060_nano/`；编译出的 13,416 字节程序区与 COM8 上 Nano 闪存逐字节一致。该临时恢复件不是已建立的活动固件维护目录。浏览器预览中的置零只是模拟行为，修改它不能改变真实转台，也不能提供真实精度证据。
+PC 端 `ct-engine` 只发送 `HOME`，要求 `HOME_DONE <id> POS=0`，再检查 `STATUS` 中 `IDLE`、`rearmed`、`homed`、`reference`；零位写入发生在 Nano 固件侧。2026-09-29 经用户授权，从指定封存文件恢复固件草稿到 `.cache/tests/turntable/20260929-firmware-recovery/rts9060_nano/`；编译出的 13,416 字节程序区与 COM8 上 Nano 闪存逐字节一致。该临时恢复件是当时的诊断证据；现行活动固件源码位于 firmware/rts9060_nano/，不得以旧恢复件替代。浏览器预览中的置零只是模拟行为，修改它不能改变真实转台，也不能提供真实精度证据。
 
 项目中的 Arduino 安装包、Nano 教程和 `frontend/preview/rts9060/transport.ts` 预览模拟器均不是已烧录固件的源代码。已验证的实际 `GET_HALL` 响应是 `HALL <id> <0|1>`；不能用预览模拟器中的 `level=` 字段推断真实固件实现。
 
-当前临时诊断版本位于 `.cache/tests/turntable/20260929-firmware-recovery/rts9060_nano_diag/`。它沿用原固件的脉冲时序、STOP 按钮、心跳及故障锁定；`DIAG_RUN <id> <1..3>` 只允许按 HOME 方向发送指定整圈脉冲，记录霍尔进入边沿时的原始脉冲与 `micros()` 时间，运行结束统一输出事件；诊断 `HOME` 的最后一次霍尔触发只打印 `HALL_HOME_RAW`，不清零、不返回 `HOME_DONE`，且 `reference/homed` 始终为 0。普通 `MOVE`、`ZERO`、射线警告 ON 均被拒绝。该记录只能测霍尔事件相对于**电机命令计数**的一致性；没有独立负载侧角度传感器时，不能生成本规程中的 `θ_i`、`φ_i` 或 `e_i`。
+2026-09-29 的历史诊断版本位于 `.cache/tests/turntable/20260929-firmware-recovery/rts9060_nano_diag/`。它沿用原固件的脉冲时序、STOP 按钮、心跳及故障锁定；`DIAG_RUN <id> <1..3>` 只允许按 HOME 方向发送指定整圈脉冲，记录霍尔进入边沿时的原始脉冲与 `micros()` 时间，运行结束统一输出事件；诊断 `HOME` 的最后一次霍尔触发只打印 `HALL_HOME_RAW`，不清零、不返回 `HOME_DONE`，且 `reference/homed` 始终为 0。普通 `MOVE`、`ZERO`、射线警告 ON 均被拒绝。该记录只能测霍尔事件相对于**电机命令计数**的一致性；没有独立负载侧角度传感器时，不能生成本规程中的 `θ_i`、`φ_i` 或 `e_i`。
 
 ### 2026-09-29 台架实测
 

@@ -336,6 +336,8 @@ pub struct CameraHealth {
     #[serde(default)]
     pub last_capture_event_diagnostic: Option<CameraCaptureEventDiagnostic>,
     #[serde(default)]
+    pub last_card_capture_timing: Option<CardCaptureTiming>,
+    #[serde(default)]
     pub last_cleanup_diagnostic: Option<CameraCleanupDiagnostic>,
     pub discovered: Vec<CameraIdentity>,
     pub session_id: Option<String>,
@@ -354,6 +356,34 @@ pub struct CameraHealth {
     pub operation_id: Option<String>,
     pub phase: String,
     pub focus_position: Option<i64>,
+}
+
+/// Monotonic software observations, never shutter-edge or capture evidence.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardCaptureTiming {
+    pub session_id: Option<String>,
+    pub operation_id: String,
+    pub precheck_ms: u64,
+    pub trigger_ms: u64,
+    pub exposure_ended_observed_ms: Option<u64>,
+    pub object_added_observed_ms: Option<u64>,
+    pub total_ms: u64,
+    pub completed: bool,
+    pub usb_commands: u64,
+    pub usb_call_ms: f64,
+    pub property_reads: u64,
+    pub descriptor_reads: u64,
+    pub event_polls: u64,
+    /// Acceptance measurement only, never exposure or commit evidence: elapsed
+    /// milliseconds from this capture's start to the first time the raw `0xD1A4`
+    /// value was seen with its running-state bit (`0x0000_8000`) cleared while the
+    /// operation was in flight, and that raw value. It records an observed
+    /// correlate for a later hardware acceptance; no decision reads it.
+    #[serde(default)]
+    pub early_end_observed_ms: Option<u64>,
+    #[serde(default)]
+    pub early_end_value: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -384,9 +414,18 @@ pub struct CapturedImage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CameraCaptureEvent {
+    /// Card L1 acceptance only; never substitutes for the receipt's completion.
+    EarlyExposureEnded {
+        session_id: String,
+        operation_id: String,
+        #[serde(skip)]
+        observed_at: Option<std::time::Instant>,
+    },
     ExposureEnded {
         session_id: String,
         operation_id: String,
+        #[serde(skip)]
+        observed_at: Option<std::time::Instant>,
     },
     ObjectAdded {
         session_id: String,

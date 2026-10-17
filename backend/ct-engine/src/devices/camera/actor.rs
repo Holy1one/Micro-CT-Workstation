@@ -13,8 +13,8 @@ use super::nikon::*;
 use super::properties::{refresh_property_controls,clear_live_view_controls,require_card_destination};
 use super::ptp::*;
 use super::storage::{
-    bind_storage_ids, parse_storage_ids, parse_storage_info, plan_task_cards, CardPlan,
-    CONSERVATIVE_NEF_BYTES,
+    bind_storage_ids, parse_storage_ids, parse_storage_info, plan_camera_task_cards, CardPlan,
+    StorageInfo,
 };
 use super::types::*;
 use std::collections::BTreeMap;
@@ -111,6 +111,8 @@ enum Request {
     CardPlan {
         projection_count: u32,
     },
+    /// Read actual storage metadata without claiming whole-task admission.
+    CardStorages,
     /// One card exposure: the plan was frozen by the scan coordinator, and the
     /// transaction sends exactly one standard `InitiateCapture` and reads only
     /// object metadata. No local file exists for this request.
@@ -131,6 +133,8 @@ enum Request {
         staging: PathBuf,
         progress: Option<Arc<Mutex<CardImportProgress>>>,
     },
+    /// Exact post-seal deletion; never part of capture cancellation/cleanup.
+    CardImportDelete { object: Box<CardImportObject>, identity: CameraIdentity },
     LvStart(u64),
     LvStop,
     LvRead(String,u64),
@@ -145,6 +149,7 @@ enum Reply {
     Applied(PropertyApplyResult),
     Captured(CapturedImage),
     CardPlan(CardPlan),
+    CardStorages(Vec<StorageInfo>),
     CardCaptured(CardCaptureOutcome),
     CardImportInventory(Box<CardImportInventory>),
     CardImportDownloaded(Box<CardImportDownload>),
@@ -163,6 +168,8 @@ struct Control {
     frames: LatestFrameSlot,
     commit_gate: Mutex<()>,
     deadline: Mutex<Option<(u64, Instant)>>,
+    /// Only a Stop admitted between native calls may reuse this generation.
+    idle_stop_epoch: AtomicU64,
     shutter_target: Mutex<Option<CameraValue>>,
     /// True while the unresolved pending capture was triggered as a card
     /// operation. It only selects the termination-evidence code in `cleanup`:
@@ -208,6 +215,7 @@ impl CameraAdapter {
             frames: LatestFrameSlot::default(),
             commit_gate: Mutex::new(()),
             deadline: Mutex::new(None),
+            idle_stop_epoch: AtomicU64::new(0),
             shutter_target: Mutex::new(None),
             card_capture_pending: AtomicBool::new(false),
             post_commit_drain_window: Mutex::new(POST_COMMIT_DRAIN_WINDOW),
@@ -280,6 +288,12 @@ impl CameraAdapter {
             &self.control,
             "Cancellation requested; camera cleanup not yet confirmed",
         )
+    }
+    /// Stop business work, keeping an already idle healthy transport when its
+    /// owner can freshly confirm that no exposure or Live View remains.
+    pub fn request_stop(&self) -> CameraHealth {
+        invalidate_generation_with_policy(&self.control, None,
+            "Stop requested; camera cleanup not yet confirmed", true)
     }
     fn call(
         &self,
@@ -534,7 +548,7 @@ impl CameraAdapter {
     }
     /// Enumerates the advertised card storages on the single COM owner thread and
     /// applies the whole-task capacity gate for `projection_count` projections plus
-    /// the 20 pre-scan references at the documented conservative per-frame bound.
+    /// the 20 pre-scan references at the documented per-frame planning reserve.
     /// Read-only metadata only: `GetStorageIDs` and one bounded `GetStorageInfo`
     /// per advertised id, bound positionally, then the shared offline card
     /// planner. A plan that cannot cover the whole task is refused with its stable
@@ -543,6 +557,14 @@ impl CameraAdapter {
     pub fn plan_card_storages(&self, projection_count: u32) -> Result<CardPlan, CameraError> {
         match self.call(Request::CardPlan { projection_count }, COMMAND_TIMEOUT, None)? {
             Reply::CardPlan(plan) => Ok(plan),
+            _ => unreachable!(),
+        }
+    }
+    /// Metadata-only inspection through the same COM owner. Access flags and
+    /// capacities stay exactly as reported; this grants no scan/capture credit.
+    pub fn read_card_storages(&self) -> Result<Vec<StorageInfo>, CameraError> {
+        match self.call(Request::CardStorages, COMMAND_TIMEOUT, None)? {
+            Reply::CardStorages(storages) => Ok(storages),
             _ => unreachable!(),
         }
     }
@@ -617,6 +639,13 @@ impl CameraAdapter {
             Reply::CardImportDownloaded(download) => Ok(*download),
             _ => unreachable!(),
         }
+    }
+    pub(crate) fn card_import_delete(
+        &self, object: &CardImportObject, identity: &CameraIdentity, cancel: &AtomicBool,
+    ) -> Result<(), CameraError> {
+        self.call(Request::CardImportDelete {
+            object: Box::new(object.clone()), identity: identity.clone(),
+        }, CARD_IMPORT_ENUMERATE_TIMEOUT, Some(cancel)).map(|_| ())
     }
     pub fn capture_frame_cancellable(
         &self,
@@ -706,18 +735,31 @@ fn invalidate_epoch(control: &Control, epoch: u64, reason: &str) -> CameraHealth
     invalidate_generation(control, Some(epoch), reason)
 }
 fn invalidate_generation(control: &Control, expected_epoch: Option<u64>, reason: &str) -> CameraHealth {
+    invalidate_generation_with_policy(control, expected_epoch, reason, false)
+}
+fn invalidate_generation_with_policy(control: &Control, expected_epoch: Option<u64>, reason: &str, retain_idle: bool) -> CameraHealth {
     let _gate = control.commit_gate.lock().unwrap();
     // An old waiter may observe its cancellation after Stop already retired
     // the session. It must not revoke that newer generation's cleanup proof.
     if expected_epoch.is_some_and(|epoch| control.generation.load(Ordering::Acquire) != epoch) {
         return control.cached.lock().unwrap().clone();
     }
-    control.generation.fetch_add(1, Ordering::AcqRel);
+    let native_idle = control.deadline.lock().unwrap().is_none();
+    let mut h = control.cached.lock().unwrap();
+    // Repeated Stop joins this same pending idle verification. Explicit
+    // disconnect, watchdog failure and shutdown still retire it immediately.
+    if retain_idle && control.idle_stop_epoch.load(Ordering::Acquire)
+        == control.generation.load(Ordering::Acquire) && h.isolated && !h.cleanup_confirmed {
+        return h.clone();
+    }
+    let retain_idle = retain_idle && native_idle && h.connected && !h.isolated
+        && !h.busy && !h.live_view.active && h.last_error.is_none();
+    let epoch = control.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    control.idle_stop_epoch.store(if retain_idle { epoch } else { 0 }, Ordering::Release);
     control.live_generation.fetch_add(1,Ordering::AcqRel);
     control.live_stop_pending.store(true,Ordering::Release);
     control.frames.revoke();
-    let mut h = control.cached.lock().unwrap();
-    h.connected = false;
+    if !retain_idle { h.connected = false; }
     h.isolated = true;
     h.cleanup_confirmed = false;
     h.phase = "cancel_requested".into();
@@ -734,6 +776,70 @@ fn invalidate_generation(control: &Control, expected_epoch: Option<u64>, reason:
 mod cancellation_tests {
     use super::*;
     use crate::devices::camera::{scripted_camera, ScriptedCameraConfig};
+
+    #[test]
+    fn idle_stop_keeps_native_session_and_late_waiter_cannot_retire_it() {
+        let (camera, probe) = crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig::default());
+        let session = camera.health().session_id;
+        let lifecycle = probe.transport_lifecycle();
+        let old_epoch = camera.control.generation.load(Ordering::Acquire);
+        assert!(camera.request_stop().connected);
+        camera.request_stop();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !camera.health().cleanup_confirmed && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+        let health = camera.health();
+        assert!(health.connected && !health.isolated && health.cleanup_confirmed, "{health:?}");
+        assert_eq!(health.session_id, session);
+        assert_eq!(probe.transport_lifecycle(), lifecycle);
+        invalidate_epoch(&camera.control, old_epoch, "late old waiter");
+        assert!(camera.health().connected && camera.health().cleanup_confirmed);
+        camera.read_properties().unwrap();
+        camera.disconnect_confirmed().unwrap();
+        assert!(!camera.health().connected);
+        assert_eq!(probe.transport_lifecycle(), (lifecycle.0, lifecycle.1 + 1, lifecycle.2 + 1));
+    }
+
+    #[test]
+    fn stop_during_native_io_retires_instead_of_reusing_uncertain_transport() {
+        let (camera, probe) = crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig::default());
+        let (entered, receive) = mpsc::channel();
+        probe.stall_operation(GET_PROPERTY, Duration::from_millis(120), entered);
+        let reading = camera.clone();
+        let worker = thread::spawn(move || reading.read_properties());
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!camera.request_stop().connected);
+        assert!(worker.join().unwrap().is_err());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !camera.health().cleanup_confirmed && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+        let health = camera.health();
+        assert!(!health.connected && health.isolated && health.cleanup_confirmed);
+        assert_eq!(probe.transport_lifecycle(), (1, 1, 1));
+    }
+
+    #[test]
+    fn idle_stop_readback_failure_isolates_and_closes_camera() {
+        let (camera, probe) = crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig::default());
+        probe.fail_transport_operation(GET_EVENT);
+        camera.request_stop();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !camera.health().cleanup_confirmed && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+        let health = camera.health();
+        assert!(!health.connected && health.isolated && health.last_error.is_some());
+        assert_eq!(probe.transport_lifecycle(), (1, 1, 1));
+    }
+
+    #[test]
+    fn unexpected_live_view_during_idle_stop_prevents_session_reuse() {
+        let (camera, probe) = crate::devices::camera::scripted_camera_with_probe(ScriptedCameraConfig::default());
+        probe.set_live_view_state(true);
+        camera.request_stop();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !camera.health().cleanup_confirmed && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
+        let health = camera.health();
+        assert!(!health.connected && health.isolated && health.cleanup_confirmed);
+        assert_eq!(probe.live_view_stop_count(), 1);
+        assert_eq!(probe.transport_lifecycle(), (1, 1, 1));
+    }
 
     #[test]
     fn retired_waiter_cannot_revoke_confirmed_stop_cleanup() {
@@ -769,6 +875,54 @@ fn publish(camera: &NativeCamera, control: &Control, epoch: u64) {
         if control.live_stop_pending.load(Ordering::Acquire){clear_live_view_controls(&mut health,"LV停止/取消已受理");health.live_view.fresh=false;}
         *cached = health;
     }
+}
+/// Admission and Stop share a gate: queued old work cannot start native I/O
+/// after Stop decided that the owner was idle.
+fn begin_io(control: &Control, context: &CallContext) -> Result<(), CameraError> {
+    let _gate = control.commit_gate.lock().unwrap();
+    context.check()?;
+    *control.deadline.lock().unwrap() = Some((context.epoch, context.deadline));
+    Ok(())
+}
+fn stop_idle_or_cleanup(camera: &mut NativeCamera, control: &Control, epoch: u64) {
+    if control.idle_stop_epoch.load(Ordering::Acquire) == epoch
+        && camera.transport_open && camera.health.connected && !camera.health.isolated
+        && !camera.capture_pending && !camera.health.live_view.active
+        && camera.health.last_error.is_none() && camera.d7100
+        && camera.health.capabilities.live_view
+        && camera.info.as_ref().is_some_and(|info|
+            info.operations.contains(&DEVICE_READY) && info.operations.contains(&GET_EVENT)) {
+        let context = CallContext { deadline: Instant::now() + Duration::from_secs(2),
+            epoch, generation: control.generation.clone() };
+        let result = begin_io(control, &context)
+            .and_then(|()| poll_idle_health(camera, &context))
+            .and_then(|()| {
+                // Unknown or externally enabled Live View cannot qualify the
+                // retained connection. Cleanup must obtain its own OFF proof.
+                camera.health.live_view.active = true;
+                let state = camera.read_data(GET_PROPERTY, &[LV_STATUS as u32], 16, &context)?;
+                if state != [0] {return Err(CameraError::Safety("Live View is not confirmed OFF during Stop".into()));}
+                camera.health.live_view.active = false;
+                Ok(())
+            })
+            .and_then(|()| context.check());
+        *control.deadline.lock().unwrap() = None;
+        if result.is_ok() {
+            camera.health.cleanup_confirmed = true;
+            camera.health.isolated = false;
+            camera.health.busy = false;
+            camera.health.phase = "idle".into();
+            camera.health.live_view.session_id = None;
+            camera.health.live_view.fresh = false;
+            camera.health.live_view.error = None;
+            camera.health.last_seen_at = Some(chrono::Utc::now().to_rfc3339());
+            clear_live_view_controls(&mut camera.health, "Live View stopped");
+            publish(camera, control, epoch);
+            return;
+        }
+        if let Err(error) = result { camera.health.last_error = Some(error.to_string()); }
+    }
+    cleanup(camera, control, control.generation.load(Ordering::Acquire));
 }
 fn cleanup(camera: &mut NativeCamera, control: &Control, epoch: u64) {
     let trigger_error = camera.health.last_error.clone();
@@ -936,7 +1090,10 @@ fn cleanup(camera: &mut NativeCamera, control: &Control, epoch: u64) {
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(CameraError::Busy(_)) => thread::sleep(Duration::from_millis(10)),
+                Err(CameraError::Busy(_) | CameraError::DeviceBusy(_)) => {
+                    diagnostic.last_event_diagnostic = camera.health.last_event_diagnostic.clone();
+                    thread::sleep(Duration::from_millis(10));
+                }
                 Err(error) => {
                     diagnostic.last_event_diagnostic = camera.health.last_event_diagnostic.clone();
                     diagnostic.error = Some(error.to_string());
@@ -1103,12 +1260,12 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
         loop {
             let epoch = control.generation.load(Ordering::Acquire);
             if epoch != observed_epoch {
-                cleanup(&mut camera, &control, epoch);
+                stop_idle_or_cleanup(&mut camera, &control, epoch);
                 observed_epoch = epoch;
             }
             match receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(message) => {
-                    if let Err(e) = message.context.check() {
+                    if let Err(e) = begin_io(&control, &message.context) {
                         let _ = message.response.send(Err(e));
                         continue;
                     }
@@ -1128,7 +1285,6 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
                         }
                     }
                     publish(&camera, &control, epoch);
-                    *control.deadline.lock().unwrap() = Some((epoch, message.context.deadline));
                     let mut result =
                         execute(&mut camera, &control, &message.request, &message.context);
                     *control.deadline.lock().unwrap() = None;
@@ -1140,7 +1296,10 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
                         camera.health.last_error = Some(e.to_string());
                         // Validation rejection does not poison a healthy session.
                         // Once native I/O may be unresolved, retire the entire session.
-                        if matches!(
+                        let retryable_read = matches!(message.request, Request::Read)
+                            && matches!(e, CameraError::DeviceBusy(_))
+                            && !camera.capture_pending;
+                        if !retryable_read && (matches!(
                             e,
                             CameraError::Timeout(_)
                                 | CameraError::Unavailable(_)
@@ -1157,7 +1316,7 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
                                     | Request::LvStart(_)
                                     | Request::LvStop
                             )
-                        {
+                        ) {
                             let new_epoch = control.generation.load(Ordering::Acquire);
                             cleanup(&mut camera, &control, new_epoch);
                             observed_epoch = new_epoch;
@@ -1204,7 +1363,7 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
                     epoch,
                     generation: control.generation.clone(),
                 };
-                *control.deadline.lock().unwrap() = Some((epoch, context.deadline));
+                if begin_io(&control, &context).is_err() { continue; }
                 let result = camera
                     .transport
                     .execute(
@@ -1242,7 +1401,9 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
                     Err(e) => {
                         camera.health.live_view.error = Some(e.to_string());
                         camera.health.last_error = Some(e.to_string());
-                        control.generation.fetch_add(1, Ordering::AcqRel);
+                        // A cancelled background call belongs to its old epoch.
+                        // It must not cancel a newer Disconnect/Stop request.
+                        invalidate_epoch(&control, epoch, &e.to_string());
                         observed_epoch = control.generation.load(Ordering::Acquire);
                         cleanup(&mut camera, &control, observed_epoch);
                     }
@@ -1259,7 +1420,7 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
                     epoch,
                     generation: control.generation.clone(),
                 };
-                *control.deadline.lock().unwrap() = Some((epoch, context.deadline));
+                if begin_io(&control, &context).is_err() { continue; }
                 let result = poll_idle_health(&mut camera, &context);
                 *control.deadline.lock().unwrap() = None;
                 match result {
@@ -1270,7 +1431,7 @@ fn worker(mut camera: NativeCamera, receiver: mpsc::Receiver<Message>, control: 
                     Ok(_) => (),
                     Err(e) => {
                         camera.health.last_error = Some(e.to_string());
-                        invalidate(&control, &e.to_string());
+                        invalidate_epoch(&control, epoch, &e.to_string());
                         observed_epoch = control.generation.load(Ordering::Acquire);
                         cleanup(&mut camera, &control, observed_epoch);
                     }
@@ -1580,7 +1741,7 @@ fn execute(
             });
             Ok(Reply::Captured(image))
         }
-        Request::CardPlan { projection_count } => {
+        Request::CardStorages | Request::CardPlan { .. } => {
             camera.ensure_connected()?;
             // Only a session whose destination is the confirmed card may enumerate
             // and plan card storage: a host-RAM session is refused here instead of
@@ -1602,10 +1763,22 @@ fn execute(
                 )?)?);
             }
             let bound = bind_storage_ids(&ids, infos)?;
-            let plan = plan_task_cards(&bound, *projection_count, CONSERVATIVE_NEF_BYTES)
+            let Request::CardPlan { projection_count } = request else {
+                return Ok(Reply::CardStorages(bound));
+            };
+            let plan = plan_camera_task_cards(&camera.health, &bound, *projection_count)
                 .map_err(|code| {
+                    let unavailable = if bound.iter().any(|info| info.capacity.free_bytes > 0 && info.capacity.free_images == 0) {
+                        "; a card reports zero remaining exposures despite free bytes: check its LOCK switch and camera card-slot mode"
+                    } else {
+                        ""
+                    };
                     invalid(&format!(
-                        "{code}: the advertised card storage cannot cover the whole task"
+                        "{code}: the advertised card storage cannot cover the whole task; requiredFrames={}, planningReserveMiB={}{}; advertisedStorages={}",
+                        super::storage::task_card_frames(*projection_count),
+                        super::storage::CONSERVATIVE_NEF_BYTES / (1024 * 1024),
+                        unavailable,
+                        serde_json::to_string(&bound).unwrap_or_else(|_| "unavailable".into())
                     ))
                 })?;
             Ok(Reply::CardPlan(plan))
@@ -1632,6 +1805,10 @@ fn execute(
         Request::CardImportEnumerate { storages } => Ok(Reply::CardImportInventory(Box::new(
             enumerate_card_objects(camera, storages, context)?,
         ))),
+        Request::CardImportDelete { object, identity } => {
+            super::card_import::delete_verified_card_object(camera, object, identity, context)?;
+            Ok(Reply::Done)
+        }
         Request::CardImportObject {
             object,
             staging,

@@ -25,6 +25,15 @@ fn main() {
         .unwrap_or_else(|| repository.join(".cache/cargo"));
     let engine_target_dir = outer_target_dir.join("engine-package");
     let source = engine_target_dir.join(&profile).join(executable);
+    let triple = env::var("TARGET").expect("TARGET is unavailable");
+    let sidecars = workspace.join("src-tauri/binaries");
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let sidecar = sidecars.join(format!("ct-engine-{triple}{suffix}"));
+    // A debug test or a preparation hook can replace the shared bundle input
+    // without changing Rust source. Refresh the embedded identity in that case.
+    for input in [&source, &sidecar, &workspace.join("Cargo.toml"), &workspace.join("Cargo.lock")] {
+        println!("cargo:rerun-if-changed={}", input.display());
+    }
 
     let mut command = Command::new("cargo");
     command
@@ -42,12 +51,9 @@ fn main() {
     fs::write(output.join("ct-engine.sha256"), format!("{:x}", Sha256::digest(&bytes)))
         .expect("failed to record ct-engine identity");
     // The same bytes are tested, bundled, and launched next to the desktop app.
-    let triple = env::var("TARGET").expect("TARGET is unavailable");
-    let sidecars = workspace.join("src-tauri/binaries");
     fs::create_dir_all(&sidecars).expect("failed to create sidecar directory");
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
     for destination in [output.join(executable), outer_target_dir.join(&profile).join(executable),
-        sidecars.join(format!("ct-engine-{triple}{suffix}"))] {
+        sidecar] {
         if fs::read(&destination).ok().as_deref() != Some(bytes.as_slice()) {
             fs::copy(&source, &destination).expect("failed to stage ct-engine");
         }

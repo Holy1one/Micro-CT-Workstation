@@ -59,6 +59,7 @@ impl Engine {
             let project = load_project(&path, &cancel,&shared)?;
             Ok(Box::new(move |engine| {
                 engine.metadata_generation += 1;
+                engine.card_import = None;
                 engine.parameters = project.parameters;
                 engine.current = project.manifest.frames.len() as u32;
                 engine.real_frames = project.frames;
@@ -130,6 +131,29 @@ mod tests {
         (engine,root,manifest)
     }
     fn save(root: &Path, manifest: &Value) { fs::write(root.join("manifest.json"),serde_json::to_vec(manifest).unwrap()).unwrap(); }
+    fn card_fixture() -> (Engine, PathBuf, Value) {
+        let (engine,root,mut manifest)=fixture(3);
+        manifest["schemaVersion"]=json!(4);
+        manifest["captureProfile"]=json!(crate::capture_profile::test_card_profile("single"));
+        manifest["captureDestination"]=json!("cameraCard");
+        manifest["acquisitionStatus"]=json!(scan::ACQUISITION_ACQUIRED);
+        manifest["dataStatus"]=json!(scan::DATA_VERIFIED);
+        let mut records=vec![];
+        for (kind,frames) in [("preDark",&manifest["references"]["preDark"]),("preFlat",&manifest["references"]["preFlat"]),("projection",&manifest["frames"])] {
+            for frame in frames.as_array().unwrap() {
+                let mut imported=frame.clone();
+                if imported.get("angleDeg").is_none(){imported["angleDeg"]=json!(0.0);}
+                records.push(json!({"index":frame["index"],"kind":kind,"angleDeg":imported["angleDeg"],"exposureMs":200.0,
+                    "state":scan::DATA_VERIFIED,"cameraSessionId":"card-session","operationId":format!("{kind}-{}",frame["index"]),
+                    "storageId":131073,"storageChanged":false,"handle":records.len()+1,"parent":7,
+                    "sourceFileName":format!("DSC_{:04}.NEF",records.len()+1),"format":14336,
+                    "size":frame["bytes"],"captureDate":"20261013T060000","importedFile":imported}));
+            }
+        }
+        manifest["captureRecords"]=json!(records);
+        save(&root,&manifest);
+        (engine,root,manifest)
+    }
     fn finish(engine: &mut Engine) {
         let deadline = Instant::now()+Duration::from_secs(3);
         while engine.operations.blocks_controls() && Instant::now()<deadline {
@@ -170,6 +194,42 @@ mod tests {
             assert_eq!(fs::read(root.join("manifest.json")).unwrap(),before);
             // The same metadata qualifies for the existing reconstruction entry.
             assert!(scan::completed_manifest_exists(&engine.parameters));
+        }
+    }
+    #[test]
+    fn opens_verified_schema_four_card_project_without_devices_or_writing_inputs() {
+        let (mut engine,root,_)=card_fixture();
+        let before=fs::read(root.join("manifest.json")).unwrap();
+        open(&mut engine,&root);
+        let receipt=engine.operations.history.last().unwrap();
+        assert_eq!(receipt.status,"completed","{:?}",receipt.error);
+        assert_eq!(receipt.progress.as_ref().unwrap().verified_files,23);
+        assert!(engine.snapshot()["workstation"]["reconstruction"]["unlocked"].as_bool().unwrap());
+        assert_eq!(engine.real_frames.len(),3);
+        assert_eq!(fs::read(root.join("manifest.json")).unwrap(),before);
+        assert!(engine.camera.is_none()&&engine.nano.is_none()&&engine.xray.is_none());
+    }
+    #[test]
+    fn schema_four_read_gate_requires_verified_card_records_bound_to_every_input() {
+        for problem in ["pending","acquisition","destination","stage","missing","unverified","duplicate","path","hash","size"] {
+            let (_,root,mut manifest)=card_fixture();
+            match problem {
+                "pending"=>manifest["dataStatus"]=json!(scan::DATA_PENDING_IMPORT),
+                "acquisition"=>manifest["acquisitionStatus"]=json!("running"),
+                "destination"=>manifest["captureDestination"]=json!("hostRam"),
+                "stage"=>manifest["stage"]=json!("finishing"),
+                "missing"=>{manifest["captureRecords"].as_array_mut().unwrap().pop();},
+                "unverified"=>manifest["captureRecords"][0]["state"]=json!(scan::DATA_PENDING_IMPORT),
+                "duplicate"=>manifest["captureRecords"][1]=manifest["captureRecords"][0].clone(),
+                "path"=>manifest["captureRecords"][0]["importedFile"]["path"]=json!("/unrelated.nef"),
+                "hash"=>manifest["captureRecords"][0]["importedFile"]["sha256"]=json!("00".repeat(32)),
+                "size"=>manifest["captureRecords"][0]["size"]=json!(1),
+                _=>unreachable!(),
+            }
+            save(&root,&manifest);
+            let before=fs::read(root.join("manifest.json")).unwrap();
+            assert!(reconstruction::validate_scan_project(&root,&AtomicBool::new(false),|_|{}).is_err(),"{problem}");
+            assert_eq!(fs::read(root.join("manifest.json")).unwrap(),before);
         }
     }
     #[test]

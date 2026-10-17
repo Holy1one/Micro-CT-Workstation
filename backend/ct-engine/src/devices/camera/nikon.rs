@@ -42,6 +42,9 @@ pub(crate) const LV_FOCUS_MODE:u16=0xd061;
 pub(crate) const LENS_SORT:u16=0xd0e1;
 pub(crate) const LV_SELECTOR:u16=0xd1a6;
 pub(crate) const ACTIVE_SLOT:u16=0xd1f2;
+/// Nikon namespace defines D1F1 as remaining exposures. Native read-only scalar
+/// qualification comes from this device's descriptor; it is not completion proof.
+pub(crate) const EXPOSURE_REMAINING:u16=0xd1f1;
 pub(crate) const LIVE_VIEW_PROPERTIES:&[(&str,&str,u16)]=&[
     ("cameraZoom","Camera Live View zoom",LV_ZOOM),
     ("focusMode","Live View focus mode",LV_FOCUS_MODE),
@@ -65,6 +68,7 @@ pub(crate) const RUNTIME_DIAGNOSTICS: &[(&str, &str, u16, Option<u16>)] = &[
     ("lensSort","Lens mount/CPU category (native diagnostic)",LENS_SORT,None),
     ("liveViewSelector","Photo/movie Live View selector (native diagnostic)",LV_SELECTOR,None),
     ("activeSlot","Active storage slot (raw diagnostic)",ACTIVE_SLOT,None),
+    ("exposureRemaining","Remaining exposures (raw read-only diagnostic)",EXPOSURE_REMAINING,None),
     (
         "batteryLevel",
         "Battery level (standard read-only diagnostic)",
@@ -193,6 +197,7 @@ const STANDARD_PROPERTIES: &[(&str, &str, u16)] = &[
 
 pub(crate) struct NativeCamera {
     pub transport: Box<dyn CameraTransport>,
+    pub transport_metrics: std::rc::Rc<std::cell::RefCell<TransportMetrics>>,
     pub health: CameraHealth,
     pub info: Option<DeviceInfo>,
     pub d7100: bool,
@@ -228,8 +233,10 @@ pub(crate) struct PostCommitDrainWindow {
 }
 impl NativeCamera {
     pub fn new(transport: Box<dyn CameraTransport>) -> Self {
+        let transport_metrics = std::rc::Rc::new(std::cell::RefCell::new(TransportMetrics::default()));
         Self {
-            transport,
+            transport: Box::new(MeteredTransport { inner: transport, metrics: transport_metrics.clone() }),
+            transport_metrics,
             health: CameraHealth {
                 backend: "windows_wpd_ptp".into(),
                 cleanup_confirmed: true,
@@ -337,6 +344,7 @@ impl NativeCamera {
         self.health.last_event_diagnostic = None;
         self.health.last_device_info_changed_diagnostic = None;
         self.health.last_capture_event_diagnostic = None;
+        self.health.last_card_capture_timing = None;
         self.health.last_cleanup_diagnostic = None;
         self.health.connected = true;
         self.health.isolated = false;
@@ -566,11 +574,12 @@ impl NativeCamera {
                 .properties
                 .get(key)
                 .and_then(|p| p.target.clone());
-            let result = self.read_data(GET_PROPERTY_DESC, &[code as u32], 128 * 1024, context);
+            let result = self.read_property_data(GET_PROPERTY_DESC, &[code as u32], 128 * 1024, context);
             if let Err(error) = &result {
                 if matches!(
                     error,
                     CameraError::Cancelled
+                        | CameraError::DeviceBusy(_)
                         | CameraError::Timeout(_)
                         | CameraError::Unavailable(_)
                         | CameraError::Io(_)
@@ -591,11 +600,12 @@ impl NativeCamera {
                             .contains(&SET_PROPERTY)
                         && (!p.supported_values.is_empty() || p.range.is_some());
                     // Read the current value explicitly, independently of the enumeration.
-                    let readback = self.read_data(GET_PROPERTY, &[code as u32], 4096, context);
+                    let readback = self.read_property_data(GET_PROPERTY, &[code as u32], 4096, context);
                     if let Err(error) = &readback {
                         if matches!(
                             error,
                             CameraError::Cancelled
+                                | CameraError::DeviceBusy(_)
                                 | CameraError::Timeout(_)
                                 | CameraError::Unavailable(_)
                                 | CameraError::Io(_)
@@ -701,6 +711,48 @@ impl NativeCamera {
             }else if matches!(code,LENS_SORT|LV_SELECTOR|ACTIVE_SLOT){
                 let (key,label,_,_)=RUNTIME_DIAGNOSTICS.iter().find(|row|row.2==code).unwrap();
                 self.health.runtime_properties.insert((*key).into(),unknown_property(key,label,code,"本次设备未广告此诊断；未发送读取或写入").into());
+            }
+        }
+        refresh_property_controls(&mut self.health);
+        self.refresh_live_view_permissions();
+        Ok(())
+    }
+    /// Fresh values with the native descriptors validated in this owner/session.
+    /// Capture rejects DeviceInfoChanged/photographic PropertyChanged events,
+    /// so it cannot continue using these descriptions after a capability change.
+    /// Apply, connect and explicit property reads still obtain full descriptors.
+    pub(crate) fn read_frozen_values(
+        &mut self, expected: &CameraProperties, context: &CallContext,
+    ) -> Result<(), CameraError> {
+        self.ensure_connected()?;
+        for key in expected.keys() {
+            context.check()?;
+            let property = self.health.properties.get(key)
+                .ok_or_else(|| invalid("frozen property descriptor missing"))?;
+            let (code, kind) = (property.code, property.data_type);
+            if !property.readable || !property.confirmed || property.error.is_some()
+                || !self.info.as_ref().is_some_and(|info| info.properties.contains(&code)
+                    && info.operations.contains(&GET_PROPERTY)) {
+                return Err(invalid(&format!("frozen {key} native descriptor is unqualified")));
+            }
+            let readback = self.read_data(GET_PROPERTY, &[code as u32], 4096, context)
+                .and_then(|bytes| parse_value(&bytes, kind));
+            let property = self.health.properties.get_mut(key).unwrap();
+            match readback {
+                Ok(actual) => {
+                    property.confirmed = true;
+                    property.actual = Some(actual.clone());
+                    if actual != expected[key] {
+                        property.error = Some("frozen capture parameter changed; receipt refused".into());
+                        return Err(invalid(&format!("frozen card capture parameter {key} changed")));
+                    }
+                }
+                Err(error) => {
+                    property.confirmed = false;
+                    property.actual = None;
+                    property.error = Some(error.to_string());
+                    return Err(error);
+                }
             }
         }
         refresh_property_controls(&mut self.health);
@@ -952,6 +1004,20 @@ impl NativeCamera {
             Err(error)=>Err(error),
         }
     }
+    // A device's explicit busy rejection is a completed read transaction, not an
+    // unresolved transport timeout. Preserve that distinction after bounded
+    // retries so a scan can pause without retiring its camera session.
+    fn read_property_data(&mut self, opcode: u16, params: &[u32], max: usize,
+        context: &CallContext) -> Result<Vec<u8>, CameraError> {
+        for attempt in 0..3 {
+            context.check()?;
+            let response=self.transport.execute(opcode,params,DataPhase::Read {max},context)?;
+            if response.code!=DEVICE_BUSY {return response.data();}
+            if attempt<2 {thread::sleep(Duration::from_millis(100));}
+        }
+        Err(CameraError::DeviceBusy("property read rejected after three bounded checks".into()))
+    }
+
     pub fn read_data(
         &mut self,
         opcode: u16,
@@ -1093,6 +1159,16 @@ impl NativeCamera {
                 return Err(error);
             }
         }
+        self.confirm_runtime_status_diagnostic(context)
+    }
+    /// Fresh D1B2 qualification only. Card boundaries already freshly read and
+    /// validate recordingMedia with the complete frozen profile; rereading that
+    /// same value here would add no destination evidence. Notification callers
+    /// still use confirm_runtime_diagnostic_for to refresh the destination too.
+    pub(crate) fn confirm_runtime_status_diagnostic(
+        &mut self,
+        context: &CallContext,
+    ) -> Result<(), CameraError> {
         self.read_runtime_status(context)?;
         let status = &self.health.runtime_properties[RUNTIME_ERROR_KEY];
         if status.data_type != 2
@@ -1792,6 +1868,8 @@ mod tests {
         property.readable = true;
         property.writable = writable;
         property.confirmed = confirmed;
+        property.supported = true;
+        property.data_type = 2;
         property.supported_values = vec![CameraValue::Integer(0), CameraValue::Integer(1)];
         property.actual = actual.map(CameraValue::Integer);
         health.properties.insert("recordingMedia".into(), property);
@@ -1828,5 +1906,23 @@ mod tests {
         let mut missing = health_with_media(Some(0), true, true);
         missing.properties.clear();
         assert!(require_card_destination(&missing).is_err());
+    }
+
+    #[test]
+    fn card_destination_accepts_the_measured_d7100_uint8_range_descriptor() {
+        // Real D7100: D10B is UINT8, range 0..2 step 1, no enumeration, actual 0.
+        let mut health = health_with_media(Some(0), true, true);
+        let media = health.properties.get_mut("recordingMedia").unwrap();
+        media.supported_values.clear();
+        media.range = Some([0, 2, 1]);
+        assert!(require_card_destination(&health).is_ok());
+        health.properties.get_mut("recordingMedia").unwrap().actual = Some(CameraValue::Integer(1));
+        assert!(require_card_destination(&health).is_err());
+        let media = health.properties.get_mut("recordingMedia").unwrap();
+        media.actual = Some(CameraValue::Integer(0));
+        media.range = Some([1, 2, 1]);
+        assert!(require_card_destination(&health).is_err());
+        health.properties.get_mut("recordingMedia").unwrap().range = None;
+        assert!(require_card_destination(&health).is_err());
     }
 }

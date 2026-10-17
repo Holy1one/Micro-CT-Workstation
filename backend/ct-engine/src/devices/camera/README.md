@@ -1,5 +1,17 @@
 # Native camera adapter (offline candidate)
 
+Property readback preserves explicit device-busy rejection after bounded retries.
+Only an idle read-only `Read` request may retain the camera session on this error;
+capture/write failures and unresolved native I/O still use their original cleanup.
+The scan coordinator retries readback while OFF, then retains Paused for Resume.
+
+Exposure-ended events also carry a process-local monotonic observation time.
+It is excluded from serialization; deserialized events have no such evidence.
+The scan coordinator uses the correlated session/operation and this timestamp
+to distinguish an exposure already ended before a monitor-triggered OFF from
+an uncertain exposure. A communication pause never credits an uncertain image
+or invents its completion from a filename, timing estimate or old event.
+
 This module owns Windows WPD/PTP communication, identity and capability discovery,
 property write/readback, Nikon D7100 host RAM NEF capture, Live View, and host file
 confirmation. `ct-engine` owns all device occupancy and cross-device safety rules.
@@ -16,6 +28,19 @@ operator checks the camera body before preflight; USB connection, a disabled men
 and a single host NEF do not prove that this setting is OFF.
 
 ## Sources and acceptance status
+
+Ordinary Stop and fault cleanup retain an already idle, healthy camera session
+after a fresh owner-side idle event check. Stop revokes queued work and Live View
+frames before that check; native I/O admission shares its generation gate. A
+pending exposure, in-flight native call, readback failure or unconfirmed cleanup
+still retires the transport. Explicit disconnect, application shutdown and update
+preparation always close it. Retaining a connection does not restore preflight,
+motion reference or a cancelled capture result. This retention path is only
+offline verified until separately accepted on hardware.
+
+SD checkpoint recovery uses the same owner for bounded metadata enumeration and
+receipt binding. The shared `MAX_OBJECT_BYTES` bound also validates persisted
+records; recovery never downloads, deletes or repeats an unresolved exposure.
 
 - The WPD transport is independently implemented against Microsoft's
   [MTP extension interface](https://learn.microsoft.com/en-us/windows/win32/wpd_sdk/supporting-mtp-extensions)
@@ -49,6 +74,32 @@ and a single host NEF do not prove that this setting is OFF.
 | `live_view.rs` | Strict JPEG validation, binary envelope, latest frame slot and current-user-only named pipe |
 | `tests.rs` | Scripted transport through the same production actor and capture implementation |
 
+New sessions prefer SD (`recordingMedia=0`) in the draft; Apply and verified
+readback select the actual destination for every dark, flat and projection.
+Inherited RAM does not authorize local transfer: independent capture and new
+scans require explicit `recordingMedia=1` Apply in the current camera session.
+Read/reload, other parameter Apply, reconnect and engine restart do not grant it.
+Retained RAM tasks keep their frozen profile and recovery semantics.
+The independent SD photo entry uses the standard card transaction, needs no
+local image root and downloads no image or preview. `cardCaptureReady` publishes
+card readiness separately from host `captureReady`; `hostTransferOptIn` explains
+the additional domain admission block for inherited RAM.
+
+`plan_camera_cards` limits body-capture admission to the negotiated native Nikon
+D7100 SD session and removable non-ROM media. PTP AccessCapability describes
+host object writes; values 1 (`ReadOnly`, no deletion) and 2
+(`ReadOnlyWithDeletion`) remain distinct in storage evidence. Neither value alone
+proves that the camera body cannot capture; zero remaining exposures must not be
+replaced with a byte-derived estimate or described as a physically observed lock.
+The D7100 body capture planner uses usable remaining bytes (including all 20
+references), with a 32 MiB planning reserve per NEF, and only counts a second card
+with negotiated overflow capability. The reserve is an estimate, not a file-size
+limit; zero/unknown camera counts and real storage errors remain enforced.
+Generic `plan_cards`/`plan_task_cards` retain CARD_READ_ONLY for USB write planning.
+Actual storage/InitiateCapture errors still abort without retry or RAM fallback.
+This scoped change was separately authorized on 2026-10-13; it has offline
+coverage, with hardware acceptance still pending.
+
 The verified D7100 NEF-only RAM ObjectInfo path accepts the measured `0x3800`
 image format and date fields with contiguous trailing NUL padding. Filename,
 keywords, identity and property strings remain strict; nonzero date padding is
@@ -76,6 +127,18 @@ USB VID `04B0` / PID `0430` binding or an explicit `nikon.com` extension.
 Capabilities still require the returned operation/property/event lists. Idle
 monitoring falls back to standard GetDeviceInfo when DeviceReady/GetEvent are
 not advertised; no private capability is fabricated or probed.
+
+`read_card_storages()` reads bounded StorageIDs/StorageInfo metadata through the
+same owner, retaining the reported access flags and capacities. It grants no
+capture or scan admission. `plan_card_storages()` applies the separate whole-task
+gate; local isolated bench tests can inspect metadata without a full scan.
+
+Card capture sends standard `0x100E InitiateCapture` with StorageID/format
+`[0, 0]` (camera-selected card/current format); the RAM-only `0xFFFFFFFF`
+parameter is invalid here (real D7100 replied `0x2008`). A concrete
+InvalidStorageID rejection starts no associated exposure and clears that pending
+intent without emitting ExposureEnded. Transport uncertainty and other failures
+retain unknown termination and the existing isolation behavior.
 
 Health `deviceInfo` exposes the original standard/extension versions, extension
 ID/description, functional mode, device version, operations, events, properties,
@@ -246,12 +309,139 @@ unknown property is admitted. Every accepted notification still requires fresh
 frozen capture values, RAM/single-image settings and Live View OFF. All raw
 runtime values remain semantically unknown and provide no completion evidence.
 
+The SD path admits the same exact advertised read-only catalog diagnostics.
+During capture, the frequent display-only D1A4/D1B4/D1F1 notifications retain
+their raw event evidence and invalidate stale displayed values without another
+descriptor/value query. The same-session advertised read-only scalar descriptor
+is still required. Explicit property reads and subsequent idle notifications
+refresh these displays. D1B2 and other accepted catalog notifications keep their
+fresh native reads. All frozen photographic values, card
+destination and Live View OFF are freshly confirmed once before triggering and
+once before returning a receipt; the same owner's native descriptions are reused.
+These fresh values are compared once; D1B2 boundary qualification no longer
+rereads the destination already confirmed in that same profile sweep. A D1B2
+change notification still refreshes the destination immediately. Nonempty event
+batches are drained without an added 10 ms sleep; empty polls remain throttled.
+Connect, explicit property reads, Apply and capability refresh still re-describe
+properties. Photographic PropertyChanged, DeviceInfoChanged and unknown events
+refuse the current capture; silent parameter drift refuses the final receipt.
+Nikon `0xD1F1` remaining exposures is also a raw runtime diagnostic
+([namespace definition](https://raw.githubusercontent.com/gphoto/libgphoto2/master/camlibs/ptp2/ptp.h));
+its integer type and read-only flag require the advertised native descriptor.
+Neither a changed remaining count nor a runtime notification confirms exposure
+termination or associates an SD object. Frozen parameter drift still refuses a
+receipt; standard ObjectAdded and CaptureComplete evidence remain required.
+
+The D7100 task planner uses usable `FreeSpaceInBytes` with the operator's 32 MiB
+per-frame reserve, including ten dark and ten flat references. Positive
+`FreeSpaceInImages` values are body estimates at current settings, retained
+unchanged in storage diagnostics; they do not cap this byte budget. A zero
+count excludes that card's bytes and frames, and an unknown count/capacity
+still refuses the plan. Only negotiated overflow permits a second card to
+contribute. `CardPlan.writable_images` records budgeted whole frames per card,
+not the body estimate. Native StoreFull, StoreRemoved and capture errors still
+fail the transaction and invoke safety cleanup. The reserve is an estimate,
+not a guaranteed maximum NEF size. See the
+[capacity recheck and authorized card-clear report](../../../../../docs/validation/card-capacity-recheck-clear-2026-10-13.md).
+The isolated bench verified five consecutive 1-degree / 1-second captures on one
+selected D7100 session, with these normal notifications, matching card receipts
+and motion tickets, and confirmed cleanup (see
+`docs/validation/history.md`). Card capture now also
+confirms DeviceReady before triggering and polls Busy within its shared deadline.
+
+`lastCardCaptureTiming` records monotonic software observations and actual PTP
+command/property/descriptor/event counts through an owner-thread transport
+wrapper. It adds no I/O and carries no exposure or commit evidence. Timing is
+retained after a refusal with `completed=false` and cleared on a new connect.
+The frontend diagnostics and local bench consume it without advancing scans.
+See [the historical serial measurements](../../../../../docs/validation/camera-card-serial-multiexposure-2026-10-12.md);
+the existing five-shot baseline and subsequent two six-shot hardware comparisons
+predate the latest display-query cleanup. A separately authorized post-cleanup
+six-shot production-adapter/Nano bench measured a 5.333 s mean cycle (5.250 s
+minimum) at 1 s exposure and 1-degree steps. Fixed-angle single-operation tests
+also covered 0.25 through 8 s exposures; changing empty-event polling from 10
+to 100 ms did not demonstrate a speed gain. See
+[the serial multi-exposure report](../../../../../docs/validation/camera-card-serial-multiexposure-2026-10-12.md).
+The serial option retains reliable completion and receipt-before-CAPTURE_DONE;
+the default early-release option is described below,
+with both exposure and projection count variable. Other projection counts have
+not received this hardware bench acceptance; all ordinary steps still require
+their matched READY after the firmware's 150 ms settle interval. These historical timings do not certify current default-pipeline speed, image
+quality or full-system accuracy. Later installed small-scan evidence is indexed
+in docs/validation/README.md.
+
+Subsequent fixed-angle native tests measured next-trigger admission separately
+from card-file confirmation: after a healthy-battery command returned success,
+1250 ms still produced DeviceBusy, while 1300 ms pairs and a 1650 ms / 16-shot
+sequence completed. Native trigger calls still blocked for up to 2686 ms. These
+experiments bypass the production serial capture transaction; they do not
+qualify multi-operation event association, an early motion release, or a full
+scan cadence. The low-battery StoreNotAvailable failure, recovery and scoped
+test-photo deletion are recorded in
+[the historical timing and power summary](../../../../../docs/validation/history.md).
+The production single-operation association remains implemented as described above.
+
+### L1 early release (default ON)
+
+Scan Preparation accepts `earlyRelease`, default true. The engine freezes it
+in RealScanConfig at start and the coordinator copies it into each CardCapturePlan.
+The production choice is explicit and does not read an environment switch. The
+photographic profile, receipt and manifest schemas stay unchanged. Disable
+"Move as soon as exposure ends" to retain serial card acquisition.
+
+Each operation starts with fresh D1A4 observation: raw UINT32 bit15 must first be
+set and then cleared. The first clear emits one correlated EarlyExposureEnded.
+Missing notifications, missing running evidence or an unavailable diagnostic
+read cause that frame to use the ordinary complete-card receipt path. No early
+event is awaited as a requirement; every later frame attempts detection anew.
+The diagnostic-only MICRO_CT_CARD_EARLY_END_ACCEPTANCE flag still grants no release.
+
+For a matching nonfinal projection, CAPTURE_DONE/IDLE releases the current ticket
+and move_to_projection_monitored prefetches the next MOVE. The next trigger still
+requires the previous durable receipt and a freshly verified CAPTURE_HOLD. There
+is only one capture in flight. Duplicates add no action; foreign evidence and
+movement errors fail closed. The final frame never prefetches another move.
+References use the same card transaction without any turntable prefetch.
+
+The early event never validates an object or substitutes for ObjectAdded plus
+CaptureComplete, metadata, frozen fresh reads or a receipt. A failure after early
+release retains the unresolved intent and task without re-release, re-shoot or
+acquired status. Pause, Stop, limits and cooldown retain their monitored logic.
+
+After all 10 dark, 10 flat and N projection receipts, safe finishing confirms OFF
+and retains acquired_pending_import. The engine automatically runs the existing
+USB importer, with another fresh confirmed OFF before camera enumeration/payload.
+It preserves the original frames/frame-NNNN.nef and
+references/pre-dark|pre-flat/frame-NNNN.nef paths. After all local files verify
+and the manifest is sealed, all files are re-hashed before any deletion. A separate
+card-cleanup.json journal binds every receipt/local identity and records per-object
+pending/deleting/deleted states. The same COM owner rechecks body identity and exact
+ObjectInfo immediately before DeleteObject [exactHandle, 0], confirms absence via
+fresh GetObjectHandles, and performs a final inventory check. No wildcard, format,
+folder removal or capture-cancellation deletion is used. Existing card files stay.
+
+Journal replacement uses the shared durable metadata writer. On Windows, access
+denied/sharing/lock errors retry the same atomic rename for at most one second,
+checking cancellation every 20 ms. A persistent failure preserves the previous
+journal and reports the failing staging or commit path; it never advances deletion
+without a durable intent or bypasses filesystem permissions.
+
+Only after cleanup confirmation does the registry mark the workflow Completed.
+Cleanup failure/Stop preserves the sealed verified manifest, local files and pending
+registry entry; Card import resumes remaining deletions across restart/reconnect,
+without downloading or shooting again. Missing objects are reconciled only with
+a durable deleting/deleted state; changed/ambiguous sources and local hash drift
+refuse deletion. USB access/protection errors are reported without a workaround.
+This restores the captured file set, not the camera file counter or directory metadata.
+L2 is not implemented. Hardware evidence remains scoped to each build and test; see
+[the exact-cleanup failure and real-device recovery](../../../../../docs/validation/card-cleanup-commit-2026-10-14.md).
+
 The actor confirms current properties and Live View off, confirms DeviceReady,
 and requires an empty event queue before triggering the Nikon-private SDRAM
 opcode `0x90C0 InitiateCaptureRecInSdram` with parameter `0xFFFFFFFF` (the
 reference library's host/SDRAM path, `Nikon/NikonBase.cs:61`/`:1871`/`:1908`;
 its card path sends standard `0x100E` instead, `BaseMTPCamera.cs:82`). Host RAM
-is the only destination this module triggers, and the private code is reachable
+is the only destination that the host capture path triggers, and the private code is reachable
 only after capability negotiation already required the advertised `0x90C0`;
 without that advertisement capture is refused before any send. One capture is in
 flight. SDRAM `0xC101` identifies an object for this operation and is sufficient
@@ -265,7 +455,7 @@ committed and registered its file keeps a bounded second-scale post-commit drain
 window (5 s, compile-time asserted inside the unchanged 75 s owner deadline). The
 real body delivered `0xC102, 0x00000000` after the file boundary while the camera
 was already idle, and that used to retire the session after every success
-(`docs/validation/card-sd-migration-hardware-2026-10-11.md` section 9). Only that
+(historical evidence summarized in `docs/validation/history.md`). Only that
 one operation's `0xC102`, only inside that window, only for the unchanged session
 and only once is then recorded as its optional late completion. It is diagnostic
 only: it never completes, commits or resurrects an operation, never becomes
@@ -307,6 +497,9 @@ the cancelled generation before side effects. Unconfirmed capture termination,
 Live View shutdown or close remains isolated; it is never reported as successful
 cancellation. The independent watchdog also isolates a stalled Live View call
 without UI polling.
+Idle and Live View background failures invalidate only the epoch that issued the
+read. A read cancelled by a newer Stop/Disconnect cannot invalidate that newer
+request; physical cleanup evidence still comes from the original COM owner.
 Pending-capture cleanup uses a separate finite I/O context on the original
 physical session, so repeated Stop generations cannot cancel its C102 consumer.
 Its bound is the trigger's frozen timed exposure plus two seconds; time is only
@@ -315,7 +508,7 @@ clears the pending exposure (the object is the operation's own capture
 evidence), so cleanup no longer needs a completion to consider the termination
 proven; a completion is still consumed as optional exposure-end evidence when it
 arrives. Cancelled objects are not downloaded or
-committed. Busy polling retries within this bound, and Close follows the wait.
+committed. Both the PTP Busy response and Windows WPD DeviceBusy (0x800700AA) retry within this original bound; Busy alone never proves termination. Close follows the wait.
 An attempted Close retires the interface even when Close fails; subsequent Stop
 does not poll that dead interface or reinterpret a no-op Close as confirmation.
 `lastCleanupDiagnostic` retains the first attempt's session/operation, bounded

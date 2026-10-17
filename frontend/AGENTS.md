@@ -10,5 +10,6 @@ index.html、tsconfig.json、vite.config.mjs 位于本目录；从仓库根运�
 - Total projections 为 1–3600；Exposure 使用 ms、按原生档位与读回确认；Max X-ray time 在界面使用 mm:ss（上限 16:40 = 1000 秒整数，也接受十进制分钟），IPC、清单与冻结值一律使用整数秒。无效草稿不得沿用旧值启动。
 - 三维姿态只跟随确认位置，未知、暂停、停止、失联和完成不继续预测运动；无 WebGL 时显示文字状态，不使用静态降级图片。
 - 颜色和样式由 src/tokens.css、src/styles.css 维护；桌面能力由 src/platform/ 封装。静态资源从根 assets/ 暂存，测试输出进入 .cache/。
+- 自动图像处理与重构沿用现有操作入口；默认由引擎选取适用处理并显示结果、质量提示和失败原因。只有帮助操作员作出实际决定的信息才进入主操作流程。
 
-验证：npm.cmd run typecheck、npm.cmd run build；本机套件使用 npm.cmd run test:frontend。涉及生产契约时再运行桌面及 Rust 测试。
+验证：前端行为修改运行 npm.cmd run typecheck、npm.cmd run build 及相关 test:frontend 用例；涉及生产契约时覆盖对应桌面及 Rust 测试。纯文档按根规则检查。

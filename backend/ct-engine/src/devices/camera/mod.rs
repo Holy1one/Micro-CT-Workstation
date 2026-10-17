@@ -12,7 +12,8 @@ mod types;
 mod wpd;
 
 pub use actor::CameraAdapter;
-pub use card_capture::{CardCaptureOutcome, CardCapturePlan, CardObjectReceipt};
+pub(crate) use ptp::MAX_OBJECT_BYTES;
+pub use card_capture::{card_capture_readiness, CardCaptureOutcome, CardCapturePlan, CardObjectReceipt};
 pub use live_view::{
     decode_live_view_frame, encode_live_view_frame, encode_live_view_ack, LiveViewFrame, LiveViewPipeDescriptor,
     LIVE_VIEW_ACK_BYTES, LIVE_VIEW_HEADER_BYTES, LIVE_VIEW_PIPE_VERSION, MAX_LIVE_VIEW_BYTES,
@@ -23,7 +24,7 @@ pub use nikon::{
 };
 pub use properties::{capture_readiness, property_rejection, PropertyRejection};
 pub use storage::{
-    bind_storage_ids, plan_cards, plan_task_cards, parse_object_handles, parse_storage_ids,
+    bind_storage_ids, plan_cards, plan_task_cards, plan_camera_cards, parse_object_handles, parse_storage_ids,
     parse_storage_info, task_card_frames, CardPlan, StorageAccess, StorageCapacity, StorageId,
     StorageInfo, CONSERVATIVE_NEF_BYTES,
 };
@@ -32,4 +33,5 @@ pub use types::*;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(crate) use tests::{scripted_camera,scripted_camera_with_probe,scripted_card_adapter,ScriptedCameraConfig};
+pub(crate) use tests::{scripted_camera,scripted_camera_with_probe,scripted_card_adapter,ScriptedCameraConfig,
+    ScriptedCameraProbe, CardAcceptanceSwitch, synthetic_nef};
