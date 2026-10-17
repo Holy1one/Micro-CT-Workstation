@@ -5,7 +5,7 @@
  * decisions; those remain authoritative in ct-engine.
  */
 
-import { englishDisplayText, unicodeDisplayText } from "./engine/native-labels";
+import { deviceConnectionLabel, englishDisplayText, unicodeDisplayText } from "./engine/native-labels";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -1534,7 +1534,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
         <h2>12 Watt Controller</h2>
         <HelpTip text={sourceHelp} />
         <span className={`chip chip--${beamState === "on" ? "danger" : connected ? "accent" : "muted"}`}>
-          {beamState === "on" ? "EMITTING" : connected ? "CONNECTED" : "NOT CONNECTED"}
+          {beamState === "on" ? "EMITTING" : deviceConnectionLabel(ws.xray.connected, stale)}
         </span>
       </div>
       <div className="xray-panel__body">

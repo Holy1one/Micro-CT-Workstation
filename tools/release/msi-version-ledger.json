@@ -209,6 +209,10 @@
     {
       "appVersion": "0.9.53",
       "productVersion": "0.9.53"
+    },
+    {
+      "appVersion": "0.9.54",
+      "productVersion": "0.9.54"
     }
   ]
 }

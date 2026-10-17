@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "ct-engine"
-version = "0.9.53"
+version = "0.9.54"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "ct-workstation"
-version = "0.9.53"
+version = "0.9.54"
 dependencies = [
  "base64 0.22.1",
  "ct-engine",

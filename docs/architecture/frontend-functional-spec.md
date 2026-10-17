@@ -189,7 +189,7 @@ SD 独立单拍只确认本次卡回执，不自动导入或显示本地预览�
 
 位置读数消费`confirmedAngleDeg`和Nano status，不用目标角度冒充实测。未知或陈旧的位置显示 `— °` 并保留未知原因提示；`REFERENCE UNKNOWN` 仍明确显示，已确认零位保留数值。扫描/暂停/收尾/停止清理/重构及保留taskLock锁住手动参数/对焦/运动，受控恢复HOME例外。STOP、OFF及只读状态持续可用。
 
-转台标题标签只表达连接（CONNECTED/DISCONNECTED；快照陈旧为UNKNOWN），motion state放在提示中；位置与REFERENCE UNKNOWN继续独立显示。普通Stop/故障清理可保留健康空闲设备会话，完成回执仍必须等待OFF/STOP及相机空闲确认；正在调用、曝光未决或清理失败的相机继续隔离。显式Disconnect、退出与更新维护关闭连接。连接保留不撤销持久任务锁、故障锁或重新预检/建立运动基准的要求。空闲相机会话保留路径目前仅离线验证，不继承此前关闭再连接的硬件验收。
+相机、转台和射线标题标签共用连接文案：CONNECTED/DISCONNECTED，快照陈旧为UNKNOWN；相机 phase 与转台 motion state 放在提示中，不混作连接状态。相机 CLEANUP UNKNOWN 与射线 EMITTING 保留优先警示，位置、REFERENCE UNKNOWN 及射线输出/安全状态继续独立显示。普通Stop/故障清理可保留健康空闲设备会话，完成回执仍必须等待OFF/STOP及相机空闲确认；正在调用、曝光未决或清理失败的相机继续隔离。显式Disconnect、退出与更新维护关闭连接。连接保留不撤销持久任务锁、故障锁或重新预检/建立运动基准的要求。空闲相机会话保留路径目前仅离线验证，不继承此前关闭再连接的硬件验收。
 
 转台栏固定高度不变：位置与按钮/运动控件各30px，状态行保持单行省略并保留完整 tooltip。底部只留一个入口：无保留任务时 Prepare scan / Preflight，有锁时 Resume / end retained task，后接进度条；不叠放重复恢复按钮。
 

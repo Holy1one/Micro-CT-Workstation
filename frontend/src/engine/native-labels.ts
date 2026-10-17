@@ -12,6 +12,11 @@
  *  Chinese; it degrades to one neutral English sentence that points at the preserved
  *  raw text. An engine message that is already free of CJK passes through verbatim. */
 
+/** Shared connection wording; stale or missing evidence never means disconnected. */
+export function deviceConnectionLabel(connected: boolean | null | undefined, stale = false): string {
+  return stale || typeof connected !== "boolean" ? "UNKNOWN" : connected ? "CONNECTED" : "DISCONNECTED";
+}
+
 /** Canonical English names for the 34 catalog keys (docs/architecture/frontend-functional-spec.md §4.1). */
 export const NATIVE_PROPERTY_LABELS: Record<string, string> = {
   activeDLighting: "Active D-Lighting",

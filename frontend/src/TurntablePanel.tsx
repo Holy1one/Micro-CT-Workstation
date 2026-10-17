@@ -1,7 +1,7 @@
 /** Permanent prescribed-direction controls and the single scan-preparation entry.
  *  Same instrument grammar as the camera panel: open device group, titled
  *  move section, mono position readout and a footer with the preflight status. */
-import { englishDisplayText } from "./engine/native-labels";
+import { deviceConnectionLabel, englishDisplayText } from "./engine/native-labels";
 import { useState } from "react";
 import type { EngineCommand, EngineSnapshot } from "./engine/types";
 import { deviceConnectionReason, manualControlReason } from "./engine/deviceControls";
@@ -21,7 +21,7 @@ export function TurntablePanel({ snapshot, pending, stale, run, onPreflight, onR
   const act = (command: EngineCommand) => { setError(null); void run(command).catch(reason => setError(String(reason))); };
   const referenceKnown = Boolean(turntable.status?.referenceValid && turntable.status.homed);
   const position = stale || turntable.confirmedAngleDeg === null ? "— °" : `${turntable.confirmedAngleDeg.toFixed(3)}°`;
-  return <section className="panel turntable-panel" id="turntable-panel"><header className="panel__header"><LineIcon name="rotate" size={15} className="panel__icon" /><h2>Turntable</h2><span className={`chip ${!stale && turntable.connected ? "chip--accent" : "chip--muted"}`} title={`Motion state: ${stale ? "UNKNOWN" : turntable.status?.state || "UNKNOWN"}`}>{stale ? "UNKNOWN" : turntable.connected ? "CONNECTED" : "DISCONNECTED"}</span></header><div className="device-body">
+  return <section className="panel turntable-panel" id="turntable-panel"><header className="panel__header"><LineIcon name="rotate" size={15} className="panel__icon" /><h2>Turntable</h2><span className={`chip ${!stale && turntable.connected ? "chip--accent" : "chip--muted"}`} title={`Motion state: ${stale ? "UNKNOWN" : turntable.status?.state || "UNKNOWN"}`}>{deviceConnectionLabel(turntable.connected, stale)}</span></header><div className="device-body">
     <div className="device-group">
       <div className="device-group__head"><h3 className="device-group__title">Position</h3><span className={`chip ${referenceKnown ? "chip--accent" : "chip--muted"}`} title={referenceKnown ? "HOME reference confirmed" : "Reference unknown / invalid"}>{referenceKnown ? "REFERENCE OK" : "REFERENCE UNKNOWN"}</span></div>
       <div className="device-well device-well--readout"><span className="device-value" title={position === "— °" ? "Position unknown; confirmed readback required" : position} aria-label={position === "— °" ? "Position unknown" : undefined}>{position}</span></div>

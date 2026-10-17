@@ -6,7 +6,7 @@ import { useState } from "react";
 import type { CameraProperty, EngineCommand, EngineSnapshot } from "./engine/types";
 import type { CameraDraftModel } from "./camera-draft";
 import { cameraCapturePreparationReason, cameraControlReason, cameraPropertyLabel, cameraPropertyReason, cameraPropertyUsesSelect, cameraPropertyValueLabel, deviceConnectionReason, manualControlReason } from "./engine/deviceControls";
-import { englishDisplayText, unicodeDisplayText, englishOptionLabel, englishReason } from "./engine/native-labels";
+import { deviceConnectionLabel, englishDisplayText, unicodeDisplayText, englishOptionLabel, englishReason } from "./engine/native-labels";
 import { chooseImageDirectory, resolveDefaultImageDirectory } from "./platform/desktopPaths";
 import { LineIcon } from "./icons";
 
@@ -55,12 +55,14 @@ export function CameraPanel({ snapshot, stale, pending, model, run, onAdvanced, 
   const captureReason = cameraReason || ((cardPhoto ? camera?.capabilities.cardCapture : camera?.capabilities.hostCapture) ? null : "Selected photo destination unavailable") || (camera?.liveView.active ? "Stop Live View explicitly before capture" : null) || cameraCapturePreparationReason(camera) || (cardPhoto || snapshot.parameters.savePath.trim() ? null : "Choose an image storage root before capture") || (model.dirty ? "Apply or reload the parameter draft first" : null);
   const readiness = snapshot.cameraScanReadiness;
   const scanReady = Boolean(readiness?.ready && !model.dirty);
-  const state = !camera || (!camera.connected && !camera.isolated) ? "DISCONNECTED" : !camera.cleanupConfirmed ? "CLEANUP UNKNOWN" : camera.connected && !camera.isolated ? camera.phase.toUpperCase() : "DISCONNECTED";
+  const connected = Boolean(camera?.connected && !camera.isolated);
+  const cleanupUnknown = Boolean(camera && (camera.connected || camera.isolated) && !camera.cleanupConfirmed);
+  const state = !stale && cleanupUnknown ? "CLEANUP UNKNOWN" : deviceConnectionLabel(connected, stale);
   const act = (action: () => Promise<unknown>) => { setMessage(null); void action().catch(reason => setMessage(String(reason))); };
   const root = snapshot.parameters.savePath;
   const identity = camera?.identity;
   const reason = message || (!camera?.cleanupConfirmed && camera?.isolated ? "Camera cleanup unconfirmed" : camera?.lastError) || captureReason || (readiness?.ready ? "Confirmed configuration" : readiness?.issues[0]?.remedy || "Read and verify camera configuration");
-  return <section className="panel camera-panel" id="camera-panel"><header className="panel__header"><LineIcon name="camera" size={15} className="panel__icon" /><h2>Camera</h2><span className="chip chip--muted">{stale ? "UNKNOWN" : state}</span></header><div className="device-body">
+  return <section className="panel camera-panel" id="camera-panel"><header className="panel__header"><LineIcon name="camera" size={15} className="panel__icon" /><h2>Camera</h2><span className={`chip ${!stale && connected && !cleanupUnknown ? "chip--accent" : "chip--muted"}`} title={`Camera state: ${stale ? "UNKNOWN" : englishDisplayText(camera?.phase?.toUpperCase() || "UNKNOWN")}`}>{state}</span></header><div className="device-body">
     <div className="device-group">
       <div className="device-group__head"><h3 className="device-group__title">Device</h3><span className="chip chip--muted" title={identity?.deviceId || "Select a camera explicitly"}>{identity ? `${unicodeDisplayText(identity.manufacturer)} ${unicodeDisplayText(identity.model)}` : "Not selected"}</span></div>
       <div className="device-grid device-grid--pick"><button className="primary" disabled={Boolean(connectionReason) || Boolean(camera?.connected)} onClick={() => act(() => run({ type: "camera_connect" }))}>Discover</button><select className="device-control" aria-label="Active camera device" value={selected} disabled={Boolean(connectionReason) || Boolean(camera?.connected)} onChange={event => setSelected(event.target.value)}><option value="">Select camera</option>{camera?.discovered.map(item => <option key={item.deviceId} value={item.deviceId}>{unicodeDisplayText(item.model)} · {unicodeDisplayText(item.serial || item.deviceId)}</option>)}</select></div>
