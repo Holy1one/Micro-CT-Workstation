@@ -1380,20 +1380,18 @@ function ControlDock({
 }
 
 /**
- * Read-only eight-state console feedback strip. The active state is emphasised;
- * its detail line always carries the meaning as text, so no reading depends on
- * the colour of a dot. The strip scrolls horizontally inside its own row when
- * the column is narrow, which never clips a fixed column.
+ * Read-only current state and queue summary, with other states in a disclosure.
+ * The current state remains visible as text independently of colour.
  */
 function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: boolean }) {
-  const active = stale ? "Fault" : feedback.state;
+  const active = stale ? "UNKNOWN" : feedback.state;
   // The strip is one glance, not a paragraph: only the leading segment of the
   // detail stays on the row; the full sentence lives in the help bubble.
   const detailLead = feedback.detail.split(" · ")[0];
   return (
     <div className={`op-feedback ${feedback.active ? "is-hot" : ""}`}>
       <div
-        className={`op-feedback__row ${feedbackToneClass(feedback.tone)}`}
+        className={`op-feedback__row ${feedbackToneClass(stale ? "danger" : feedback.tone)}`}
         role="status"
         aria-live="polite"
         aria-label={localize(englishDisplayText(`Console feedback state: ${active}. ${feedback.detail}`))}
@@ -1402,8 +1400,10 @@ function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: 
         <span className="op-feedback__detail">{localize(englishDisplayText(detailLead))}</span>
         <HelpTip text={feedback.detail} align="end" />
       </div>
-      <div className="op-feedback__states">
-        {CONSOLE_FEEDBACK_STATES.map((state) => (
+      <details className="op-feedback__disclosure">
+        <summary>{localize("Operation Status")}</summary>
+        <div className="op-feedback__states">
+        {CONSOLE_FEEDBACK_STATES.filter((state) => state !== active).map((state) => (
           <span
             key={state}
             className={`op-feedback__chip ${state.toLowerCase()} ${state === active ? "is-active" : "is-idle"}`}
@@ -1411,7 +1411,8 @@ function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: 
             {localize(state)}
           </span>
         ))}
-      </div>
+        </div>
+      </details>
     </div>
   );
 }
@@ -1543,7 +1544,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
         <LineIcon name="radiation" size={15} className="panel__icon" />
         <h2>{localize("12 Watt Controller")}</h2>
         <HelpTip text={sourceHelp} />
-        <span className={`chip chip--${beamState === "on" ? "danger" : connected ? "accent" : "muted"}`}>
+        <span className={`chip chip--${beamState === "on" ? "danger" : stale ? "warn" : "muted"}`}>
           {localize(beamState === "on" ? "EMITTING" : deviceConnectionLabel(ws.xray.connected, stale))}
         </span>
       </div>
@@ -1709,7 +1710,7 @@ function OperationPanel({ snapshot, ws, stale, onImport }: { snapshot: EngineSna
       <div className="panel__header">
         <LineIcon name="gauge" size={15} className="panel__icon" />
         <h2>{localize("Operation Status")}</h2>
-        <span className={`chip chip--${stale ? "muted" : ws.phaseTone}`}>{localize(stale ? "UNKNOWN" : ws.phaseWord)}</span>
+        <span className={`chip chip--${stale ? "warn" : ws.phaseTone}`}>{localize(stale ? "UNKNOWN" : ws.phaseWord)}</span>
       </div>
       <div className="operation-panel__body">
         <StateFeedback feedback={feedback} stale={stale} />

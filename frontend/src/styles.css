@@ -266,7 +266,7 @@ button[aria-busy="true"] { cursor: progress; }
   align-items: center;
   gap: 5px;
   height: 20px;
-  padding: 0 9px;
+  padding: 0 8px;
   border-radius: 100px;
   font-size: var(--fontSizeHint);
   font-weight: var(--fontWeightStrong);
@@ -352,8 +352,8 @@ button[aria-busy="true"] { cursor: progress; }
 .chip {
   display: inline-flex;
   align-items: center;
-  height: 22px;
-  padding: 0 9px;
+  height: 20px;
+  padding: 0 8px;
   border-radius: var(--radiusChip);
   font-size: var(--fontSizeHint);
   font-weight: var(--fontWeightStrong);
@@ -1044,7 +1044,7 @@ i.tone-danger { background: var(--danger); }
 /* Eight-state read-only console feedback. The active state is emphasised and
    always carries its meaning as text; the remaining seven stay as a reference
    strip so the console names every state it can report. */
-.op-feedback { flex: 0 0 auto; margin: 8px 12px 0; display: flex; flex-direction: column; border: 1px solid var(--lineStrong); border-radius: var(--radiusSmall); background: var(--well); }
+.op-feedback { position: relative; flex: 0 0 auto; margin: 8px 12px 0; display: flex; flex-direction: column; border: 1px solid var(--lineStrong); border-radius: var(--radiusSmall); background: var(--well); }
 .op-feedback__row {
   display: flex;
   flex-direction: row;
@@ -1070,9 +1070,7 @@ i.tone-danger { background: var(--danger); }
 .op-feedback__detail {
   flex: 1 1 auto;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
   font-size: var(--fontSizeHint);
   line-height: 1.4;
   color: var(--textSecondary);
@@ -1084,6 +1082,9 @@ i.tone-danger { background: var(--danger); }
 .op-feedback__row.tone-muted { border-left-color: var(--textMuted); }
 .op-feedback__row.tone-danger .op-feedback__detail { color: var(--dangerText); }
 
+.op-feedback__disclosure { font-size: var(--fontSizeHint); color: var(--textSecondary); }
+.op-feedback__disclosure summary { cursor: pointer; padding: 2px 8px; }
+.op-feedback__disclosure[open] .op-feedback__states { position: absolute; z-index: 2; left: 0; right: 0; background: var(--well); border: 1px solid var(--lineStrong); border-radius: var(--radiusSmall); }
 .op-feedback__states {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1108,7 +1109,7 @@ i.tone-danger { background: var(--danger); }
 .op-feedback__chip.is-active { color: var(--textPrimary); border-color: var(--lineStrong); background: var(--controlBg); box-shadow: var(--selectionShadow); }
 .op-feedback__chip.is-idle { color: var(--textHint); font-weight: var(--fontWeightRegular); }
 
-.op-feedback.is-hot .op-feedback__row { min-height: 26px; border-left-width: 4px; }
+.op-feedback.is-hot .op-feedback__row { min-height: 32px; border-left-width: 4px; }
 .op-feedback.is-hot .op-feedback__detail { font-size: var(--fontSizeHint); }
 .operation-panel .op-stats .op-stat strong { line-height: 1.15; }
 
@@ -1632,7 +1633,7 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 }
 .operation-panel__body > * { flex: 0 0 auto; }
 .operation-panel .op-feedback { margin: 0; }
-.operation-panel .op-feedback__row { min-height: 26px; padding-block: calc(1px + var(--panelSpace)); }
+.operation-panel .op-feedback__row { min-height: 32px; padding-block: calc(1px + var(--panelSpace)); }
 .operation-panel .op-feedback__states { gap: calc(2px + 2 * var(--panelSpace)); padding: calc(2px + 2 * var(--panelSpace)); }
 .operation-panel .op-feedback__chip { min-height: 20px; padding: 0 3px; font-size: var(--fontSizeHint); }
 .operation-panel .op-card { margin: 0; padding-block: calc(2px + 2 * var(--panelSpace)); gap: calc(2px + 2 * var(--panelSpace)); }
@@ -1794,7 +1795,9 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 .camera-panel .device-group { gap: 6px; }
 .camera-panel .device-readout { gap: 2px; }
 .camera-panel .device-footer { padding-top: 4px; flex-wrap: wrap; row-gap: 3px; }
-.camera-panel .device-footer p { flex-basis: 100%; }
+.camera-panel .device-footer p { flex-basis: 100%; white-space: normal; overflow-wrap: anywhere; line-height: 1.35; max-height: 2.7em; }
+.camera-capability { color: var(--textSecondary); font-size: var(--fontSizeHint); white-space: nowrap; }
+.device-identity { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--textSecondary); font-size: var(--fontSizeHint); }
 /* The permanent panel stays compact: the Advanced dialog keeps the per-parameter
    actual-value caption, while the panel shows it in the field title tooltip. */
 .camera-panel .device-field .device-caption { display: none; }
