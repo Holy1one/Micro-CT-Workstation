@@ -58,6 +58,7 @@
   --well:         #F2F3F5;
   /* 发丝线：看得见但不刻意——只承担分区职责，不抢内容 */
   --line:         rgba(15, 23, 42, 0.09);
+  --lineSoft:     rgba(15, 23, 42, 0.09);
   --lineStrong:   rgba(15, 23, 42, 0.13);
   --lineField:    rgba(15, 23, 42, 0.18);
 
@@ -187,6 +188,7 @@
 
   /* Shared comfortable scale; controls and spacing grow with the type while
      the fixed canvas and aligned bottom row stay put. */
+  --fontSizeMicro: 12px;
   --fontSizeHint: 14px;
   --fontSizeLabel: 15px;
   --fontSizeBody: 16px;
@@ -236,6 +238,7 @@
   --panelHeader:  #2A3039;
   --well:         #1D2229;
   --line:         rgba(255, 255, 255, 0.085);
+  --lineSoft:     rgba(255, 255, 255, 0.085);
   --lineStrong:   rgba(255, 255, 255, 0.125);
   --lineField:    rgba(255, 255, 255, 0.18);
 
@@ -557,7 +560,7 @@
 .console__tab[aria-selected="true"] .console__tab-icon { color: var(--accent); }
 .log-line { display: flex; gap: 10px; font-size: var(--fontSizeHint); line-height: 1.45; }
 .log-line__time { flex: 0 0 124px; font-family: var(--fontUi); color: var(--textMuted); }
-.log-line__tag  { flex: 0 0 118px; font-family: var(--fontUi); font-weight: var(--fontWeightStrong); }
+.log-line__tag  { flex: 0 0 96px; font-family: var(--fontUi); font-weight: var(--fontWeightStrong); }
 .log-line__msg  { flex: 1 1 auto; color: var(--textPrimary); }
 .log-line--info .log-line__tag { color: var(--accentText); }
 .log-line--pass .log-line__tag { color: var(--accent); }

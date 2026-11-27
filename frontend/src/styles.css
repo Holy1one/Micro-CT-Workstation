@@ -109,15 +109,15 @@ button[aria-busy="true"] { cursor: progress; }
   overflow-y: auto; display: flex; flex-direction: column; gap: 8px;
   padding: 12px 14px 14px; border-radius: var(--radiusCard);
   font-family: var(--fontUi); color: var(--textPrimary);
-  background: color-mix(in srgb, var(--dangerSoft) 88%, var(--panel));
-  border: 1px solid color-mix(in srgb, var(--danger) 60%, transparent);
+  background: var(--panel);
+  border: 0; border-left: 3px solid var(--danger);
   box-shadow: var(--shadowFloat);
   -webkit-backdrop-filter: var(--floatingBlur); backdrop-filter: var(--floatingBlur);
   animation: toast-in var(--durSlow) var(--easeSpring);
 }
-.failure-card--engine { background: color-mix(in srgb, var(--dangerSoft) 70%, var(--panel)); }
 .failure-card__head { display: flex; align-items: center; gap: 8px; }
-.failure-card__head h2 { margin: 0; font-size: var(--fontSizeTitle); font-weight: var(--fontWeightStrong); letter-spacing: 0; line-height: 1.25; }
+.failure-card__head svg { color: var(--danger); }
+.failure-card__head h2 { color: var(--dangerText); margin: 0; font-size: var(--fontSizeTitle); font-weight: var(--fontWeightStrong); letter-spacing: 0; line-height: 1.25; }
 .failure-card__stage { font-family: var(--fontUi); font-size: var(--fontSizeHint); color: var(--textSecondary); }
 .failure-card__dismiss {
   margin-left: auto; min-height: 28px; padding: 2px 9px; border-radius: 7px;
@@ -485,7 +485,8 @@ i.tone-danger { background: var(--danger); }
 .scene-view-control .scene-view-btn { min-width: 0; height: 26px; border: 0; border-radius: 7px; }
 .scene-view-btn.active { background: transparent; color: var(--textPrimary); box-shadow: none; }
 .scene-view-control .scene-view-btn:hover { background: transparent; color: var(--accent); }
-.scene-view-control .scene-view-btn:active { transform: none; box-shadow: none; }
+.scene-view-control .scene-view-btn.active:hover { color: var(--textPrimary); }
+.scene-view-control .scene-view-btn:active:not(:disabled) { transform: none; box-shadow: none; background-image: linear-gradient(var(--pressedOverlay), var(--pressedOverlay)); }
 
 .live-scene--reconstruction { background: var(--well); }
 .recon-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--textSecondary); font-size: var(--fontSizeBody); }
@@ -1393,8 +1394,9 @@ i.tone-danger { background: var(--danger); }
 .control-dock .dock-key--stop:disabled .dock-icon { filter: grayscale(1); opacity: 0.42; }
 .follow-toggle { padding: 3px 9px; border-radius: 6px; background: var(--panelHeader); color: var(--accent); font-size: var(--fontSizeHint); cursor: pointer; white-space: nowrap; transition: background-color var(--durFast) var(--easeOut), color var(--durFast) var(--easeOut); }
 .console { border: 1px solid var(--line); border-radius: var(--radiusCardCompact); overflow: hidden; }
-.log-line { font-size: var(--fontSizeHint); line-height: 1.5; }
-.log-line__time { font-variant-numeric: tabular-nums; }
+.log-line { font-size: var(--fontSizeHint); line-height: 1.4; }
+.log-line:not(:last-child) { padding-bottom: 2px; border-bottom: 1px solid var(--lineSoft); }
+.log-line__time { font-size: var(--fontSizeMicro); color: var(--textMuted); font-variant-numeric: tabular-nums; }
 .log-line__msg { overflow-wrap: anywhere; }
 
 /* 仪器读数：数值井一律使用等宽数字，强化仪表感与可读性 */
@@ -1962,7 +1964,7 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 :is(.console__tab, .camera-advanced__tab, .trouble-pane__tab):is([aria-selected=true], .is-active) { font-weight: var(--fontWeightStrong); }
 .camera-advanced__nav, .trouble-pane__nav { border-radius: var(--radiusControl) 0 0 var(--radiusControl); background: var(--sidebarBg); padding-left: 6px; }
 .theme-toggle .theme-toggle__seg { justify-content: center; border: 0; }
-.theme-toggle .theme-toggle__seg:active { transform: none; box-shadow: none; }
+.theme-toggle .theme-toggle__seg:active:not(:disabled) { transform: none; box-shadow: none; background-image: linear-gradient(var(--pressedOverlay), var(--pressedOverlay)); }
 .modal-card .modal-card__close { border-radius: 50%; background: var(--neutralSoft); border-color: transparent; }
 
 @media (hover: hover) and (pointer: fine) {
