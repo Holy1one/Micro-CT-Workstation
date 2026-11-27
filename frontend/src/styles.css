@@ -1649,19 +1649,30 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 .camera-settings-dialog .scan-prep__lead, .camera-settings-dialog .device-control-reason { flex: 0 0 auto; }
 .camera-settings-dialog .camera-properties label { display: flex; flex-direction: column; }
 /* Two-pane Advanced page: the same grammar as the log category rail. */
-.camera-advanced { flex: 1 1 0; display: grid; grid-template-columns: 268px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 12px; min-height: 0; margin-top: 10px; }
+.camera-advanced { flex: 1 1 0; display: grid; grid-template-columns: 224px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 12px; min-height: 0; margin-top: 10px; }
 .camera-advanced__nav { display: flex; flex-direction: column; gap: 2px; min-height: 0; overflow-y: auto; padding: 6px 12px 6px 0; border-right: 1px solid var(--line); background: transparent; }
 .camera-advanced__tab { position: relative; display: flex; align-items: center; gap: 8px; min-height: var(--controlHeight); padding: 4px 9px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--textSecondary); font-family: var(--fontUi); font-size: var(--fontSizeLabel); font-weight: var(--fontWeightStrong); text-align: left; cursor: pointer; }
 .camera-advanced__tab:hover { background: var(--neutralSoft); color: var(--textPrimary); }
 .camera-advanced__tab.is-active { background: var(--navigationSelected); color: var(--accent); border-color: transparent; box-shadow: none; }
-.camera-advanced__tab span:first-child { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.camera-advanced__tab span:first-child { flex: 1 1 auto; min-width: 0; white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
 .camera-advanced__count { flex: 0 0 auto; font-family: var(--fontUi); font-size: var(--fontSizeHint); color: var(--textMuted); }
 .camera-advanced__dot { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 .camera-advanced__pane { min-width: 0; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; border: 1px solid var(--line); border-radius: var(--radiusCardCompact); background: var(--panel); padding: 4px 12px 12px; }
 .camera-advanced__pane .camera-properties { margin-top: 0; }
 .camera-advanced__empty { margin: 12px 0; font-size: var(--fontSizeBody); color: var(--textSecondary); }
-.camera-advanced__actions { display: flex; align-items: center; gap: 10px; }
-.camera-advanced__dirty { margin-left: auto; font-size: var(--fontSizeHint); color: var(--textHint); }
+.camera-advanced__actions { display: flex; width: 100%; align-items: center; gap: 12px; }
+.camera-advanced__dirty { flex: 1; font-size: var(--fontSizeHint); font-weight: var(--fontWeightRegular); color: var(--textSecondary); }
+.camera-advanced__apply:not(:disabled) { background: var(--actionFill); border-color: var(--actionFill); color: var(--onAccent); }
+.camera-settings-dialog .scan-prep__lead { font-size: var(--fontSizeLabel); font-weight: var(--fontWeightMedium); color: var(--textPrimary); }
+.camera-advanced__explanation { margin-bottom: 12px; }
+.camera-settings-dialog .camera-advanced__explanation summary { font-size: var(--fontSizeHint); font-weight: var(--fontWeightMedium); }
+.camera-advanced__explanation .device-note { font-size: var(--fontSizeHint); font-weight: var(--fontWeightRegular); line-height: 1.45; }
+.camera-advanced__table td { vertical-align: middle; }
+.camera-advanced__table td:nth-child(3) { font-size: var(--fontSizeBody); font-weight: var(--fontWeightMedium); }
+.camera-advanced__table td:nth-child(4) { font-size: var(--fontSizeHint); font-weight: var(--fontWeightRegular); line-height: 1.4; }
+.camera-advanced__table td.camera-advanced__evidence--confirmed { color: var(--textSecondary); }
+.camera-settings-dialog .camera-advanced__availability { display: inline; margin: 0 0 0 8px; font-size: var(--fontSizeHint); font-weight: var(--fontWeightRegular); color: var(--textSecondary); }
+.camera-advanced__table thead th { position: sticky; top: 0; z-index: 1; background: var(--panel); border-bottom: 1px solid var(--line); }
 .device-note { margin: 8px 0 0; font-size: var(--fontSizeHint); line-height: 1.45; color: var(--textHint); }
 .preset-save-row { display: grid; grid-template-columns: 1fr 1fr 190px; gap: 6px; margin: 8px 0; }
 .preset-save-row > * { min-width: 0; }

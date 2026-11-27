@@ -449,6 +449,8 @@ export const zhCN: Readonly<Record<string, string>> = {
   "Write serially and verify every readback": "顺序写入并逐项核验读回",
   "{0} change(s) not applied": "{0} 项修改尚未应用",
   "No unapplied changes": "没有未应用的修改",
+  "Apply a mode change and read it back to unlock its dependent controls. Shutter and scan Exposure share one target. Disabled parameters show the camera's reason.": "切换模式后先应用并读回，以解锁依赖控件。快门与扫描曝光共用同一目标。禁用参数会显示相机返回的原因。",
+  "Mode and dependency details": "模式与依赖说明",
   "Shutter and scan Exposure share one target. Apply a mode change and read it back to unlock its dependent controls. Disabled parameters show the camera's reason.": "快门与扫描曝光共用同一目标。切换模式后先应用并读回，以解锁依赖控件。禁用参数会显示相机返回的原因。",
   "Camera advanced categories": "相机高级设置分类",
   "Other described parameters": "其他已描述参数",
