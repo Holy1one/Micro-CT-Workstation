@@ -44,9 +44,9 @@ const REFERENCE_COUNT: usize = 10;
 /// or the separately pinned preceding settle candidate. Text cannot prove the flashed image; this is a fail-closed identity
 /// gate, not a certification.
 pub(crate) const CARD_FIRMWARE_VERSION: &str = "2.3.0";
-pub(crate) const CARD_FIRMWARE_BUILD: &str = "20261011";
+pub(crate) const CARD_FIRMWARE_BUILD: &str = "20261127";
 pub(crate) const CARD_FIRMWARE_SOURCE_SHA256: &str =
-    "fc2d01af3d16ea83f3887ec196efdf4712d8ffe782d5c89d62bb7fb8f53fac06";
+    "4aa4ff2b595872f1c4ae51ecaa95582b32243dabaf5c69bf2614b41f3871e9e1";
 // Preserve the deployed settle firmware and the provenance of existing tasks.
 // Version text never upgrades that controller to the new motion profile.
 const CARD_PREVIOUS_FIRMWARE_VERSION: &str = "2.2.0";

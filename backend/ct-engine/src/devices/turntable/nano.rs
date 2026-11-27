@@ -1754,7 +1754,7 @@ pub(crate) mod tests {
     }
 
     fn card_identity_line(identity:String)->String{
-        format!("{},{}",identity.replace("VERSION=2.1.0","VERSION=2.3.0").replace("BUILD=20260918","BUILD=20261011"),"MOVE_SETTLE_150MS,MOVE_RAMP_4MS")
+        format!("{},{}",identity.replace("VERSION=2.1.0","VERSION=2.3.0").replace("BUILD=20260918","BUILD=20261127"),"MOVE_SETTLE_150MS,MOVE_RAMP_4MS")
     }
 
     fn status_line(
