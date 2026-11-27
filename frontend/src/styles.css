@@ -278,9 +278,9 @@ button[aria-busy="true"] { cursor: progress; }
   border: 1px solid color-mix(in srgb, var(--warn) 38%, transparent);
 }
 .badge--engine {
-  color: var(--accentText);
-  background: color-mix(in srgb, var(--ok) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--ok) 38%, transparent);
+  color: var(--textSecondary);
+  background: var(--neutralSoft);
+  border: 1px solid var(--line);
 }
 .badge--locked { color: var(--textSecondary); background: var(--neutralSoft); border: 1px solid var(--line); }
 .badge--engine i { width: 6px; height: 6px; border-radius: 3px; background: currentColor; }
@@ -539,26 +539,17 @@ i.tone-danger { background: var(--danger); }
   -webkit-backdrop-filter: blur(4px);
   backdrop-filter: blur(4px);
 }
-.scene-status-float__summary { display: flex; flex-direction: column; gap: 2px; }
+.scene-status-float__summary { display: flex; align-items: center; }
 .scene-status-float__summary strong {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: var(--fontSizeLabel);
+  font-size: var(--fontSizeHint);
   font-weight: var(--fontWeightStrong);
   line-height: 1.2;
   white-space: nowrap;
 }
 .scene-status-float__summary i { flex: 0 0 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.scene-status-float__detail {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--fontSizeHint);
-  font-weight: var(--fontWeightRegular);
-  line-height: 1.25;
-  color: var(--textSecondary);
-}
 
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
   .scene-status-float {
@@ -1991,6 +1982,12 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 }
 
 /* Bench safety and scan-preparation refusal hierarchy. */
+.bench-dialog { height: auto; min-height: 360px; max-height: calc(100% - 48px); }
+.bench-dialog .modal-card__body > .device-console-section:first-child { padding-top: 4px; }
+.bench-dialog .device-console-section:first-child > h3:first-child { margin-top: 0; }
+.bench-dialog .diagnostic-json { overflow: visible; max-height: none; }
+.bench-dialog .bench-mode-status { margin: 0; font-size: var(--fontSizeLabel); font-weight: var(--fontWeightMedium); color: var(--textSecondary); white-space: normal; overflow-wrap: anywhere; }
+.bench-dialog .bench-mode-status.is-warning { color: var(--warnText); }
 .bench-warning { display: flex; flex-direction: column; gap: 6px; padding: 12px; border-left: 3px solid var(--warn); background: color-mix(in srgb, var(--warnSoft) 70%, var(--panel)); color: var(--textPrimary); }
 .bench-warning strong { font-size: var(--fontSizeBody); font-weight: var(--fontWeightStrong); }
 .bench-warning p { margin: 0; font-size: var(--fontSizeLabel); font-weight: var(--fontWeightRegular); line-height: 1.45; }

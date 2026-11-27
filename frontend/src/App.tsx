@@ -1417,16 +1417,14 @@ function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: 
   );
 }
 
-/** One compact status summary; the scene and controls share the same engine feedback. */
+/** One phase line; the operation panel retains queue details and all phase entries. */
 function SceneStatusFloat({ feedback }: { feedback: ConsoleFeedback }) {
-  // Translate the complete message before shortening it, so sentence templates
-  // retain their Chinese translation and the tooltip keeps the full evidence.
+  // The tooltip retains the full evidence, including abnormal and unknown states.
   const detail = localize(englishDisplayText(feedback.detail));
   return (
     <aside className="scene-status-float" aria-label={localize("Operation Status")} title={detail}>
       <div className="scene-status-float__summary" role="status" aria-live="polite" aria-atomic="true">
         <strong className={feedbackToneClass(feedback.tone)}><i aria-hidden="true" />{localize(feedback.state)}</strong>
-        <span className="scene-status-float__detail">{detail.split(" · ")[0]}</span>
       </div>
     </aside>
   );
@@ -1650,7 +1648,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
       <div className="safety-block">
         <div className="safety-block__head">
           <span className="safety-block__title">{localize("DEVICE SAFETY")}</span>
-          <span className={`chip chip--${stale || !ws.xray.usbAutoShutDownKnown ? "warn" : ws.xray.usbAutoShutDown ? "ok" : "warn"}`}>
+          <span className={`chip chip--${stale || !ws.xray.usbAutoShutDownKnown ? "warn" : ws.xray.usbAutoShutDown ? "muted" : "warn"}`}>
             {localize(stale || !ws.xray.usbAutoShutDownKnown
               ? "NOT VERIFIED"
               : ws.xray.usbAutoShutDown
