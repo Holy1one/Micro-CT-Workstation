@@ -77,7 +77,7 @@ HOME 与手动 MOVE 的界面等待上限为 360 秒，覆盖 Nano 的 300 秒�
 
 基本与Advanced共用camera连接会话关联的摄影草稿。首次确认读回可载入草稿，不写设备；后续外部变化不能静默覆盖用户草稿。更改父属性草稿不预测子属性已生效，必须明确Apply后重新描述/读回才解锁依赖。快门是扫描exposureMs唯一来源，按原生code/精确分数计算，不能另设可写扫描曝光或四舍五入。
 
-`CameraProperty`保留`key/label/code/dataType/supported/readable/nativeWritable/effective/writable/disabledReason/options/supportedValues/range/actual/target/confirmed/error`。原生writable不等于当前可写。只有引擎允许的属性及选项可交互；不支持、只读、当前无效、未确认或占用时灰禁并给理由。枚举用下拉，option分别按supported/enabled禁用；真实数值range不能被少数标签缩窄。actual、target和未Apply草稿分开显示，null/confirmed=false/error表示未知。主相机面板的无值参数与未知只读值以主题主文字色的 `—` 占位，tooltip/可访问名称继续说明 Unknown；陈旧快照不展示旧值为当前读数，也不清除用户草稿。已确认的 0/Off 和显式草稿保持原值；连接、清理、定位参考及射线安全状态不使用这个占位规则。
+`CameraProperty`保留`key/label/code/dataType/supported/readable/nativeWritable/effective/writable/disabledReason/options/supportedValues/range/actual/target/confirmed/error`。原生writable不等于当前可写。只有引擎允许的属性及选项可交互；不支持、只读、当前无效、未确认或占用时灰禁并给理由。枚举用下拉，option分别按supported/enabled禁用；真实数值range不能被少数标签缩窄。actual、target和未Apply草稿分开显示，null/confirmed=false/error表示未知。主相机面板的无值参数与未知只读值以主题主文字色的 `–` 占位，tooltip/可访问名称继续说明 Unknown；陈旧快照不展示旧值为当前读数，也不清除用户草稿。已确认的 0/Off 和显式草稿保持原值；连接、清理、定位参考及射线安全状态不使用这个占位规则。
 
 Advanced必须能展示当前摄影目录的34个key，是否可写及有哪些选项仍取实际descriptor；分类只是展示建议，不规定布局：
 
@@ -187,7 +187,7 @@ SD 独立单拍只确认本次卡回执，不自动导入或显示本地预览�
 | timer | `{type:"timer_toggle"}` | 仅浏览器预览兼容入口；当前生产明确拒绝XRAY_STAGE_LOCKED，不展示成可用的硬件定时器 |
 | 历史连接兼容/重试 | `{type:"connect",adapter:"developer_preview"|"real_hardware"}` / `{type:"disconnect"}` / `{type:"retry_device",device:"turntable"|"camera"|"xray"}` | 生产connect只连接Nano，adapter=developer_preview拒绝；disconnect走全局清理。retry camera仅刷新发现，不隐式选择设备；其 operation kind 现为 `camera_discover`（不再是 `connect`，F-06 已修），因此前端不会把发现回执误当连接成功。无 deviceId 的 `camera_connect` 同样使用 `camera_discover`；只有带明确 deviceId 才是 `connect`。新前端使用分设备显式入口 |
 
-位置读数消费`confirmedAngleDeg`和Nano status，不用目标角度冒充实测。未知或陈旧的位置显示 `— °` 并保留未知原因提示；`REFERENCE UNKNOWN` 仍明确显示，已确认零位保留数值。扫描/暂停/收尾/停止清理/重构及保留taskLock锁住手动参数/对焦/运动，受控恢复HOME例外。STOP、OFF及只读状态持续可用。
+位置读数消费`confirmedAngleDeg`和Nano status，不用目标角度冒充实测。未知或陈旧的位置显示 `– °` 并保留未知原因提示；`REFERENCE UNKNOWN` 仍明确显示，已确认零位保留数值。扫描/暂停/收尾/停止清理/重构及保留taskLock锁住手动参数/对焦/运动，受控恢复HOME例外。STOP、OFF及只读状态持续可用。
 
 相机、转台和射线标题标签共用连接文案：CONNECTED/DISCONNECTED，快照陈旧为UNKNOWN；相机 phase 与转台 motion state 放在提示中，不混作连接状态。相机 CLEANUP UNKNOWN 与射线 EMITTING 保留优先警示，位置、REFERENCE UNKNOWN 及射线输出/安全状态继续独立显示。普通Stop/故障清理可保留健康空闲设备会话，完成回执仍必须等待OFF/STOP及相机空闲确认；正在调用、曝光未决或清理失败的相机继续隔离。显式Disconnect、退出与更新维护关闭连接。连接保留不撤销持久任务锁、故障锁或重新预检/建立运动基准的要求。空闲相机会话保留路径目前仅离线验证，不继承此前关闭再连接的硬件验收。
 
@@ -235,7 +235,7 @@ SD 独立单拍只确认本次卡回执，不自动导入或显示本地预览�
 
 一次收集全部数据并原子提交；projectionCount整数1–3600，角步长由引擎360/N派生；maxXraySec为整数秒、范围1–1000（界面用 mm:ss 或十进制分钟收集并精确换算，默认600秒；旧任务沿用原冻结值，独立手动出束默认期限保持600秒）。通用几何DTO可表示两方向和真实/估计来源，用于读取既有资料；当前prepare_scan要求rotationDirection="counterclockwise"且measurement="measured"，estimated或clockwise明确拒绝。SOD、物体到探测器距离及屏宽必须有限且大于0；两轴偏移必须有限；mirrorX必须boolean。只读展示当前根、任务目录和确认原生快门，不能在此重复编辑快门。取消未提交草稿无文件/任务锁/动作。
 
-prepare成功的同会话/同任务响应后调用`{type:"preflight",restore?:boolean,confirmUsbAutoShutdownRelease?:boolean}`。新任务不带恢复覆盖；恢复需明确本次confirmUsbAutoShutdownRelease。Preflight/Start/恢复鲜读比较，不写快门/RAM/burst，不自动停LV。自动配置、未知、漂移、未Apply均阻塞；展示`cameraScanReadiness.issues[]`的key/actual/requirement/remedy并允许转Advanced，关闭提示不解除门禁。相机预检按当前已确认参数逐项检查；界面使用英文参数标签、实际值、要求和建议呈现，原始错误保留在日志与 Copy details。高级设置左右栏目撑满标题和固定按钮区之间的可用高度。
+prepare成功的同会话/同任务响应后调用`{type:"preflight",restore?:boolean,confirmUsbAutoShutdownRelease?:boolean}`。新任务不带恢复覆盖；恢复需明确本次confirmUsbAutoShutdownRelease。Preflight/Start/恢复鲜读比较，不写快门/RAM/burst，不自动停LV。自动配置、未知、漂移、未Apply均阻塞；展示`cameraScanReadiness.issues[]`的key/actual/requirement/remedy并允许转Advanced，关闭提示不解除门禁。相机预检按当前已确认参数逐项检查；界面按当前语言使用参数标签、实际值、要求和建议呈现，原始错误保留在日志与 Copy details。高级设置左右栏目撑满标题和固定按钮区之间的可用高度。
 
 SD 扫描的 `earlyRelease` 默认 true，Scan Preparation 的 “Move as soon as exposure ends” 允许关闭，快照 `workstation.scanSetup.earlyRelease` 回显引擎接受值。每张单独识别 D1A4 bit15 1→0；缺失时等本张唯一存卡回执持久化再释放，不等待一个必达的早事件、不沿用前帧证据。下一张仍必须等前张回执和本位点到位，关闭即使用串行存卡时序。该选项属于扫描调度，扫描开始后冻结，不改变摄影 profile、回执或 manifest schema；环境验收标志不再控制生产扫描选择。
 
@@ -317,7 +317,7 @@ UpdateState字段：updateId/phase/currentVersion/targetVersion/channel/kind/sou
 
 真实硬件未验证的新增LV控制、镜头资格与完整扫描须明确待验；不能把离线fixture、模拟照片或旧版本实机结果升级为新版本认证。当前RAM/SD profile不含多重曝光的人工确认门禁。机身OFF检查是操作前置条件；提示不产生机器OFF证据，不覆盖引擎readiness，不写人工确认字段。一次物理曝光与C101/C102的对应关系仍需独立实测。
 
-## 11. 失败呈现、Troubleshooting 与全英文呈现层
+## 11. 失败呈现、Troubleshooting 与双语呈现层
 
 ### 11.1 统一失败面（`frontend/src/FailureBanner.tsx` + `deriveFailureReport`）
 
@@ -328,21 +328,35 @@ UpdateState字段：updateId/phase/currentVersion/targetVersion/channel/kind/sou
 - 关闭只隐藏通知：`cleanup_unconfirmed` 与 `transport` 两类保留明确文案，说明未确认清理、未清除故障或未完成任务锁。
 - 未知错误码原样显示（`docs/architecture/frontend-error-codes.md` §0.2），不得改写成成功/OFF/正常/安全。
 - 同时识别 `ENGINE:<CODE>` 和 operation.error 开头的原始 `CODE` / `CODE: detail`。SCAN_OUTPUT 类错误显示 Scan folder needs attention、实际 code 与 files 建议，不用相机拒绝或通用通信错误代替。目录不存在时后台撤销登记；目录仍在、读失败或有采集线程时保持相应占用。
-- 关闭窗口等待引擎 EOF 清理；已经异常退出的引擎不再造成永久拦截，桌面保留失败返回码后退出。真实仍在运行的清理超时给出英文原生提示；更新仍要求严格 exit0，不把“进程不存在”当设备安全完成。
+- 关闭窗口等待引擎 EOF 清理；已经异常退出的引擎不再造成永久拦截，桌面保留失败返回码后退出。真实仍在运行的清理超时给出当前界面语言的原生提示；更新仍要求严格 exit0，不把“进程不存在”当设备安全完成。
 
 ### 11.2 单一建议表与 Troubleshooting
 
 `FAILURE_ADVICE`（`frontend/src/engine/deviceControls.ts`）是失败卡片 `nextAction`/`group` 与 Help → Troubleshooting 页面的同一份数据源。分组固定为 `camera` / `readiness` / `turntable` / `xray` / `files`；每组的 code 必须真实存在于 `docs/architecture/frontend-error-codes.md`，每条给出具体动作，不得出现「看日志」式空话，也不得承诺重启即可解决未知或未支持条件。`readiness` 组另附当前 session 的 `cameraScanReadiness.issues` 原样表格（key/actual/requirement/remedy）。
 
-### 11.3 产品界面全英文（`frontend/src/engine/native-labels.ts`）
+### 11.3 中英文界面与数据边界
 
-- 呈现在前端的英文层是唯一映射点：34 项 `property.label` 中 15 项、全部枚举 `options[].label`、`options[].reason`、`disabledReason` 与 `capabilities.disabledReasons` 目前由引擎返回中文，必须在呈现层映射；不得改 Rust，也不得渲染中文。
-- 语言中立的引擎标签（ISO/EV/f/K/mm 等）原样保留；未命中的中文枚举降级为 `Native value {n}`；未命中的中文原因降级为一句中性英文并指向原始记录，绝不机器翻译。
-- `property.label` 现由 `cameraPropertyLabel()` 统一提供英文名；`cameraPropertyUsesSelect` 仍只看原生 value/range，不受标签映射影响。
-- 界面日志、失败详情、状态、提示与只读诊断全部使用英文呈现。已知原因映射为英文；未映射诊断以 `Unmapped diagnostic (raw Unicode)` 和可还原的 Unicode 转义保留细节。诊断 JSON（Camera → Advanced → Read-only diagnostics）将中文转义为 `\uXXXX`，解析后与原记录一致。错误码、`ENGINE:<CODE>`、引擎快照和 `Export Session Log` 的 `entry.message` 保持引擎原文。
-- 日志 `source` 统一为引擎自身的字面量（system/preflight/operator/xray/nano/camera/reconstruction/devices）；preview adapter 不再翻译成中文，控制台标签按同一组字面量过滤。
+- 默认英文，不依据 Windows 或浏览器语言自动切换。Tools → Interface Preferences → Interface language 可选择 English / 简体中文；中文入口为“工具 → 界面偏好设置”。选择以 `micro-ct-workstation.language` 保存在本机；存储不可用时仍可在当前会话切换。
+- 产品品牌始终为 `Micro-CT Workstation`，自定义标题栏、网页/原生窗口标题、启动页和关于页均不翻译。中文与英文共用同一字体栈和 400/500/600 字重、14/15/16/18/22px 角色字号；英文和数字使用 Inter，中文优先系统 PingFang SC，其余平台使用内置 Noto Sans SC 可变字重，避免系统 Regular/Bold 替换导致视觉粗细不一致。字符间距和固定设计画布保持不变。
+- 同级标题使用相同字号、字重与行高：面板、日志和弹窗主标题为 18px/600/1.25；分组标题为 15px/600/1.25；字段标签为 14px/500；输入与普通读数为 16px，已确认读数用 600 字重。运行主状态为 16px/600，说明为 14px；已采集、角度、预计剩余与转台位置等关键读数为 22px/600。紧凑布局只收紧间距，不改变角色字号。
+- 常规表单与动作控件采用 36px 高度；较矮客户区中的相机、转台、射线控制器通过容器查询收紧间距和使用 32px 紧凑控件，不另降字号或引入固定栏内滚动。三列共用 660:313 的上下排比例和 12px 间距：上排为相机、设备视图、射线控制器，下排为转台、日志、运行状态。1920×1080 基准下下排高 313px，其他客户区同步保持上下边缘对齐；三列宽度和 39px 标题栏不变，为相机连接后的附加对焦控件保留位置。
+- `i18n.ts` / `zh-CN.ts` 仅在 JSX 和原生窗口文案边界翻译菜单、表单、选项名称、提示、状态、帮助、预检、恢复、更新与已知日志/错误说明。语言切换立即生效，不重建组件，不清空未应用参数/任务草稿，不改变操作门禁。
+- `engine/native-labels.ts` 提供原生属性、枚举、原因的规范标签。英文模式保留既有中文映射与未知诊断的可还原 Unicode 转义；中文模式显示已审阅译文，并保留原生中文。新增未识别的设备/厂商诊断保留原文，不能猜测安全状态。
+- 普通缺失值两种语言都使用同一个短横线 `–`（en dash）；状态未知必须显示 UNKNOWN / 未知，不能显示关闭、正常或安全。设定值、实际值、确认状态必须保持原区别。
+- 原生枚举值、属性 key、命令 type、错误码、路径、序列号、型号、用户命名和输入、引擎快照、诊断 JSON、复制的原始详情、导出日志保持原数据。JSON 中的 Unicode 转义可还原；不得为翻译改写协议或导出证据。ISO、NEF、kV、µA 等标准缩写/单位保留。
+- 日志来源在内部始终使用 system/preflight/operator/xray/nano/camera/reconstruction/devices 原始值进行过滤，仅显示名称翻译。`cameraPropertyUsesSelect` 仍只看原生 value/range，不看译文。
+- `set_interface_language` 是桌面表现层 IPC，仅接受 en/zh-CN，按顺序更新原生预设导入/导出及关机失败提示，原生窗口标题始终保留英文品牌名，不转发引擎。前端选择文件的标题和过滤器名称同步翻译；Windows 自带文件选择器的系统按钮依操作系统语言显示。
 
 ### 11.4 弹窗尺寸与滚动面
 
-- 扫描准备窗口（`ScanPreparationDialog.tsx`）与 Camera Advanced（`CameraSettingsDialog.tsx`）是**固定高度仪器**：header 与 footer 不动，`WorkstationDialog` 新增可选 `footer`/`footerNote` 槽；只有 `.scan-readiness-report__table`（readiness 报告）与 `.camera-advanced__pane`（参数面板）两个受界限的弹窗区域可滚动，`.modal-card__body` 仍可滚动。固定控制台栏目一律不得新增栏内滚动。
+- 弹窗共用固定宽高、客户区边界与内部滚动规则：普通窗口为 720×640，偏好设置和关于页为 720×440，更新为 440×360；扫描准备为 1100×860，Camera Advanced 和故障排查为 1180×860。上述均为设计画布尺寸，受客户区四边 24px 留白限制；切换分类、展开详情、状态更新及切换语言不改变外框大小。header 与可选 footer 保持固定，正文及受界限的报告、导航和参数面板允许内部滚动；故障排查的导航与正文独立滚动，切换分类回到正文顶部。固定控制台栏目不新增栏内滚动。
 - Camera Advanced 为左侧 8 项导航 + 右侧单 pane：5 个摄影分组（9+5+10+7+3=34）+ `Other described parameters`（由实时 descriptor 编译，保证引擎新增属性不被隐藏）+ Presets + Read-only diagnostics。切换分组只改本地展示状态，不发命令、不 Apply、不丢草稿；基本栏与高级页共用同一 `model` 草稿与同一 Apply。
+
+- 运行状态按状态反馈、存储卡采集与导入、关键读数划分有边界的分组，投影进度保持底部可见。设备三维视口左上角使用只读悬浮卡片展示当前状态和一句简要说明，悬停显示完整说明；中央控制坞标为扫描控制，保留进度和操作入口。悬浮卡片与展开后的控制坞保持间距；位置、射线输出和安全读回仍由对应设备面板展示。无 WebGL 时仍明确提示图形不可用，状态卡片保持可见。
+
+### 11.5 材质与交互层次
+
+- 主界面各面板、设备视图和日志标题区共用至少 44px 的高度，标题字号保持一致；较矮客户区也不再压缩面板标题。转台和运行状态按可用高度连续分配组内、组间及上下留白，进度与主动作保持完整可见，避免空白集中在底部。转台动作使用 32px 控件，为分组之间保留呼吸空间；整体三列和上下排比例保持一致。
+- 浅色使用中性银灰底色，深色使用石墨灰；面板、内凹读数、动作按钮和浮层分别使用统一材质令牌。蓝色强调主要操作与当前导航，设备警告、故障和已确认输出保留独立语义色。分组框线和固定三列布局继续保留。
+- 设备视图和主题选择使用分段控件，指针切换以短时滑动反馈；控制坞按需展开，弹窗轻微平移与缩放进入。键盘操作即时响应，减少动态效果时禁用移动，降低透明度或提高对比度时使用实色浮层。动效不改变命令、读回或设备状态。
+- 状态悬浮卡片保持两行、176×约52设计像素及半透明背景，不增加重复标题。三维背景使用平滑底色和细微表面纹理、柔和照明及抗锯齿；模型位置和运动继续只取已确认反馈。

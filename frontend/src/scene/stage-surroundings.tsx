@@ -257,9 +257,8 @@ const BACKDROP_GRADIENT_MAP = createGrainMap((ctx, size) => {
   addGrain(ctx, size, 1.5);
 }, [1, 1]);
 
-/** The oversized floor gets a broad centre lift and gentle edge falloff. It is
- *  an emissive multiplier only: the existing fabric albedo and relief remain
- *  responsible for the ground's material character. */
+/** The oversized floor gets a broad centre lift and gentle edge falloff.
+ *  Colour stays smooth while the fine roughness and relief catch the light. */
 function createGroundFalloffMap(edge: string): THREE.Texture {
   const size = 512;
   const canvas = document.createElement("canvas");
@@ -354,7 +353,6 @@ export function StageSurroundings({ theme, reducedMotion }: { theme: SceneTheme;
         <circleGeometry args={[STAGE_RADIUS, 96]} />
         <meshStandardMaterial
           color={theme.stageTable}
-          map={CLOTH_MAP}
           emissive={theme.stageTable}
           emissiveMap={night ? GROUND_FALLOFF_DARK : GROUND_FALLOFF_LIGHT}
           emissiveIntensity={theme.stageGlow}
@@ -362,7 +360,7 @@ export function StageSurroundings({ theme, reducedMotion }: { theme: SceneTheme;
           metalness={0}
           roughnessMap={CLOTH_MAP}
           bumpMap={CLOTH_MAP}
-          bumpScale={1.5}
+          bumpScale={0.15}
         />
       </mesh>
       {/* The raised miniature landscape participates in camera fit. The rail

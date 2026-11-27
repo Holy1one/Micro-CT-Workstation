@@ -38,8 +38,9 @@
   consumes the same single advice table as the banner, so the two cannot drift.
 - `DeviceConsoles.tsx`: auxiliary isolated-turntable bench confirmation dialog;
   it does not create a second camera draft or independent device owner.
-  The 39px title bar, 251.25px aligned bottom panels and 12px gaps share the
-  client-filling grid. Only overlays and the log/image console scroll.
+  The 39px title bar and 12px gaps frame a client-filling grid. All three columns
+  share 660:313 upper/lower tracks; Turntable, Log and Operation Status align at
+  313px in the 1920x1080 baseline. Only overlays and the log/image console scroll.
 - `tokens.css`: semantic color and state tokens for light/dark and safety states.
 - `styles.css`: workstation layout and component styling.
 - `canvas-layout.ts`: pure client-filling grid dimensions and uniform control scale; never letterboxes.

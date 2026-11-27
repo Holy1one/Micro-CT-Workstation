@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { isDesktopRuntime } from "./desktopPaths";
+import { localize } from "../i18n";
 /** Engine frame payload. `capturedAtMs` is the engine-side capture time and is part of
  * the contract even though freshness is judged by session id and sequence. */
 export interface CameraLiveFrame { sessionId: string; sequence: number; width: number; height: number; capturedAtMs: number; jpeg: number[] }
@@ -28,7 +29,7 @@ export async function resolveCameraCaptureDirectory(): Promise<string> {
  * choosing a path here changes no engine configuration and cannot override normal capture routing. */
 export async function chooseCameraCaptureDirectory(current: string): Promise<string | null> {
   if (!isDesktopRuntime()) return null;
-  const selected = await open({ directory: true, multiple: false, defaultPath: current || undefined, title: "Select independent camera capture directory" });
+  const selected = await open({ directory: true, multiple: false, defaultPath: current || undefined, title: localize("Select independent camera capture directory") });
   return typeof selected === "string" ? selected : null;
 }
 export async function importCameraPresets(): Promise<string | null> {

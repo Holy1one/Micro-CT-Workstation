@@ -1,3 +1,4 @@
+import { localize } from "./i18n";
 /**
  * Top-level workstation presentation and user-interaction composition.
  * The UI renders complete engine snapshots and translates gestures into domain
@@ -24,6 +25,8 @@ import { ReconstructionConsole } from "./ReconstructionConsole";
 import { useCameraDraft, useDeviceActions } from "./camera-draft";
 import { UpdateDialog } from "./UpdateDialog";
 import { WorkstationDialog } from "./WorkstationDialog";
+import { useLanguage } from "./useLanguage";
+import { syncDesktopLanguage } from "./platform/language";
 import { getApplicationVersion } from "./platform/updater";
 import { deriveFailureReport, deviceConnectionReason, manualControlReason } from "./engine/deviceControls";
 import { LineIcon, type LineIconName } from "./icons";
@@ -147,7 +150,7 @@ function HelpTip({ text, align = "start", side = "down" }: { text: string; align
         ref={button}
         type="button"
         className="help-tip"
-        aria-label={englishDisplayText(text)}
+        aria-label={localize(englishDisplayText(text))}
         aria-describedby={visible ? id : undefined}
         onPointerEnter={show}
         onPointerLeave={() => setVisible(false)}
@@ -163,7 +166,7 @@ function HelpTip({ text, align = "start", side = "down" }: { text: string; align
           className="help-tip__bubble"
           role="tooltip"
           style={{ top: position.top, left: position.left }}
-        >{englishDisplayText(text)}</span>,
+        >{localize(englishDisplayText(text))}</span>,
         document.body,
       )}
     </>
@@ -172,7 +175,7 @@ function HelpTip({ text, align = "start", side = "down" }: { text: string; align
 
 const toneClass = (tone: string) => `tone-${tone}`;
 const measured = (value: number | null, stale = false): string =>
-  stale || value == null ? "—" : value.toFixed(1);
+  stale || value == null ? "–" : value.toFixed(1);
 
 /* ------------------------------------------------------------------ */
 /* Menu bar + floating drop-down submenu                               */
@@ -269,10 +272,10 @@ function MenuBar({
     >
       <div className="workstation-brand" data-tauri-drag-region>
         <img src={theme === "dark" ? "/assets/micro-ct-logo-dark.png" : "/assets/micro-ct-logo.png"} alt="" draggable={false} />
-        <strong>Micro-CT Workstation</strong>
-        <span>{version}</span>
+        <strong>{localize("Micro-CT Workstation")}</strong>
+        <span>{localize(version)}</span>
       </div>
-      <nav className="sys-menu" aria-label="Application menu">
+      <nav className="sys-menu" aria-label={localize("Application menu")}>
         {MENU_GROUPS.map((group) => {
           const open = openMenu === group.label;
           return (
@@ -287,10 +290,10 @@ function MenuBar({
                   if (openMenu) setOpenMenu(group.label);
                 }}
               >
-                {group.label}
+                {localize(group.label)}
               </button>
               {open ? (
-                <div className="menu-dropdown" role="menu" aria-label={`${group.label} menu`}>
+                <div className="menu-dropdown" role="menu" aria-label={localize(`${group.label} menu`)}>
                   {group.entries.map((entry) => {
                     const state = availability[entry.id];
                     return (
@@ -301,14 +304,14 @@ function MenuBar({
                         className="menu-dropdown__item"
                         disabled={!state.available}
                         aria-disabled={!state.available}
-                        title={englishDisplayText(state.reason ?? entry.label)}
+                        title={localize(englishDisplayText(state.reason ?? entry.label))}
                         onClick={() => {
                           setOpenMenu(null);
                           onAction(entry.id);
                         }}
                       >
                         <LineIcon name={entry.icon} size={13} className="menu-dropdown__icon" />
-                        <span>{state.label || entry.label}</span>
+                        <span>{localize(state.label || entry.label)}</span>
                       </button>
                     );
                   })}
@@ -319,20 +322,20 @@ function MenuBar({
         })}
       </nav>
       <span className="title-drag-space" data-tauri-drag-region aria-hidden="true" />
-      <div className="window-controls" aria-label="Window controls">
-        <button type="button" aria-label="Minimise window" title="Minimise" onClick={() => void desktopWindow?.minimize().catch(() => undefined)}>
+      <div className="window-controls" aria-label={localize("Window controls")}>
+        <button type="button" aria-label={localize("Minimise window")} title={localize("Minimise")} onClick={() => void desktopWindow?.minimize().catch(() => undefined)}>
           <span className="window-glyph window-glyph--minimise" aria-hidden="true" />
         </button>
         <button
           type="button"
-          aria-label={windowMaximized ? "Restore window" : "Maximise window"}
-          title={windowMaximizable ? (windowMaximized ? "Restore" : "Maximise") : "Window remains maximised at this display size"}
+          aria-label={localize(windowMaximized ? "Restore window" : "Maximise window")}
+          title={localize(windowMaximizable ? (windowMaximized ? "Restore" : "Maximise") : "Window remains maximised at this display size")}
           disabled={!windowMaximizable}
           onClick={() => void desktopWindow?.toggleMaximize().catch(() => undefined)}
         >
           <span className={`window-glyph ${windowMaximized ? "window-glyph--restore" : "window-glyph--maximise"}`} aria-hidden="true" />
         </button>
-        <button type="button" className="window-controls__close" aria-label="Close window" title="Close" onClick={() => void desktopWindow?.close().catch(() => undefined)}>
+        <button type="button" className="window-controls__close" aria-label={localize("Close window")} title={localize("Close")} onClick={() => void desktopWindow?.close().catch(() => undefined)}>
           <span className="window-glyph window-glyph--close" aria-hidden="true" />
         </button>
       </div>
@@ -363,13 +366,13 @@ function DockKey({
     <button
       type="button"
       className={`dock-key dock-key--${variant}`}
-      aria-label={label}
-      title={englishDisplayText(title)}
+      aria-label={localize(label)}
+      title={localize(englishDisplayText(title))}
       disabled={disabled}
       onClick={onClick}
     >
       <LineIcon name={icon} size={28} className="dock-icon" />
-      <span className="dock-key__label">{label}</span>
+      <span className="dock-key__label">{localize(label)}</span>
     </button>
   );
 }
@@ -1140,7 +1143,7 @@ function RingReadout({
           transform="rotate(-90 18 18)"
         />
       </svg>
-      <span className="dock-ring__text">{known ? `${percent}` : label}</span>
+      <span className="dock-ring__text">{localize(known ? `${percent}` : label)}</span>
     </span>
   );
 }
@@ -1223,7 +1226,7 @@ function ControlDock({
     setApproaching(true);
   }, [clearExpandTimer, reducedMotion]);
 
-  // Keep the approach ripple alive briefly as the pointer crosses the capsule.
+  // Keep the hover highlight stable as the pointer crosses the capsule.
   const scheduleHoverClose = useCallback((): void => {
     clearExpandTimer();
     expandTimer.current = window.setTimeout(() => {
@@ -1292,7 +1295,7 @@ function ControlDock({
   return (
     <div
       className={`control-dock ${expanded ? "is-expanded" : "is-collapsed"} ${approaching ? "is-approaching" : ""} ${reducedMotion ? "is-reduced-motion" : ""} dock-state--${feedback.state.toLowerCase()}`}
-      aria-label="Scan controls"
+      aria-label={localize("Scan controls")}
       aria-expanded={expanded}
       onMouseEnter={openForHover}
       onMouseLeave={scheduleHoverClose}
@@ -1322,18 +1325,18 @@ function ControlDock({
           aria-expanded={expanded}
           aria-controls="control-dock-keys"
           aria-label={
-            expanded
+            localize(expanded
               ? `Collapse scan controls. ${feedback.state}. Progress ${progressReadout}.`
-              : `Expand scan controls. ${feedback.state}. Progress ${progressReadout}.`
+              : `Expand scan controls. ${feedback.state}. Progress ${progressReadout}.`)
           }
-          title={englishDisplayText(`${feedback.state} · ${feedback.detail}`)}
+          title={localize(englishDisplayText(`${feedback.state} · ${feedback.detail}`))}
           onClick={toggleOpen}
         >
           <span className="dock-capsule__lead">
             <RingReadout percent={percent ?? 0} tone={feedback.tone} label="–" known={percentKnown} />
             <span className="dock-capsule__text">
-              <span className="dock-capsule__state">{feedback.state}</span>
-              <span className="dock-capsule__progress">{progressReadout}</span>
+              <span className="dock-capsule__label">{localize("Scan controls")}</span>
+              <span className="dock-capsule__progress">{localize(progressReadout)}</span>
             </span>
           </span>
           <span className="dock-capsule__chevron" aria-hidden="true" />
@@ -1342,7 +1345,7 @@ function ControlDock({
           variant="home"
           icon="crosshair"
           label="Home"
-          title={setupInvalid ? "Complete valid scan parameters first" : dock.homeReason || "Home turntable"}
+          title={localize(setupInvalid ? "Complete valid scan parameters first" : dock.homeReason || "Home turntable")}
           disabled={setupBlocked || !dock.home}
           onClick={() => void dispatch({ type: "home" })}
         />
@@ -1350,7 +1353,7 @@ function ControlDock({
           variant="play"
           icon={play.icon}
           label={play.label}
-          title={cardImportReason || (setupInvalid ? "Complete valid scan parameters first" : dock.playReason || play.label)}
+          title={localize(cardImportReason || (setupInvalid ? "Complete valid scan parameters first" : dock.playReason || play.label))}
           disabled={playBlocked || !dock.play}
           onClick={() => void dispatch(play.command)}
         />
@@ -1358,7 +1361,7 @@ function ControlDock({
           variant="restore"
           icon="history"
           label="Restore"
-          title={setupInvalid ? "Complete valid scan parameters first" : dock.restoreReason || "After Preflight and a valid Nano reference, verify saved frames; Start continues at the next view"}
+          title={localize(setupInvalid ? "Complete valid scan parameters first" : dock.restoreReason || "After Preflight and a valid Nano reference, verify saved frames; Start continues at the next view")}
           disabled={setupBlocked || !dock.restore}
           onClick={() => void dispatch({ type: "restore_previous" })}
         />
@@ -1366,12 +1369,12 @@ function ControlDock({
           variant="stop"
           icon="stop"
           label="Stop"
-          title="End this task · stop devices, confirm cleanup and retain every file. Use Pause to continue this scan later."
+          title={localize("End this task · stop devices, confirm cleanup and retain every file. Use Pause to continue this scan later.")}
           disabled={false}
           onClick={() => void dispatch({ type: "stop" })}
         />
       </div>
-      <span className="sr-only" role="status" aria-live="polite">{announcement}</span>
+      <span className="sr-only" role="status" aria-live="polite">{localize(announcement)}</span>
     </div>
   );
 }
@@ -1393,10 +1396,10 @@ function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: 
         className={`op-feedback__row ${feedbackToneClass(feedback.tone)}`}
         role="status"
         aria-live="polite"
-        aria-label={englishDisplayText(`Console feedback state: ${active}. ${feedback.detail}`)}
+        aria-label={localize(englishDisplayText(`Console feedback state: ${active}. ${feedback.detail}`))}
       >
-        <span className="op-feedback__word">{active}</span>
-        <span className="op-feedback__detail">{englishDisplayText(detailLead)}</span>
+        <span className="op-feedback__word">{localize(active)}</span>
+        <span className="op-feedback__detail">{localize(englishDisplayText(detailLead))}</span>
         <HelpTip text={feedback.detail} align="end" />
       </div>
       <div className="op-feedback__states">
@@ -1405,11 +1408,26 @@ function StateFeedback({ feedback, stale }: { feedback: ConsoleFeedback; stale: 
             key={state}
             className={`op-feedback__chip ${state.toLowerCase()} ${state === active ? "is-active" : "is-idle"}`}
           >
-            {state}
+            {localize(state)}
           </span>
         ))}
       </div>
     </div>
+  );
+}
+
+/** One compact status summary; the scene and controls share the same engine feedback. */
+function SceneStatusFloat({ feedback }: { feedback: ConsoleFeedback }) {
+  // Translate the complete message before shortening it, so sentence templates
+  // retain their Chinese translation and the tooltip keeps the full evidence.
+  const detail = localize(englishDisplayText(feedback.detail));
+  return (
+    <aside className="scene-status-float" aria-label={localize("Operation Status")} title={detail}>
+      <div className="scene-status-float__summary" role="status" aria-live="polite" aria-atomic="true">
+        <strong className={feedbackToneClass(feedback.tone)}><i aria-hidden="true" />{localize(feedback.state)}</strong>
+        <span className="scene-status-float__detail">{detail.split(" · ")[0]}</span>
+      </div>
+    </aside>
   );
 }
 
@@ -1432,12 +1450,14 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
   return (
     <section className="panel live-panel">
       <div className="scene-toolbar">
-        <span className="chip chip--accent">3D RENDER</span>
         <LineIcon name="cube" size={15} className="panel__icon" />
-        <h2>{centerView === "equipment" ? "Equipment View" : centerView === "photo" ? "Independent Photo" : centerView === "live" ? "Live View" : "Reconstruction Preview"}</h2>
+        <h2>{localize(centerView === "equipment" ? "Equipment View" : centerView === "photo" ? "Independent Photo" : centerView === "live" ? "Live View" : "Reconstruction Preview")}</h2>
         <HelpTip text={centerView === "equipment" ? `Read-only geometry view. ${setupInvalid ? "Complete valid scan parameters first." : ws.dock.playReason || "Ready for the next operation."}` : "Three linked slices and a rotatable volume from the saved reconstruction."} />
         <span className="menu-spacer" />
-        {centerView === "equipment" && (["iso", "front", "top"] as const).map((preset) => (
+        {centerView === "equipment" && <div className="scene-view-control" role="group" aria-label={localize("View")} data-view={viewPreset}
+          onPointerDown={event => { event.currentTarget.dataset.motion = "pointer"; }}
+          onKeyDownCapture={event => { event.currentTarget.dataset.motion = "keyboard"; }}>
+          {(["iso", "front", "top"] as const).map((preset) => (
           <button
             key={preset}
             type="button"
@@ -1445,9 +1465,10 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
             aria-pressed={viewPreset === preset}
             onClick={() => { setViewPreset(preset); setPresetRevision(value => value + 1); }}
           >
-            {preset.toUpperCase()}
+            {localize(preset.toUpperCase())}
           </button>
-        ))}
+          ))}
+        </div>}
       </div>
       <div className={`live-scene ${centerView === "reconstruction" ? "live-scene--reconstruction" : ""}`}>
         {/* Keep the live canvas and its orbit state mounted across result navigation. */}
@@ -1459,21 +1480,10 @@ function LiveScene({ snapshot, ws, theme, dispatch, stale, setupInvalid, feedbac
           )}
         </div>
         {centerView === "reconstruction" && (
-          volume ? <ReconstructionPreview key={ws.reconstruction.cachePath || "preview"} volume={volume} mode={volumeMode} resetRevision={volumeResetRevision} onVolumeAvailable={onVolumeAvailable} /> : <div className="recon-empty" role="status">{previewError ? reconstructionMessageEn(previewError, "failed") : ws.reconstruction.status === "running" ? "Reconstructing…" : "Waiting for result data"}</div>
+          volume ? <ReconstructionPreview key={ws.reconstruction.cachePath || "preview"} volume={volume} mode={volumeMode} resetRevision={volumeResetRevision} onVolumeAvailable={onVolumeAvailable} /> : <div className="recon-empty" role="status">{localize(previewError ? reconstructionMessageEn(previewError, "failed") : ws.reconstruction.status === "running" ? "Reconstructing…" : "Waiting for result data")}</div>
         )}
-        {centerView === "equipment" && <><span className="live-indicator">
-          <i aria-hidden="true" />
-          GEOMETRY VIEW · {stale ? "STATUS UNAVAILABLE" : "OPTICAL AXIS"}
-        </span>
-        <div className="scene-readout-block">
-          <span className="scene-label">TURNTABLE ANGLE <HelpTip side="up" text="Latest confirmed turntable angle. The model follows confirmed feedback without predicting a position; reduced motion jumps directly between samples." /></span>
-          <strong className="scene-readout">{stale || !ws.scene.angleKnown ? "—" : ws.scene.angleDeg.toFixed(2)}°</strong>
-          <span className={`scene-safety ${ws.safetyBar.tone !== "muted" ? "scene-safety--danger" : ""} ${ws.safetyBar.tone === "dangerBold" ? "scene-safety--bold" : ""}`}>
-            {stale ? "Control service unavailable · readings are unknown" : ws.safetyBar.text}
-          </span>
-        </div>
-        </>}
-        <WorkstationMedia mode={centerView} camera={camera} photo={photo} requestRevision={requestRevision} onClose={onCloseMedia} run={runDevice} controlReason={manualControlReason(snapshot, stale) || (pending ? "Operation pending" : null)} readReason={deviceConnectionReason(snapshot, stale) || (pending ? "Operation pending" : null)} liveBlockedReason={liveBlockedReason} />
+        {centerView === "equipment" && <SceneStatusFloat feedback={feedback} />}
+        <WorkstationMedia mode={centerView} camera={camera} stale={stale} photo={photo} requestRevision={requestRevision} onClose={onCloseMedia} run={runDevice} controlReason={manualControlReason(snapshot, stale) || (pending ? "Operation pending" : null)} readReason={deviceConnectionReason(snapshot, stale) || (pending ? "Operation pending" : null)} liveBlockedReason={liveBlockedReason} />
         {centerView === "equipment" && <ControlDock
           snapshot={snapshot}
           ws={ws}
@@ -1531,16 +1541,16 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
     <section className="panel xray-panel" id="xray-panel">
       <div className="panel__header">
         <LineIcon name="radiation" size={15} className="panel__icon" />
-        <h2>12 Watt Controller</h2>
+        <h2>{localize("12 Watt Controller")}</h2>
         <HelpTip text={sourceHelp} />
         <span className={`chip chip--${beamState === "on" ? "danger" : connected ? "accent" : "muted"}`}>
-          {beamState === "on" ? "EMITTING" : deviceConnectionLabel(ws.xray.connected, stale)}
+          {localize(beamState === "on" ? "EMITTING" : deviceConnectionLabel(ws.xray.connected, stale))}
         </span>
       </div>
       <div className="xray-panel__body">
       <div className={`xray-mode-banner ${scanLocked || faultLocked ? "xray-mode-banner--locked" : "xray-mode-banner--manual"}`}>
-        <span>{faultLocked ? "Device fault · manual locked" : scanLocked ? "Scan control · manual locked" : "Manual source control"}</span>
-        <strong className={beamState === "on" ? "tone-danger" : beamState === "off" ? "tone-ok" : "tone-muted"}>{outputText}</strong>
+        <span>{localize(faultLocked ? "Device fault · manual locked" : scanLocked ? "Scan control · manual locked" : "Manual source control")}</span>
+        <strong className={beamState === "on" ? "tone-danger" : beamState === "off" ? "tone-ok" : "tone-warn"}>{localize(outputText)}</strong>
       </div>
       <button
         type="button"
@@ -1548,67 +1558,63 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
         disabled={busy || scanLocked || ws.xray.beamOn}
         onClick={() => void dispatch(ws.xray.connected ? { type: "xray_disconnect" } : { type: "retry_device", device: "xray" })}
       >
-        {ws.xray.connected ? "Xray Disconnect" : "Xray Connect"}
+        {localize(ws.xray.connected ? "Xray Disconnect" : "Xray Connect")}
       </button>
       <div className="xray-channels">
         <div className="xray-channel">
-          <span className="xray-channel__label">Voltage · kV <HelpTip align="end" text="SET is your draft. Applied is the last device-confirmed sent value, available before beam ON. Measured is output telemetry. A dash means unconfirmed or unavailable." /></span>
+          <span className="xray-channel__label">{localize("Voltage · kV ")}<HelpTip align="end" text="SET is your draft. Applied is the last device-confirmed sent value, available before beam ON. Measured is output telemetry. A dash means unconfirmed or unavailable." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
-              <label className="xray-channel__draft"><span className="xray-channel__key">SET</span>
+              <label className="xray-channel__draft"><span className="xray-channel__key">{localize("SET")}</span>
               <input
                 className="xray-channel__well"
-                aria-label="Voltage setpoint in kV"
+                aria-label={localize("Voltage setpoint in kV")}
                 value={kvDraft}
                 disabled={busy || !ws.xray.setpointControlsEnabled}
                 inputMode="decimal"
                 onChange={(event) => setKvDraft(event.target.value)}
               />
               </label>
-              <span className="xray-channel__monitor xray-channel__applied" aria-label="Applied voltage">Applied <b>{measured(ws.xray.connected && ws.xray.voltageConfirmed ? ws.xray.setKv : null, stale)}</b></span>
-              <span className="xray-channel__monitor">Measured <b>{measured(ws.xray.monKv, stale)}</b></span>
+              <span className="xray-channel__monitor xray-channel__applied" aria-label={localize("Applied voltage")}>{localize("Applied ")}<b>{localize(measured(ws.xray.connected && ws.xray.voltageConfirmed ? ws.xray.setKv : null, stale))}</b></span>
+              <span className="xray-channel__monitor">{localize("Measured ")}<b>{localize(measured(ws.xray.monKv, stale))}</b></span>
             </div>
-            <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(kvDraft))} onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) })}>
-              SEND V
-            </button>
+            <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(kvDraft))} onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) })}>{localize("SEND V")}</button>
           </div>
         </div>
         <div className="xray-channel">
-          <span className="xray-channel__label">Current · µA <HelpTip align="end" text="SET is your draft. Applied is the last device-confirmed sent value, available before beam ON. Measured is output telemetry. A dash means unconfirmed or unavailable." /></span>
+          <span className="xray-channel__label">{localize("Current · µA ")}<HelpTip align="end" text="SET is your draft. Applied is the last device-confirmed sent value, available before beam ON. Measured is output telemetry. A dash means unconfirmed or unavailable." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
-              <label className="xray-channel__draft"><span className="xray-channel__key">SET</span>
+              <label className="xray-channel__draft"><span className="xray-channel__key">{localize("SET")}</span>
               <input
                 className="xray-channel__well"
                 value={uaDraft}
-                aria-label="Current setpoint in microamps"
+                aria-label={localize("Current setpoint in microamps")}
                 disabled={busy || !ws.xray.setpointControlsEnabled}
                 inputMode="decimal"
                 onChange={(event) => setUaDraft(event.target.value)}
               />
               </label>
-              <span className="xray-channel__monitor xray-channel__applied" aria-label="Applied current">Applied <b>{measured(ws.xray.connected && ws.xray.currentConfirmed ? ws.xray.setUa : null, stale)}</b></span>
-              <span className="xray-channel__monitor">Measured <b>{measured(ws.xray.monUa, stale)}</b></span>
+              <span className="xray-channel__monitor xray-channel__applied" aria-label={localize("Applied current")}>{localize("Applied ")}<b>{localize(measured(ws.xray.connected && ws.xray.currentConfirmed ? ws.xray.setUa : null, stale))}</b></span>
+              <span className="xray-channel__monitor">{localize("Measured ")}<b>{localize(measured(ws.xray.monUa, stale))}</b></span>
             </div>
-            <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(uaDraft))} onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) })}>
-              SEND I
-            </button>
+            <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(uaDraft))} onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) })}>{localize("SEND I")}</button>
           </div>
         </div>
       </div>
       <div className="xray-meters">
         <div className="xray-meter">
-          <span>Measured power</span>
-          <div className="xray-meter__well">{measured(ws.xray.powerW, stale)} <small>W</small></div>
+          <span>{localize("Measured power")}</span>
+          <div className="xray-meter__well">{localize(measured(ws.xray.powerW, stale))} <small>{localize("W")}</small></div>
         </div>
         <div className="xray-meter">
-          <span>Temperature</span>
-          <div className="xray-meter__well">{measured(ws.xray.tempC, stale)} <small>°C</small></div>
+          <span>{localize("Temperature")}</span>
+          <div className="xray-meter__well">{localize(measured(ws.xray.tempC, stale))} <small>{localize("°C")}</small></div>
         </div>
         <div className="xray-meter">
-          <span>Output state</span>
+          <span>{localize("Output state")}</span>
           <div className={`xray-meter__well ${beamState === "on" ? "xray-meter__well--danger" : beamState === "off" ? "xray-meter__well--safe" : "xray-meter__well--unknown"}`}>
-            {beamState === "on" ? "ON" : beamState === "off" ? "OFF" : "UNKNOWN"}
+            {localize(beamState === "on" ? "ON" : beamState === "off" ? "OFF" : "UNKNOWN")}
           </div>
         </div>
       </div>
@@ -1616,20 +1622,20 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
         type="button"
         className={`switch-btn switch-btn--block ${ws.xray.beamOn ? "switch-btn--on" : "switch-btn--idle"}`}
         disabled={beamState === "off" && (busy || ws.dataState === "fault" || !ws.xray.manualControlsEnabled)}
-        title={faultLocked ? "Device fault latched · inspect the log, then repeat Preflight and HOME" : scanLocked ? "The scan owns X-ray output" : !ws.xray.connected ? "Connect the X-ray source first" : busy ? "Wait for the current command" : "Manual X-ray output control"}
+        title={localize(faultLocked ? "Device fault latched · inspect the log, then repeat Preflight and HOME" : scanLocked ? "The scan owns X-ray output" : !ws.xray.connected ? "Connect the X-ray source first" : busy ? "Wait for the current command" : "Manual X-ray output control")}
         onClick={() => void dispatch({ type: beamState === "off" ? "xray_toggle" : "xray_off" })}
       >
-        {beamState === "off" ? "Xray Enable" : "Xray OFF"}
+        {localize(beamState === "off" ? "Xray Enable" : "Xray OFF")}
       </button>
       <div className="panel__divider" />
       <div className="timer-row">
         <div className="timer-field">
-          <span>On Sec</span>
-          <div className="timer-field__well">{ws.xray.onSec}</div>
+          <span>{localize("On Sec")}</span>
+          <div className="timer-field__well">{localize(ws.xray.onSec)}</div>
         </div>
         <div className="timer-field">
-          <span>Off Sec</span>
-          <div className="timer-field__well">{ws.xray.offSec}</div>
+          <span>{localize("Off Sec")}</span>
+          <div className="timer-field__well">{localize(ws.xray.offSec)}</div>
         </div>
         <button
           type="button"
@@ -1637,14 +1643,14 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           disabled={busy || ws.dataState === "scanning" || !ws.xray.timerControlsEnabled}
           onClick={() => void dispatch({ type: "timer_toggle" })}
         >
-          {ws.xray.timerOn ? "Timer On" : "Timer Off"}
+          {localize(ws.xray.timerOn ? "Timer On" : "Timer Off")}
         </button>
       </div>
       <div className="safety-block">
         <div className="safety-block__head">
-          <span className="safety-block__title">DEVICE SAFETY</span>
-          <span className={`chip chip--${stale || !ws.xray.usbAutoShutDownKnown ? "muted" : ws.xray.usbAutoShutDown ? "ok" : "warn"}`}>
-            {stale || !ws.xray.usbAutoShutDownKnown
+          <span className="safety-block__title">{localize("DEVICE SAFETY")}</span>
+          <span className={`chip chip--${stale || !ws.xray.usbAutoShutDownKnown ? "warn" : ws.xray.usbAutoShutDown ? "ok" : "warn"}`}>
+            {localize(stale || !ws.xray.usbAutoShutDownKnown
               ? "NOT VERIFIED"
               : ws.xray.usbAutoShutDown
               ? "TIMER ARMED"
@@ -1652,7 +1658,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
                 ? "RELEASED · SCAN OWNED"
                 : faultLocked
                   ? "RELEASED · FAULT LOCKED"
-                : "RELEASED · MANUAL"}
+                : "RELEASED · MANUAL")}
           </span>
         </div>
         {/* Unknown readback is already indicated by NOT VERIFIED and the indeterminate
@@ -1665,12 +1671,10 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
             disabled={busy || ws.dataState === "scanning" || !ws.xray.connected}
             onChange={() => void dispatch({ type: "usb_auto_shut_down_toggle" })}
           />
-          <i aria-hidden="true" />
-          USB Auto Shut Down
-        </label>
+          <span>{localize("USB Auto Shut Down")}</span></label>
         <div className="delay-row">
           <div className="delay-row__field">
-            <span>Shut Down Delay</span>
+            <span>{localize("Shut Down Delay")}</span>
             <input
               value={delayDraft}
               inputMode="numeric"
@@ -1683,10 +1687,8 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
             className="send-btn"
             disabled={busy || ws.dataState === "scanning" || !ws.xray.manualControlsEnabled || !/^\d+$/.test(delayDraft.trim()) || Number(delayDraft) <= 0 || Number(delayDraft) > 65535}
             onClick={() => void dispatch({ type: "set_usb_shutdown_delay", delay: Number(delayDraft) })}
-          >
-            SET
-          </button>
-          <span className="delay-row__device">Device {stale ? "—" : ws.xray.usbShutdownDelay ?? "—"}</span>
+          >{localize("SET")}</button>
+          <span className="delay-row__device">{localize("Device ")}<strong>{localize(stale ? "–" : ws.xray.usbShutdownDelay ?? "–")}</strong></span>
         </div>
       </div>
       </div>
@@ -1706,46 +1708,48 @@ function OperationPanel({ snapshot, ws, stale, onImport }: { snapshot: EngineSna
     <section className="panel operation-panel">
       <div className="panel__header">
         <LineIcon name="gauge" size={15} className="panel__icon" />
-        <h2>Operation Status</h2>
-        <span className={`chip chip--${stale ? "muted" : ws.phaseTone}`}>{stale ? "UNKNOWN" : ws.phaseWord}</span>
+        <h2>{localize("Operation Status")}</h2>
+        <span className={`chip chip--${stale ? "muted" : ws.phaseTone}`}>{localize(stale ? "UNKNOWN" : ws.phaseWord)}</span>
       </div>
-      <StateFeedback feedback={feedback} stale={stale} />
-      {card && <div className="op-card">
-        <div className="op-card__row">
-          <span className="op-card__tag" title="Where this acquisition stores its images">CARD · {CARD_DESTINATION_LABELS[card.destination].toUpperCase()}</span>
-          <strong role="status">{stale ? "UNKNOWN" : cardState}</strong>
-          <button type="button" disabled={!canImport} title={stale ? "Control service unavailable" : card.importStatus === "running" ? "Import already running" : card.currentTaskPendingImport || card.pendingImportTasks > 0 ? "Open the USB card import and verification controls" : "No task is waiting for a card import"} onClick={onImport}>Card import…</button>
+      <div className="operation-panel__body">
+        <StateFeedback feedback={feedback} stale={stale} />
+        {card && <div className="op-card">
+          <div className="op-card__row">
+            <span className="op-card__tag" title={localize("Where this acquisition stores its images")}>{localize("CARD · ")}{localize(CARD_DESTINATION_LABELS[card.destination].toUpperCase())}</span>
+            <strong role="status">{localize(stale ? "UNKNOWN" : cardState)}</strong>
+            <button type="button" disabled={!canImport} title={localize(stale ? "Control service unavailable" : card.importStatus === "running" ? "Import already running" : card.currentTaskPendingImport || card.pendingImportTasks > 0 ? "Open the USB card import and verification controls" : "No task is waiting for a card import")} onClick={onImport}>{localize("Card import…")}</button>
+          </div>
+          <div className="op-card__counts">
+            <span title={localize("Tasks waiting for card import")}>{localize("Pending ")}<b>{localize(stale ? "–" : String(card.pendingImportTasks))}</b></span>
+            <span>{localize("Acquired ")}<b>{localize(stale ? "–" : String(card.acquiredProjectionCount))}</b></span>
+            <span>{localize("Imported ")}<b>{localize(stale ? "–" : String(card.importedProjectionCount))}</b></span>
+            <span>{localize("Verified ")}<b>{localize(stale ? "–" : String(card.verifiedProjectionCount))}</b></span>
+          </div>
+        </div>}
+        <div className="op-stats">
+          <div className="op-stat">
+            <span>{localize("CAPTURED")}</span>
+            <strong>
+              {localize(stale || ws.progress.total === 0 ? "– / –" : `${ws.progress.captured} / ${ws.progress.total}`)}
+            </strong>
+          </div>
+          <div className="op-stat">
+            <span>{localize("ANGLE")}</span>
+            <strong>{localize(stale || !ws.scene.angleKnown ? "– °" : `${ws.progress.angleDeg.toFixed(2)}°`)}</strong>
+          </div>
+          <div className="op-stat">
+            <span title={localize("Estimated from completed projection cycles, including X-ray cooling")}>{localize("EST. REMAINING")}</span>
+            <strong>{localize(stale || ws.progress.etaText === "—" ? "–" : ws.progress.etaText)}</strong>
+          </div>
         </div>
-        <div className="op-card__counts">
-          <span title="Tasks waiting for card import">Pending <b>{stale ? "—" : String(card.pendingImportTasks)}</b></span>
-          <span>Acquired <b>{stale ? "—" : String(card.acquiredProjectionCount)}</b></span>
-          <span>Imported <b>{stale ? "—" : String(card.importedProjectionCount)}</b></span>
-          <span>Verified <b>{stale ? "—" : String(card.verifiedProjectionCount)}</b></span>
-        </div>
-      </div>}
-      <div className="op-stats">
-        <div className="op-stat">
-          <span>CAPTURED</span>
-          <strong>
-            {stale || ws.progress.total === 0 ? "— / —" : `${ws.progress.captured} / ${ws.progress.total}`}
-          </strong>
-        </div>
-        <div className="op-stat">
-          <span>ANGLE</span>
-          <strong>{stale || !ws.scene.angleKnown ? "—" : ws.progress.angleDeg.toFixed(2)}°</strong>
-        </div>
-        <div className="op-stat">
-          <span title="Estimated from completed projection cycles, including X-ray cooling">EST. REMAINING</span>
-          <strong>{stale ? "—" : ws.progress.etaText}</strong>
-        </div>
-      </div>
-      <div className="op-progress">
-        <div className="op-progress__head">
-          <span>VIEW PROGRESS</span>
-          <small>{stale ? "Status unavailable" : ws.progress.total ? ws.progress.barLabel : "Awaiting scan setup"}</small>
-        </div>
-        <div className={`op-progress__bar op-progress__bar--${ws.progress.barTone}`} role="progressbar" aria-valuenow={ws.progress.percent} aria-valuemin={0} aria-valuemax={100}>
-          <span style={{ width: `${ws.progress.percent}%` }} />
+        <div className="op-progress">
+          <div className="op-progress__head">
+            <span>{localize("VIEW PROGRESS")}</span>
+            <small>{localize(stale ? "Status unavailable" : ws.progress.total ? ws.progress.barLabel : "Awaiting scan setup")}</small>
+          </div>
+          <div className={`op-progress__bar op-progress__bar--${ws.progress.barTone}`} role="progressbar" aria-valuenow={ws.progress.percent} aria-valuemin={0} aria-valuemax={100}>
+            <span style={{ width: `${ws.progress.percent}%` }} />
+          </div>
         </div>
       </div>
     </section>
@@ -1788,46 +1792,45 @@ function CardImportDialog({ snapshot, pending, stale, run, onClose, onStop }: { 
   const inProgressFile = progress && progress.totalFiles > 0
     ? Math.min(progress.verifiedFiles + 1, progress.totalFiles)
     : null;
-  return <WorkstationDialog title="Camera Card Import" onClose={onClose} onStop={onStop}>
-    <p className={`card-import__status ${verified ? "is-verified" : running ? "is-running" : "is-pending"}`} role="status">{statusLine}</p>
+  return <WorkstationDialog title={localize("Camera Card Import")} onClose={onClose} onStop={onStop}>
+    <p className={`card-import__status ${verified ? "is-verified" : running ? "is-running" : "is-pending"}`} role="status">{localize(statusLine)}</p>
     <dl className="modal-facts">
-      <div><dt>Destination</dt><dd>{card ? CARD_DESTINATION_LABELS[card.destination] : "UNKNOWN"}</dd></div>
-      <div><dt>Acquisition state</dt><dd>{card && !stale ? cardAcquisitionStateWord(card) : "UNKNOWN"}</dd></div>
-      <div><dt>Pending import tasks</dt><dd>{card && !stale ? card.pendingImportTasks : "UNKNOWN"}</dd></div>
-      <div><dt>Acquired projections</dt><dd>{card && !stale ? card.acquiredProjectionCount : "UNKNOWN"}</dd></div>
-      <div><dt>Imported projections</dt><dd>{card && !stale ? card.importedProjectionCount : "UNKNOWN"}</dd></div>
-      <div><dt>Verified projections</dt><dd>{card && !stale ? card.verifiedProjectionCount : "UNKNOWN"}</dd></div>
-      <div><dt>Camera objects imported / recorded</dt><dd>{card && !stale ? `${card.importedRecords} / ${card.recordCount}` : "UNKNOWN"}</dd></div>
-      <div><dt>Camera objects verified</dt><dd>{card && !stale ? card.verifiedRecords : "UNKNOWN"}</dd></div>
+      <div><dt>{localize("Destination")}</dt><dd>{localize(card ? CARD_DESTINATION_LABELS[card.destination] : "UNKNOWN")}</dd></div>
+      <div><dt>{localize("Acquisition state")}</dt><dd>{localize(card && !stale ? cardAcquisitionStateWord(card) : "UNKNOWN")}</dd></div>
+      <div><dt>{localize("Pending import tasks")}</dt><dd>{localize(card && !stale ? card.pendingImportTasks : "UNKNOWN")}</dd></div>
+      <div><dt>{localize("Acquired projections")}</dt><dd>{localize(card && !stale ? card.acquiredProjectionCount : "UNKNOWN")}</dd></div>
+      <div><dt>{localize("Imported projections")}</dt><dd>{localize(card && !stale ? card.importedProjectionCount : "UNKNOWN")}</dd></div>
+      <div><dt>{localize("Verified projections")}</dt><dd>{localize(card && !stale ? card.verifiedProjectionCount : "UNKNOWN")}</dd></div>
+      <div><dt>{localize("Camera objects imported / recorded")}</dt><dd>{localize(card && !stale ? `${card.importedRecords} / ${card.recordCount}` : "UNKNOWN")}</dd></div>
+      <div><dt>{localize("Camera objects verified")}</dt><dd>{localize(card && !stale ? card.verifiedRecords : "UNKNOWN")}</dd></div>
     </dl>
     {running && <div className="card-import__progress">
       <div className="recon-workspace__load-summary">
-        <span>{operation?.stage === "cleaning_card" ? "Verifying and removing this scan’s SD images…" : operation ? englishDisplayText(`USB transfer · ${operation.stage}`) : "Waiting for the engine's transfer operation…"}</span>
-        <b>{determinate ? `${percent}%` : "—"}</b>
+        <span>{localize(operation?.stage === "cleaning_card" ? "Verifying and removing this scan’s SD images…" : operation ? englishDisplayText(`USB transfer · ${operation.stage}`) : "Waiting for the engine's transfer operation…")}</span>
+        <b>{localize(determinate ? `${percent}%` : "–")}</b>
       </div>
-      <div className={`recon-workspace__progress-track${determinate ? "" : " is-indeterminate"}`} role="progressbar" aria-label="Camera card USB import progress" aria-valuenow={percent ?? undefined} aria-valuemin={0} aria-valuemax={100} aria-valuetext={determinate ? `${percent}% of file data transferred` : "Preparing transfer"}>
+      <div className={`recon-workspace__progress-track${determinate ? "" : " is-indeterminate"}`} role="progressbar" aria-label={localize("Camera card USB import progress")} aria-valuenow={percent ?? undefined} aria-valuemin={0} aria-valuemax={100} aria-valuetext={localize(determinate ? `${percent}% of file data transferred` : "Preparing transfer")}>
         <i style={{ width: determinate ? `${percent}%` : undefined }} />
       </div>
       <div className="recon-workspace__load-summary">
-        <span>{progress && progress.totalFiles > 0
+        <span>{localize(progress && progress.totalFiles > 0
           ? `${progress.verifiedFiles} / ${progress.totalFiles} files done${inProgressFile && progress.verifiedFiles < progress.totalFiles ? ` · file ${inProgressFile} in progress` : ""}`
-          : "File counts are not yet reported by the engine"}</span>
-        <b role="status">{determinate ? eta : "—"}</b>
+          : "File counts are not yet reported by the engine")}</span>
+        <b role="status">{localize(determinate ? eta : "–")}</b>
       </div>
-      {determinate && <p className="card-import__note">{progress!.processedBytes} / {progress!.totalBytes} bytes read by the engine</p>}
+      {determinate && <p className="card-import__note">{localize(progress!.processedBytes)} / {localize(progress!.totalBytes)}{localize(" bytes read by the engine")}</p>}
     </div>}
-    {card?.importError && <p className="card-import__error" role="alert">{englishDisplayText(card.importError)}</p>}
-    {retained.length > 1 && <label className="card-import__task">Task waiting for import
-      <select aria-label="Task waiting for a camera card import" value={taskId} disabled={running || pending} onChange={event => setTaskId(event.target.value)}>
+    {card?.importError && <p className="card-import__error" role="alert">{localize(englishDisplayText(card.importError))}</p>}
+    {retained.length > 1 && <label className="card-import__task">{localize("Task waiting for import")}<select aria-label={localize("Task waiting for a camera card import")} value={taskId} disabled={running || pending} onChange={event => setTaskId(event.target.value)}>
         {retained.map(record => <option key={`${record.parameters.savePath}/${record.parameters.taskId}`} value={record.parameters.taskId}>{unicodeDisplayText(record.parameters.taskId)}</option>)}
       </select>
     </label>}
     <div className="permanent-actions">
-      <button className="primary" disabled={!readyToImport} title={stale ? "Control service unavailable" : running ? "An import is already running" : pending ? "Operation pending" : readyToImport ? "Start or resume the USB import for the selected task" : "No task is waiting for a card import"} onClick={() => run({ type: "start_card_import", taskId })}>{card?.importStatus === "failed" || card?.importStatus === "cancelled" ? "Resume USB import" : "Start USB import"}</button>
-      <button disabled={!running || stale} title={running ? "Stop the USB transfer; every verified file and the acquisition ledger are kept" : "No import is running"} onClick={() => run({ type: "cancel_card_import" })}>Cancel import</button>
+      <button className="primary" disabled={!readyToImport} title={localize(stale ? "Control service unavailable" : running ? "An import is already running" : pending ? "Operation pending" : readyToImport ? "Start or resume the USB import for the selected task" : "No task is waiting for a card import")} onClick={() => run({ type: "start_card_import", taskId })}>{localize(card?.importStatus === "failed" || card?.importStatus === "cancelled" ? "Resume USB import" : "Start USB import")}</button>
+      <button disabled={!running || stale} title={localize(running ? "Stop the USB transfer; every verified file and the acquisition ledger are kept" : "No import is running")} onClick={() => run({ type: "cancel_card_import" })}>{localize("Cancel import")}</button>
     </div>
-    <p className="card-import__note">After all local files are verified and sealed, the engine removes only this task’s SD images and confirms their absence. Existing card files are kept. If cleanup fails or is cancelled, verified local files and the remaining card images are retained; resume to finish.</p>
-    {!card && <p className="card-import__error" role="alert">This engine build publishes no camera-card acquisition state.</p>}
+    <p className="card-import__note">{localize("After all local files are verified and sealed, the engine removes only this task’s SD images and confirms their absence. Existing card files are kept. If cleanup fails or is cancelled, verified local files and the remaining card images are retained; resume to finish.")}</p>
+    {!card && <p className="card-import__error" role="alert">{localize("This engine build publishes no camera-card acquisition state.")}</p>}
   </WorkstationDialog>;
 }
 
@@ -1859,7 +1862,7 @@ function LogLines({ logs, follow, onFollow }: { logs: ConsoleLogLine[]; follow: 
   useEffect(() => {
     if (follow && list.current) list.current.scrollTop = list.current.scrollHeight;
   }, [ordered, follow]);
-  if (!logs.length) return <div className="log-empty">No records in this channel.</div>;
+  if (!logs.length) return <div className="log-empty">{localize("No records in this channel.")}</div>;
   return (
     <div className="log-lines" ref={list} onScroll={(event) => {
       const node = event.currentTarget;
@@ -1867,11 +1870,11 @@ function LogLines({ logs, follow, onFollow }: { logs: ConsoleLogLine[]; follow: 
     }}>
       {ordered.map((entry) => (
         <div className={`log-line ${logLevelClass[entry.level]}`} key={entry.id}>
-          <time className="log-line__time">[{logTime(entry.timestamp)}]</time>
+          <time className="log-line__time">[{localize(logTime(entry.timestamp))}]</time>
           <span className="log-line__tag">
-            {entry.level} · {englishDisplayText(entry.source)}
+            {localize(entry.level)} · {localize(englishDisplayText(entry.source))}
           </span>
-          <span className="log-line__msg">{englishDisplayText(entry.message)}</span>
+          <span className="log-line__msg">{localize(englishDisplayText(entry.message))}</span>
         </div>
       ))}
     </div>
@@ -1902,11 +1905,11 @@ function FrameThumbnail({ frame, production }: { frame: ConsoleFrame; production
     }).catch(reason => { if (active) setFailure(String(reason)); });
     return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [frame.index, frame.sha256, production, visible]);
-  return <div className="image-tile image-tile--captured" ref={element} title={englishDisplayText(failure || frame.fileName)}>
+  return <div className="image-tile image-tile--captured" ref={element} title={localize(englishDisplayText(failure || frame.fileName))}>
     <div className="image-tile__image">
-      {url ? <img src={url} alt={`Camera projection ${frame.index}`} /> : <span>{failure ? "Preview unavailable" : production ? "Loading image…" : "Offline preview"}</span>}
+      {url ? <img src={url} alt={localize(`Camera projection ${frame.index}`)} /> : <span>{localize(failure ? "Preview unavailable" : production ? "Loading image…" : "Offline preview")}</span>}
     </div>
-    <div className="image-tile__caption"><strong>VIEW {String(frame.index).padStart(2, "0")}</strong><span>{frame.angleDeg.toFixed(2)}° · {frame.exposureMs} ms</span></div>
+    <div className="image-tile__caption"><strong>{localize("VIEW ")}{localize(String(frame.index).padStart(2, "0"))}</strong><span>{localize(frame.angleDeg.toFixed(2))}° · {localize(frame.exposureMs)}{localize(" ms")}</span></div>
   </div>;
 }
 
@@ -1959,24 +1962,24 @@ function BottomConsole({ tab, onTab, ws, card, projectOperation, openingProject,
     : `${tab === "xray" ? "X-RAY" : tab === "nano" ? "TURNTABLE" : "CAMERA"} EVENTS`;
 
   return <section className="console">
-    <div className="console__tabs" role="tablist" aria-label="Logs and image preview">
+    <div className="console__tabs" role="tablist" aria-label={localize("Logs and image preview")}>
       {bottomTabs.map(item => <button key={item.id} type="button" role="tab" aria-selected={tab === item.id} className="console__tab" onClick={() => onTab(item.id)}>
-        <LineIcon name={item.icon} size={13} className="console__tab-icon" /><em>{item.label}</em><span>{counts[item.id]}</span>
+        <LineIcon name={item.icon} size={13} className="console__tab-icon" /><em>{localize(item.label)}</em><span>{localize(counts[item.id])}</span>
       </button>)}
     </div>
     <div className="console__body" role="tabpanel">
       <div className="recon-workspace-mount" hidden={tab !== "reconstruction"}><ReconstructionConsole ws={ws} projectOperation={projectOperation} openingProject={openingProject} centerView={centerView} volumeReady={volumeReady} volume3DAvailable={volume3DAvailable} busy={busy} stale={stale} volumeMode={volumeMode} onVolumeMode={onVolumeMode} onResetVolume={onResetVolume} onOpenReconstruction={onOpenReconstruction} onShowEquipment={onShowEquipment} onStartReconstruction={onStartReconstruction} cardGateReason={cardGateReason} /></div>
       {tab !== "reconstruction" && <>
-        <div className="console__head"><span>{header}</span>{tab !== "images" && <button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => setFollow(!follow)}>{follow ? "Following latest" : "Resume live log"}</button>}</div>
+        <div className="console__head"><h2>{localize(header)}</h2>{tab !== "images" && <button type="button" className="follow-toggle" aria-pressed={follow} onClick={() => setFollow(!follow)}>{localize(follow ? "Following latest" : "Resume live log")}</button>}</div>
         {tab === "images" ? <div className="image-strip">
           {cardPending && <div className="image-strip__card-note" role="status">
-            <strong>Images are on the camera SD card</strong>
-            <span>{`Acquired ${card!.acquiredProjectionCount} · imported ${card!.importedProjectionCount} · verified ${card!.verifiedProjectionCount}`}</span>
-            {unverifiedFrames.length > 0 && <span>{`${unverifiedFrames.length} captured view${unverifiedFrames.length === 1 ? "" : "s"} have no verified local file yet and show no thumbnail.`}</span>}
-            <button type="button" disabled={card!.importStatus === "running" || stale} onClick={onCardImport}>{card!.importStatus === "running" ? "Import running…" : "Card import…"}</button>
+            <strong>{localize("Images are on the camera SD card")}</strong>
+            <span>{localize(`Acquired ${card!.acquiredProjectionCount} · imported ${card!.importedProjectionCount} · verified ${card!.verifiedProjectionCount}`)}</span>
+            {unverifiedFrames.length > 0 && <span>{localize(`${unverifiedFrames.length} captured view${unverifiedFrames.length === 1 ? "" : "s"} have no verified local file yet and show no thumbnail.`)}</span>}
+            <button type="button" disabled={card!.importStatus === "running" || stale} onClick={onCardImport}>{localize(card!.importStatus === "running" ? "Import running…" : "Card import…")}</button>
           </div>}
-          {visibleFrames.length === 0 && !cardPending && <div className="image-strip__empty">No projections yet. Configure a scan task to view its image sequence.</div>}
-          {visibleFrames.length === 0 && cardPending && unverifiedFrames.length === 0 && <div className="image-strip__empty">No projection is registered locally yet. Import the card data to preview it.</div>}
+          {visibleFrames.length === 0 && !cardPending && <div className="image-strip__empty">{localize("No projections yet. Configure a scan task to view its image sequence.")}</div>}
+          {visibleFrames.length === 0 && cardPending && unverifiedFrames.length === 0 && <div className="image-strip__empty">{localize("No projection is registered locally yet. Import the card data to preview it.")}</div>}
           {visibleFrames.map(frame => <FrameThumbnail frame={frame} production={production} key={`${ws.scanSetup.taskId}:${frame.index}:${frame.sha256 ?? "preview"}`} />)}
         </div> : <LogLines logs={filtered} follow={follow} onFollow={setFollow} />}
       </>}
@@ -2032,70 +2035,64 @@ function InfoDialog({
   onClose: () => void;
 }) {
   let body: ReactNode = null;
+  const [language, chooseLanguage] = useLanguage();
   if (kind === "guide") {
     body = (
       <ol className="modal-list">
-        <li><strong>Connect each device independently.</strong> Use its permanent panel. Choose the camera explicitly; read actual parameters and set the common image root.</li>
-        <li><strong>Apply camera targets explicitly.</strong> Basic and Advanced Settings share one draft. Apply and verify finishes only after its engine operation and readback.</li>
-        <li><strong>Independent photo / Live View.</strong> Neither starts X-ray output. Stop Live View explicitly before a photo. Confirmed photos stay visible until Close; preview errors do not delete the saved NEF.</li>
-        <li><strong>Prepare a fixed scan.</strong> Task → Scan Preparation / Preflight opens task ID, projection count, continuous-output limit and all geometry in one window. Resolve every fixed-configuration issue and rerun preflight.</li>
-        <li><strong>Acquire.</strong> Establish the required HOME reference, follow dark/flat and sample confirmations, then Start. Pause commits a safe boundary; Stop waits for confirmed cleanup.</li>
-        <li><strong>Recover or abandon.</strong> Task → Restore uses frozen settings and verified retained files. Explicit abandonment preserves every file and unlocks only after cleanup confirmation.</li>
-        <li><strong>Reconstruct and view.</strong> Reconstruction remains in the bottom tab. Equipment/Result only change display; a result appears after validated data loading.</li>
-        <li><strong>Update.</strong> Help → Check Update or Import Signed Offline Update verifies packages. Installation requires separate confirmation and an engine-issued maintenance-ready state.</li>
+        <li><strong>{localize("Connect each device independently.")}</strong>{localize(" Use its permanent panel. Choose the camera explicitly; read actual parameters and set the common image root.")}</li>
+        <li><strong>{localize("Apply camera targets explicitly.")}</strong>{localize(" Basic and Advanced Settings share one draft. Apply and verify finishes only after its engine operation and readback.")}</li>
+        <li><strong>{localize("Independent photo / Live View.")}</strong>{localize(" Neither starts X-ray output. Stop Live View explicitly before a photo. Confirmed photos stay visible until Close; preview errors do not delete the saved NEF.")}</li>
+        <li><strong>{localize("Prepare a fixed scan.")}</strong>{localize(" Task → Scan Preparation / Preflight opens task ID, projection count, continuous-output limit and all geometry in one window. Resolve every fixed-configuration issue and rerun preflight.")}</li>
+        <li><strong>{localize("Acquire.")}</strong>{localize(" Establish the required HOME reference, follow dark/flat and sample confirmations, then Start. Pause commits a safe boundary; Stop waits for confirmed cleanup.")}</li>
+        <li><strong>{localize("Recover or abandon.")}</strong>{localize(" Task → Restore uses frozen settings and verified retained files. Explicit abandonment preserves every file and unlocks only after cleanup confirmation.")}</li>
+        <li><strong>{localize("Reconstruct and view.")}</strong>{localize(" Reconstruction remains in the bottom tab. Equipment/Result only change display; a result appears after validated data loading.")}</li>
+        <li><strong>{localize("Update.")}</strong>{localize(" Help → Check Update or Import Signed Offline Update verifies packages. Installation requires separate confirmation and an engine-issued maintenance-ready state.")}</li>
       </ol>
     );
   } else if (kind === "safety") {
     body = (
       <ul className="modal-list">
         <li>
-          <strong>Device faults fail closed.</strong> The engine attempts to turn off X-rays and stop motion,
-          then invalidates Preflight and HOME. A physical emergency stop remains part of the hardware safety system.
-        </li>
+          <strong>{localize("Device faults fail closed.")}</strong>{localize(" The engine attempts to turn off X-rays and stop motion, then invalidates Preflight and HOME. A physical emergency stop remains part of the hardware safety system.")}</li>
         <li>
-          <strong>Preflight before exposure.</strong> The engine requires a live, valid Nano reference.
-          HOME establishes it when the controller reports none; STOP or a lost reference requires HOME again.
-        </li>
+          <strong>{localize("Preflight before exposure.")}</strong>{localize(" The engine requires a live, valid Nano reference. HOME establishes it when the controller reports none; STOP or a lost reference requires HOME again.")}</li>
         <li>
-          <strong>Any parameter change invalidates the safety chain.</strong> Editing Task ID, Save Path,
-          projections, exposure or Max X-ray resets preflight; a still valid Nano reference is checked again.
-        </li>
+          <strong>{localize("Any parameter change invalidates the safety chain.")}</strong>{localize(" Editing Task ID, Save Path, projections, exposure or Max X-ray resets preflight; a still valid Nano reference is checked again.")}</li>
         <li>
-          <strong>{snapshot?.mode === "developer_preview" ? "This preview drives no hardware." : "Native device controls are an offline candidate pending hardware acceptance."}</strong>{" "}
-          {snapshot?.modeLabel || "Control service unavailable"}. Independent camera and turntable controls never enable X-ray output. Unknown readback is not OFF; complete acquisition requires engine preflight and verified device evidence.
-        </li>
+          <strong>{localize(snapshot?.mode === "developer_preview" ? "This preview drives no hardware." : "Native device controls are an offline candidate pending hardware acceptance.")}</strong>{localize(" ")}
+          {localize(snapshot?.modeLabel || "Control service unavailable")}{localize(". Independent camera and turntable controls never enable X-ray output. Unknown readback is not OFF; complete acquisition requires engine preflight and verified device evidence.")}</li>
       </ul>
     );
   } else if (kind === "about") {
     body = (
       <dl className="modal-facts">
         <div>
-          <dt>Application</dt>
-          <dd>Micro-CT Workstation</dd>
+          <dt>{localize("Application")}</dt>
+          <dd>{localize("Micro-CT Workstation")}</dd>
         </div>
         <div>
-          <dt>Version</dt>
-          <dd>{version}</dd>
+          <dt>{localize("Version")}</dt>
+          <dd>{localize(version)}</dd>
         </div>
         <div>
-          <dt>Engine</dt>
-          <dd>{snapshot?.modeLabel || "Control service unavailable"}</dd>
+          <dt>{localize("Engine")}</dt>
+          <dd>{localize(snapshot?.modeLabel || "Control service unavailable")}</dd>
         </div>
         <div>
-          <dt>Control chain</dt>
+          <dt>{localize("Control chain")}</dt>
           <dd>
-            {adapterKind === "tauri"
+            {localize(adapterKind === "tauri"
               ? "React → Tauri invoke → Rust EngineClient → ct-engine (JSONL stdio IPC)"
-              : "Browser developer preview (no ct-engine sidecar)"}
+              : "Browser developer preview (no ct-engine sidecar)")}
           </dd>
         </div>
         <div>
-          <dt>Connection</dt>
-          <dd>{snapshot?.connectionState.toUpperCase() || "UNKNOWN"}</dd>
+          <dt>{localize("Connection")}</dt>
+          <dd>{localize(snapshot?.connectionState.toUpperCase() || "UNKNOWN")}</dd>
         </div>
         <div>
-          <dt>Devices</dt>
-          <dd>{ws?.onlineSummary || "UNKNOWN"}</dd>
+          <dt>{localize("Devices")}</dt>
+          <dd>{localize(ws?.onlineSummary || "UNKNOWN")}</dd>
         </div>
       </dl>
     );
@@ -2103,8 +2100,16 @@ function InfoDialog({
     body = (
       <div className="modal-stack">
         <div className="modal-row">
-          <span>Interface theme</span>
-          <div className="theme-toggle" role="group" aria-label="Theme">
+          <label htmlFor="interface-language">{localize("Interface language")}</label>
+          <select id="interface-language" value={language} onChange={event => chooseLanguage(event.target.value === "zh-CN" ? "zh-CN" : "en")}>
+            <option value="en" lang="en">{localize("English")}</option>
+            <option value="zh-CN" lang="zh-CN">{localize("简体中文")}</option>
+          </select>
+        </div>
+        <p className="modal-note">{localize("Language changes apply immediately and are remembered on this device. Device commands and saved data are unchanged.")}</p>
+        <div className="modal-row">
+          <span>{localize("Interface theme")}</span>
+          <div className="theme-toggle" role="group" aria-label={localize("Theme")}>
             {(["light", "dark"] as const).map((value) => (
               <button
                 key={value}
@@ -2113,23 +2118,23 @@ function InfoDialog({
                 aria-pressed={theme === value}
                 onClick={() => onTheme(value)}
               >
-                {value === "light" ? "Light" : "Dark"}
+                {localize(value === "light" ? "Light" : "Dark")}
               </button>
             ))}
           </div>
         </div>
         <dl className="modal-facts">
           <div>
-            <dt>Engine bridge</dt>
-            <dd>{adapterKind === "tauri" ? "TAURI / CT-ENGINE" : "BROWSER PREVIEW"}</dd>
+            <dt>{localize("Engine bridge")}</dt>
+            <dd>{localize(adapterKind === "tauri" ? "TAURI / CT-ENGINE" : "BROWSER PREVIEW")}</dd>
           </div>
           <div>
-            <dt>Canvas</dt>
-            <dd>1920 × 1080 design baseline; fills the actual client with one control scale</dd>
+            <dt>{localize("Canvas")}</dt>
+            <dd>{localize("1920 × 1080 design baseline; fills the actual client with one control scale")}</dd>
           </div>
           <div>
-            <dt>Safety model</dt>
-            <dd>Engine-owned scan state · device fault protection · preflight then HOME</dd>
+            <dt>{localize("Safety model")}</dt>
+            <dd>{localize("Engine-owned scan state · device fault protection · preflight then HOME")}</dd>
           </div>
         </dl>
       </div>
@@ -2139,21 +2144,19 @@ function InfoDialog({
   } else {
     body = (
       <div className="modal-stack">
-        <p className="modal-note">
-          Read-only device and operation evidence. Opening this dialog does not reconnect devices.
-        </p>
+        <p className="modal-note">{localize("Read-only device and operation evidence. Opening this dialog does not reconnect devices.")}</p>
         <dl className="modal-facts">
-          {ws?.devices.map((device) => (
+          {localize(ws?.devices.map((device) => (
             <div key={device.id}>
-              <dt>{device.name}</dt>
+              <dt>{localize(device.name)}</dt>
               <dd>
-                <span className={`tone-${device.tone}`}>{device.word}</span> · {englishDisplayText(device.spec)}
+                <span className={`tone-${device.tone}`}>{localize(device.word)}</span> · {localize(englishDisplayText(device.spec))}
               </dd>
             </div>
-          ))}
+          )))}
           <div>
-            <dt>Link summary</dt>
-            <dd>{ws?.onlineSummary || "UNKNOWN"}</dd>
+            <dt>{localize("Link summary")}</dt>
+            <dd>{localize(ws?.onlineSummary || "UNKNOWN")}</dd>
           </div>
         </dl>
       </div>
@@ -2161,24 +2164,9 @@ function InfoDialog({
   }
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <section
-        className="modal-card"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="menu-dialog-title"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <header className="modal-card__head">
-          <LineIcon name={DIALOG_ICONS[kind]} size={15} className="panel__icon" />
-          <h2 id="menu-dialog-title">{DIALOG_TITLES[kind]}</h2>
-          <button type="button" className="modal-card__close" onClick={onClose} aria-label="Close dialog">
-            ×
-          </button>
-        </header>
-        <div className="modal-card__body">{body}</div>
-      </section>
-    </div>
+    <WorkstationDialog title={localize(DIALOG_TITLES[kind])} titleIcon={<LineIcon name={DIALOG_ICONS[kind]} size={15} className="panel__icon" />} onClose={onClose} className={kind === "troubleshooting" ? "troubleshooting-dialog" : kind === "about" || kind === "preferences" ? "compact-dialog" : ""}>
+      {localize(body)}
+    </WorkstationDialog>
   );
 }
 
@@ -2240,26 +2228,26 @@ function ScanStageDialog({ stage, recorded, beamState, busy, onConfirm, onCancel
   }, [locked, onCancel]);
   const cancel = () => { if (!locked) { setSubmitting(true); void onCancel().finally(() => setSubmitting(false)); } };
   const field = (key: string, label: string, hint: string) => <label className="scan-geometry-field" key={key}>
-    <span>{label}</span><input type="number" inputMode="decimal" step="any" value={values[key]} aria-label={label} placeholder={hint} disabled={locked} onChange={event => setValues(current => ({ ...current, [key]: event.target.value }))} />
+    <span>{localize(label)}</span><input type="number" inputMode="decimal" step="any" value={values[key]} aria-label={localize(label)} placeholder={localize(hint)} disabled={locked} onChange={event => setValues(current => ({ ...current, [key]: event.target.value }))} />
   </label>;
   const select = (key: string, label: string, options: Array<[string, string]>) => <label className="scan-geometry-field" key={key}>
-    <span>{label}</span><select value={values[key]} disabled={locked} onChange={event => setValues(current => ({ ...current, [key]: event.target.value }))}><option value="">Select</option>{options.map(([value, text]) => <option value={value} key={value}>{text}</option>)}</select>
+    <span>{localize(label)}</span><select value={values[key]} disabled={locked} onChange={event => setValues(current => ({ ...current, [key]: event.target.value }))}><option value="">{localize("Select")}</option>{options.map(([value, text]) => <option value={value} key={value}>{localize(text)}</option>)}</select>
   </label>;
   return <div className="modal-backdrop scan-stage-backdrop" onClick={cancel}>
     <section ref={dialogRef} className="modal-card scan-stage-card" role="dialog" aria-modal="true" aria-labelledby="scan-stage-title" onClick={event => event.stopPropagation()}>
-      <header className="modal-card__head"><LineIcon name="warning" size={15} className="panel__icon" /><h2 id="scan-stage-title">{copy.title}</h2><button type="button" className="modal-card__close" aria-label="Cancel this scan" disabled={locked} onClick={cancel}>×</button></header>
-      <div className="modal-card__body"><p className="scan-stage-copy">{copy.body}</p>
+      <header className="modal-card__head"><LineIcon name="warning" size={15} className="panel__icon" /><h2 id="scan-stage-title">{localize(copy.title)}</h2><button type="button" className="modal-card__close" aria-label={localize("Cancel this scan")} disabled={locked} onClick={cancel}>×</button></header>
+      <div className="modal-card__body"><p className="scan-stage-copy">{localize(copy.body)}</p>
         {stage === "geometry" && <div className="scan-geometry-grid">
-          {field("sodMm", "Source to axis · mm", "Above 0")}
-          {field("objectToDetectorMm", "Axis to detector · mm", "Above 0")}
-          {field("detectorWidthMm", "Active detector width · mm", "Above 0")}
-          {field("centerOffsetXMm", "Horizontal offset · mm", "May be 0")}
-          {field("centerOffsetYMm", "Vertical offset · mm", "May be 0")}
-          {select("mirrorX", "Mirror image horizontally", [["false", "No"], ["true", "Yes"]])}
+          {localize(field("sodMm", "Source to axis · mm", "Above 0"))}
+          {localize(field("objectToDetectorMm", "Axis to detector · mm", "Above 0"))}
+          {localize(field("detectorWidthMm", "Active detector width · mm", "Above 0"))}
+          {localize(field("centerOffsetXMm", "Horizontal offset · mm", "May be 0"))}
+          {localize(field("centerOffsetYMm", "Vertical offset · mm", "May be 0"))}
+          {localize(select("mirrorX", "Mirror image horizontally", [["false", "No"], ["true", "Yes"]]))}
         </div>}
-        {attempted && stage === "geometry" && !geometry && <p className="scan-stage-error" role="alert">Enter complete, valid geometry values.</p>}
-        {sampleAccessBlocked && <p className="scan-stage-error" role="alert">X-ray OFF is unconfirmed. Do not handle the sample.</p>}
-        <div className="scan-stage-actions"><button type="button" disabled={locked} onClick={cancel}>Cancel Scan</button><button type="button" className="scan-stage-confirm" disabled={locked || sampleAccessBlocked} onClick={() => { if (stage === "geometry") { setAttempted(true); if (!geometry) return; } setSubmitting(true); void onConfirm(stage === "geometry" ? geometry ?? undefined : undefined).finally(() => setSubmitting(false)); }}>{copy.confirm}</button></div>
+        {attempted && stage === "geometry" && !geometry && <p className="scan-stage-error" role="alert">{localize("Enter complete, valid geometry values.")}</p>}
+        {sampleAccessBlocked && <p className="scan-stage-error" role="alert">{localize("X-ray OFF is unconfirmed. Do not handle the sample.")}</p>}
+        <div className="scan-stage-actions"><button type="button" disabled={locked} onClick={cancel}>{localize("Cancel Scan")}</button><button type="button" className="scan-stage-confirm" disabled={locked || sampleAccessBlocked} onClick={() => { if (stage === "geometry") { setAttempted(true); if (!geometry) return; } setSubmitting(true); void onConfirm(stage === "geometry" ? geometry ?? undefined : undefined).finally(() => setSubmitting(false)); }}>{localize(copy.confirm)}</button></div>
       </div>
     </section>
   </div>;
@@ -2270,6 +2258,22 @@ function ScanStageDialog({ stage, recorded, beamState, busy, onConfirm, onCancel
 /* ------------------------------------------------------------------ */
 
 export function App() {
+  useEffect(() => {
+    // Keyboard navigation stays immediate; pointer interactions may use the
+    // short surface transitions. This changes presentation only.
+    const root = document.documentElement;
+    const keyboard = () => { root.dataset.inputModality = "keyboard"; };
+    const pointer = () => { root.dataset.inputModality = "pointer"; };
+    document.addEventListener("keydown", keyboard, true);
+    document.addEventListener("pointerdown", pointer, true);
+    return () => {
+      document.removeEventListener("keydown", keyboard, true);
+      document.removeEventListener("pointerdown", pointer, true);
+      delete root.dataset.inputModality;
+    };
+  }, []);
+  const [language] = useLanguage();
+  useEffect(() => { void syncDesktopLanguage(language).catch(error => console.error("Native interface language synchronization failed", error)); }, [language]);
   const { adapterKind, snapshot, busy, error, transportError, dispatch: engineDispatch } = useEngine();
   const actions = useDeviceActions(snapshot, engineDispatch);
   const model = useCameraDraft(snapshot);
@@ -2469,21 +2473,21 @@ export function App() {
   };
   const info = dialog ? <InfoDialog kind={dialog} version={version} ws={ws || null} snapshot={snapshot} adapterKind={adapterKind} theme={theme} troubleshootingGroup={troubleshootingGroup} onTheme={setTheme} onClose={() => setDialog(null)} /> : null;
   const failureBanner = <FailureBanner report={visibleFailure} onDismiss={dismissFailure} onTroubleshooting={openTroubleshooting} onDiagnostics={() => setDialog("diagnostics")} topOffset={Math.round(FAILURE_TOP_LANE_DESIGN_PX * canvasLayout.zoom)} />;
-  if (!snapshot || !ws) return <main className="viewport-shell"><div className="design-canvas" style={{zoom:canvasLayout.zoom,width:`${canvasLayout.designWidth}px`,height:`${canvasLayout.designHeight}px`}}><MenuBar theme={theme} availability={availability} onAction={id => void handleMenuAction(id)} version={version} /><div className="app-divider" /><main className="boot-screen"><strong>Micro-CT Workstation</strong><span>{englishDisplayText(error || "Starting control service…")}</span><span>Device readings are UNKNOWN. Help and desktop platform actions remain available.</span></main><div className="app-divider" /><footer className="status-bar">Control service unavailable · no device action permitted</footer>{failureBanner}{info}<UpdateDialog open={update} onClose={() => setUpdate(false)} /></div></main>;
+  if (!snapshot || !ws) return <main className="viewport-shell"><div className="design-canvas" style={{zoom:canvasLayout.zoom,width:`${canvasLayout.designWidth}px`,height:`${canvasLayout.designHeight}px`}}><MenuBar theme={theme} availability={availability} onAction={id => void handleMenuAction(id)} version={version} /><div className="app-divider" /><main className="boot-screen"><strong>{localize("Micro-CT Workstation")}</strong><span>{localize(englishDisplayText(error || "Starting control service…"))}</span><span>{localize("Device readings are UNKNOWN. Help and desktop platform actions remain available.")}</span></main><div className="app-divider" /><footer className="status-bar">{localize("Control service unavailable · no device action permitted")}</footer>{localize(failureBanner)}{localize(info)}<UpdateDialog open={update} onClose={() => setUpdate(false)} /></div></main>;
   const submitPreparation = async (draft: ScanPreparation) => {
     if (auxiliaryCurrent.current !== "prepare") return false;
     setPreparationError(null);
     return runScanPreparationRequest(preparationScope.current, draft, () => preparationContext.current, actions.run, setPreparationStage, setPreparationError);
   };
   return <main className="viewport-shell"><div className="design-canvas" style={{zoom:canvasLayout.zoom,width:`${canvasLayout.designWidth}px`,height:`${canvasLayout.designHeight}px`}}><MenuBar theme={theme} availability={availability} onAction={id => void handleMenuAction(id)} version={version} /><div className="app-divider" />
-    {failureBanner}
+    {localize(failureBanner)}
     <section className="workspace-body">
       <aside className="col device-column"><CameraPanel snapshot={snapshot} stale={stale} pending={pending} model={model} run={actions.run} cardImportReason={cardImportReason} onAdvanced={() => setAuxiliary("camera")} onPhoto={onPhoto} mediaRevision={requestRevision} onLive={revision => { if(revision === presentation.current) navigate("live"); }} /><TurntablePanel snapshot={snapshot} stale={stale} pending={pending} run={actions.run} onPreflight={openPreparation} onRecovery={() => setAuxiliary("recovery")} onBench={() => setAuxiliary("bench")} /></aside>
       <section className="main-console"><LiveScene snapshot={snapshot} ws={ws} theme={theme} dispatch={dispatch} stale={stale} setupInvalid={setupInvalid} feedbackId={snapshot.updatedAt} centerView={centerView} volume={activeVolume} previewError={previewError} volumeMode={volumeMode} volumeResetRevision={volumeResetRevision} onVolumeAvailable={setVolume3DAvailable} camera={snapshot.deviceControls.camera} photo={photo} requestRevision={requestRevision} onCloseMedia={closeMedia} runDevice={actions.run} pending={pending} liveBlockedReason={cardImportReason} /></section>
       <BottomConsole tab={bottomTab} onTab={setBottomTab} ws={ws} card={card} projectOperation={snapshot.operations.filter(operation => operation.device === "task_project" && operation.kind === "open_project").at(-1) || null} openingProject={openingProject} production={adapterKind === "tauri"} centerView={centerView} volumeReady={Boolean(activeVolume)} volume3DAvailable={volume3DAvailable} busy={pending} stale={stale} volumeMode={volumeMode} onVolumeMode={setVolumeMode} onResetVolume={() => setVolumeResetRevision(value => value + 1)} onOpenReconstruction={openReconstruction} onShowEquipment={() => navigate("equipment")} onStartReconstruction={startReconstruction} onCardImport={() => setAuxiliary("card")} cardGateReason={cardGateReason} />
       <aside className="col col--right"><XrayPanel ws={ws} busy={pending || stale} dispatch={dispatch} stale={stale} /><OperationPanel snapshot={snapshot} ws={ws} stale={stale} onImport={() => setAuxiliary("card")} /></aside>
-    </section><div className="app-divider" /><footer className="status-bar"><span className="status-bar__left"><i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} /><strong>{stale ? "Control service unavailable · device readings UNKNOWN" : englishDisplayText(snapshot.lastError || ws.dock.playReason || ws.phaseWord)}</strong></span><div className="status-bar__right"><span>{ws.scanSetup.taskId || "No task selected"}</span>{snapshot.mode === "developer_preview" && <span className="badge badge--dev">Offline preview · no hardware</span>}<span className={`badge badge--engine badge--${stale ? "lost" : "connected"}`}>Control service · {stale ? "Unavailable" : "Ready"}</span><div className="theme-toggle" role="group" aria-label="Theme">{(["light","dark"] as const).map(value => <button key={value} className="theme-toggle__seg" aria-pressed={theme === value} onClick={() => setTheme(value)}>{value === "light" ? "Light" : "Dark"}</button>)}</div></div></footer>
-    {info}<UpdateDialog open={update} onClose={() => setUpdate(false)} />
+    </section><div className="app-divider" /><footer className="status-bar"><span className="status-bar__left"><i className={`status-dot ${toneClass(ws.statusbar.dotTone)}`} /><strong>{localize(stale ? "Control service unavailable · device readings UNKNOWN" : englishDisplayText(snapshot.lastError || ws.dock.playReason || ws.phaseWord))}</strong></span><div className="status-bar__right"><span>{ws.scanSetup.taskId ? unicodeDisplayText(ws.scanSetup.taskId) : localize("No task selected")}</span>{snapshot.mode === "developer_preview" && <span className="badge badge--dev">{localize("Offline preview · no hardware")}</span>}<span className={`badge badge--engine badge--${stale ? "lost" : "connected"}`}>{localize("Control service · ")}{localize(stale ? "Unavailable" : "Ready")}</span><div className="theme-toggle" role="group" aria-label={localize("Theme")}>{(["light","dark"] as const).map(value => <button key={value} className="theme-toggle__seg" aria-pressed={theme === value} onClick={() => setTheme(value)}>{localize(value === "light" ? "Light" : "Dark")}</button>)}</div></div></footer>
+    {localize(info)}<UpdateDialog open={update} onClose={() => setUpdate(false)} />
     {auxiliary === "camera" && <CameraSettingsDialog snapshot={snapshot} pending={pending} stale={stale} model={model} run={actions.run} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}
     {auxiliary === "bench" && <TurntableBenchDialog snapshot={snapshot} pending={pending} stale={stale} run={actions.run} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}
     {auxiliary === "recovery" && <TaskRecoveryDialog snapshot={snapshot} pending={pending} stale={stale} run={actions.run} onClose={() => setAuxiliary(null, auxiliaryRevision)} onStop={stop} />}

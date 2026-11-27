@@ -1,6 +1,8 @@
+import { localize } from "./i18n";
 /** Check, download and installation are separate user actions. */
 import { englishDisplayText } from './engine/native-labels';
 import { useEffect, useState } from 'react';
+import { WorkstationDialog } from './WorkstationDialog';
 import { cancelSoftwareUpdate, checkSoftwareUpdate, downloadSoftwareUpdate, confirmSoftwareUpdate, getUpdateStatus, type UpdateState } from './platform/updater';
 
 export interface UpdateDialogProps { open: boolean; onClose: () => void }
@@ -11,8 +13,13 @@ const phaseText: Record<UpdateState['phase'], string> = {
   cancelled: 'Update cancelled.', failed: "Couldn't complete the update.",
 };
 const size = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+export function UpdateDownloadProgress({ downloadedBytes, totalBytes }: Pick<UpdateState, 'downloadedBytes' | 'totalBytes'>) {
+  const known = totalBytes !== null && Number.isFinite(totalBytes) && totalBytes > 0;
+  const progress = known ? Math.min(100, Math.max(0, downloadedBytes / totalBytes * 100)) : undefined;
+  return <><progress max="100" value={progress} aria-label={localize(known ? 'Download progress' : 'Download progress · total size unknown')} /><p className="readout-value">{localize(size(downloadedBytes))} / <span title={localize(known ? undefined : 'Total size unknown')}>{localize(known ? size(totalBytes) : '–')}</span></p></>;
+}
 export function UpdateFeedback({ notice, error }: { notice: string | null; error: string | null }) {
-  return <>{notice && <p role="status" className="update-notice">{englishDisplayText(notice)}</p>}{error && <p role="alert" className="update-error">{englishDisplayText(error)}</p>}</>;
+  return <>{notice && <p role="status" className="update-notice">{localize(englishDisplayText(notice))}</p>}{error && <p role="alert" className="update-error">{localize(englishDisplayText(error))}</p>}</>;
 }
 export function UpdateDialog({ open, onClose }: UpdateDialogProps) {
   const [state, setState] = useState<UpdateState | null>(null);
@@ -45,25 +52,19 @@ export function UpdateDialog({ open, onClose }: UpdateDialogProps) {
   if (!open) return null;
   const working = state && ['checking', 'downloading', 'verifying', 'preparing', 'applying'].includes(state.phase);
   const cancellable = state?.updateId && ['checking', 'downloading', 'verifying'].includes(state.phase);
-  const progress = state?.totalBytes ? Math.min(100, state.downloadedBytes / state.totalBytes * 100) : 0;
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className="workstation-dialog update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-title">
-      <header className="dialog-header"><h2 id="update-title">Software Update</h2><button type="button" onClick={onClose} aria-label="Close">×</button></header>
-      <div className="dialog-content">
-        <p role="status">{state ? phaseText[state.phase] : 'Checking for updates…'}</p>
-        <p>Installed version {state?.currentVersion ?? '…'}</p>
-        {state?.targetVersion && ['available', 'downloading', 'verifying', 'ready', 'preparing', 'applying'].includes(state.phase) && <p>Version {state.targetVersion}</p>}
-        {state && ['downloading', 'verifying'].includes(state.phase) && <><progress max="100" value={progress} aria-label="Download progress" /><p>{size(state.downloadedBytes)} / {size(state.totalBytes ?? 0)}</p></>}
-        {state?.phase === 'ready' && <p>The app will close to install the update. Your tasks and images will be kept.</p>}
+  const footer = <div className="update-actions">
+        {state?.phase === 'available' && <button type="button" disabled={pending} onClick={() => void run(() => downloadSoftwareUpdate(state.updateId!))}>{localize("Download update")}</button>}
+        {state?.phase === 'ready' && state.verified && <button type="button" disabled={pending} onClick={() => void run(() => confirmSoftwareUpdate(state.updateId!, state.targetVersion!))}>{localize("Install update")}</button>}
+        {cancellable && <button type="button" onClick={() => void run(() => cancelSoftwareUpdate(state!.updateId!))}>{localize("Cancel")}</button>}
+        {!working && !['available', 'ready'].includes(state?.phase ?? '') && <button type="button" disabled={pending} onClick={() => void run(() => checkSoftwareUpdate('stable'))}>{localize(state?.phase === 'failed' || error ? 'Try again' : 'Check again')}</button>}
+        <button type="button" onClick={onClose}>{localize("Close")}</button>
+      </div>;
+  return <WorkstationDialog title={localize("Software Update")} onClose={onClose} className="update-dialog" footer={footer}>
+        <p role="status">{localize(state ? phaseText[state.phase] : 'Checking for updates…')}</p>
+        <p>{localize("Installed version ")}{localize(state?.currentVersion ?? '…')}</p>
+        {state?.targetVersion && ['available', 'downloading', 'verifying', 'ready', 'preparing', 'applying'].includes(state.phase) && <p>{localize("Version ")}{localize(state.targetVersion)}</p>}
+        {state && ['downloading', 'verifying'].includes(state.phase) && <UpdateDownloadProgress downloadedBytes={state.downloadedBytes} totalBytes={state.totalBytes} />}
+        {state?.phase === 'ready' && <p>{localize("The app will close to install the update. Your tasks and images will be kept.")}</p>}
         <UpdateFeedback notice={state?.notice ?? null} error={error ?? state?.error ?? null} />
-      </div>
-      <footer className="dialog-footer">
-        {state?.phase === 'available' && <button type="button" disabled={pending} onClick={() => void run(() => downloadSoftwareUpdate(state.updateId!))}>Download update</button>}
-        {state?.phase === 'ready' && state.verified && <button type="button" disabled={pending} onClick={() => void run(() => confirmSoftwareUpdate(state.updateId!, state.targetVersion!))}>Install update</button>}
-        {cancellable && <button type="button" onClick={() => void run(() => cancelSoftwareUpdate(state!.updateId!))}>Cancel</button>}
-        {!working && !['available', 'ready'].includes(state?.phase ?? '') && <button type="button" disabled={pending} onClick={() => void run(() => checkSoftwareUpdate('stable'))}>{state?.phase === 'failed' || error ? 'Try again' : 'Check again'}</button>}
-        <button type="button" onClick={onClose}>Close</button>
-      </footer>
-    </section>
-  </div>;
+  </WorkstationDialog>;
 }

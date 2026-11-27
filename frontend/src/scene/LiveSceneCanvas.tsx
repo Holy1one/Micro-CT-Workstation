@@ -228,7 +228,7 @@ export function LiveSceneCanvas({
       resize={{ offsetSize: true }}
       frameloop="demand"
       dpr={[1, 1.75]}
-      gl={{ alpha: true, antialias: false, powerPreference: "high-performance" }}
+      gl={{ alpha: true, antialias: true, powerPreference: "high-performance" }}
       onCreated={({ gl, invalidate }) => {
         gl.setClearColor(0x000000, 0);
         invalidate();

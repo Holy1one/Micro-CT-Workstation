@@ -15,6 +15,8 @@ for (const [source, name] of [
   ["app-logo-light-256.png", "micro-ct-logo.png"],
   ["app-logo-dark-256.png", "micro-ct-logo-dark.png"],
   ["inter-var.woff2", "inter-var.woff2"],
+  ["noto-sans-sc-var.woff2", "noto-sans-sc-var.woff2"],
+  ["LICENSE-NotoSansSC.txt", "LICENSE-NotoSansSC.txt"],
   ["jetbrains-mono-var.woff2", "jetbrains-mono-var.woff2"],
 ]) {
   copyFileSync(join(root, "assets", source), join(output, name));

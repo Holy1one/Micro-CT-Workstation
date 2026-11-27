@@ -1,3 +1,4 @@
+import { localize } from "./i18n";
 /** Auxiliary bench dialog; device controls remain in the permanent columns. */
 import { englishDisplayText, diagnosticJson } from "./engine/native-labels";
 import { useState } from "react";
@@ -10,14 +11,14 @@ export function TurntableBenchDialog({ snapshot, stale, pending, run, onClose, o
   const reason = manualControlReason(snapshot, stale) || (pending ? "Operation pending" : null);
   const xrayConnected = snapshot.workstation?.xray.connected;
   const act = (command: EngineCommand) => { setError(null); void run(command).catch(error => setError(String(error))); };
-  return <WorkstationDialog title="Isolated Turntable Bench" onClose={onClose} onStop={onStop}>
-    <section className="device-console-section"><h3>Bench mode <small>X-ray stays UNKNOWN / unmonitored</small></h3>
-      <p className="device-note">Bench mode prohibits beam commands. A previously unconfirmed OFF cannot be overridden.</p>
-      <label className="recovery-confirm"><input type="checkbox" checked={confirmed} disabled={Boolean(reason) || Boolean(xrayConnected)} onChange={event => setConfirmed(event.target.checked)} /> I confirm the X-ray source is physically isolated for this turntable-only task.</label>
-      <div className="device-actions device-actions--wide"><button disabled={!confirmed || Boolean(reason) || Boolean(xrayConnected)} onClick={() => act({ type: "turntable_bench_mode", enabled: true, physicallyIsolated: true })}>Confirm bench mode</button><button disabled={Boolean(reason) || !snapshot.deviceControls.turntable.benchMode} onClick={() => act({ type: "turntable_bench_mode", enabled: false, physicallyIsolated: false })}>Leave bench mode</button></div>
-      <div className="device-footer"><p role="status">{snapshot.deviceControls.turntable.benchMode ? "Bench mode active" : "Bench mode inactive"}</p><span className={`chip ${snapshot.deviceControls.turntable.benchMode ? "chip--warn" : "chip--muted"}`}>{snapshot.deviceControls.turntable.benchMode ? "BENCH" : "NORMAL"}</span></div>
+  return <WorkstationDialog title={localize("Isolated Turntable Bench")} onClose={onClose} onStop={onStop}>
+    <section className="device-console-section"><h3>{localize("Bench mode ")}<small>{localize("X-ray stays UNKNOWN / unmonitored")}</small></h3>
+      <p className="device-note">{localize("Bench mode prohibits beam commands. A previously unconfirmed OFF cannot be overridden.")}</p>
+      <label className="recovery-confirm"><input type="checkbox" checked={confirmed} disabled={Boolean(reason) || Boolean(xrayConnected)} onChange={event => setConfirmed(event.target.checked)} />{localize(" I confirm the X-ray source is physically isolated for this turntable-only task.")}</label>
+      <div className="device-actions device-actions--wide"><button disabled={!confirmed || Boolean(reason) || Boolean(xrayConnected)} onClick={() => act({ type: "turntable_bench_mode", enabled: true, physicallyIsolated: true })}>{localize("Confirm bench mode")}</button><button disabled={Boolean(reason) || !snapshot.deviceControls.turntable.benchMode} onClick={() => act({ type: "turntable_bench_mode", enabled: false, physicallyIsolated: false })}>{localize("Leave bench mode")}</button></div>
+      <div className="device-footer"><p role="status">{localize(snapshot.deviceControls.turntable.benchMode ? "Bench mode active" : "Bench mode inactive")}</p><span className={`chip ${snapshot.deviceControls.turntable.benchMode ? "chip--warn" : "chip--muted"}`}>{localize(snapshot.deviceControls.turntable.benchMode ? "BENCH" : "NORMAL")}</span></div>
     </section>
-    {error && <p role="alert" className="device-note">{englishDisplayText(error)}</p>}
-    <details><summary>Motion and pulse evidence</summary><pre className="diagnostic-json">{diagnosticJson(snapshot.deviceControls.turntable)}</pre></details>
+    {error && <p role="alert" className="device-note">{localize(englishDisplayText(error))}</p>}
+    <details><summary>{localize("Motion and pulse evidence")}</summary><pre className="diagnostic-json">{diagnosticJson(snapshot.deviceControls.turntable)}</pre></details>
   </WorkstationDialog>;
 }

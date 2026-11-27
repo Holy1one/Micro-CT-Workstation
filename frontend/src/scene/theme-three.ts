@@ -11,6 +11,21 @@ function readCssVariable(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+function readColor(name: string): string {
+  const value = readCssVariable(name);
+  if (!/^(Canvas|CanvasText|Highlight|HighlightText)$/i.test(value)) return value;
+  // Three.js cannot parse OS system-color keywords. Let the browser resolve
+  // the current high-contrast palette without changing normal theme colors.
+  const probe = document.createElement("span");
+  probe.hidden = true;
+  probe.style.color = value;
+  probe.style.forcedColorAdjust = "none";
+  document.documentElement.append(probe);
+  const resolved = getComputedStyle(probe).color;
+  probe.remove();
+  return resolved;
+}
+
 function readOpacity(name: string, fallback: number): number {
   const value = Number.parseFloat(readCssVariable(name));
   return Number.isFinite(value) ? value : fallback;
@@ -18,17 +33,17 @@ function readOpacity(name: string, fallback: number): number {
 
 export function readSceneTheme(): SceneTheme {
   return {
-    accent: readCssVariable("--accent"),
-    beam: readCssVariable("--beamGlow"),
-    sceneLine: readCssVariable("--sceneLine"),
-    optics: readCssVariable("--optics"),
-    textPrimary: readCssVariable("--textPrimary"),
-    panel: readCssVariable("--panel"),
-    panelHeader: readCssVariable("--panelHeader"),
-    well: readCssVariable("--well"),
-    chassis: readCssVariable("--chassis"),
-    stageTable: readCssVariable("--stageTable"),
-    stageWall: readCssVariable("--stageWall"),
+    accent: readColor("--accent"),
+    beam: readColor("--beamGlow"),
+    sceneLine: readColor("--sceneLine"),
+    optics: readColor("--optics"),
+    textPrimary: readColor("--textPrimary"),
+    panel: readColor("--panel"),
+    panelHeader: readColor("--panelHeader"),
+    well: readColor("--well"),
+    chassis: readColor("--chassis"),
+    stageTable: readColor("--stageTable"),
+    stageWall: readColor("--stageWall"),
     stageGlow: readOpacity("--stageGlow", 0.3),
     rayReady: readOpacity("--rayReady", 0.12),
     rayScanning: readOpacity("--rayScanning", 0.85),
@@ -44,9 +59,12 @@ export function useSceneTheme(): SceneTheme {
     const update = (): void => setTheme(readSceneTheme());
     const observer = new MutationObserver(update);
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    const forcedColors = window.matchMedia("(forced-colors: active)");
+    forcedColors.addEventListener("change", update);
     window.addEventListener("resize", update);
     return () => {
       observer.disconnect();
+      forcedColors.removeEventListener("change", update);
       window.removeEventListener("resize", update);
     };
   }, []);

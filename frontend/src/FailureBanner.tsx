@@ -1,3 +1,4 @@
+import { localize } from "./i18n";
 /** One closable failure surface above every page and dialog.
  *
  *  It is portalled to <body> because the design canvas carries a CSS `zoom`, which
@@ -35,27 +36,27 @@ export function FailureBanner({ report, onDismiss, onTroubleshooting, onDiagnost
       <section className={`failure-card failure-card--${report.kind}`} role="alert" aria-live="assertive">
         <header className="failure-card__head">
           <LineIcon name="warning" size={14} />
-          <h2>{report.title}</h2>
-          <span className="failure-card__stage">{report.stage}</span>
+          <h2>{localize(report.title)}</h2>
+          <span className="failure-card__stage">{localize(report.stage)}</span>
           <button type="button" className="failure-card__dismiss"
-            title={persistent ? "Hides this notice. Cleanup is still unconfirmed; no lock is cleared." : "Hide this notice"}
+            title={localize(persistent ? "Hides this notice. Cleanup is still unconfirmed; no lock is cleared." : "Hide this notice")}
             onClick={() => { setOpen(false); onDismiss(report.key); }}>
-            {persistent ? "Hide · still unconfirmed" : "Dismiss"} ×
+            {localize(persistent ? "Hide · still unconfirmed" : "Dismiss")} ×
           </button>
         </header>
-        <p className="failure-card__reason">{report.displayReason || report.reason}</p>
+        <p className="failure-card__reason">{localize(report.displayReason || report.reason)}</p>
         <dl className="failure-card__facts">
-          <div><dt>Failed at</dt><dd>{report.stage}</dd></div>
-          <div><dt>Engine code</dt><dd>{report.code ?? "no code in this message"}</dd></div>
-          <div><dt>Next action</dt><dd>{report.nextAction}</dd></div>
+          <div><dt>{localize("Failed at")}</dt><dd>{localize(report.stage)}</dd></div>
+          <div><dt>{localize("Engine code")}</dt><dd>{localize(report.code ?? "no code in this message")}</dd></div>
+          <div><dt>{localize("Next action")}</dt><dd>{localize(report.nextAction)}</dd></div>
         </dl>
         <div className="failure-card__actions">
-          <button type="button" onClick={() => onTroubleshooting(report.group)}>Open Troubleshooting…</button>
-          <button type="button" onClick={onDiagnostics}>View diagnostics</button>
+          <button type="button" onClick={() => onTroubleshooting(report.group)}>{localize("Open Troubleshooting…")}</button>
+          <button type="button" onClick={onDiagnostics}>{localize("View diagnostics")}</button>
           <button type="button" onClick={() => void navigator.clipboard?.writeText(
-            [report.stage, report.code ?? "(no code)", report.reason].join("\n")).catch(() => undefined)}>Copy details</button>
+            [report.stage, report.code ?? "(no code)", report.reason].join("\n")).catch(() => undefined)}>{localize("Copy details")}</button>
         </div>
-        {persistent && <p className="failure-card__guard">Hiding this notice does not confirm cleanup and does not clear the fault or unfinished-task lock. Stop and status reads stay available.</p>}
+        {persistent && <p className="failure-card__guard">{localize("Hiding this notice does not confirm cleanup and does not clear the fault or unfinished-task lock. Stop and status reads stay available.")}</p>}
       </section>
     </div>,
     document.body,

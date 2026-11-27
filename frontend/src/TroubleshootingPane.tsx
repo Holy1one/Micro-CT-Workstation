@@ -1,3 +1,4 @@
+import { localize } from "./i18n";
 /** Help → Troubleshooting: symptom → engine code → exact next action.
  *
  *  The next-action text comes from the single FAILURE_ADVICE table in
@@ -6,7 +7,7 @@
  *  device condition into success/off/normal/safe, and nothing promises that a restart
  *  resolves an unknown or unsupported condition. */
 import { useState } from "react";
-import { englishDisplayText } from "./engine/native-labels";
+import { englishDisplayText, readoutText } from "./engine/native-labels";
 import type { EngineSnapshot } from "./engine/types";
 import { failureAdvice } from "./engine/deviceControls";
 
@@ -148,7 +149,7 @@ export function TroubleshootingPane({ snapshot, initialGroup }: { snapshot: Engi
   const readiness = snapshot?.cameraScanReadiness;
   return (
     <div className="trouble-pane">
-      <nav className="trouble-pane__nav" aria-label="Troubleshooting topics">
+      <nav className="trouble-pane__nav" aria-label={localize("Troubleshooting topics")}>
         {TROUBLESHOOTING_GROUPS.map(entry => (
           <button
             key={entry.id}
@@ -157,53 +158,53 @@ export function TroubleshootingPane({ snapshot, initialGroup }: { snapshot: Engi
             aria-pressed={entry.id === group.id}
             onClick={() => setActive(entry.id)}
           >
-            {entry.title}
+            {localize(entry.title)}
           </button>
         ))}
       </nav>
-      <div className="trouble-pane__body">
-        <p className="modal-note">{group.intro}</p>
+      <div key={group.id} className="trouble-pane__body">
+        <p className="modal-note">{localize(group.intro)}</p>
         <table className="trouble-table">
           <thead>
-            <tr><th>Symptom</th><th>Engine code</th><th>Exact next action</th></tr>
+            <tr><th>{localize("Symptom")}</th><th>{localize("Engine code")}</th><th>{localize("Exact next action")}</th></tr>
           </thead>
           <tbody>
             {group.rows.map(row => (
               <tr key={row.code}>
-                <td>{row.symptom}</td>
+                <td>{localize(row.symptom)}</td>
                 <td className="trouble-table__code">{row.code}</td>
-                <td>{failureAdvice(row.code)?.action ?? "This code has no documented action in this build. Record the exact code and text, keep the reported machine state, and do not assume a restart resolves it."}</td>
+                <td>{localize(failureAdvice(row.code)?.action ?? "This code has no documented action in this build. Record the exact code and text, keep the reported machine state, and do not assume a restart resolves it.")}</td>
               </tr>
             ))}
           </tbody>
         </table>
         {group.id === "readiness" && (
           <section className="trouble-readiness">
-            <h3>Live scan readiness for this session</h3>
+            <h3>{localize("Live scan readiness for this session")}</h3>
             {readiness && Array.isArray(readiness.issues) && readiness.issues.length > 0 ? (
               <table className="trouble-table">
                 <thead>
-                  <tr><th>Item</th><th>Actual</th><th>Requirement</th><th>How to remedy</th></tr>
+                  <tr><th>{localize("Item")}</th><th>{localize("Actual")}</th><th>{localize("Requirement")}</th><th>{localize("How to remedy")}</th></tr>
                 </thead>
                 <tbody>
                   {readiness.issues.map(issue => (
                     <tr key={issue.key}>
-                      <td className="trouble-table__code">{issue.key}</td>
-                      <td className="trouble-table__code">{issue.actual === null || issue.actual === undefined ? "UNKNOWN" : String(issue.actual)}</td>
-                      <td>{englishDisplayText(issue.requirement)}</td>
-                      <td>{englishDisplayText(issue.remedy)}</td>
+                      <td className="trouble-table__code">{localize(issue.key)}</td>
+                      <td className="trouble-table__code readout-value" title={localize(issue.actual == null ? "Unknown actual value" : undefined)}>{readoutText(issue.actual)}</td>
+                      <td>{localize(englishDisplayText(issue.requirement))}</td>
+                      <td>{localize(englishDisplayText(issue.remedy))}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             ) : (
               <p className="modal-note">
-                {readiness ? "No readiness blockers are published for the current session." : "Readiness evidence is unavailable while the control service has no snapshot."}
+                {localize(readiness ? "No readiness blockers are published for the current session." : "Readiness evidence is unavailable while the control service has no snapshot.")}
               </p>
             )}
           </section>
         )}
-        <p className="trouble-pane__guard"><strong>What this does NOT mean:</strong> {group.notMeaning}</p>
+        <p className="trouble-pane__guard"><strong>{localize("What this does NOT mean:")}</strong> {localize(group.notMeaning)}</p>
       </div>
     </div>
   );

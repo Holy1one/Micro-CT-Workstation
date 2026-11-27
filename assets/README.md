@@ -8,8 +8,13 @@
 - app-icon.icns：既有母版的 macOS 配置资源，当前仅交付 Windows MSI。
 - installer-banner.bmp、installer-dialog.bmp：MSI 标题区和侧边品牌图，使用本项目 Logo；按 WiX 标准画布的 3 倍尺寸提供高 DPI 像素，24 位 BMP 格式用于 MSI Bitmap 控件，白底与安装器页面一致。维护时运行 python tools/build/prepare-installer-images.py；常规打包不依赖 Python。
 - inter-var.woff2、jetbrains-mono-var.woff2：既有运行字体，保留原始字节与来源。
+- noto-sans-sc-var.woff2：中文 UI 使用的 Noto Sans SC 可变字体（100–900 字重）；源自 [Noto CJK 官方仓库](https://github.com/notofonts/noto-cjk/blob/165c01b46ea533872e002e0785ff17e44f6d97d8/Sans/Variable/TTF/Subset/NotoSansSC-VF.ttf)，固定提交 `165c01b46ea533872e002e0785ff17e44f6d97d8`，原 TTF SHA-256 为 `d68bafcb48a2707749396aa12bbbd833cb70401f3a9a689fd2902c7e0d295964`。使用 fontTools 4.61.1 / Brotli 1.2.0 转换为 WOFF2，保留完整上游简体中文字集、字重轴和字体版权元数据，不按当前翻译表删字。`LICENSE-NotoSansSC.txt` 保存上游 OFL-1.1 许可（Git blob `d952d62c065f3f35fb83a173496e90b21525aef3`），随运行资源及 MSI 许可证清单分发。
 
-tools/build/prepare-assets.mjs 将浅色和深色 256px 透明图标分别暂存为 .cache/frontend/public/assets/micro-ct-logo.png、micro-ct-logo-dark.png，并复制两款字体；应用菜单栏和网页 favicon 跟随实际主题自动切换，4096px 母版不进入应用包。主题保留显式用户选择，否则跟随系统。Windows 安装快捷方式的静态图标继续使用透明原图。
+tools/build/prepare-assets.mjs 将浅色和深色 256px 透明图标分别暂存为 .cache/frontend/public/assets/micro-ct-logo.png、micro-ct-logo-dark.png，并复制字体和中文字体许可证；应用菜单栏和网页 favicon 跟随实际主题自动切换，4096px 母版不进入应用包。主题保留显式用户选择，否则跟随系统。Windows 安装快捷方式的静态图标继续使用透明原图。
+
+界面统一使用 Inter → PingFang SC → 内置 Noto Sans SC 的字体栈：拉丁字母、数字及单位保持 Inter，不因切换中文改变；macOS 优先使用已有系统苹方，Windows 不安装或内嵌 Apple 系统字体。全部控件共享 400/500/600 字重及既有字号令牌，关闭合成粗体，中文字面按同一行盒对齐。常规构建直接复制已维护 WOFF2，不依赖 Python、不访问字体 CDN。
+
+Noto Sans SC 版权元数据：© 2014–2021 Adobe (http://www.adobe.com/)，Reserved Font Name 为 “Source”。运行 WOFF2 大小 7,779,764 字节，SHA-256 `45228ce987d6a7788255a27891762f2ba2b7367e7755c72cb5331c3f70a27e38`。
 
 原生窗口由 backend/src-tauri/src/windows_icons.rs 使用 Windows LoadImageW 从 EXE 的 32512 图标资源分别加载大/小尺寸，按窗口 DPI 刷新，由 Windows 完成透明边缘解码和尺寸选择。仅销毁本模块持有的替换句柄，不释放框架句柄。
 

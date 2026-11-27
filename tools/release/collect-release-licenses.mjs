@@ -41,6 +41,8 @@ for (const [path,pkg] of Object.entries(lock.packages)) {
     typeof manifest.repository === "string" ? manifest.repository : manifest.repository?.url,directory);
 }
 const nikon = join(root,"backend/ct-engine/src/devices/camera/THIRD-PARTY-NOTICES.md");
+collect("font", "Noto Sans SC", "2.004", "OFL-1.1", "https://github.com/notofonts/noto-cjk",
+  join(root, "assets"), join(root, "assets/LICENSE-NotoSansSC.txt"));
 copyFileSync(nikon,join(output,"THIRD-PARTY-NOTICES.md"));
 records.sort((a,b) => `${a.kind}/${a.name}/${a.version}`.localeCompare(`${b.kind}/${b.name}/${b.version}`));
 writeFileSync(join(output,"third-party-licenses.json"),JSON.stringify({schemaVersion:1,source:"locked Cargo metadata and installed npm package declarations",packages:records},null,2)+"\n");

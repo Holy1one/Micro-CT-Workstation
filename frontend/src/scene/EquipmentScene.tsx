@@ -4,7 +4,7 @@
  * geometry here is illustrative and must never be used as hardware telemetry.
  */
 
-import { Html, Line, RoundedBox } from "@react-three/drei";
+import { Line, RoundedBox } from "@react-three/drei";
 import { useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useMemo, useRef } from "react";
 import { FeedbackAngle } from "./angle-feedback";
@@ -1290,7 +1290,7 @@ export function EquipmentScene({ view, status, reducedMotion, theme }: {
           />
           <directionalLight
             position={[620, 520, 780]}
-            intensity={0.65}
+            intensity={0.9}
             color="#e8e9ea"
             castShadow
             shadow-mapSize-width={1024}
@@ -1304,13 +1304,13 @@ export function EquipmentScene({ view, status, reducedMotion, theme }: {
             shadow-bias={-0.0001}
             shadow-normalBias={0.035}
           />
-          <directionalLight position={[-420, 260, -360]} intensity={0.3} color="#e6e8ea" />
+          <directionalLight position={[-420, 260, -360]} intensity={0.45} color="#e6e8ea" />
         </>
       ) : (
         <>
           <directionalLight
             position={[420, 650, 360]}
-            intensity={0.78}
+            intensity={1.15}
             color={theme.panelHeader}
             castShadow
             shadow-mapSize-width={1024}
@@ -1324,7 +1324,7 @@ export function EquipmentScene({ view, status, reducedMotion, theme }: {
             shadow-bias={-0.0001}
             shadow-normalBias={0.035}
           />
-          <directionalLight position={[-420, 260, -360]} intensity={0.22} color="#e6e8ea" />
+          <directionalLight position={[-420, 260, -360]} intensity={0.35} color="#e6e8ea" />
         </>
       )}
       {/* The room first, so the shells of the beam composite over it. */}
@@ -1354,42 +1354,6 @@ export function EquipmentScene({ view, status, reducedMotion, theme }: {
         <planeGeometry args={[1000, 1000]} />
         <shadowMaterial color={theme.sceneLine} transparent opacity={0.18} />
       </mesh>
-      <Html fullscreen zIndexRange={[4, 0]}>
-        <div
-          role="status"
-          data-scene-feedback-state={status.state}
-          aria-label={`Scene state ${status.state}: ${status.detail}`}
-          title={status.detail}
-          style={{
-            position: "absolute",
-            right: "14px",
-            bottom: "48px",
-            display: "flex",
-            alignItems: "baseline",
-            gap: "8px",
-            boxSizing: "border-box",
-            maxWidth: "min(420px, calc(100% - 28px))",
-            padding: "5px 9px",
-            border: `1px solid ${theme.sceneLine}`,
-            borderRadius: "7px",
-            backgroundColor: theme.panel,
-            color: theme.textPrimary,
-            fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace",
-            fontSize: "9px",
-            lineHeight: 1.35,
-            opacity: 0.86,
-            pointerEvents: "none",
-            userSelect: "none",
-          }}
-        >
-          <strong style={{ flex: "0 0 auto", fontSize: "9px", letterSpacing: "0.06em" }}>
-            {status.state.toUpperCase()}
-          </strong>
-          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {status.detail}
-          </span>
-        </div>
-      </Html>
     </group>
   );
 }

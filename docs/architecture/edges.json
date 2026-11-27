@@ -2,6 +2,13 @@
   "version": 1,
   "edges": [
     {
+      "from": "platform",
+      "to": "desktop-shell",
+      "type": "interface-language-ipc",
+      "strength": "strong",
+      "reason": "set_interface_language accepts only en/zh-CN for native dialog copy; the window brand remains Micro-CT Workstation in either locale. The remembered frontend preference defaults to English; this presentation-only IPC never enters the engine or changes device/data state."
+    },
+    {
       "from": "device-turntable",
       "to": "turntable-firmware",
       "type": "candidate-serial-contract",

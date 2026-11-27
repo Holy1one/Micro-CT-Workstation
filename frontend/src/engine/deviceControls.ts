@@ -3,6 +3,13 @@
 import type { CameraHealth, CameraProperties, CameraProperty, CameraScanReadiness, CameraValue, EngineSnapshot } from "./types";
 import { NATIVE_ENUM_LABELS, englishDisplayText, unicodeDisplayText, englishOptionLabel, englishPropertyLabel, englishReason } from "./native-labels";
 
+/** One readout rule for basic, Advanced and Live View controls. Drafts and raw
+ * diagnostics are deliberately separate from current confirmed evidence. */
+export function cameraParameterReadout(property?: CameraProperty, stale = false): string {
+  return !stale && property?.confirmed && property.supported && property.readable && !property.error && property.actual != null
+    ? cameraPropertyValueLabel(property, property.actual) : "–";
+}
+
 export function deviceConnectionReason(snapshot: EngineSnapshot, stale = false): string | null {
   if (stale) return "Control service unavailable · device evidence unknown";
   if (snapshot.softwareUpdatePreparation?.maintenanceLocked || snapshot.softwareUpdatePreparation?.ready) return "Software update preparation owns the devices";

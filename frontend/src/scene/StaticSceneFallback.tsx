@@ -1,3 +1,4 @@
+import { localize } from "../i18n";
 /**
  * Non-interactive scene replacement for unavailable or lost WebGL contexts.
  * It communicates the graphics limitation while continuing to display the
@@ -19,7 +20,7 @@ export function StaticSceneFallback({
 }) {
   return (
     <div className="scene-fallback" data-reason={reason}>
-      <span className="scene-fallback__label">3D VIEW UNAVAILABLE · {REASON_LABELS[reason]}</span>
+      <span className="scene-fallback__label">{localize("3D VIEW UNAVAILABLE · ")}{localize(REASON_LABELS[reason])}</span>
     </div>
   );
 }

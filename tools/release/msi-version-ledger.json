@@ -213,6 +213,34 @@
     {
       "appVersion": "0.9.54",
       "productVersion": "0.9.54"
+    },
+    {
+      "appVersion": "0.9.55",
+      "productVersion": "0.9.55"
+    },
+    {
+      "appVersion": "0.9.56",
+      "productVersion": "0.9.56"
+    },
+    {
+      "appVersion": "0.9.57",
+      "productVersion": "0.9.57"
+    },
+    {
+      "appVersion": "0.9.58",
+      "productVersion": "0.9.58"
+    },
+    {
+      "appVersion": "0.9.59",
+      "productVersion": "0.9.59"
+    },
+    {
+      "appVersion": "0.9.60",
+      "productVersion": "0.9.60"
+    },
+    {
+      "appVersion": "0.9.61",
+      "productVersion": "0.9.61"
     }
   ]
 }

@@ -8,6 +8,7 @@
 mod engine_client;
 mod camera_forwarder;
 mod updater;
+mod ui_language;
 #[cfg(windows)]
 mod windows_icons;
 use engine_client::EngineClient;
@@ -60,7 +61,7 @@ async fn software_update_import(app: tauri::AppHandle, state: tauri::State<'_, S
     let service = update_service(&state)?;
     service.clear_feedback()?;
     let chosen = tauri::async_runtime::spawn_blocking(move || app.dialog().file()
-        .add_filter("Signed offline update", &["zip"]).blocking_pick_file())
+        .add_filter(app.state::<ui_language::UiLanguage>().text("Signed offline update", "已签名的离线更新"), &["zip"]).blocking_pick_file())
         .await.map_err(|error| error.to_string())?;
     match chosen {
         Some(path) => service.import_zip(path.into_path().map_err(|error| error.to_string())?).await,
@@ -203,8 +204,11 @@ fn begin_shutdown(app:&tauri::AppHandle){
                         eprintln!("Desktop close waits for unconfirmed engine cleanup: {error}");
                         state.1.store(false,Ordering::SeqCst);
                         if let Some(window)=app.get_webview_window("main"){let _=window.show();let _=window.set_focus();}
-                        app.dialog().message(format!("The control service is still stopping. Device cleanup could not be confirmed.\n\n{error}\n\nCheck the physical devices and retry closing after cleanup finishes."))
-                            .title("Shutdown needs attention").kind(tauri_plugin_dialog::MessageDialogKind::Error).show(|_|{});
+                        let language = app.state::<ui_language::UiLanguage>();
+                        let message = language.text("The control service is still stopping. Device cleanup could not be confirmed.", "控制服务仍在停止，尚未确认设备清理完成。");
+                        let guidance = language.text("Check the physical devices and retry closing after cleanup finishes.", "请检查实际设备，等待清理完成后重试关闭。");
+                        app.dialog().message(format!("{message}\n\n{error}\n\n{guidance}"))
+                            .title(language.text("Shutdown needs attention", "关闭需要处理")).kind(tauri_plugin_dialog::MessageDialogKind::Error).show(|_|{});
                     }
                 }
                 return;
@@ -256,7 +260,8 @@ fn confirm_live_view_delivery(frame: Value, view: &Value, expected_session: &str
 async fn camera_preset_import(app:tauri::AppHandle)->Result<Option<String>,String> {
     use tauri_plugin_dialog::DialogExt;
     tauri::async_runtime::spawn_blocking(move||{
-        let Some(file)=app.dialog().file().set_title("Import camera presets").add_filter("Camera presets",&["json"]).blocking_pick_file() else{return Ok(None);};
+        let language = app.state::<ui_language::UiLanguage>();
+        let Some(file)=app.dialog().file().set_title(language.text("Import camera presets", "导入相机预设")).add_filter(language.text("Camera presets", "相机预设"),&["json"]).blocking_pick_file() else{return Ok(None);};
         let path=file.into_path().map_err(|error|error.to_string())?;
         if path.extension().and_then(|value|value.to_str()).is_none_or(|value|!value.eq_ignore_ascii_case("json")){return Err("Camera presets require a JSON file".into());}
         let size=std::fs::metadata(&path).map_err(|error|error.to_string())?.len();
@@ -272,7 +277,8 @@ async fn camera_preset_export(contents:String,app:tauri::AppHandle)->Result<Opti
     use tauri_plugin_dialog::DialogExt;
     ct_engine::presets::PresetStore::parse_import(&contents)?;
     tauri::async_runtime::spawn_blocking(move||{
-        let Some(file)=app.dialog().file().set_title("Export camera presets").set_file_name("microct-camera-presets.json").add_filter("Camera presets",&["json"]).blocking_save_file() else{return Ok(None);};
+        let language = app.state::<ui_language::UiLanguage>();
+        let Some(file)=app.dialog().file().set_title(language.text("Export camera presets", "导出相机预设")).set_file_name("microct-camera-presets.json").add_filter(language.text("Camera presets", "相机预设"),&["json"]).blocking_save_file() else{return Ok(None);};
         let path=file.into_path().map_err(|error|error.to_string())?;
         if path.extension().and_then(|value|value.to_str()).is_none_or(|value|!value.eq_ignore_ascii_case("json")){return Err("Camera presets require a JSON target".into());}
         // Same-directory staging preserves existing exports on a failed write.
@@ -1249,6 +1255,7 @@ fn main() {
             }
         })
         .manage(EngineState(Mutex::new(None),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false)))
+        .manage(ui_language::UiLanguage::default())
         .setup(|app| {
             #[cfg(windows)]
             app.manage(windows_icons::Icons::default());
@@ -1265,6 +1272,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ui_language::set_interface_language,
             software_update_check,
             software_update_download,
             software_update_status,

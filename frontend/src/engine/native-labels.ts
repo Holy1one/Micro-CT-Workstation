@@ -1,16 +1,15 @@
-/** English presentation of engine-provided native descriptor labels and reasons.
- *
- *  ct-engine keeps sending its raw native values and, for part of the D7100 catalog,
- *  Chinese labels: 15 of the 34 photographic `property.label`s, every enum
- *  `options[].label`, and the `disabledReason` / `options[].reason` /
- *  `capabilities.disabledReasons` texts. The renderer presents English and never
- *  mutates the record: raw codes, raw engine messages, the diagnostics JSON and the
- *  exported session log keep the engine's original text. Visible raw diagnostics
- *  encode Chinese as Unicode escapes so the JSON remains lossless and readable.
- *
- *  An unrecognised Chinese message is never machine-translated and never rendered as
- *  Chinese; it degrades to one neutral English sentence that points at the preserved
- *  raw text. An engine message that is already free of CJK passes through verbatim. */
+/** Canonical English labels for native descriptors; JSX localizes presentation.
+ * Commands, option values, identity, diagnostics and exported logs retain source
+ * data. English mode escapes unknown Chinese diagnostics losslessly; Chinese mode
+ * shows original Chinese directly. Neither mode invents unsupported device facts. */
+
+import { getLanguage } from "../i18n";
+
+/** Ordinary missing values only; never use this to hide a safety/status verdict. */
+export function readoutText(value: string | number | boolean | null | undefined): string {
+  return value == null || (typeof value === "string" && !value.trim()) || (typeof value === "number" && !Number.isFinite(value))
+    ? "–" : unicodeDisplayText(String(value));
+}
 
 /** Shared connection wording; stale or missing evidence never means disconnected. */
 export function deviceConnectionLabel(connected: boolean | null | undefined, stale = false): string {
@@ -124,6 +123,7 @@ export function hasCjk(text: string | null | undefined): boolean {
 
 /** Lossless display of native text and identifiers, including supplementary Han. */
 export function unicodeDisplayText(text: string): string {
+  if (getLanguage() === "zh-CN") return text;
   return text.replace(new RegExp(CJK.source, "gu"), character =>
     character.split("").map(unit => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`).join(""));
 }
@@ -136,6 +136,7 @@ export function diagnosticJson(value: unknown): string {
 export function englishPropertyLabel(key: string, fallback?: string | null): string {
   const mapped = NATIVE_PROPERTY_LABELS[key];
   if (mapped) return mapped;
+  if (getLanguage() === "zh-CN" && fallback) return fallback;
   return fallback && !hasCjk(fallback) ? fallback : unicodeDisplayText(key);
 }
 
@@ -144,6 +145,7 @@ export function englishPropertyLabel(key: string, fallback?: string | null): str
 export function englishOptionLabel(key: string, value: number | string, fallback: string | undefined): string {
   const mapped = NATIVE_ENUM_LABELS[key]?.[String(value)];
   if (mapped) return mapped;
+  if (getLanguage() === "zh-CN" && fallback) return fallback;
   return fallback && !hasCjk(fallback) ? fallback : `Native value ${unicodeDisplayText(String(value))}`;
 }
 
@@ -256,6 +258,7 @@ export function englishReason(message: string | null | undefined): string {
  *  This affects presentation only; snapshots, command values and exports stay raw. */
 export function englishDisplayText(message: string | null | undefined): string {
   if (!message) return "";
+  if (getLanguage() === "zh-CN") return message;
   if (!hasCjk(message)) return message;
   const mapped = englishReason(message);
   return mapped === UNMAPPED_ENGINE_REASON

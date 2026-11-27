@@ -23,6 +23,7 @@ flowchart LR
   extensions["Sites-compatible static preview worker"]
   documentation["Architecture, guides, and evidence"]
   release_artifacts["Windows installer release tooling"]
+  platform -->|interface-language-ipc| desktop_shell
   device_turntable -->|candidate-serial-contract| turntable_firmware
   developer_preview -->|offline-motion-semantics| turntable_firmware
   release_artifacts -->|release-pipeline| build_tooling
@@ -75,6 +76,7 @@ flowchart LR
 
 | Consumer | Provider | Type | Strength | Reason |
 |---|---|---|---|---|
+| `platform` | `desktop-shell` | interface-language-ipc | strong | set_interface_language accepts only en/zh-CN for native dialog copy; the window brand remains Micro-CT Workstation in either locale. The remembered frontend preference defaults to English; this presentation-only IPC never enters the engine or changes device/data state. |
 | `device-turntable` | `turntable-firmware` | candidate-serial-contract | strong | The prescribed-direction planner and Nano protocol share the recovered source candidate's pulse scale, capture hold IDs and HOME exceptions; hardware flash consistency remains a separate acceptance gate. |
 | `developer-preview` | `turntable-firmware` | offline-motion-semantics | strong | Preview preserves negative ordinary moves, bounded HOME exceptions and confirmed capture hold semantics from the candidate without representing hardware evidence. |
 | `release-artifacts` | `build-tooling` | release-pipeline | strong | installer:build compiles current theme assets and packages the desktop app, license texts and verified adjacent engine in the sole latest Windows MSI; build metadata stays in the local evidence cache. |

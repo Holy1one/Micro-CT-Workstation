@@ -1,14 +1,15 @@
+import { localize } from "./i18n";
 /** Only the central content layer is covered. The device state and Stop dock remain outside it. */
 import { englishDisplayText, englishOptionLabel } from "./engine/native-labels";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CameraHealth, CameraProperties, EngineCommand, EngineSnapshot, IndependentCapturedImage } from "./engine/types";
-import { cameraControlReason, cameraPropertyReason, cameraPropertyValueLabel } from "./engine/deviceControls";
+import { cameraControlReason, cameraParameterReadout, cameraPropertyReason } from "./engine/deviceControls";
 import { cameraLiveViewFrame, validateLiveFrame } from "./platform/cameraControls";
 import { cameraCapturePreview, capturePreviewDataUrl } from "./platform/cameraCaptures";
 import { MemoryLiveViewFeed, liveViewDataUrl, type LiveViewImage } from "./platform/cameraLiveView";
 export type WorkstationMediaMode = "equipment" | "reconstruction" | "photo" | "live";
 /** Drafts for these two controls expire with their preview session; camera truth remains in the engine. */
-function LiveCameraControls({ camera, reason, readReason, run }: { camera: CameraHealth | null; reason: string | null; readReason: string | null; run?: (command: EngineCommand) => Promise<EngineSnapshot> }) {
+function LiveCameraControls({ camera, stale, reason, readReason, run }: { camera: CameraHealth | null; stale: boolean; reason: string | null; readReason: string | null; run?: (command: EngineCommand) => Promise<EngineSnapshot> }) {
   const session = camera?.liveView.sessionId;
   const controls = camera?.liveViewControls;
   const current = useRef(session); current.current = session;
@@ -18,7 +19,7 @@ function LiveCameraControls({ camera, reason, readReason, run }: { camera: Camer
   const [error, setError] = useState<string | null>(null);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => { setDraft({}); setPending(false); setError(null); }, [session]);
-  const unavailable = reason || cameraControlReason(camera) || (pending ? "Live View operation pending" : null)
+  const unavailable = (stale ? "Control service unavailable · device evidence unknown" : null) || reason || cameraControlReason(camera) || (pending ? "Live View operation pending" : null)
     || (!run ? "Camera controls unavailable" : null)
     || (!session || !camera?.liveView.active || controls?.sessionId !== session ? "Read the current Live View controls" : null);
   const changes = Object.fromEntries(Object.entries(draft).filter(([key, value]) => controls?.properties[key]?.actual !== value));
@@ -37,20 +38,22 @@ function LiveCameraControls({ camera, reason, readReason, run }: { camera: Camer
     } catch (failure) { if (mounted.current && current.current === expected) setError(String(failure)); }
     finally { if (mounted.current && current.current === expected) setPending(false); }
   };
-  return <div className="workstation-camera-controls" aria-label="Camera Live View controls">
+  return <div className="workstation-camera-controls" aria-label={localize("Camera Live View controls")}>
     {[["cameraZoom", "Camera zoom"], ["focusMode", "Live focus"]].map(([key, label]) => {
       const property = controls?.sessionId === session ? controls?.properties[key] : undefined;
       const disabled = unavailable || cameraPropertyReason(property);
-      return <label key={key} title={englishDisplayText(disabled || property?.label)}><span>{label}</span><select aria-label={label} disabled={Boolean(disabled)} value={JSON.stringify(draft[key] ?? property?.actual ?? "")} onChange={event => setDraft(previous => ({...previous,[key]:JSON.parse(event.target.value)}))}>
-        <option value={JSON.stringify("")} disabled>UNKNOWN</option>{property?.options.map(option => <option key={JSON.stringify(option.value)} value={JSON.stringify(option.value)} disabled={!option.supported || !option.enabled} title={englishDisplayText(option.reason) || undefined}>{englishOptionLabel(key, option.value, option.label)}</option>)}
-      </select><small>Actual: {property?.confirmed && !property.error ? cameraPropertyValueLabel(property,property.actual) : "UNKNOWN"}</small></label>;
+      const actual = cameraParameterReadout(property, stale);
+      const value = stale ? "" : draft[key] ?? (actual === "–" ? "" : property?.actual);
+      return <label key={key} title={localize(englishDisplayText(disabled || property?.label))}><span>{localize(label)}</span><select className={value === "" ? "is-unknown" : undefined} aria-label={localize(`${label}${value === "" ? " · Unknown" : ""}`)} disabled={Boolean(disabled)} value={JSON.stringify(value)} onChange={event => setDraft(previous => ({...previous,[key]:JSON.parse(event.target.value)}))}>
+        <option value={JSON.stringify("")} disabled>–</option>{localize(property?.options.map(option => <option key={JSON.stringify(option.value)} value={JSON.stringify(option.value)} disabled={!option.supported || !option.enabled} title={localize(englishDisplayText(option.reason) || undefined)}>{localize(englishOptionLabel(key, option.value, option.label))}</option>))}
+      </select><small title={localize(actual === "–" ? "Unknown; no current confirmed readback" : actual)}>{localize("Actual: ")}<span className="readout-value">{localize(actual)}</span></small></label>;
     })}
-    <button disabled={Boolean(readReason || pending || cameraControlReason(camera)) || !run || !session || !camera?.liveView.active} onClick={() => void act({type:"camera_live_view_read",sessionId:session!})}>Read controls</button>
-    <button disabled={Boolean(unavailable) || invalid || !Object.keys(changes).length} onClick={() => void act({type:"camera_live_view_configure",sessionId:session!,controls:changes})}>Apply controls</button>
-    {error && <p role="status" className="workstation-camera-control-error">{englishDisplayText(error)}</p>}
+    <button disabled={stale || Boolean(readReason || pending || cameraControlReason(camera)) || !run || !session || !camera?.liveView.active} onClick={() => void act({type:"camera_live_view_read",sessionId:session!})}>{localize("Read controls")}</button>
+    <button disabled={Boolean(unavailable) || invalid || !Object.keys(changes).length} onClick={() => void act({type:"camera_live_view_configure",sessionId:session!,controls:changes})}>{localize("Apply controls")}</button>
+    {error && <p role="status" className="workstation-camera-control-error">{localize(englishDisplayText(error))}</p>}
   </div>;
 }
-export function WorkstationMedia({ mode, camera, photo, requestRevision, onClose, run, controlReason = null, readReason = controlReason, liveBlockedReason = null }: { mode: WorkstationMediaMode; camera: CameraHealth | null; photo: IndependentCapturedImage | null; requestRevision: number; onClose: () => void; run?: (command: EngineCommand) => Promise<EngineSnapshot>; controlReason?: string | null; readReason?: string | null; liveBlockedReason?: string | null }) {
+export function WorkstationMedia({ mode, camera, stale = false, photo, requestRevision, onClose, run, controlReason = null, readReason = controlReason, liveBlockedReason = null }: { mode: WorkstationMediaMode; camera: CameraHealth | null; stale?: boolean; photo: IndependentCapturedImage | null; requestRevision: number; onClose: () => void; run?: (command: EngineCommand) => Promise<EngineSnapshot>; controlReason?: string | null; readReason?: string | null; liveBlockedReason?: string | null }) {
   const [live, setLive] = useState<LiveViewImage | null>(null);
   const [still, setStill] = useState<{ id: string; url: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -86,5 +89,5 @@ export function WorkstationMedia({ mode, camera, photo, requestRevision, onClose
   const url = mode === "photo" ? still?.id === photo?.captureId ? still?.url : null : live?.url;
   const fresh = mode === "live" && live && camera?.liveView.fresh && !error && now - live.receivedAt <= 1000;
   const blocked = mode === "live" ? liveBlockedReason : null;
-  return <div className={`workstation-media-layer ${grid ? "has-grid" : ""} ${crosshair ? "has-crosshair" : ""}`}><div className="workstation-media-toolbar"><strong>{mode === "photo" ? "Independent photo" : blocked ? "LIVE VIEW UNAVAILABLE" : fresh ? "LIVE" : "STALE · waiting for current frame"}</strong><button onClick={() => setZoom(1)}>Fit</button><select aria-label="Image display zoom" value={zoom} onChange={event => setZoom(Number(event.target.value))}>{[1, 1.5, 2, 3, 4].map(value => <option key={value} value={value}>{value}×</option>)}</select><label><input type="checkbox" checked={grid} onChange={event => setGrid(event.target.checked)} /> Grid</label><label><input type="checkbox" checked={crosshair} onChange={event => setCrosshair(event.target.checked)} /> Crosshair</label><button onClick={onClose}>{mode === "live" ? "Stop preview / Equipment" : "Close / Equipment"}</button></div>{mode === "live" && <LiveCameraControls camera={camera} reason={controlReason} readReason={readReason} run={run} />}<div className="workstation-media-image">{url ? <img src={url} alt={mode === "photo" ? "Confirmed independent camera photo" : fresh ? "Current camera Live View" : "Last camera frame · stale"} style={{ transform: `scale(${zoom})` }} /> : <span role="status">{englishDisplayText(blocked || error || "Waiting for verified image")}</span>}</div>{error && url && <p role="status" className="workstation-media-error">{englishDisplayText(error)}</p>}</div>;
+  return <div className={`workstation-media-layer ${grid ? "has-grid" : ""} ${crosshair ? "has-crosshair" : ""}`}><div className="workstation-media-toolbar"><strong>{localize(mode === "photo" ? "Independent photo" : blocked ? "LIVE VIEW UNAVAILABLE" : fresh ? "LIVE" : "STALE · waiting for current frame")}</strong><button onClick={() => setZoom(1)}>{localize("Fit")}</button><select aria-label={localize("Image display zoom")} value={zoom} onChange={event => setZoom(Number(event.target.value))}>{[1, 1.5, 2, 3, 4].map(value => <option key={value} value={value}>{localize(value)}×</option>)}</select><label><input type="checkbox" checked={grid} onChange={event => setGrid(event.target.checked)} />{localize(" Grid")}</label><label><input type="checkbox" checked={crosshair} onChange={event => setCrosshair(event.target.checked)} />{localize(" Crosshair")}</label><button onClick={onClose}>{localize(mode === "live" ? "Stop preview / Equipment" : "Close / Equipment")}</button></div>{mode === "live" && <LiveCameraControls camera={camera} stale={stale} reason={controlReason} readReason={readReason} run={run} />}<div className="workstation-media-image">{url ? <img src={url} alt={localize(mode === "photo" ? "Confirmed independent camera photo" : fresh ? "Current camera Live View" : "Last camera frame · stale")} style={{ transform: `scale(${zoom})` }} /> : <span role="status">{localize(englishDisplayText(blocked || error || "Waiting for verified image"))}</span>}</div>{error && url && <p role="status" className="workstation-media-error">{localize(englishDisplayText(error))}</p>}</div>;
 }

@@ -6,6 +6,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { localize } from "../i18n";
 
 /** Returns whether the page is running inside the Tauri desktop shell. */
 export function isDesktopRuntime(): boolean {
@@ -33,7 +34,7 @@ export async function chooseImageDirectory(currentPath: string): Promise<string 
     directory: true,
     multiple: false,
     defaultPath: currentPath.trim() || undefined,
-    title: "Select projection image directory",
+    title: localize("Select projection image directory"),
   });
   return typeof selection === "string" ? selection : null;
 }
@@ -45,7 +46,7 @@ export async function chooseScanProjectDirectory(currentPath: string): Promise<s
     directory: true,
     multiple: false,
     defaultPath: currentPath.trim() || undefined,
-    title: "Open Scan Project · select the folder containing manifest.json",
+    title: localize("Open Scan Project · select the folder containing manifest.json"),
   });
   return typeof selection === "string" ? selection : null;
 }
@@ -53,7 +54,7 @@ export async function chooseScanProjectDirectory(currentPath: string): Promise<s
 /** Selects measured detector/material calibration; the engine validates its contents. */
 export async function chooseMaterialCalibration(): Promise<string | null> {
   if (!isDesktopRuntime()) throw new Error("Material calibration requires the desktop application");
-  const selection=await open({multiple:false,title:"Select measured material calibration",filters:[{name:"Calibration JSON",extensions:["json"]}]});
+  const selection=await open({multiple:false,title:localize("Select measured material calibration"),filters:[{name:localize("Calibration JSON"),extensions:["json"]}]});
   return typeof selection === "string" ? selection : null;
 }
 
@@ -75,8 +76,8 @@ export async function exportSessionLog(suggestedName: string, contents: string):
   }
   const target = await save({
     defaultPath: suggestedName,
-    title: "Export session log",
-    filters: [{ name: "Session log", extensions: ["log", "txt"] }],
+    title: localize("Export session log"),
+    filters: [{ name: localize("Session log"), extensions: ["log", "txt"] }],
   });
   if (typeof target !== "string" || target.trim() === "") return null;
   return invoke<string>("export_session_log", { path: target, contents });

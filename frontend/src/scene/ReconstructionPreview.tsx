@@ -1,3 +1,4 @@
+import { localize } from "../i18n";
 /** Read-only views of a validated reconstruction preview volume. */
 import { englishDisplayText } from "../engine/native-labels";
 import { useEffect, useRef, useState } from "react";
@@ -70,8 +71,8 @@ function Slice({ volume, axis, position, onPosition }: {
   const title = axis === "z" ? "XY · AXIAL" : axis === "y" ? "XZ · CORONAL" : "YZ · SAGITTAL";
   const marker = axis.toUpperCase();
   const spacing = volume.spacingMm[axis === "z" ? 0 : axis === "y" ? 1 : 2];
-  return <section className="recon-pane recon-pane--slice" aria-label={`${title} slice`}>
-    <div className="recon-pane__head"><strong>{title}</strong><span>{marker} {((index - (count - 1) / 2) * spacing).toFixed(2)} mm</span></div>
+  return <section className="recon-pane recon-pane--slice" aria-label={localize(`${title} slice`)}>
+    <div className="recon-pane__head"><strong>{localize(title)}</strong><span>{localize(marker)} {localize(((index - (count - 1) / 2) * spacing).toFixed(2))}{localize(" mm")}</span></div>
     <div className="recon-slice-stage" onPointerDown={(event) => {
       const rect = event.currentTarget.getBoundingClientRect();
       const displayScale = Math.min(rect.width / width, rect.height / height);
@@ -84,13 +85,13 @@ function Slice({ volume, axis, position, onPosition }: {
       if (axis === "y") onPosition("z", zSize - 1 - Math.floor(v * zSize));
       if (axis === "x") { onPosition("y", ySize - 1 - Math.floor(u * ySize)); onPosition("z", zSize - 1 - Math.floor(v * zSize)); }
     }}>
-      <canvas ref={canvas} width={width} height={height} aria-label={`${title} reconstructed data`} />
-      <span className="recon-axis recon-axis--top">+{axis === "z" ? "Y" : "Z"}</span>
-      <span className="recon-axis recon-axis--right">+{axis === "x" ? "Y" : "X"}</span>
-      <span className="recon-axis recon-axis--bottom">−{axis === "z" ? "Y" : "Z"}</span>
-      <span className="recon-axis recon-axis--left">−{axis === "x" ? "Y" : "X"}</span>
+      <canvas ref={canvas} width={width} height={height} aria-label={localize(`${title} reconstructed data`)} />
+      <span className="recon-axis recon-axis--top">+{localize(axis === "z" ? "Y" : "Z")}</span>
+      <span className="recon-axis recon-axis--right">+{localize(axis === "x" ? "Y" : "X")}</span>
+      <span className="recon-axis recon-axis--bottom">−{localize(axis === "z" ? "Y" : "Z")}</span>
+      <span className="recon-axis recon-axis--left">−{localize(axis === "x" ? "Y" : "X")}</span>
     </div>
-    <input type="range" min={0} max={Math.max(0, count - 1)} value={index} aria-label={`${marker} slice position`} onChange={(event) => onPosition(axis, Number(event.target.value))} />
+    <input type="range" min={0} max={Math.max(0, count - 1)} value={index} aria-label={localize(`${marker} slice position`)} onChange={(event) => onPosition(axis, Number(event.target.value))} />
   </section>;
 }
 
@@ -227,18 +228,18 @@ function VolumeView({ volume, mode, resetRevision, onVolumeAvailable }: { volume
       if (program) gl.deleteProgram(program);
     }
   }, [volume, onVolumeAvailable]);
-  return <section className="recon-pane recon-pane--volume" aria-label="Interactive 3D reconstruction">
-    <div className="recon-pane__head"><strong>3D · {mode === "mip" ? "MIP" : "Opacity"}</strong><span>{angle}</span></div>
+  return <section className="recon-pane recon-pane--volume" aria-label={localize("Interactive 3D reconstruction")}>
+    <div className="recon-pane__head"><strong>{localize("3D · ")}{localize(mode === "mip" ? "MIP" : "Opacity")}</strong><span>{localize(angle)}</span></div>
     <div className="recon-volume-stage">
-      <canvas ref={canvas} aria-label="Drag to rotate reconstructed volume" onPointerDown={(event) => { pose.current.dragging = true; pose.current.x = event.clientX; pose.current.y = event.clientY; event.currentTarget.setPointerCapture(event.pointerId); }} onPointerMove={(event) => {
+      <canvas ref={canvas} aria-label={localize("Drag to rotate reconstructed volume")} onPointerDown={(event) => { pose.current.dragging = true; pose.current.x = event.clientX; pose.current.y = event.clientY; event.currentTarget.setPointerCapture(event.pointerId); }} onPointerMove={(event) => {
         if (!pose.current.dragging) return;
         pose.current.yaw += (event.clientX - pose.current.x) * .008;
         pose.current.pitch = Math.max(-1.48, Math.min(1.48, pose.current.pitch + (event.clientY - pose.current.y) * .008));
         pose.current.x = event.clientX; pose.current.y = event.clientY; renderer.current?.();
       }} onPointerUp={() => { pose.current.dragging = false; }} onPointerCancel={() => { pose.current.dragging = false; }} onWheel={(event) => { event.preventDefault(); pose.current.span = Math.max(.55, Math.min(2.7, pose.current.span * Math.exp(event.deltaY * .001))); renderer.current?.(); }} onDoubleClick={() => { pose.current.yaw = .55; pose.current.pitch = .35; pose.current.span = 1.15; renderer.current?.(); }} />
-      {error && <div className="recon-volume-error" role="status">{englishDisplayText(error)}</div>}
+      {error && <div className="recon-volume-error" role="status">{localize(englishDisplayText(error))}</div>}
     </div>
-    <div className="recon-volume-tools"><span title="Entire reconstructed volume is shown; no coverage-mask clipping. Low-signal, low-gain and partially covered regions may contain artifacts and are not quantitative. Signed values and coverage diagnostics are saved separately.">{volume.colors ? `${volume.colorLegend?.map(englishDisplayText).join(" / ")} · ${volume.materialLabels ? "CALIBRATED BASIS" : "MATERIALS UNVERIFIED"}` : `WINDOW ${volume.windowMin.toFixed(2)}–${volume.windowMax.toFixed(2)} · NOT HU · FULL VOLUME`}</span></div>
+    <div className="recon-volume-tools"><span title={localize("Entire reconstructed volume is shown; no coverage-mask clipping. Low-signal, low-gain and partially covered regions may contain artifacts and are not quantitative. Signed values and coverage diagnostics are saved separately.")}>{localize(volume.colors ? `${volume.colorLegend?.map(englishDisplayText).join(" / ")} · ${volume.materialLabels ? "CALIBRATED BASIS" : "MATERIALS UNVERIFIED"}` : `WINDOW ${volume.windowMin.toFixed(2)}–${volume.windowMax.toFixed(2)} · NOT HU · FULL VOLUME`)}</span></div>
   </section>;
 }
 
