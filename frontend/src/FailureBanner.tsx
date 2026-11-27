@@ -30,26 +30,34 @@ export function FailureBanner({ report, onDismiss, onTroubleshooting, onDiagnost
     if (report.key !== lastKey.current) { lastKey.current = report.key; setOpen(true); }
   }, [report?.key]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!report || !open) return null;
+  const scanPreparation = report.code === "INVALID_SCAN_PREPARATION";
+  const displayedStage = scanPreparation && report.stage === `engine_command ? ${report.code}` ? "engine_command" : report.stage;
   const persistent = report.kind === "cleanup_unconfirmed" || report.kind === "transport";
   return createPortal(
     <div className="failure-layer" style={topOffset === undefined ? undefined : { paddingTop: `${topOffset}px` }}>
       <section className={`failure-card failure-card--${report.kind}`} role="alert" aria-live="assertive">
         <header className="failure-card__head">
           <LineIcon name="warning" size={14} />
-          <h2>{localize(report.title)}</h2>
-          <span className="failure-card__stage">{localize(report.stage)}</span>
+          <h2>{localize(scanPreparation ? "Scan preparation was refused" : report.title)}</h2>
+          <span className="failure-card__stage">{localize(displayedStage)}</span>
           <button type="button" className="failure-card__dismiss"
             title={localize(persistent ? "Hides this notice. Cleanup is still unconfirmed; no lock is cleared." : "Hide this notice")}
             onClick={() => { setOpen(false); onDismiss(report.key); }}>
             {localize(persistent ? "Hide · still unconfirmed" : "Dismiss")} ×
           </button>
         </header>
-        <p className="failure-card__reason">{localize(report.displayReason || report.reason)}</p>
-        <dl className="failure-card__facts">
-          <div><dt>{localize("Failed at")}</dt><dd>{localize(report.stage)}</dd></div>
-          <div><dt>{localize("Engine code")}</dt><dd>{localize(report.code ?? "no code in this message")}</dd></div>
-          <div><dt>{localize("Next action")}</dt><dd>{localize(report.nextAction)}</dd></div>
-        </dl>
+        {scanPreparation ? <>
+          <p className="failure-card__reason">{localize("The prepare payload did not match the required structure.")}</p>
+          <p className="failure-card__guidance">{localize("Close and reopen Scan Preparation so the draft is rebuilt from the current contract.")}</p>
+          <details className="failure-card__technical"><summary>{localize("Technical details")}</summary><div>{localize("Engine code")}: {report.code}</div></details>
+        </> : <>
+          <p className="failure-card__reason">{localize(report.displayReason || report.reason)}</p>
+          <dl className="failure-card__facts">
+            <div><dt>{localize("Failed at")}</dt><dd>{localize(report.stage)}</dd></div>
+            <div><dt>{localize("Engine code")}</dt><dd>{localize(report.code ?? "no code in this message")}</dd></div>
+            <div><dt>{localize("Next action")}</dt><dd>{localize(report.nextAction)}</dd></div>
+          </dl>
+        </>}
         <div className="failure-card__actions">
           <button type="button" onClick={() => onTroubleshooting(report.group)}>{localize("Open Troubleshooting…")}</button>
           <button type="button" onClick={onDiagnostics}>{localize("View diagnostics")}</button>

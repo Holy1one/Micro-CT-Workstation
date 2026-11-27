@@ -1989,3 +1989,14 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
   }
   .camera-advanced__tab.is-active .camera-advanced__count { color: inherit; }
 }
+
+/* Bench safety and scan-preparation refusal hierarchy. */
+.bench-warning { display: flex; flex-direction: column; gap: 6px; padding: 12px; border-left: 3px solid var(--warn); background: color-mix(in srgb, var(--warnSoft) 70%, var(--panel)); color: var(--textPrimary); }
+.bench-warning strong { font-size: var(--fontSizeBody); font-weight: var(--fontWeightStrong); }
+.bench-warning p { margin: 0; font-size: var(--fontSizeLabel); font-weight: var(--fontWeightRegular); line-height: 1.45; }
+.workstation-dialog .device-console-section .recovery-confirm { font-size: var(--fontSizeLabel); font-weight: var(--fontWeightMedium); line-height: 1.45; }
+.bench-reasons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 6px; }
+.bench-reasons p { margin: 0; font-size: var(--fontSizeHint); font-weight: var(--fontWeightRegular); line-height: 1.45; color: var(--textSecondary); }
+.device-actions button.bench-enable:not(:disabled) { color: var(--warnText); border-color: var(--warn); }
+.failure-card__guidance { margin: 0; font-size: var(--fontSizeLabel); font-weight: var(--fontWeightMedium); line-height: 1.45; }
+.failure-card__technical { font-size: var(--fontSizeHint); font-weight: var(--fontWeightRegular); color: var(--textSecondary); }
