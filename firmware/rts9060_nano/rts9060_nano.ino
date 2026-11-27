@@ -59,13 +59,13 @@ constexpr bool BUZZER_INSTALLED = true;   // 面包板(模块)与 V2 PCB(板载 
 // 蜂鸣器有效电平（以 kernal 原理图为准，换板只改这一处）：
 //   V1 面包板：J5/J_BUZZ 直连 MH-FMD 有源蜂鸣器模块，低电平触发 → 响=LOW
 //   V2 PCB   ：D8→R9(1k)→Q3(SS8050 低边)+R10(10k) 下拉      → 响=HIGH（把下面改成 true）
-constexpr bool BUZZER_ACTIVE_HIGH = false;
+constexpr bool BUZZER_ACTIVE_HIGH = true;   // V2 PCB：D8 高=响；V1 面包板需改回 false
 constexpr uint8_t BUZZER_ON_LEVEL  = BUZZER_ACTIVE_HIGH ? HIGH : LOW;
 constexpr uint8_t BUZZER_OFF_LEVEL = BUZZER_ACTIVE_HIGH ? LOW  : HIGH;
 constexpr uint8_t PROTOCOL_VERSION = 2;
 #define DEVICE_TYPE_TEXT "RTS9060_NANO"
 #define FIRMWARE_VERSION_TEXT "2.3.0"
-#define FIRMWARE_BUILD_TEXT "20261011"
+#define FIRMWARE_BUILD_TEXT "20261127"
 constexpr uint32_t XRAY_WARNING_PERIOD_MS = 1000;
 constexpr uint32_t XRAY_WARNING_ON_MS = 500;
 constexpr uint8_t STEP_IDLE = LOW;
