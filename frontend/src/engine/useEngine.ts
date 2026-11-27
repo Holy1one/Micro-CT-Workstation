@@ -103,7 +103,6 @@ function parseSnapshot(snapshot: unknown): ParsedDeviceSessionSnapshot | null {
 
   const startupLogs = logs.filter((entry) => entry.message.trim() === ENGINE_STARTUP_MESSAGE);
   if (startupLogs.length > 1 || startupLogs.some((entry) => entry.id.length === 0)) return null;
-  const startupLog = startupLogs[0];
   const sequences = logs
     .map((entry) => /^(\d+)-/.exec(entry.id))
     .filter((match): match is RegExpExecArray => match !== null)
@@ -121,7 +120,7 @@ function parseSnapshot(snapshot: unknown): ParsedDeviceSessionSnapshot | null {
     xrayState,
     xrayConnected: snapshot.workstation.xray.connected,
     logs,
-    engineSessionId: typeof snapshot.engineSessionId === "string" && snapshot.engineSessionId.length > 0 ? snapshot.engineSessionId : startupLog?.id ?? null,
+    engineSessionId: typeof snapshot.engineSessionId === "string" && snapshot.engineSessionId.length > 0 ? snapshot.engineSessionId : null,
     maxLogSequence: sequences.length ? Math.max(...sequences) : null,
   };
 }
@@ -249,72 +248,45 @@ function parseStoredEvidence(value: string | null): StoredDeviceSessionEvidence 
   }
 }
 
-/**
- * Tracks per-device connection observations without relying on retained log
- * history. A changed startup-log ID identifies a new engine process. If the
- * startup line has been evicted, a positive stored record remains monotonic;
- * a stored negative is never reused without seeing that startup line again.
- */
+/** Tracks positive observations for the current engine session, including when storage fails. */
 export class DeviceSessionEvidenceTracker {
   private value: DeviceSessionEverEstablished = "unknown";
-  private storageUnavailable: boolean;
+  private currentSessionId: string | null = null;
+  private observed: DeviceEvidence = emptyDeviceEvidence();
 
-  constructor(private readonly storage: DeviceSessionStorage | null = browserSessionStorage()) {
-    this.storageUnavailable = storage === null;
-  }
+  constructor(private readonly storage: DeviceSessionStorage | null = browserSessionStorage()) {}
 
   hasEverEstablished(): DeviceSessionEverEstablished {
-    if (this.storageUnavailable || !this.storage || this.value === "unknown") return "unknown";
-    try {
-      const stored = parseStoredEvidence(this.storage.getItem(DEVICE_SESSION_STORAGE_KEY));
-      return stored === null || stored === "invalid" ? "unknown" : this.value;
-    } catch {
-      this.storageUnavailable = true;
-      return "unknown";
-    }
+    return this.value;
   }
 
   observeSnapshot(snapshotValue: unknown, successfulCommand?: EngineCommand): DeviceSessionEverEstablished {
-    if (this.storageUnavailable || !this.storage) return (this.value = "unknown");
     const snapshot = parseSnapshot(snapshotValue);
-    if (!snapshot) return (this.value = "unknown");
+    if (!snapshot || snapshot.engineSessionId === null) return (this.value = "unknown");
 
+    if (this.currentSessionId !== snapshot.engineSessionId) {
+      this.currentSessionId = snapshot.engineSessionId;
+      this.observed = emptyDeviceEvidence();
+    }
     const currentEvidence = snapshotDeviceEvidence(snapshot);
     if (!currentEvidence) return (this.value = "unknown");
     const commandEvidence = commandDeviceEvidence(successfulCommand, snapshot, currentEvidence);
     if (!commandEvidence) return (this.value = "unknown");
     const logEvidence = deviceLogEvidence(snapshot.logs);
 
-    let stored: StoredDeviceSessionEvidence | null | "invalid";
+    let stored: StoredDeviceSessionEvidence | null | "invalid" = null;
     try {
-      stored = parseStoredEvidence(this.storage.getItem(DEVICE_SESSION_STORAGE_KEY));
+      stored = parseStoredEvidence(this.storage?.getItem(DEVICE_SESSION_STORAGE_KEY) ?? null);
     } catch {
-      this.storageUnavailable = true;
-      return (this.value = "unknown");
+      // The snapshot and in-memory observations remain authoritative for this renderer.
     }
-    if (stored === "invalid") return (this.value = "unknown");
-
-    const newEngineSession = snapshot.engineSessionId !== null
-      && stored !== null
-      && stored.engineSessionId !== snapshot.engineSessionId;
-    const retainedStartupContradictsStoredPositive = snapshot.engineSessionId !== null
-      && stored !== null
-      && stored.engineSessionId === snapshot.engineSessionId
-      && anyDeviceEvidence(stored.devices)
-      && !logEvidence.anyConnectionEvidence
-      && !anyDeviceEvidence(currentEvidence)
-      && !anyDeviceEvidence(commandEvidence);
-    if (retainedStartupContradictsStoredPositive) return (this.value = "unknown");
-
-    const base = newEngineSession || stored === null ? emptyDeviceEvidence() : { ...stored.devices };
-
-    if (stored !== null && snapshot.engineSessionId === null
-        && snapshot.maxLogSequence !== null && stored.lastLogSequence !== null
-        && snapshot.maxLogSequence < stored.lastLogSequence) {
-      // A sequence rollback without the startup marker suggests an engine
-      // restart, but cannot license `false`: the startup evidence is absent.
-      return (this.value = "unknown");
-    }
+    const matching = stored !== null && stored !== "invalid" && stored.engineSessionId === snapshot.engineSessionId
+      ? stored : null;
+    const base: DeviceEvidence = {
+      nano: this.observed.nano || (matching?.devices.nano ?? false),
+      camera: this.observed.camera || (matching?.devices.camera ?? false),
+      xray: this.observed.xray || (matching?.devices.xray ?? false),
+    };
 
     const devices: DeviceEvidence = {
       nano: base.nano || currentEvidence.nano || logEvidence.devices.nano || commandEvidence.nano,
@@ -337,21 +309,21 @@ export class DeviceSessionEvidenceTracker {
     if (!anyDeviceEvidence(devices) && !cleanStartup) return (this.value = "unknown");
     if (!anyDeviceEvidence(devices) && logEvidence.anyConnectionEvidence) return (this.value = "unknown");
 
-    const previousLogSequence = newEngineSession ? null : stored?.lastLogSequence ?? null;
+    this.observed = devices;
+    const previousLogSequence = matching?.lastLogSequence ?? null;
     const maxLogSequence = snapshot.maxLogSequence === null
       ? previousLogSequence
       : Math.max(snapshot.maxLogSequence, previousLogSequence ?? snapshot.maxLogSequence);
     const next: StoredDeviceSessionEvidence = {
       version: 1,
-      engineSessionId: snapshot.engineSessionId ?? stored?.engineSessionId ?? null,
+      engineSessionId: snapshot.engineSessionId,
       devices,
       lastLogSequence: maxLogSequence,
     };
     try {
-      this.storage.setItem(DEVICE_SESSION_STORAGE_KEY, JSON.stringify(next));
+      this.storage?.setItem(DEVICE_SESSION_STORAGE_KEY, JSON.stringify(next));
     } catch {
-      this.storageUnavailable = true;
-      return (this.value = "unknown");
+      // Keep the in-memory evidence even when persistence is unavailable.
     }
 
     return (this.value = anyDeviceEvidence(devices) ? true : false);
