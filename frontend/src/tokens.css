@@ -1,4 +1,8 @@
 /*
+ * 视觉规范：docs/architecture/frontend-visual-hierarchy.md
+ * 颜色/时长一律走令牌，禁止在 styles.css 写十六进制或毫秒字面量。
+ */
+/*
  * Design-token source of truth for the workstation UI and Three.js theme.
  * Components consume semantic variables from this file instead of hard-coded
  * colors. Theme and safety-state selectors override values in one place.
