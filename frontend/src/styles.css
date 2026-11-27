@@ -46,11 +46,11 @@ h2, h3 { color: var(--textHeading); }
 button:where(:not(.dock-key):not([role=tab]):not([role=menuitem]):not(.trouble-pane__tab)) {
   border: 1px solid var(--line);
   box-shadow: none;
-  transition: background-color var(--durFast) var(--easeOut), border-color var(--durFast) var(--easeOut), box-shadow var(--durFast) var(--easeOut), transform var(--durFast) var(--easeSpring), opacity var(--durFast) var(--easeOut);
+  transition: background-color var(--motionControl) var(--easeControl), border-color var(--motionControl) var(--easeControl), box-shadow var(--motionControl) var(--easeControl), transform var(--motionControl) var(--easeSpring), opacity var(--motionControl) var(--easeControl);
 }
 button:where(:not(.dock-key):not([role=tab]):not([role=menuitem]):not(.trouble-pane__tab)):hover:not(:disabled) { border-color: var(--lineField); }
-button:where(:not(.dock-key):not([role=tab]):not([role=menuitem]):not(.trouble-pane__tab)):active:not(:disabled) { transform: scale(0.98); box-shadow: inset 0 1px 2px color-mix(in srgb, var(--textPrimary) 10%, transparent); }
-button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:where(:not(.dock-key):not([role=tab]):not([role=menuitem]):not(.trouble-pane__tab)):active:not(:disabled) { background-image: linear-gradient(var(--pressedOverlay), var(--pressedOverlay)); }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible, a[href]:focus-visible, [tabindex]:not([tabindex="-1"]):focus-visible { outline: 2px solid var(--focusRing); outline-offset: 2px; }
 button:disabled { cursor: not-allowed; box-shadow: none; }
 button[aria-busy="true"] { cursor: progress; }
 
@@ -644,7 +644,7 @@ i.tone-danger { background: var(--danger); }
   box-shadow: none;
   color: var(--islandText);
   cursor: pointer;
-  transition: background-color 180ms ease-out, color 180ms ease-out, border-color 180ms ease-out, box-shadow 180ms ease-out, transform 180ms ease-out;
+  transition: background-color var(--durFeedback) var(--easeControl), color var(--durFeedback) var(--easeControl), border-color var(--durFeedback) var(--easeControl), box-shadow var(--durFeedback) var(--easeControl), transform var(--durFeedback) var(--easeControl);
 }
 .control-dock.is-collapsed .dock-capsule {
   width: max-content;
@@ -673,7 +673,7 @@ i.tone-danger { background: var(--danger); }
 .dock-ring { position: relative; display: block; flex: 0 0 36px; width: 36px; height: 36px; color: var(--islandText); }
 .dock-ring__svg { display: block; width: 36px; height: 36px; }
 .dock-ring__track { stroke: var(--islandTrack); }
-.dock-ring__value { stroke: var(--danger); transition: stroke-dashoffset 150ms linear; }
+.dock-ring__value { stroke: var(--danger); transition: stroke-dashoffset var(--durProgressFollow) linear; }
 .dock-ring__text {
   position: absolute;
   inset: 0;
@@ -719,7 +719,7 @@ i.tone-danger { background: var(--danger); }
   border-right: 1.5px solid var(--islandTextMuted);
   border-bottom: 1.5px solid var(--islandTextMuted);
   transform: rotate(-45deg);
-  transition: transform 180ms ease-out;
+  transition: transform var(--durFeedback) var(--easeControl);
 }
 .control-dock.is-expanded .dock-capsule__chevron { transform: rotate(45deg); }
 
@@ -1116,7 +1116,7 @@ i.tone-danger { background: var(--danger); }
 .op-progress__bar { height: 6px; border-radius: 3px; background: var(--preflightTrack); overflow: hidden; }
 /* Local linear follow: a short, cheap transition that keeps the bar in step
    with the committed projection instead of lagging 320 ms behind it. */
-.op-progress__bar span { display: block; height: 100%; border-radius: 3px; transition: width 120ms linear; }
+.op-progress__bar span { display: block; height: 100%; border-radius: 3px; transition: width var(--durProgressFollow) linear; }
 .op-progress__bar--accent span { background: var(--accent); }
 .op-progress__bar--warn span { background: var(--warn); }
 .op-progress__bar--danger span { background: var(--dangerSolid); }
@@ -1231,10 +1231,10 @@ i.tone-danger { background: var(--danger); }
 .recon-workspace__methods .is-selected { border-color: var(--accent); background: var(--accentSoft); }
 .recon-workspace__actions-group { display: flex; flex-direction: column; gap: 6px; }
 .recon-workspace__actions-group > button { min-height: 29px; padding: 3px 8px; background: var(--neutralSoft); color: var(--textPrimary); }
-.recon-workspace__actions-group > .recon-workspace__primary { background: var(--accent); color: var(--onAccent); }
+.recon-workspace__actions-group > .recon-workspace__primary { background: var(--actionFill); color: var(--onAccent); }
 .recon-workspace__view-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
 .recon-workspace__view-controls button { min-width: 0; min-height: var(--controlHeight); white-space: nowrap; padding: 3px 5px; background: var(--neutralSoft); color: var(--textPrimary); }
-.recon-workspace__view-controls button[aria-pressed="true"] { border-color: var(--accent); color: var(--accentText); }
+.recon-workspace__view-controls button[aria-pressed="true"] { border-color: var(--accent); }
 .recon-workspace__progress { display: flex; gap: 7px; align-items: center; margin-top: auto; padding-bottom: 6px; }
 .recon-workspace__progress-track { height: 7px; flex: 1 1 auto; background: var(--neutralSoft); border-radius: 4px; overflow: hidden; }
 .recon-workspace__progress-track i { display: block; height: 100%; background: var(--accent); }
@@ -1385,7 +1385,7 @@ i.tone-danger { background: var(--danger); }
    read-only unknown, but it never borrows the "on" tone. */
 .xray-meter__well--unknown { font-size: var(--fontSizeBody); font-weight: var(--fontWeightStrong); color: var(--warnText); letter-spacing: 0; }
 .xray-mode-banner strong.tone-danger { color: var(--dangerText); }
-.xray-mode-banner strong.tone-ok { color: var(--accentText); }
+.xray-mode-banner strong.tone-ok { color: var(--statusConfirmedText); }
 .xray-mode-banner strong.tone-warn { color: var(--warnText); }
 .safety-block__head { gap: 6px; }
 .panel__footnote { line-height: 1.5; }
@@ -1393,7 +1393,7 @@ i.tone-danger { background: var(--danger); }
 .control-dock .dock-key--stop:disabled .dock-icon { filter: grayscale(1); opacity: 0.42; }
 .follow-toggle { padding: 3px 9px; border-radius: 6px; background: var(--panelHeader); color: var(--accent); font-size: var(--fontSizeHint); cursor: pointer; white-space: nowrap; transition: background-color var(--durFast) var(--easeOut), color var(--durFast) var(--easeOut); }
 .console { border: 1px solid var(--line); border-radius: var(--radiusCardCompact); overflow: hidden; }
-.log-line { font-size: var(--fontSizeHint); line-height: 1.5; animation: log-in var(--durBase) var(--easeOut) backwards; }
+.log-line { font-size: var(--fontSizeHint); line-height: 1.5; }
 .log-line__time { font-variant-numeric: tabular-nums; }
 .log-line__msg { overflow-wrap: anywhere; }
 
@@ -1881,7 +1881,7 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 .card-import__task select{flex:1 1 auto;min-width:0;min-height:28px;padding:3px 6px;font:inherit;background:var(--neutralSoft);color:var(--textPrimary);border:1px solid var(--lineField);border-radius:7px}
 .card-import__note{margin:6px 0 0;font-size:var(--fontSizeLabel);color:var(--textMuted)}
 .card-import__error{margin:8px 0 0;color:var(--danger)}
-.recon-workspace__gate{margin:6px 0 0;color:var(--danger);font-size:var(--fontSizeLabel);line-height:1.4}
+.recon-workspace__gate{margin:6px 0 0;color:var(--dangerText);font-size:var(--fontSizeLabel);line-height:1.4}
 
 /* Disabled is a text role, not a panel-specific opacity multiplier. Keep known
    readbacks and unknown-value dashes legible; only unavailable controls are dimmed.
@@ -1924,7 +1924,7 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 .modal-card summary:hover { background: var(--navigationHover); }
 .modal-card details[open] > summary { margin-bottom: 8px; }
 .modal-card :is(summary, button, input, select, textarea):focus-visible {
-  outline: 2px solid var(--accent); outline-offset: 2px;
+  outline: 2px solid var(--focusRing); outline-offset: 2px;
 }
 .readout-value { color: var(--textValue); font-variant-numeric: tabular-nums; }
 :root :is(input, select).is-unknown:disabled { color: var(--textValue); -webkit-text-fill-color: currentColor; }
@@ -2008,3 +2008,13 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 .device-actions button.bench-enable:not(:disabled) { color: var(--warnText); border-color: var(--warn); }
 .failure-card__guidance { margin: 0; font-size: var(--fontSizeLabel); font-weight: var(--fontWeightMedium); line-height: 1.45; }
 .failure-card__technical { font-size: var(--fontSizeHint); font-weight: var(--fontWeightRegular); color: var(--textSecondary); }
+
+/* Selection remains identifiable without relying on colour. */
+.recon-workspace__methods button[aria-checked="true"]::before,
+.recon-workspace__view-controls button[aria-pressed="true"]::before { content: "\2713\00a0"; }
+
+/* Keep each control's own fill visible beneath the pressed tint. */
+:is(.menu-dropdown__item, .console__tab, .camera-advanced__tab, .trouble-pane__tab, .window-controls button, .theme-toggle__seg, .scene-view-btn):active:not(:disabled) {
+  background-image: linear-gradient(var(--pressedOverlay), var(--pressedOverlay));
+}
+.window-controls .window-controls__close:active:not(:disabled) { background: var(--dangerSolid); color: var(--onAccent); }
