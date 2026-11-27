@@ -879,7 +879,7 @@ i.tone-danger { background: var(--danger); }
   font-weight: var(--fontWeightRegular);
   outline: none; letter-spacing: 0;
 }
-.xray-channel__monitor { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: var(--fontSizeHint); color: var(--textLabel); border-left: 1px solid var(--line); padding: 0 0 0 5px; min-width: 0; white-space: nowrap; font-weight: var(--fontWeightMedium); letter-spacing: 0; line-height: 1.25; }
+.xray-channel__monitor { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: var(--fontSizeHint); color: var(--textLabel); min-width: 0; white-space: nowrap; font-weight: var(--fontWeightMedium); letter-spacing: 0; line-height: 1.25; }
 .xray-channel__monitor b { display: flex; align-items: center; height: var(--controlHeight); font-family: var(--fontUi); font-size: var(--fontSizeBody); font-weight: var(--fontWeightStrong); letter-spacing: 0; color: var(--textValue); }
 
 .send-btn {
@@ -913,7 +913,6 @@ i.tone-danger { background: var(--danger); }
   font-weight: var(--fontWeightStrong);
   color: var(--textValue); letter-spacing: 0;
 }
-.xray-meter + .xray-meter { border-left: 1px solid var(--line); padding-left: 12px; }
 .xray-meter__well--safe { color: var(--accentText); background: var(--okSoft); }
 .xray-meter__well--danger { color: var(--dangerText); background: var(--dangerSoft); border-color: var(--danger); }
 
@@ -1783,18 +1782,18 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 /* Enlarged type and the optional focus controls share a fixed column. Size each
    row by its content: flex shrinking must not paint one section over the next. */
 .camera-panel .device-body > *, .turntable-panel .device-body > * { flex: 0 0 auto; }
-.camera-panel .device-section { gap: 4px; }
-.camera-panel .device-grid { gap: 6px; }
-.camera-panel .device-field { gap: 3px; }
+.camera-panel .device-section { gap: 2px; }
+.camera-panel .device-grid { gap: 3px 6px; }
+.camera-panel .device-field { gap: 1px; }
 .camera-destination-grid > :last-child { grid-column: 1 / -1; }
 .camera-panel .device-control { height: var(--controlHeight); }
 .camera-panel .device-well { height: var(--controlHeight); }
 .camera-panel .device-value { line-height: 32px; }
 /* Keep the SD destination and actual readback visible in the fixed panel. */
-.camera-panel .device-body { gap: 6px; padding-block: 8px; }
-.camera-panel .device-group { gap: 6px; }
+.camera-panel .device-body { gap: 2px; padding-block: 4px; }
+.camera-panel .device-group { gap: 3px; }
 .camera-panel .device-readout { gap: 2px; }
-.camera-panel .device-footer { padding-top: 4px; flex-wrap: wrap; row-gap: 3px; }
+.camera-panel .device-footer { margin-top: 0; padding-top: 3px; flex-wrap: wrap; row-gap: 3px; }
 .camera-panel .device-footer p { flex-basis: 100%; white-space: normal; overflow-wrap: anywhere; line-height: 1.35; max-height: 2.7em; }
 .camera-capability { color: var(--textSecondary); font-size: var(--fontSizeHint); white-space: nowrap; }
 .device-identity { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--textSecondary); font-size: var(--fontSizeHint); }
@@ -1807,8 +1806,8 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
    Reserve room for the optional focus-step row and the complete status footer. */
 .camera-panel { container-type: size; container-name: camera; }
 @container camera (max-height: 640px) {
-  .camera-panel .device-body { gap: 4px; padding-block: 6px; }
-  .camera-panel .device-group { gap: 6px; }
+  .camera-panel .device-body { gap: 2px; padding-block: 4px; }
+  .camera-panel .device-group { gap: 3px; }
   .camera-panel .device-grid button { min-height: var(--controlHeightCompact); }
   .camera-panel .device-control, .camera-panel .device-well { height: var(--controlHeightCompact); }
   .camera-panel .device-value { line-height: 28px; }
