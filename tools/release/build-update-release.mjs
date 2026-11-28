@@ -10,7 +10,8 @@ const output=join(root,'.cache/tests/release',version);
 const delivery=join(root,'release');
 const filename='micro-ct-workstation_'+version+'_windows_x86_64.msi';
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
-function run(exe,args){const child=spawnSync(exe,args,{cwd:root,stdio:'inherit',env:{...process.env,TAURI_SIGNING_PRIVATE_KEY:undefined,TAURI_SIGNING_PRIVATE_KEY_PATH:undefined,TAURI_SIGNING_PRIVATE_KEY_PASSWORD:undefined}});if(child.status!==0)throw Error(exe+' exited '+child.status);}
+function run(exe,args){const child=spawnSync(exe,args,{cwd:root,stdio:'inherit',env:{...process.env,TAURI_SIGNING_PRIVATE_KEY:undefined,TAURI_SIGNING_PRIVATE_KEY_PATH:undefined,TAURI_SIGNING_PRIVATE_KEY_PASSWORD:undefined}});if(child.status!==0)throw Error(exe+' exited '+child.status+(child.error?': '+child.error.message:''));}
+const powershell=process.platform==='win32'?(spawnSync('pwsh',['-NoProfile','-Command','exit 0'],{stdio:'ignore'}).status===0?'pwsh':'powershell.exe'):'pwsh';
 if(process.platform!=='win32'||process.arch!=='x64')throw Error('Build the Windows x64 installer on Windows x64');
 if(JSON.parse(readFileSync(join(root,'node_modules/@tauri-apps/cli/package.json'),'utf8')).version!=='2.12.1')throw Error('CLI must be exactly 2.12.1');
 const config=JSON.parse(readFileSync(join(root,'backend/src-tauri/tauri.conf.json'),'utf8'));
@@ -30,7 +31,7 @@ if(!readFileSync(join(root,'.cache/cargo/release/ct-workstation.exe')).includes(
 const directory=join(root,'.cache/cargo/release/bundle/msi');
 const files=readdirSync(directory).filter(name=>name.endsWith('.msi')&&name.includes(version));
 if(files.length!==1)throw Error('Expected exactly one current-version MSI');
-run('pwsh',['-NoProfile','-File',join(root,'tools/release/verify-installer-ui.ps1'),'-Path',join(directory,files[0])]);
+run(powershell,['-NoProfile','-File',join(root,'tools/release/verify-installer-ui.ps1'),'-Path',join(directory,files[0])]);
 copyFileSync(join(directory,files[0]),join(output,filename));
 // Validate files extracted from this MSI before it becomes the latest delivery.
 const extracted=join(output,'extracted');
