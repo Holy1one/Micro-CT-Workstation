@@ -1560,7 +1560,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           <span className="xray-channel__label">{localize("Voltage · kV ")}<HelpTip align="end" text="SET is your draft. Applied is the last device-confirmed sent value, available before beam ON. Measured is output telemetry. A dash means unconfirmed or unavailable." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
-              <label className="xray-channel__draft"><span className="xray-channel__key">{localize("SET")}</span>
+              <label className="xray-channel__draft">
               <input
                 className="xray-channel__well"
                 aria-label={localize("Voltage setpoint in kV")}
@@ -1578,7 +1578,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           <span className="xray-channel__label">{localize("Current · µA ")}<HelpTip align="end" text="SET is your draft. Applied is the last device-confirmed sent value, available before beam ON. Measured is output telemetry. A dash means unconfirmed or unavailable." /></span>
           <div className="xray-channel__row">
             <div className="xray-channel__control">
-              <label className="xray-channel__draft"><span className="xray-channel__key">{localize("SET")}</span>
+              <label className="xray-channel__draft">
               <input
                 className="xray-channel__well"
                 value={uaDraft}
@@ -1594,8 +1594,9 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
         </div>
       </div>
       <div className="xray-readbacks">
-        <div className="xray-readback-row"><span>{localize("Voltage · kV ")}</span><span className="xray-channel__monitor xray-channel__applied" aria-label={localize("Applied voltage")}>{localize("Applied ")}<b>{localize(measured(ws.xray.connected && ws.xray.voltageConfirmed ? ws.xray.setKv : null, stale))}</b></span><span className="xray-channel__monitor">{localize("Measured ")}<b>{localize(measured(ws.xray.monKv, stale))}</b></span></div>
-        <div className="xray-readback-row"><span>{localize("Current · µA ")}</span><span className="xray-channel__monitor xray-channel__applied" aria-label={localize("Applied current")}>{localize("Applied ")}<b>{localize(measured(ws.xray.connected && ws.xray.currentConfirmed ? ws.xray.setUa : null, stale))}</b></span><span className="xray-channel__monitor">{localize("Measured ")}<b>{localize(measured(ws.xray.monUa, stale))}</b></span></div>
+        <div className="xray-readback-row xray-readback-row--head"><span></span><span>{localize("Applied ")}</span><span>{localize("Measured ")}</span></div>
+        <div className="xray-readback-row"><span>{localize("Voltage · kV ")}</span><span className="xray-channel__monitor" aria-label={localize("Applied voltage")}><b>{localize(measured(ws.xray.connected && ws.xray.voltageConfirmed ? ws.xray.setKv : null, stale))}</b></span><span className="xray-channel__monitor"><b>{localize(measured(ws.xray.monKv, stale))}</b></span></div>
+        <div className="xray-readback-row"><span>{localize("Current · µA ")}</span><span className="xray-channel__monitor" aria-label={localize("Applied current")}><b>{localize(measured(ws.xray.connected && ws.xray.currentConfirmed ? ws.xray.setUa : null, stale))}</b></span><span className="xray-channel__monitor"><b>{localize(measured(ws.xray.monUa, stale))}</b></span></div>
       </div>
       <div className="xray-meters">
         <div className="xray-meter">
@@ -1647,7 +1648,8 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           {localize(ws.xray.timerOn ? "Timer On" : "Timer Off")}
         </button>
       </div>
-      <div className="safety-block">
+      </div>
+      <div className="safety-block xray-safety-card">
         <div className="safety-block__head">
           <span className="safety-block__title">{localize("DEVICE SAFETY")}</span>
           <span className={`chip chip--${stale || !ws.xray.usbAutoShutDownKnown ? "warn" : ws.xray.usbAutoShutDown ? "muted" : "warn"}`}>
@@ -1691,7 +1693,6 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           >{localize("SET")}</button>
           <span className="delay-row__device">{localize("Device ")}<strong>{localize(stale ? "–" : ws.xray.usbShutdownDelay ?? "–")}</strong></span>
         </div>
-      </div>
       </div>
       </div>
 

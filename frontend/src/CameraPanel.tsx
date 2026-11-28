@@ -75,6 +75,7 @@ export function CameraPanel({ snapshot, stale, pending, model, run, onAdvanced, 
           mode is applied and read back. No predicted writability. */}
       <div className="device-grid device-grid--2 camera-destination-grid"><CameraPropertyControl property={camera?.properties.whiteBalanceTemperature} model={model} reason={cameraReason} stale={stale} label="Color temperature" hint="Selects a Kelvin value on the camera, sent as its native index 0–30 (index 20 = 5000 K). Preset manual is the camera's own measured/photo-reference white balance, not a software photographic preset." /><CameraPropertyControl property={camera?.properties.recordingMedia} model={model} reason={cameraReason} stale={stale} label="Photo destination" hint="Default: keep every photo on the camera SD card. Apply and verify before capture or Preflight. Local downloads require explicitly selecting Host RAM and Apply in this session. Scans import after X-ray OFF and remove their SD images after every local file is verified." /></div>
     </div>
+    <div className="camera-capture">
     <div className="device-readouts">{[["exposureMode", "Mode"], ["autoIso", "Auto ISO"], ["focusMode", "Focus"]].map(([key, label]) => { const property = camera?.properties[key]; const text = cameraParameterReadout(property, stale); return <div className="device-readout" key={key}><span>{localize(label)}</span><strong className={text === "–" ? "is-unknown" : undefined} title={localize(text === "–" ? `${label} · Unknown; no current confirmed readback` : text)} aria-label={localize(text === "–" ? `${label} unknown` : undefined)}>{localize(text)}</strong></div>; })}</div>
     {/* U9: the engine snapshot already publishes camera status continuously, so the
         redundant Status button is gone. Each remaining entry names one duty:
@@ -91,5 +92,6 @@ export function CameraPanel({ snapshot, stale, pending, model, run, onAdvanced, 
       </>}
     </div>
     <div className="device-footer"><p role="status" title={localize(englishDisplayText(reason))}>{localize(englishDisplayText(reason))}</p><span className="camera-capability" title={localize(englishDisplayText(captureReason || "Single photo ready"))} aria-label={`${localize("Single photo ")}${captureReason ? "\u2715" : "\u2713"} \u00b7 ${localize(englishDisplayText(captureReason || "Single photo ready"))}`}>{localize("Single photo ")}{localize(captureReason ? "✕" : "✓")}</span><span className="camera-capability" title={localize(englishDisplayText(scanReady ? "Fixed scan ready" : readiness?.issues[0]?.requirement || "Fixed scan not ready"))} aria-label={`${localize("Fixed scan ")}${scanReady ? "\u2713" : "\u2715"} \u00b7 ${localize(englishDisplayText(scanReady ? "Fixed scan ready" : readiness?.issues[0]?.requirement || "Fixed scan not ready"))}`}>{localize("Fixed scan ")}{localize(scanReady ? "✓" : "✕")}</span></div>
+    </div>
   </div></section>;
 }

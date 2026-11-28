@@ -2044,3 +2044,32 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 .xray-channel__draft { flex-direction: row; align-items: center; gap: var(--space2); }
 .xray-channel__draft .xray-channel__well { min-width: 0; }
 .xray-secondary .safety-block__head, .xray-secondary .check-row--inset, .xray-secondary .delay-row { padding-top: var(--space1); }
+
+/* Compact device panels at the workstation's fixed upper-row height. */
+.xray-panel__body { justify-content: flex-start; gap: var(--space1); padding: var(--space2); }
+.xray-channel__row { grid-template-columns: minmax(0, 4fr) minmax(0, 1fr); }
+.xray-channel__draft .xray-channel__well, .xray-channel .send-btn, .xray-beam-btn { height: var(--controlHeight); }
+.xray-readbacks { padding-top: var(--space1); }
+.xray-readback-row--head { color: var(--textSecondary); font-size: var(--fontSizeHint); text-align: center; }
+.xray-mode-banner--manual { padding-block: 0; }
+.xray-action-reason { font-size: var(--fontSizeHint); line-height: 1.25; }
+.xray-secondary { margin-top: var(--space2); padding: var(--space2); }
+.timer-row { align-items: center; gap: var(--space2); }
+.timer-field { display: flex; align-items: center; gap: var(--space1); min-width: 0; text-align: left; }
+.timer-field > span { margin: 0; white-space: nowrap; font-size: var(--fontSizeHint); }
+.timer-field__well { min-width: 0; }
+.xray-safety-card { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--space1) var(--space2); margin: 0; padding: 10px; border: 0; border-radius: var(--radiusControl); background: var(--neutralSoft); }
+.xray-safety-card .safety-block__head { grid-column: 1 / -1; padding: 0; }
+.xray-safety-card .check-row { padding: 0; white-space: nowrap; }
+.xray-safety-card .delay-row { grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; padding: 0; gap: var(--space1); }
+.xray-safety-card .delay-row__field { display: flex; align-items: center; gap: var(--space1); min-width: 0; }
+.xray-safety-card .delay-row__field span { margin: 0; white-space: nowrap; font-size: var(--fontSizeHint); }
+.xray-safety-card .delay-row__field input { min-width: 0; }
+.xray-safety-card .delay-row__device { padding: 0; font-size: var(--fontSizeHint); }
+.camera-panel .device-body { padding-block: var(--space2); }
+.camera-panel .device-group { gap: var(--space2); }
+.camera-panel .device-grid { gap: var(--space2); }
+.camera-capture { display: flex; flex-direction: column; gap: var(--space1); margin-top: auto; padding-top: 10px; border-top: 1px solid var(--lineSoft); }
+.camera-capture .device-readout span { font-size: var(--fontSizeHint); font-weight: var(--fontWeightRegular); }
+.camera-capture .device-readout strong { font-size: var(--fontSizeBody); font-weight: var(--fontWeightMedium); line-height: 1.25; }
+.camera-capture .device-footer { border-top: 0; padding-top: var(--space1); }
