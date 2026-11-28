@@ -2086,24 +2086,27 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
 
 /* Compact reconstruction controls and camera connection rows. */
 .recon-workspace { grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr); }
-.recon-workspace__actions-group { gap: var(--space3); }
+.recon-workspace__actions-group { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); grid-auto-flow: row dense; align-content: start; gap: var(--space3); }
+.recon-workspace__actions-group > .recon-workspace__primary, .recon-workspace__actions-group > .recon-workspace__reason { grid-column: 1 / -1; }
+.recon-workspace__parameters-card, .recon-workspace__method-card { grid-column: 1; }
+.recon-workspace__view-card { grid-column: 2; grid-row: span 2; align-self: start; }
 .recon-workspace__actions-group > .recon-workspace__reason { margin-top: calc(-1 * var(--space2)); }
 .recon-workspace__card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space2); }
 .recon-workspace__card-head h3 { margin: 0; }
 .recon-workspace .recon-workspace__text-action { padding: 0; border: 0; background: transparent; box-shadow: none; color: var(--accentText); font-size: var(--fontSizeLabel); font-weight: var(--fontWeightMedium); }
 .recon-workspace__methods { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.recon-workspace__methods button { min-width: 0; padding-inline: var(--space1); }
 .recon-workspace__methods button, .recon-workspace__view-controls button { min-height: var(--controlHeightCompact); }
 .recon-workspace__view-card { margin-top: 0; }
-.recon-workspace__view-controls { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-.recon-workspace__view-controls button { white-space: normal; }
+.recon-workspace__view-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space2); }
+.recon-workspace__view-controls button { height: var(--controlHeight); white-space: nowrap; }
+.recon-workspace__view-controls button:last-child { grid-column: 1 / -1; }
 .recon-workspace__colour-modes select { min-height: var(--controlHeight); }
 .recon-workspace__band-note { margin: var(--space1) 0 0; }
-.camera-panel .device-group { gap: calc(var(--space3) / 2); }
-.camera-picker { display: flex; align-items: center; gap: calc(var(--space3) / 2); min-width: 0; }
+.camera-panel .device-group { gap: var(--space2); }
+.camera-picker { display: flex; align-items: center; gap: var(--space2); min-width: 0; }
 .camera-picker select { flex: 1 1 0; }
-.camera-picker .device-identity { flex: 0 1 auto; max-width: 25%; margin: 0; font-weight: var(--fontWeightRegular); }
-.camera-discover { display: inline-flex; align-items: center; justify-content: center; gap: var(--space1); min-height: var(--controlHeight); padding: 0 var(--space2); white-space: nowrap; font-size: var(--fontSizeLabel); }
-.camera-panel .camera-root { flex-direction: row; align-items: center; gap: var(--space2); }
-.camera-root > span { flex: 0 0 calc(var(--space8) * 3); font-weight: var(--fontWeightRegular); }
-.camera-root .device-well { flex: 1 1 auto; }
-.camera-panel .device-section .device-grid { gap: var(--space2); }
+.camera-discover { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 var(--controlHeight); width: var(--controlHeight); height: var(--controlHeight); padding: 0; }
+.camera-panel .camera-root { align-items: stretch; gap: var(--space1); }
+.camera-root > span { font-size: var(--fontSizeLabel); font-weight: var(--fontWeightRegular); white-space: normal; overflow: visible; }
+.camera-panel .device-section .device-grid { gap: var(--space1) var(--space2); }
