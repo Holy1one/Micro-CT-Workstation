@@ -149,6 +149,8 @@ export const zhCN: Readonly<Record<string, string>> = {
   "Xray OFF": "关闭射线",
   "On Sec": "开启秒数",
   "Off Sec": "关闭秒数",
+  "Manual X-ray output unavailable": "手动射线输出不可用",
+  "Timer": "定时器",
   "Timer On": "定时器开启",
   "Timer Off": "定时器关闭",
   "DEVICE SAFETY": "设备安全",

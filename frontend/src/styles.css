@@ -29,6 +29,7 @@ body {
   font-size: var(--fontSizeBody);
   font-weight: var(--fontWeightRegular);
   font-variant-numeric: tabular-nums;
+  line-height: 1.5;
   font-optical-sizing: auto;
   font-synthesis: none;
   -webkit-font-smoothing: antialiased;
@@ -38,7 +39,7 @@ body {
 
 /* Native controls must not fall back to browser-specific fonts or proportional numbers. */
 button, input, select, textarea { font-family: inherit; font-variant-numeric: inherit; letter-spacing: 0; }
-button { font-size: var(--fontSizeLabel); font-weight: var(--fontWeightStrong); }
+button { font-size: var(--fontSizeLabel); font-weight: var(--fontWeightSection); }
 input, select, textarea { font-size: var(--fontSizeBody); font-weight: var(--fontWeightRegular); }
 strong, b { font-weight: var(--fontWeightStrong); }
 h2, h3 { color: var(--textHeading); }
@@ -2020,3 +2021,26 @@ button.help-tip:hover { color: var(--accent); background: var(--accentSoft); }
   background-image: linear-gradient(var(--pressedOverlay), var(--pressedOverlay));
 }
 .window-controls .window-controls__close:active:not(:disabled) { background: var(--dangerSolid); color: var(--onAccent); }
+
+/* X-ray setpoints, confirmed readbacks and secondary controls. */
+.xray-panel__body { gap: var(--space2); }
+.xray-connection-btn:not(.xray-connection-btn--connected), .xray-beam-btn:not(.switch-btn--on) { background: var(--actionFill); color: var(--onAccent); }
+.xray-channel__row { grid-template-columns: minmax(0, 1fr) auto; }
+.xray-channel__control { display: block; }
+.xray-channels { gap: var(--space2); }
+.xray-channel__label, .xray-secondary__title, .safety-block__title { font-size: var(--fontSizeSection); font-weight: var(--fontWeightSection); }
+.xray-channel__key, .xray-channel__monitor, .timer-field > span, .delay-row__field span { font-size: var(--fontSizeLabel); font-weight: var(--fontWeightBody); line-height: 1.4; }
+.xray-readbacks { display: grid; gap: var(--space1); padding-top: var(--space3); border-top: 1px solid var(--line); }
+.xray-readback-row { display: grid; grid-template-columns: minmax(0, 1fr) repeat(2, minmax(0, 1fr)); gap: var(--space2); align-items: center; font-size: var(--fontSizeLabel); }
+.xray-channel__monitor { background: var(--neutralSoft); border-radius: var(--radiusControl); }
+.xray-channel__monitor b { height: auto; font-weight: var(--fontWeightBody); font-variant-numeric: tabular-nums; }
+.xray-beam-btn { height: var(--controlHeight); }
+.xray-action-reason { margin: 0; color: var(--textSecondary); font-size: var(--fontSizeLabel); font-weight: var(--fontWeightBody); line-height: 1.4; }
+.xray-secondary { display: grid; gap: var(--space1); margin-top: var(--space4); padding: var(--space2); border-radius: var(--radiusControl); background: var(--neutralSoft); font-size: var(--fontSizeLabel); font-weight: var(--fontWeightBody); }
+.xray-secondary .timer-row { padding: 0; }
+.xray-secondary .safety-block { margin: 0; }
+.panel__header h2, .scene-toolbar h2, .console__head h2, .modal-card__head h2, .failure-card__head h2 { font-weight: var(--fontWeightTitle); }
+
+.xray-channel__draft { flex-direction: row; align-items: center; gap: var(--space2); }
+.xray-channel__draft .xray-channel__well { min-width: 0; }
+.xray-secondary .safety-block__head, .xray-secondary .check-row--inset, .xray-secondary .delay-row { padding-top: var(--space1); }

@@ -1547,10 +1547,6 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
         </span>
       </div>
       <div className="xray-panel__body">
-      <div className={`xray-mode-banner ${scanLocked || faultLocked ? "xray-mode-banner--locked" : "xray-mode-banner--manual"}`}>
-        <span>{localize(faultLocked ? "Device fault · manual locked" : scanLocked ? "Scan control · manual locked" : "Manual source control")}</span>
-        <strong className={beamState === "on" ? "tone-danger" : beamState === "off" ? "tone-ok" : "tone-warn"}>{localize(outputText)}</strong>
-      </div>
       <button
         type="button"
         className={`switch-btn switch-btn--block xray-connection-btn ${ws.xray.connected ? "xray-connection-btn--connected" : "switch-btn--idle"}`}
@@ -1574,8 +1570,6 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
                 onChange={(event) => setKvDraft(event.target.value)}
               />
               </label>
-              <span className="xray-channel__monitor xray-channel__applied" aria-label={localize("Applied voltage")}>{localize("Applied ")}<b>{localize(measured(ws.xray.connected && ws.xray.voltageConfirmed ? ws.xray.setKv : null, stale))}</b></span>
-              <span className="xray-channel__monitor">{localize("Measured ")}<b>{localize(measured(ws.xray.monKv, stale))}</b></span>
             </div>
             <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(kvDraft))} onClick={() => void dispatch({ type: "send_voltage", kv: Number(kvDraft) })}>{localize("SEND V")}</button>
           </div>
@@ -1594,12 +1588,14 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
                 onChange={(event) => setUaDraft(event.target.value)}
               />
               </label>
-              <span className="xray-channel__monitor xray-channel__applied" aria-label={localize("Applied current")}>{localize("Applied ")}<b>{localize(measured(ws.xray.connected && ws.xray.currentConfirmed ? ws.xray.setUa : null, stale))}</b></span>
-              <span className="xray-channel__monitor">{localize("Measured ")}<b>{localize(measured(ws.xray.monUa, stale))}</b></span>
             </div>
             <button type="button" className="send-btn" disabled={busy || !ws.xray.setpointControlsEnabled || !Number.isFinite(Number(uaDraft))} onClick={() => void dispatch({ type: "send_current", ua: Number(uaDraft) })}>{localize("SEND I")}</button>
           </div>
         </div>
+      </div>
+      <div className="xray-readbacks">
+        <div className="xray-readback-row"><span>{localize("Voltage · kV ")}</span><span className="xray-channel__monitor xray-channel__applied" aria-label={localize("Applied voltage")}>{localize("Applied ")}<b>{localize(measured(ws.xray.connected && ws.xray.voltageConfirmed ? ws.xray.setKv : null, stale))}</b></span><span className="xray-channel__monitor">{localize("Measured ")}<b>{localize(measured(ws.xray.monKv, stale))}</b></span></div>
+        <div className="xray-readback-row"><span>{localize("Current · µA ")}</span><span className="xray-channel__monitor xray-channel__applied" aria-label={localize("Applied current")}>{localize("Applied ")}<b>{localize(measured(ws.xray.connected && ws.xray.currentConfirmed ? ws.xray.setUa : null, stale))}</b></span><span className="xray-channel__monitor">{localize("Measured ")}<b>{localize(measured(ws.xray.monUa, stale))}</b></span></div>
       </div>
       <div className="xray-meters">
         <div className="xray-meter">
@@ -1617,16 +1613,22 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           </div>
         </div>
       </div>
+      <div className={`xray-mode-banner ${scanLocked || faultLocked ? "xray-mode-banner--locked" : "xray-mode-banner--manual"}`}>
+        <span>{localize(faultLocked ? "Device fault · manual locked" : scanLocked ? "Scan control · manual locked" : "Manual source control")}</span>
+        <strong className={beamState === "on" ? "tone-danger" : beamState === "off" ? "tone-ok" : "tone-warn"}>{localize(outputText)}</strong>
+      </div>
       <button
         type="button"
-        className={`switch-btn switch-btn--block ${ws.xray.beamOn ? "switch-btn--on" : "switch-btn--idle"}`}
+        className={`switch-btn switch-btn--block xray-beam-btn ${beamState !== "off" ? "switch-btn--on" : "switch-btn--idle"}`}
         disabled={beamState === "off" && (busy || ws.dataState === "fault" || !ws.xray.manualControlsEnabled)}
         title={localize(faultLocked ? "Device fault latched · inspect the log, then repeat Preflight and HOME" : scanLocked ? "The scan owns X-ray output" : !ws.xray.connected ? "Connect the X-ray source first" : busy ? "Wait for the current command" : "Manual X-ray output control")}
         onClick={() => void dispatch({ type: beamState === "off" ? "xray_toggle" : "xray_off" })}
       >
         {localize(beamState === "off" ? "Xray Enable" : "Xray OFF")}
       </button>
-      <div className="panel__divider" />
+      {beamState === "off" && (busy || ws.dataState === "fault" || !ws.xray.manualControlsEnabled) && <p className="xray-action-reason">{localize(faultLocked ? "Device fault latched · inspect the log, then repeat Preflight and HOME" : scanLocked ? "The scan owns X-ray output" : !ws.xray.connected ? "Connect the X-ray source first" : busy ? "Wait for the current command" : "Manual X-ray output unavailable")}</p>}
+      <div className="xray-secondary">
+      <div className="xray-secondary__title">{localize("Timer")}</div>
       <div className="timer-row">
         <div className="timer-field">
           <span>{localize("On Sec")}</span>
@@ -1689,6 +1691,7 @@ function XrayPanel({ ws, busy, dispatch, stale }: { ws: WorkstationView; busy: b
           >{localize("SET")}</button>
           <span className="delay-row__device">{localize("Device ")}<strong>{localize(stale ? "–" : ws.xray.usbShutdownDelay ?? "–")}</strong></span>
         </div>
+      </div>
       </div>
       </div>
 

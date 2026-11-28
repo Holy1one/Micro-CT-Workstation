@@ -190,16 +190,20 @@
      the fixed canvas and aligned bottom row stay put. */
   --fontSizeMicro: 12px;
   --fontSizeHint: 14px;
-  --fontSizeLabel: 15px;
+  --fontSizeLabel: 14px;
   --fontSizeBody: 16px;
-  --fontSizeTitle: 18px;
+  --fontSizeTitle: 20px;
+  --fontSizeSection: 16px;
   --fontSizeReadout: 22px;
   --controlHeight: 36px;
   --controlHeightCompact: 32px;
   --panelHeaderHeight: 44px;
   --fontWeightRegular: 400;
   --fontWeightMedium: 500;
-  --fontWeightStrong: 600;
+  --fontWeightTitle: 600;
+  --fontWeightSection: 500;
+  --fontWeightBody: 400;
+  --fontWeightStrong: 500;
 
   /* One shared bilingual stack for every semantic role. Inter keeps Latin and
      numbers identical across locales; CJK uses genuine matching weight steps.
