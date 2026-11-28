@@ -1351,6 +1351,8 @@ i.tone-danger { background: var(--danger); }
   min-height: 0;
   overflow-y: auto;
   scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: var(--lineStrong) transparent;
   padding: 14px 16px 16px;
   font-size: var(--fontSizeBody);
   line-height: 1.55;
